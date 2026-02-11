@@ -86,7 +86,35 @@ class ToolRegistry:
             # 动态导入模块
             spec = importlib.util.spec_from_file_location(path.stem, path)
             module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+            
+            # Auto-Dependency Installation Logic
+            import sys
+            import subprocess
+            
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    spec.loader.exec_module(module)
+                    break # Success
+                except ModuleNotFoundError as e:
+                    if attempt == max_retries - 1:
+                        raise # Give up after retries
+                    
+                    # Extract package name (simple heuristic)
+                    missing_package = e.name.split('.')[0]
+                    logger.warning(f"缺少依赖 '{missing_package}'，正在尝试自动安装...")
+                    
+                    try:
+                        # Use sys.executable to ensure we install in the current environment (venv)
+                        subprocess.check_call(
+                            [sys.executable, "-m", "pip", "install", missing_package],
+                            stdout=subprocess.DEVNULL, # Keep it clean
+                            stderr=subprocess.PIPE
+                        )
+                        logger.info(f"✓ 依赖 '{missing_package}' 安装成功")
+                    except subprocess.CalledProcessError as install_error:
+                        logger.error(f"无法安装依赖 '{missing_package}': {install_error}")
+                        raise e # Re-raise original error if install fails
             
             # 查找 Tool 子类
             loaded = False
