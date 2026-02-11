@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+.installed.cfg
+*.egg
+*.egg-info/
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Genesis Specific
+memory/
+data/
+workspace/
+sandbox/
+archive/
+generated_tools/
+.nanogenesis/
+logs/
+conversations/
+*.sqlite
+*.db
+*.log
+system_profile.md
+config.py
+
+# Personal/Sensitive
+*.key
+*.token
+secrets.*
+input/*
+
+# IDE
+.idea/
+.vscode/
+*.swp
