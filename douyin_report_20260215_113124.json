@@ -1,0 +1,121 @@
+{
+  "analysis_date": "2026-02-15T11:31:24.015542",
+  "account_url": "https://www.douyin.com/user/知识创作者",
+  "account_type": "知识付费创作者",
+  "data": {
+    "followers": 61184,
+    "engagement_rate": 9.1,
+    "content_type": "知识分享",
+    "estimated_potential": 15180
+  },
+  "opportunities": [
+    {
+      "type": "知识付费课程",
+      "description": "系统化课程销售",
+      "estimated_revenue": 302860,
+      "steps": [
+        "课程设计",
+        "内容制作",
+        "定价策略",
+        "推广销售"
+      ],
+      "timeline": "3-4周",
+      "success_rate": 0.7
+    },
+    {
+      "type": "电商直播带货",
+      "description": "精选商品直播销售",
+      "estimated_revenue": 61184,
+      "steps": [
+        "选品",
+        "直播准备",
+        "预热宣传",
+        "执行直播"
+      ],
+      "timeline": "2-3周",
+      "success_rate": 0.6
+    },
+    {
+      "type": "品牌广告合作",
+      "description": "内容植入广告",
+      "estimated_revenue": 48947,
+      "steps": [
+        "媒体资料",
+        "联系品牌",
+        "内容创作",
+        "发布监测"
+      ],
+      "timeline": "3-5周",
+      "success_rate": 0.5
+    }
+  ],
+  "action_plan": {
+    "recommended_actions": [
+      {
+        "type": "知识付费课程",
+        "description": "系统化课程销售",
+        "estimated_revenue": 302860,
+        "steps": [
+          "课程设计",
+          "内容制作",
+          "定价策略",
+          "推广销售"
+        ],
+        "timeline": "3-4周",
+        "success_rate": 0.7
+      },
+      {
+        "type": "电商直播带货",
+        "description": "精选商品直播销售",
+        "estimated_revenue": 61184,
+        "steps": [
+          "选品",
+          "直播准备",
+          "预热宣传",
+          "执行直播"
+        ],
+        "timeline": "2-3周",
+        "success_rate": 0.6
+      }
+    ],
+    "timeline": [
+      {
+        "week": 1,
+        "action": "启动知识付费课程",
+        "task": "课程设计",
+        "goal": "完成准备工作"
+      },
+      {
+        "week": 2,
+        "action": "执行知识付费课程",
+        "task": "内容创作/直播执行",
+        "goal": "发布变现内容"
+      },
+      {
+        "week": 3,
+        "action": "启动电商直播带货",
+        "task": "选品",
+        "goal": "完成准备工作"
+      },
+      {
+        "week": 4,
+        "action": "执行电商直播带货",
+        "task": "内容创作/直播执行",
+        "goal": "发布变现内容"
+      }
+    ],
+    "next_steps": [
+      "1. 选择1个变现方向开始",
+      "2. 准备所需材料",
+      "3. 按周执行计划",
+      "4. 每周复盘优化"
+    ],
+    "estimated_timeline": "4周实现收入"
+  },
+  "revenue_forecast": {
+    "30_day_forecast": 82598,
+    "90_day_forecast": 206495,
+    "annual_potential": 495589,
+    "realistic_monthly": 41299
+  }
+}

@@ -1,0 +1,136 @@
+"""
+上下文感知管道 - NanoGenesis Context Pipeline
+实现模块化、插件化的上下文构建，替代硬编码的字符串拼接。
+"""
+
+from abc import ABC, abstractmethod
+from typing import List, Optional, Dict, Any
+from datetime import datetime
+import os
+import platform
+from pathlib import Path
+from dataclasses import dataclass
+from .base import Message, MessageRole
+
+@dataclass
+class ContextContext:
+    """传递给插件的上下文环境"""
+    user_input: str
+    raw_memory: Optional[List[Dict]] = None
+    agent_state: Optional[Dict] = None
+
+class ContextPlugin(ABC):
+    """上下文插件基类"""
+    name: str = "base_plugin"
+    priority: int = 10  # 越小越靠前
+    
+    @abstractmethod
+    def inject(self, ctx: ContextContext) -> Optional[str]:
+        """返回要注入的上下文片段，None 表示不注入"""
+        pass
+
+class IdentityPlugin(ContextPlugin):
+    """身份定义插件 (最核心)"""
+    name = "identity"
+    priority = 0
+    
+    def __init__(self, system_prompt: str):
+        self.system_prompt = system_prompt
+        
+    def inject(self, ctx: ContextContext) -> str:
+        return self.system_prompt
+
+class TimeAwarenessPlugin(ContextPlugin):
+    """时间感知插件"""
+    name = "time_awareness"
+    priority = 1
+    
+    def inject(self, ctx: ContextContext) -> str:
+        now = datetime.now()
+        return f"\n[System Time: {now.strftime('%Y-%m-%d %H:%M:%S')} {now.astimezone().tzname() or ''}]"
+
+class EnvironmentPlugin(ContextPlugin):
+    """环境感知插件 (OS, CWD, Hardware Profile)"""
+    name = "environment"
+    priority = 2
+    
+    def inject(self, ctx: ContextContext) -> str:
+        # 1. 基础动态信息
+        info = [
+            f"OS: {platform.system()} {platform.release()}",
+            f"CWD: {os.getcwd()}",
+            f"User: {os.getlogin()}"
+        ]
+        
+        base_info = "\n[Environment Status]\n" + "\n".join(info)
+        
+        # 2. 加载静态系统画像 (如果存在)
+        # 依次查找: CWD/system_profile.md, agent_root/system_profile.md
+        profile_content = ""
+        possible_paths = [
+            Path(os.getcwd()) / "system_profile.md",
+            Path(__file__).parent.parent / "system_profile.md"
+        ]
+        
+        for path in possible_paths:
+            if path.exists():
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        profile_content = f"\n\n[System Hardware & Scope]\n{f.read().strip()}"
+                    break
+                except Exception:
+                    pass
+                    
+        return base_info + profile_content
+
+class MemoryPlugin(ContextPlugin):
+    """记忆注入插件"""
+    name = "memory"
+    priority = 5
+    
+    def inject(self, ctx: ContextContext) -> Optional[str]:
+        if not ctx.raw_memory:
+            return None
+            
+        content = "\n\n[Relevant Memories]\n"
+        for i, m in enumerate(ctx.raw_memory, 1):
+            content += f"{i}. {m.get('content', '')}\n"
+        return content
+
+class ContextPipeline:
+    """上下文管道管理器"""
+    
+    def __init__(self, base_system_prompt: str):
+        self.plugins: List[ContextPlugin] = []
+        # 默认注册核心插件
+        self.register(IdentityPlugin(base_system_prompt))
+        self.register(TimeAwarenessPlugin())
+        self.register(EnvironmentPlugin())
+        # self.register(MemoryPlugin())  # Handled by ProtocolCompressionPlugin
+        
+        # 延迟导入以避免循环依赖
+        try:
+            from .representation import ProtocolCompressionPlugin
+            self.register(ProtocolCompressionPlugin())
+        except ImportError:
+            pass
+        
+    def register(self, plugin: ContextPlugin):
+        self.plugins.append(plugin)
+        self.plugins.sort(key=lambda x: x.priority)
+        
+    def build_system_context(self, user_input: str, **kwargs) -> str:
+        """构建完整的 System Context"""
+        ctx = ContextContext(user_input=user_input, **kwargs)
+        
+        parts = []
+        for plugin in self.plugins:
+            try:
+                content = plugin.inject(ctx)
+                if content:
+                    parts.append(content)
+            except Exception as e:
+                # 插件故障不应导致崩盘
+                print(f"Plugin {plugin.name} failed: {e}")
+                
+        return "\n".join(parts)

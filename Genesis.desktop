@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=NanoGenesis
+Comment=Your Digital Lifeform (OpenClaw Architecture)
+Exec=/home/chendechusn/nanabot/start_nano.sh
+Icon=utilities-terminal
+Terminal=true
+Type=Application
+Categories=Utility;AI;
+Keywords=AI;Agent;DeepSeek;

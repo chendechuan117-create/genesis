@@ -1,0 +1,15 @@
+{
+  "pattern": {
+    "prefers_concise": 1.0,
+    "prefers_technical": 0.5,
+    "prefers_proactive": 0.5,
+    "uses_emoji": 0.0,
+    "message_length_avg": 23.059440996100093,
+    "formality": 0.25000000000000006,
+    "positive_signals": 0,
+    "negative_signals": 0,
+    "total_interactions": 105,
+    "confidence": 0.8
+  },
+  "last_updated": "2026-02-15T12:04:50.563384"
+}

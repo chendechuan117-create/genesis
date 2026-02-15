@@ -1,0 +1,111 @@
+# 抖音数据分析系统配置
+system:
+  name: "抖音变现潜力分析系统"
+  version: "1.0"
+  author: "Genesis AI"
+  
+analysis:
+  # 分析深度级别
+  depth_levels:
+    basic: "基础分析（粉丝数、互动率）"
+    standard: "标准分析（+内容类型、变现现状）"
+    comprehensive: "全面分析（+变现机会、行动计划）"
+  
+  # 变现机会类型
+  monetization_types:
+    - name: "知识付费"
+      description: "课程、咨询、社群"
+      min_followers: 10000
+      success_rate: 0.7
+      
+    - name: "电商带货"
+      description: "直播带货、橱窗商品"
+      min_followers: 30000
+      success_rate: 0.6
+      
+    - name: "广告合作"
+      description: "品牌植入、内容广告"
+      min_followers: 50000
+      success_rate: 0.5
+      
+    - name: "IP授权"
+      description: "形象授权、衍生品"
+      min_followers: 100000
+      success_rate: 0.4
+      
+    - name: "平台补贴"
+      description: "创作激励、流量分成"
+      min_followers: 20000
+      success_rate: 0.8
+
+# 收入预测参数
+revenue_forecast:
+  # 转化率假设
+  conversion_rates:
+    knowledge_paid: 0.05  # 知识付费转化率
+    ecommerce: 0.02       # 电商转化率
+    advertising: 0.01     # 广告合作转化率
+    
+  # 客单价假设（元）
+  average_order_value:
+    knowledge_course: 99
+    ecommerce_product: 50
+    ad_per_10k_followers: 800
+    
+  # 时间周期
+  forecast_periods:
+    short_term: 30    # 30天
+    medium_term: 90   # 90天
+    long_term: 365    # 365天
+
+# 行动计划模板
+action_templates:
+  week_1:
+    - "账号诊断与定位"
+    - "变现方向选择"
+    - "资源准备"
+    
+  week_2_4:
+    - "内容创作/商品选品"
+    - "营销材料准备"
+    - "预热宣传"
+    
+  week_5_8:
+    - "执行变现动作"
+    - "数据监测"
+    - "优化调整"
+    
+  week_9_12:
+    - "规模化复制"
+    - "建立系统"
+    - "团队搭建"
+
+# 示例账号配置
+demo_accounts:
+  - url: "https://www.douyin.com/user/knowledge_creator"
+    type: "知识付费"
+    expected_potential: 15000
+    
+  - url: "https://www.douyin.com/user/entertainment_funny"
+    type: "娱乐搞笑"
+    expected_potential: 50000
+    
+  - url: "https://www.douyin.com/user/lifestyle_blogger"
+    type: "生活方式"
+    expected_potential: 30000
+
+# 输出配置
+output:
+  report_format: "json"  # json, html, pdf
+  include_charts: true
+  language: "zh-CN"
+  auto_save: true
+  
+# 监控配置
+monitoring:
+  enabled: true
+  interval_hours: 24
+  alert_thresholds:
+    engagement_drop: 0.2    # 互动率下降20%
+    follower_growth_stop: 7 # 粉丝增长停滞7天
+    revenue_opportunity: 10000 # 发现万元级变现机会
