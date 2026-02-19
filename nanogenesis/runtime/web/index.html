@@ -1,0 +1,942 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Genesis AI | Self-Aware Intelligence</title>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/base16/catppuccin-mocha.min.css">
+    <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&family=JetBrains+Mono:wght@300;400&display=swap"
+        rel="stylesheet">
+    <style>
+        :root {
+            --bg: #0f0f17;
+            --glass: rgba(26, 27, 38, 0.7);
+            --border: rgba(255, 255, 255, 0.1);
+            --accent: #cba6f7;
+            --accent-glow: rgba(203, 166, 247, 0.3);
+            --user-bg: rgba(137, 180, 250, 0.15);
+            --bot-bg: rgba(49, 50, 68, 0.4);
+            --text: #cdd6f4;
+            --text-dim: #a6adc8;
+            --green: #a6e3a1;
+            --red: #f38ba8;
+            --yellow: #f9e2af;
+            --blue: #89b4fa;
+            --teal: #94e2d5;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Outfit', sans-serif;
+            background: var(--bg);
+            background-image:
+                radial-gradient(at 0% 0%, rgba(30, 30, 46, 0.5) 0px, transparent 50%),
+                radial-gradient(at 100% 100%, rgba(24, 24, 37, 0.5) 0px, transparent 50%);
+            color: var(--text);
+            display: flex;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        #layout {
+            display: flex;
+            width: 100%;
+            height: 100%;
+        }
+
+        /* ═══ 左侧对话 ═══ */
+        #chat-pane {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            border-right: 1px solid var(--border);
+        }
+
+        header {
+            padding: 18px 24px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: rgba(17, 17, 27, 0.5);
+        }
+
+        header h1 {
+            font-size: 1.3rem;
+            font-weight: 600;
+            background: linear-gradient(90deg, #cba6f7, #89b4fa);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.8rem;
+            color: var(--text-dim);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            background: var(--green);
+            border-radius: 50%;
+            box-shadow: 0 0 10px var(--green);
+            animation: pulse 2s infinite;
+        }
+
+        .status-dot.thinking {
+            background: var(--accent);
+            box-shadow: 0 0 10px var(--accent);
+            animation: pulse 0.6s infinite;
+        }
+
+        @keyframes pulse {
+
+            0%,
+            100% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0.4;
+            }
+        }
+
+        #chat-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+            scroll-behavior: smooth;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        #chat-container::-webkit-scrollbar {
+            width: 5px;
+        }
+
+        #chat-container::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 10px;
+        }
+
+        .message {
+            max-width: 88%;
+            padding: 14px 18px;
+            border-radius: 16px;
+            font-size: 0.93rem;
+            line-height: 1.6;
+            animation: slideUp 0.25s ease-out;
+        }
+
+        @keyframes slideUp {
+            from {
+                opacity: 0;
+                transform: translateY(8px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .user-message {
+            align-self: flex-end;
+            background: var(--user-bg);
+            border: 1px solid rgba(137, 180, 250, 0.2);
+            color: var(--blue);
+            border-bottom-right-radius: 4px;
+        }
+
+        .bot-message {
+            align-self: flex-start;
+            background: var(--bot-bg);
+            border: 1px solid var(--border);
+            border-bottom-left-radius: 4px;
+        }
+
+        .bot-message pre {
+            background: #181825 !important;
+            padding: 14px;
+            border-radius: 10px;
+            overflow-x: auto;
+            border: 1px solid var(--border);
+            margin: 10px 0;
+        }
+
+        .bot-message code {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+        }
+
+        .bot-message p:first-child {
+            margin-top: 0;
+        }
+
+        .bot-message p:last-child {
+            margin-bottom: 0;
+        }
+
+        .meta-info {
+            display: flex;
+            gap: 12px;
+            margin-top: 10px;
+            font-size: 0.72rem;
+            color: var(--text-dim);
+            opacity: 0.8;
+        }
+
+        /* 思考进度条 */
+        .thinking-bar {
+            align-self: flex-start;
+            max-width: 88%;
+            padding: 14px 18px;
+            border-radius: 16px;
+            background: var(--bot-bg);
+            border: 1px solid var(--accent);
+            border-bottom-left-radius: 4px;
+            animation: slideUp 0.25s ease-out;
+        }
+
+        .thinking-bar .label {
+            font-size: 0.85rem;
+            color: var(--accent);
+            margin-bottom: 8px;
+        }
+
+        .thinking-bar .progress {
+            height: 3px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+
+        .thinking-bar .progress-fill {
+            height: 100%;
+            width: 0%;
+            border-radius: 3px;
+            background: linear-gradient(90deg, var(--accent), var(--blue));
+            animation: progressAnim 180s linear forwards;
+        }
+
+        @keyframes progressAnim {
+            to {
+                width: 100%;
+            }
+        }
+
+        .thinking-bar .elapsed {
+            font-size: 0.72rem;
+            color: var(--text-dim);
+            margin-top: 6px;
+        }
+
+        footer {
+            padding: 16px 20px;
+            border-top: 1px solid var(--border);
+            background: rgba(17, 17, 27, 0.3);
+        }
+
+        .input-wrapper {
+            display: flex;
+            align-items: center;
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 3px;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+
+        .input-wrapper:focus-within {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px var(--accent-glow);
+        }
+
+        #message-input {
+            flex: 1;
+            padding: 12px 16px;
+            background: transparent;
+            border: none;
+            color: var(--text);
+            font-family: inherit;
+            font-size: 0.93rem;
+            outline: none;
+        }
+
+        #send-btn {
+            background: var(--accent);
+            border: none;
+            border-radius: 10px;
+            color: #11111b;
+            padding: 9px 18px;
+            font-weight: 600;
+            cursor: pointer;
+            font-size: 0.88rem;
+        }
+
+        #send-btn:hover {
+            transform: scale(1.03);
+            filter: brightness(1.1);
+        }
+
+        #send-btn:disabled {
+            background: var(--text-dim);
+            cursor: not-allowed;
+            opacity: 0.5;
+        }
+
+        /* ═══ 右侧日志 ═══ */
+        #log-pane {
+            width: 320px;
+            min-width: 260px;
+            display: flex;
+            flex-direction: column;
+            background: rgba(17, 17, 27, 0.6);
+        }
+
+        #log-header {
+            padding: 18px 16px 12px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        #log-header h2 {
+            font-size: 0.82rem;
+            font-weight: 600;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+        }
+
+        #log-connection-status {
+            font-size: 0.68rem;
+            padding: 2px 7px;
+            border-radius: 8px;
+            background: rgba(166, 227, 161, 0.1);
+            color: var(--green);
+            border: 1px solid rgba(166, 227, 161, 0.2);
+        }
+
+        #log-connection-status.off {
+            background: rgba(243, 139, 168, 0.1);
+            color: var(--red);
+            border-color: rgba(243, 139, 168, 0.2);
+        }
+
+        #log-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 8px 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        #log-container::-webkit-scrollbar {
+            width: 4px;
+        }
+
+        #log-container::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 10px;
+        }
+
+        .log-entry {
+            padding: 6px 8px;
+            border-radius: 6px;
+            font-size: 0.73rem;
+            line-height: 1.4;
+            font-family: 'JetBrains Mono', monospace;
+            animation: logFade 0.2s ease-out;
+            border-left: 3px solid transparent;
+            background: rgba(255, 255, 255, 0.015);
+        }
+
+        @keyframes logFade {
+            from {
+                opacity: 0;
+                transform: translateX(6px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateX(0);
+            }
+        }
+
+        .log-entry .log-time {
+            color: var(--text-dim);
+            font-size: 0.65rem;
+            opacity: 0.5;
+            margin-right: 4px;
+        }
+
+        .log-entry .log-tag {
+            display: inline-block;
+            font-size: 0.6rem;
+            font-weight: 600;
+            padding: 1px 5px;
+            border-radius: 3px;
+            text-transform: uppercase;
+            margin-right: 4px;
+        }
+
+        .log-entry .log-msg {
+            color: var(--text);
+            opacity: 0.8;
+            word-break: break-word;
+        }
+
+        .log-type-SYSTEM {
+            border-left-color: var(--teal);
+        }
+
+        .log-type-SYSTEM .log-tag {
+            background: rgba(148, 226, 213, 0.15);
+            color: var(--teal);
+        }
+
+        .log-type-AWARENESS {
+            border-left-color: var(--accent);
+        }
+
+        .log-type-AWARENESS .log-tag {
+            background: rgba(203, 166, 247, 0.15);
+            color: var(--accent);
+        }
+
+        .log-type-STRATEGY {
+            border-left-color: var(--blue);
+        }
+
+        .log-type-STRATEGY .log-tag {
+            background: rgba(137, 180, 250, 0.15);
+            color: var(--blue);
+        }
+
+        .log-type-EXECUTION {
+            border-left-color: var(--green);
+        }
+
+        .log-type-EXECUTION .log-tag {
+            background: rgba(166, 227, 161, 0.15);
+            color: var(--green);
+        }
+
+        .log-type-TOOL {
+            border-left-color: var(--yellow);
+        }
+
+        .log-type-TOOL .log-tag {
+            background: rgba(249, 226, 175, 0.15);
+            color: var(--yellow);
+        }
+
+        .log-type-MEMORY {
+            border-left-color: #f5c2e7;
+        }
+
+        .log-type-MEMORY .log-tag {
+            background: rgba(245, 194, 231, 0.15);
+            color: #f5c2e7;
+        }
+
+        .log-type-ERROR {
+            border-left-color: var(--red);
+            background: rgba(243, 139, 168, 0.04);
+        }
+
+        .log-type-ERROR .log-tag {
+            background: rgba(243, 139, 168, 0.15);
+            color: var(--red);
+        }
+
+        #log-footer {
+            padding: 8px 12px;
+            border-top: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 0.68rem;
+            color: var(--text-dim);
+        }
+
+        #log-clear-btn {
+            background: none;
+            border: 1px solid var(--border);
+            color: var(--text-dim);
+            padding: 2px 8px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 0.65rem;
+            font-family: inherit;
+        }
+
+        #log-clear-btn:hover {
+            border-color: var(--accent);
+            color: var(--text);
+        }
+
+        @media (max-width: 900px) {
+            #log-pane {
+                display: none;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div id="layout">
+        <div id="log-pane">
+            <header>
+                <h2>Execution Trace</h2>
+                <div style="flex:1"></div>
+                <button id="log-clear-btn" title="Clear trace">✖</button>
+            </header>
+            <div id="log-container"
+                style="font-family:'JetBrains Mono'; font-size:0.75rem; padding:10px; overflow-y:auto; scroll-behavior:smooth;">
+                <div style="color:rgba(255,255,255,0.3); text-align:center; margin-top:50px;">Waiting for neural
+                    activity...</div>
+            </div>
+        </div>
+        <div id="chat-pane">
+            <header>
+                <h1>GENESIS <span>2.0</span></h1>
+                <div class="status-dot" id="status-dot"></div>
+                <span id="status-text">Self-Aware Core Active</span>
+                <button id="clear-chat-btn"
+                    style="margin-left:12px; border:1px solid var(--border); background:rgba(255,255,255,0.05); color:var(--text-dim); padding:4px 8px; border-radius:6px; font-size:0.7rem; cursor:pointer;"
+                    title="清除聊天历史">🧹 清除</button>
+        </div>
+        </header>
+        <div id="chat-container">
+            <div class="message bot-message">
+                你好。我是 <b>Genesis</b> 自觉系统。发送消息后，我会在后台异步处理——你可以在右侧实时观察我的思考过程。
+            </div>
+        </div>
+        <footer>
+            <div class="input-wrapper">
+                <input type="text" id="message-input" placeholder="输入指令以启动元认知扫描..." autocomplete="off">
+                <button id="send-btn">发送</button>
+            </div>
+        </footer>
+    </div>
+
+    <div id="log-pane">
+        <div id="log-header">
+            <h2>🔍 活动日志</h2>
+            <span id="log-connection-status">● 连接中</span>
+        </div>
+        <div id="log-container"></div>
+        <div id="log-footer">
+            <span id="log-counter">0 条</span>
+            <button id="log-clear-btn">清除</button>
+        </div>
+    </div>
+    </div>
+
+    <script>
+        const chatContainer = document.getElementById('chat-container');
+        const input = document.getElementById('message-input');
+        const sendBtn = document.getElementById('send-btn');
+        const statusDot = document.getElementById('status-dot');
+        const statusText = document.getElementById('status-text');
+        const clearChatBtn = document.getElementById('clear-chat-btn');
+
+        let chatHistory = [];
+
+        // Load history on startup
+        try {
+            const saved = localStorage.getItem('genesis_chat_history');
+            if (saved) {
+                chatHistory = JSON.parse(saved);
+                // Clear default greeting if history exists
+                if (chatHistory.length > 0) {
+                    chatContainer.innerHTML = '';
+                    chatHistory.forEach(msg => {
+                        appendMessageToDOM(msg.text, msg.isUser, msg.meta, msg.reasoning_log, msg.steps || []);
+                    });
+                }
+            }
+        } catch (e) {
+            console.error('Failed to load history', e);
+        }
+
+        clearChatBtn.addEventListener('click', () => {
+            if (confirm('确定要清除所有聊天记录吗？')) {
+                localStorage.removeItem('genesis_chat_history');
+                location.reload();
+            }
+        });
+
+        function saveHistory() {
+            localStorage.setItem('genesis_chat_history', JSON.stringify(chatHistory));
+        }
+
+        hljs.highlightAll();
+
+        function setThinking(on) {
+            statusDot.classList.toggle('thinking', on);
+            statusText.textContent = on ? '思考中...' : 'Self-Aware Core Active';
+        }
+
+        function appendMessage(text, isUser, meta = null, reasoning_log = null, steps = []) {
+            // Save to history
+            chatHistory.push({ text, isUser, meta, reasoning_log, steps, ts: Date.now() });
+            saveHistory();
+            appendMessageToDOM(text, isUser, meta, reasoning_log, steps);
+        }
+
+        function appendMessageToDOM(text, isUser, meta = null, reasoning_log = null, steps = []) {
+            const div = document.createElement('div');
+            div.className = `message ${isUser ? 'user-message' : 'bot-message'}`;
+            if (isUser) {
+                div.textContent = text;
+            } else {
+                if ((reasoning_log && reasoning_log.length > 0) || (steps && steps.length > 0)) {
+                    const rd = document.createElement('details');
+                    rd.style.cssText = 'margin-bottom:12px; border-radius:8px; overflow:hidden;';
+                    const s = document.createElement('summary');
+                    s.innerHTML = '<i style="color:var(--accent)">Genesis 元认知思维链...</i>';
+                    s.style.cssText = 'cursor:pointer; padding:8px; background:rgba(255,255,255,0.05);';
+                    rd.appendChild(s);
+                    const lc = document.createElement('div');
+                    lc.style.cssText = 'padding:12px; border-left:2px solid var(--accent); background:rgba(0,0,0,0.2); font-size:0.8rem;';
+
+                    // Render Steps (Real-time actions)
+                    if (steps && steps.length > 0) {
+                        const stepsContainer = document.createElement('div');
+                        stepsContainer.style.marginBottom = '12px';
+                        stepsContainer.style.paddingBottom = '8px';
+                        stepsContainer.style.borderBottom = '1px dashed var(--border)';
+
+                        steps.forEach(step => {
+                            const d = document.createElement('div');
+                            d.style.marginBottom = '4px';
+                            d.style.fontFamily = "'JetBrains Mono', monospace";
+                            d.style.fontSize = '0.75rem';
+
+                            if (step.type === 'loop_start') {
+                                d.style.textAlign = 'center'; d.style.opacity = '0.5';
+                                d.innerHTML = `——— 🔄 Loop ${step.data} ———`;
+                            } else if (step.type === 'tool') {
+                                d.innerHTML = `🔧 调用: <b>${step.data.name}</b>`;
+                            } else if (step.type === 'tool_result') {
+                                d.innerHTML = `✅ 结果: <span style="opacity:0.7">${step.data.result.substring(0, 50)}...</span>`;
+                            } else if (step.type === 'reasoning') {
+                                d.innerHTML = `🤔 思考...`;
+                            }
+                            stepsContainer.appendChild(d);
+                        });
+                        lc.appendChild(stepsContainer);
+                    }
+
+                    // Render Reasoning Log (High-level phases)
+                    if (reasoning_log) {
+                        reasoning_log.forEach(log => {
+                            const e = document.createElement('div');
+                            e.style.marginBottom = '8px';
+                            const stage = log.stage || "THINK";
+                            const content = typeof log.content === 'object' ? JSON.stringify(log.content, null, 2) : String(log.content);
+                            e.innerHTML = `<div style="color:var(--accent); font-weight:600; font-size:0.7rem;">[${stage}]</div>
+                        <div style="font-family:'JetBrains Mono'; opacity:0.8; white-space:pre-wrap; font-size:0.75rem;">${content.substring(0, 500)}${content.length > 500 ? '...' : ''}</div>`;
+                            lc.appendChild(e);
+                        });
+                    }
+                    rd.appendChild(lc);
+                    div.appendChild(rd);
+                }
+                const mb = document.createElement('div');
+                mb.innerHTML = marked.parse(text);
+                div.appendChild(mb);
+                if (meta) {
+                    const md = document.createElement('div');
+                    md.className = 'meta-info';
+                    md.innerHTML = `<span>⚡️ ${Number(meta.time).toFixed(1)}s</span> <span>💎 ${meta.tokens} tokens</span>`;
+                    div.appendChild(md);
+                }
+            }
+            chatContainer.appendChild(div);
+            div.querySelectorAll('pre code').forEach(b => hljs.highlightElement(b));
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+
+        function createThinkingBar() {
+            const bar = document.createElement('div');
+            bar.className = 'thinking-bar';
+            bar.innerHTML = `
+        <div class="label">🧠 Genesis 正在思考...</div>
+        <div class="process-steps" style="margin-top:10px; font-size:0.8rem; font-family:'JetBrains Mono'; color:rgba(255,255,255,0.7);"></div>
+        <div class="progress"><div class="progress-fill"></div></div>
+        <div class="elapsed">已用时: 0s</div>
+    `;
+            bar.dataset.stepCount = 0;
+            bar._startTime = Date.now();
+            bar._timer = setInterval(() => {
+                const secs = Math.floor((Date.now() - bar._startTime) / 1000);
+                bar.querySelector('.elapsed').textContent = `已用时: ${secs}s`;
+            }, 1000);
+            chatContainer.appendChild(bar);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+            return bar;
+        }
+
+        function removeThinkingBar(bar) {
+            if (bar._timer) clearInterval(bar._timer);
+            if (bar.parentNode) bar.parentNode.removeChild(bar);
+        }
+
+        function updateThinkingBar(bar, steps) {
+            if (!steps || steps.length === 0) return;
+            const container = bar.querySelector('.process-steps');
+            if (!container) return; // robustness
+
+            const currentCount = parseInt(bar.dataset.stepCount || 0);
+            if (steps.length <= currentCount) return;
+
+            steps.slice(currentCount).forEach(step => {
+                const div = document.createElement('div');
+                div.style.marginBottom = '4px';
+                div.style.borderLeft = '2px solid var(--accent)';
+                div.style.paddingLeft = '8px';
+
+                let icon = '⚡';
+                let content = '';
+
+                if (step.type === 'loop_start') {
+                    div.style.textAlign = 'center'; div.style.opacity = '0.5';
+                    div.innerHTML = `——— 🔄 Loop ${step.data} ———`;
+                    div.className = 'step-entry';
+
+                    // Synced Render to Left Pane (Execution Trace)
+                    const logContainer = document.getElementById('log-container');
+                    if (logContainer) {
+                        // removing placeholder if exists
+                        if (logContainer.querySelector('div[style*="text-align:center"]')) {
+                            logContainer.innerHTML = '';
+                        }
+
+                        const traceDiv = div.cloneNode(true);
+                        traceDiv.style.borderLeft = 'none'; // distinct style for trace
+                        traceDiv.style.marginBottom = '8px';
+                        traceDiv.style.padding = '8px';
+                        traceDiv.style.background = 'rgba(0,0,0,0.2)';
+                        traceDiv.style.borderRadius = '4px';
+
+                        // Add timestamp
+                        const timeSpan = document.createElement('span');
+                        timeSpan.style.color = 'var(--text-dim)';
+                        timeSpan.style.fontSize = '0.6rem';
+                        timeSpan.style.marginRight = '8px';
+                        timeSpan.textContent = new Date().toLocaleTimeString().split(' ')[0];
+                        traceDiv.insertBefore(timeSpan, traceDiv.firstChild);
+
+                        logContainer.appendChild(traceDiv);
+                        logContainer.scrollTop = logContainer.scrollHeight;
+                    }
+
+                    container.appendChild(div);
+                    container.scrollTop = container.scrollHeight;
+                    return;
+                }
+
+                if (step.type === 'tool') {
+                    icon = '🔧';
+                    content = `调用工具: <b>${step.data.name}</b>`;
+                    // Render args in details
+                    const args = JSON.stringify(step.data.args, null, 2);
+                    content += `<pre style="margin-top:4px; opacity:0.7; max-height:100px; overflow:auto;">${args}</pre>`;
+                } else if (step.type === 'tool_result') {
+                    icon = '✅';
+                    content = `工具结果: <span style="opacity:0.7">${step.data.result.substring(0, 100)}...</span>`;
+                    // Render full result in trace pane only
+                } else if (step.type === 'reasoning') {
+                    icon = '🤔';
+                    content = `<span style="opacity:0.8">${step.data.substring(0, 80)}...</span>`;
+                }
+
+                div.innerHTML = `${icon} ${content}`;
+                div.className = 'step-entry';
+
+                // --- Sync to Left Pane ---
+                const logContainer = document.getElementById('log-container');
+                if (logContainer) {
+                    // removing placeholder if exists
+                    if (logContainer.querySelector('div[style*="text-align:center"]')) {
+                        logContainer.innerHTML = '';
+                    }
+
+                    const traceItem = document.createElement('div');
+                    traceItem.style.marginBottom = '10px';
+                    traceItem.style.padding = '8px';
+                    traceItem.style.borderLeft = `2px solid ${step.type === 'tool' ? '#ff79c6' : step.type === 'tool_result' ? '#50fa7b' : '#bd93f9'}`;
+                    traceItem.style.background = 'rgba(255,255,255,0.02)';
+
+                    let traceContent = '';
+                    if (step.type === 'tool') {
+                        traceContent = `<div style="color:#ff79c6; font-weight:bold;">[TOOL CALL] ${step.data.name}</div>
+                        <pre style="color:#f8f8f2; margin-top:5px; white-wrap:pre-wrap;">${JSON.stringify(step.data.args, null, 2)}</pre>`;
+                    } else if (step.type === 'tool_result') {
+                        traceContent = `<div style="color:#50fa7b; font-weight:bold;">[TOOL RESULT]</div>
+                        <pre style="color:#f8f8f2; margin-top:5px; white-space:pre-wrap; max-height:200px; overflow-y:auto;">${step.data.result}</pre>`;
+                    } else if (step.type === 'reasoning') {
+                        traceContent = `<div style="color:#bd93f9; font-weight:bold;">[THOUGHT]</div>
+                        <div style="color:#f8f8f2; margin-top:5px;">${step.data}</div>`;
+                    }
+
+                    traceItem.innerHTML = traceContent;
+                    logContainer.appendChild(traceItem);
+                    logContainer.scrollTop = logContainer.scrollHeight;
+                }
+
+                container.appendChild(div);
+
+                // Auto scroll
+                container.scrollTop = container.scrollHeight;
+            });
+            bar.dataset.stepCount = steps.length;
+        }
+
+        // ═══ 核心：异步发送 + 轮询 ═══
+        async function sendMessage() {
+            const text = input.value.trim();
+            if (!text) return;
+
+            input.value = '';
+            input.disabled = true;
+            sendBtn.disabled = true;
+            appendMessage(text, true);
+            setThinking(true);
+
+            const thinkingBar = createThinkingBar();
+
+            try {
+                // 1. 提交任务（立即返回）
+                const submitRes = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: text })
+                });
+                const { task_id, error: submitErr } = await submitRes.json();
+
+                if (submitErr || !task_id) {
+                    removeThinkingBar(thinkingBar);
+                    setThinking(false);
+                    appendMessage(`⚠️ 提交失败: ${submitErr || '未知错误'}`, false);
+                    input.disabled = false; sendBtn.disabled = false; input.focus();
+                    return;
+                }
+
+                // 2. 轮询结果
+                const MAX_POLL_TIME = 25 * 60 * 1000; // 25分钟超时 (匹配后台配置)
+                const startTime = Date.now();
+                const poll = () => new Promise((resolve) => {
+                    const interval = setInterval(async () => {
+                        try {
+                            const r = await fetch(`/api/task/${task_id}`);
+                            const task = await r.json();
+
+                            if (task.status === 'done') {
+                                clearInterval(interval);
+                                resolve(task);
+                            } else if (task.status === 'error') {
+                                clearInterval(interval);
+                                resolve(task);
+                            } else if (Date.now() - startTime > MAX_POLL_TIME) {
+                                clearInterval(interval);
+                                resolve({
+                                    status: 'warning',
+                                    message: '任务仍在运行中... (前端等待已超过25分钟，请直接查看活动日志确认进度)'
+                                });
+                            }
+
+                            // 实时渲染中间步骤
+                            if (task.steps && thinkingBar) {
+                                updateThinkingBar(thinkingBar, task.steps);
+                            }
+                        } catch (e) {
+                            // 网络闪断，继续轮询
+                        }
+                    }, 500);
+                });
+
+                const result = await poll();
+                removeThinkingBar(thinkingBar);
+                setThinking(false);
+
+                if (result.status === 'done') {
+                    appendMessage(result.result || '（空回复）', false, result.metrics, result.reasoning_log, result.steps);
+                } else {
+                    appendMessage(`⚠️ ${result.error || '处理失败'}`, false);
+                }
+
+            } catch (e) {
+                removeThinkingBar(thinkingBar);
+                setThinking(false);
+                appendMessage(`🚫 连接失败: ${e.message}`, false);
+            } finally {
+                input.disabled = false;
+                sendBtn.disabled = false;
+                input.focus();
+            }
+        }
+
+        sendBtn.addEventListener('click', sendMessage);
+        input.addEventListener('keypress', e => { if (e.key === 'Enter') sendMessage(); });
+
+        // ═══ SSE 活动日志 ═══
+        const logContainer = document.getElementById('log-container');
+        const logCounter = document.getElementById('log-counter');
+        const logStatus = document.getElementById('log-connection-status');
+        let logCount = 0;
+
+        function formatTime(ts) {
+            return new Date(ts * 1000).toLocaleTimeString('zh-CN', { hour12: false });
+        }
+
+        function addLogEntry(data) {
+            const e = document.createElement('div');
+            e.className = `log-entry log-type-${data.type || 'SYSTEM'}`;
+            const msg = String(data.msg || '').substring(0, 200);
+            e.innerHTML = `<span class="log-time">${formatTime(data.ts)}</span><span class="log-tag">${data.type || 'SYS'}</span><span class="log-msg">${msg}</span>`;
+            logContainer.appendChild(e);
+            logCount++;
+            logCounter.textContent = `${logCount} 条`;
+            while (logContainer.children.length > 300) logContainer.removeChild(logContainer.firstChild);
+            logContainer.scrollTop = logContainer.scrollHeight;
+        }
+
+        function connectSSE() {
+            const es = new EventSource('/api/logs');
+            es.onopen = () => { logStatus.textContent = '● 已连接'; logStatus.className = ''; };
+            es.onmessage = (ev) => { try { addLogEntry(JSON.parse(ev.data)); } catch (e) { } };
+            es.onerror = () => { logStatus.textContent = '● 断开'; logStatus.className = 'off'; es.close(); setTimeout(connectSSE, 3000); };
+        }
+
+        document.getElementById('log-clear-btn').addEventListener('click', () => {
+            logContainer.innerHTML = ''; logCount = 0; logCounter.textContent = '0 条';
+        });
+
+        // connectSSE(); // Disabled to prioritize ReAct Execution Trace
+    </script>
+</body>
+
+</html>

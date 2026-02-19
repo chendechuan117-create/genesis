@@ -1,0 +1,9 @@
+#!/bin/bash
+# Legacy 'genesis-chat' launcher
+# Redirects to the new unified CLI
+
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+cd "$DIR"
+
+echo "🤖 Launching Genesis Chat..."
+python3 cli.py "$@"

@@ -1,0 +1,69 @@
+{
+  "generated_at": "2026-02-15 11:57:59",
+  "total_opportunities": 3,
+  "opportunities": [
+    {
+      "product": "iPhone 15",
+      "buy_platform": "pdd",
+      "buy_price": 5799,
+      "buy_name": "iPhone 15 百亿补贴",
+      "sell_platform": "jd",
+      "sell_price": 6099,
+      "sell_name": "Apple iPhone 15",
+      "profit": 300,
+      "profit_percent": 5.2,
+      "timestamp": "2026-02-15 11:57:59"
+    },
+    {
+      "product": "茅台",
+      "buy_platform": "pdd",
+      "buy_price": 2699,
+      "buy_name": "飞天茅台拼多多",
+      "sell_platform": "jd",
+      "sell_price": 2999,
+      "sell_name": "贵州茅台酒",
+      "profit": 300,
+      "profit_percent": 11.1,
+      "timestamp": "2026-02-15 11:57:59"
+    },
+    {
+      "product": "显卡 RTX 4080",
+      "buy_platform": "pdd",
+      "buy_price": 8199,
+      "buy_name": "RTX 4080 拼团价",
+      "sell_platform": "jd",
+      "sell_price": 8699,
+      "sell_name": "RTX 4080 游戏显卡",
+      "profit": 500,
+      "profit_percent": 6.1,
+      "timestamp": "2026-02-15 11:57:59"
+    }
+  ],
+  "income_analysis": {
+    "total_profit_potential": 1100,
+    "average_profit_per_opportunity": 366.67,
+    "estimated_monthly_income": 33000.0,
+    "estimated_annual_income": 396000.0
+  },
+  "action_plan": [
+    "1. 注册拼多多、淘宝、京东账号",
+    "2. 准备启动资金：5000-10000元",
+    "3. 从拼多多购买低价商品（机会中的buy_platform）",
+    "4. 在淘宝/京东出售高价商品（机会中的sell_platform）",
+    "5. 处理物流和客服",
+    "6. 每天重复操作3-5次",
+    "7. 每周复盘优化策略"
+  ],
+  "best_opportunity": {
+    "product": "显卡 RTX 4080",
+    "buy_platform": "pdd",
+    "buy_price": 8199,
+    "buy_name": "RTX 4080 拼团价",
+    "sell_platform": "jd",
+    "sell_price": 8699,
+    "sell_name": "RTX 4080 游戏显卡",
+    "profit": 500,
+    "profit_percent": 6.1,
+    "timestamp": "2026-02-15 11:57:59"
+  }
+}

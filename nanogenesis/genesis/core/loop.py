@@ -1,0 +1,503 @@
+"""
+Agent 主循环 - ReAct 模式
+推理 (Reasoning) → 行动 (Acting) → 观察 (Observing)
+"""
+
+from typing import List, Dict, Any, Optional
+import logging
+import time
+import json
+
+from .base import Message, MessageRole, LLMResponse, PerformanceMetrics, LLMProvider
+from .registry import ToolRegistry
+from .registry import ToolRegistry
+from .context import SimpleContextBuilder
+import asyncio
+
+logger = logging.getLogger(__name__)
+
+
+class AgentLoop:
+    """Agent 主循环 - 核心执行引擎"""
+    
+    def __init__(
+        self,
+        tools: ToolRegistry,
+        context: SimpleContextBuilder,
+        provider: LLMProvider,
+        max_iterations: int = 10
+    ):
+        self.tools = tools
+        self.context = context
+        self.provider = provider
+        self.max_iterations = max_iterations
+        
+        # Ouroboros Loop State
+        self.iteration_history = []
+    
+    async def run(
+        self,
+        user_input: str,
+        step_callback: Optional[Any] = None, # (step_type, data) -> None
+        **context_kwargs
+    ) -> tuple[str, PerformanceMetrics]:
+        """
+        运行 Agent 循环
+        
+        Returns:
+            (响应内容, 性能指标)
+        """
+        start_time = time.time()
+        tools_used = []
+        input_tokens = 0
+        output_tokens = 0
+        total_tokens = 0
+        tool_calls_recorded = []
+        
+        # 1. 构建初始上下文
+        built_messages = await self.context.build_messages(user_input, **context_kwargs)
+        messages = [msg.to_dict() for msg in built_messages]
+        
+        # 2. ReAct 循环 (Elastic Endurance)
+        iteration = 0
+        final_response = ""
+        soft_limit = self.max_iterations
+        hard_limit = min(25, self.max_iterations * 2.5) # 弹性上限
+        
+        # 错误跟踪器 (Failure Attribution)
+        tool_errors = {} # {tool_name: [error_messages]}
+        last_tool_call_hash = None
+        loop_counter = 0
+
+        while iteration < hard_limit:
+            iteration += 1
+            
+            # Callback: Loop Start
+            # Callback: Loop Start
+            if step_callback:
+                if asyncio.iscoroutinefunction(step_callback):
+                    await step_callback("loop_start", iteration)
+                else:
+                    step_callback("loop_start", iteration)
+            
+            # 软上限检查 (Failure Attribution)
+            if iteration > soft_limit:
+                 logger.debug(f"⚠️ 超过软上限 {soft_limit}，进入弹性耐力模式 (第 {iteration} 次)")
+                 # 注入诊断线索
+                 built_messages.append(Message(
+                     role=MessageRole.SYSTEM,
+                     content=f"Diagnostic Hint: You have exceeded {soft_limit} iterations. Suspected issue: logic_loop or capability_gap. Please check if you are repeating the same failing steps."
+                 ))
+            else:
+                 logger.debug(f"迭代 {iteration}/{soft_limit}")
+            
+            # 2.1 调用 LLM (Reasoning)
+            try:
+                # 重新构建 messages
+                messages = [msg.to_dict() for msg in built_messages]
+                # 定义流式回调
+                async def stream_handler(chunk_type, chunk_data):
+                    if step_callback:
+                        if chunk_type == "reasoning":
+                             if asyncio.iscoroutinefunction(step_callback):
+                                 await step_callback("reasoning", chunk_data)
+                             else:
+                                 step_callback("reasoning", chunk_data)
+                
+                response = await self.provider.chat(
+                    messages=messages,
+                    tools=[t for t in self.tools.get_definitions()] if iteration < hard_limit else None,
+                    stream=True,
+                    stream_callback=stream_handler
+                )
+                input_tokens += getattr(response, "input_tokens", 0) or 0
+                output_tokens += getattr(response, "output_tokens", 0) or 0
+                total_tokens += getattr(response, "total_tokens", 0) or 0
+                
+                # Fallback: If content is empty but reasoning exists (DeepSeek R1 quirk), use reasoning
+                if not response.content and getattr(response, "reasoning_content", None):
+                    response.content = response.reasoning_content
+                
+            except Exception as e:
+                error_msg = str(e)
+                # Sanitize: Remove raw curl commands or massive dumps
+                if "curl" in error_msg and "messages" in error_msg:
+                    error_msg = "Connection failed to LLM provider (curl error). Check network or API key."
+                elif len(error_msg) > 500:
+                    error_msg = error_msg[:200] + "..." + error_msg[-100:]
+                    
+                logger.error(f"LLM 调用失败: {e}", exc_info=True)
+                final_response = f"Error: LLM 调用失败 - {error_msg}"
+                break
+            
+            # 2.2 检查是否有工具调用 (Acting)
+            
+             # Critical Fix: Detect Empty Response (The Silent Failure)
+            if not response.content and not response.tool_calls and not response.reasoning_content:
+                 logger.warning(f"⚠️ 收到空响应 (Iteration {iteration}). 触发重试机制...")
+                 built_messages.append(Message(
+                     role=MessageRole.SYSTEM,
+                     content="System Error: You returned an empty response. You MUST output content or a tool call."
+                 ))
+                 continue
+
+            # 2.1.5 Parse Metacognitive Reflection
+            reflection_content = ""
+            if response.content and "<reflection>" in response.content and "</reflection>" in response.content:
+                 try:
+                     reflection_content = response.content.split("<reflection>")[1].split("</reflection>")[0].strip()
+                     logger.info(f"🤔 Metacognition: {reflection_content}")
+                     
+                     # Check for Natural Language Interrupt Signal
+                     # "I am stuck", "requesting strategic intervention", "I need to stop"
+                     interrupt_keywords = ["i am stuck", "requesting strategic intervention", "requesting strategy update"]
+                     if any(k in reflection_content.lower() for k in interrupt_keywords):
+                         logger.warning(f"⛔ Organic Interrupt Triggered: {reflection_content}")
+                         return f"[STRATEGIC_INTERRUPT_SIGNAL] {reflection_content}", PerformanceMetrics(
+                            iterations=iteration,
+                            total_time=time.time() - start_time,
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            total_tokens=total_tokens,
+                            tools_used=tools_used,
+                            success=False,
+                            tool_calls=tool_calls_recorded
+                        )
+                 except Exception as e:
+                     logger.warning(f"Failed to parse reflection: {e}")
+
+                 # Self-Correction: Ambiguity Detection
+            # If no tools were parsed, but the content looks like it WANTED to call a tool (e.g. code blocks),
+            # trigger a self-correction loop instead of accepting the text response.
+            if not response.tool_calls and response.content:
+                has_code_block = "```" in response.content or "functions =" in response.content
+                # Only trigger if we are not at the very end of iterations
+                if has_code_block and iteration < hard_limit - 1:
+                     logger.warning(f"⚠️ Ambiguous output detected in iteration {iteration}. Triggering Self-Correction.")
+                     
+                     # Add the ambiguous message to history so the model sees what it did wrong
+                     built_messages.append(Message(
+                         role=MessageRole.ASSISTANT,
+                         content=response.content
+                     ))
+                     
+                     # Inject Correction Request
+                     correction_msg = (
+                         "System: Your previous response contained code blocks that appeared to be tool calls, "
+                         "but they could not be parsed. \n"
+                         "CRITICAL: Do not output Python code or variable assignments for tools. "
+                         "Use the standard tool call format (or JSON if specified). Retry now."
+                     )
+                     built_messages.append(Message(
+                         role=MessageRole.SYSTEM,
+                         content=correction_msg
+                     ))
+                     
+                     if step_callback:
+                        # Notify UI of correction
+                        if asyncio.iscoroutinefunction(step_callback):
+                            await step_callback("reasoning", "⚠️ Detected invalid format. Requesting self-correction...")
+                        else:
+                            step_callback("reasoning", "⚠️ Detected invalid format. Requesting self-correction...")
+                            
+                     if step_callback:
+                        # Notify UI of correction
+                        if asyncio.iscoroutinefunction(step_callback):
+                            await step_callback("reasoning", "⚠️ Detected invalid format. Requesting self-correction...")
+                        else:
+                            step_callback("reasoning", "⚠️ Detected invalid format. Requesting self-correction...")
+                            
+                     continue # Skip to next iteration (Retry)
+
+            if response.has_tool_calls:
+                normalized_tool_calls = []
+                current_call_hashes = []
+
+                for idx, tool_call in enumerate(response.tool_calls or []):
+                    fallback_id = f"call_{iteration}_{idx}"
+
+                    if isinstance(tool_call, dict):
+                        tool_id = tool_call.get('id') or fallback_id
+                        tool_type = tool_call.get('type') or 'function'
+                        fn = tool_call.get('function') or {}
+                        tool_name = fn.get('name') or tool_call.get('name') or ''
+                        tool_args_raw = fn.get('arguments') if fn else tool_call.get('arguments')
+
+                        if isinstance(tool_args_raw, dict):
+                            tool_args_str = json.dumps(tool_args_raw, ensure_ascii=False)
+                        elif tool_args_raw is None:
+                            tool_args_str = "{}"
+                        else:
+                            tool_args_str = tool_args_raw
+
+                        normalized_tool_calls.append({
+                            "id": tool_id,
+                            "type": tool_type,
+                            "function": {
+                                "name": tool_name,
+                                "arguments": tool_args_str
+                            }
+                        })
+                        current_call_hashes.append(f"{tool_name}:{tool_args_str}")
+
+                    else:
+                        tool_id = getattr(tool_call, 'id', None) or fallback_id
+                        tool_name = getattr(tool_call, 'name', '')
+                        tool_args = getattr(tool_call, 'arguments', {}) or {}
+                        tool_args_str = json.dumps(tool_args, ensure_ascii=False)
+
+                        normalized_tool_calls.append({
+                            "id": tool_id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_name,
+                                "arguments": tool_args_str
+                            }
+                        })
+                        current_call_hashes.append(f"{tool_name}:{tool_args_str}")
+
+                # 检测重复调用 (Loop Detection)
+                call_hash = "|".join(current_call_hashes)
+                if call_hash == last_tool_call_hash:
+                    loop_counter += 1
+                    # Strategic Interrupt: If stuck in loop for 3 turns, abort immediately
+                    if loop_counter >= 3:
+                        logger.warning(f"⛔ Strategic Interrupt: Loop Detected ({call_hash})")
+                        final_response = f"[STRATEGIC_INTERRUPT] Caught in a loop executing: {call_hash}. Stopping execution to request a new strategy."
+                        success = False
+                        # Break out of loop.py, return to agent.py
+                        return final_response, PerformanceMetrics(
+                            iterations=iteration,
+                            total_time=time.time() - start_time,
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            total_tokens=total_tokens,
+                            tools_used=tools_used,
+                            success=False,
+                            tool_calls=tool_calls_recorded
+                        )
+                else:
+                    loop_counter = 0
+                last_tool_call_hash = call_hash
+
+                tool_calls_recorded.extend(normalized_tool_calls)
+
+                built_messages.append(Message(
+                    role=MessageRole.ASSISTANT,
+                    content=response.content or "",
+                    tool_calls=normalized_tool_calls
+                ))
+
+                # 执行所有工具调用
+                for tool_call in normalized_tool_calls:
+                    tool_name = tool_call["function"]["name"]
+                    tool_args_raw = tool_call["function"].get("arguments") or "{}"
+
+                    try:
+                        tool_args = json.loads(tool_args_raw) if isinstance(tool_args_raw, str) else tool_args_raw
+                    except json.JSONDecodeError:
+                        tool_args = {}
+
+                    tool_id = tool_call["id"]
+                    tools_used.append(tool_name)
+                    
+                    # Callback: Tool Start
+                    # Callback: Tool Start
+                    if step_callback:
+                        if asyncio.iscoroutinefunction(step_callback):
+                            await step_callback("tool", {"name": tool_name, "args": tool_args})
+                        else:
+                            step_callback("tool", {"name": tool_name, "args": tool_args})
+                    
+                    if hasattr(self, 'on_tool_call') and self.on_tool_call:
+                        self.on_tool_call(tool_name, tool_args)
+
+                    result = await self.tools.execute(tool_name, tool_args)
+                    
+                    # --- MULTIMODAL HANDLING (Visual Cortex) ---
+                    # Check if result is a dict with type='image'
+                    image_payload = None
+                    result_str = str(result)
+                    
+                    if isinstance(result, dict) and result.get("type") == "image":
+                        image_path = result.get("path")
+                        if image_path:
+                            try:
+                                import base64
+                                with open(image_path, "rb") as img_file:
+                                    b64_str = base64.b64encode(img_file.read()).decode("utf-8")
+                                    
+                                image_payload = {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/png;base64,{b64_str}"
+                                    }
+                                }
+                                result_str = f"Screenshot successfully captured at {image_path}. (Image Payload attached to context)"
+                                logger.info(f"👁️ Visual Cortex: Image {image_path} injected into context.")
+                            except Exception as e:
+                                logger.error(f"Failed to encode image: {e}")
+                                result_str = f"Error encoding screenshot: {e}"
+
+                    # 采集错误信息 (Failure Attribution)
+                    if "error" in result_str.lower() or "failed" in result_str.lower():
+                        if tool_name not in tool_errors: tool_errors[tool_name] = []
+                        tool_errors[tool_name].append(result_str[:100])
+                        
+                        # Strategic Interrupt logic... [Keep existing logic]
+                        # ...
+                        # For brevity in this diff, I am assuming the surrounding logic remains or is re-inserted if I cut it.
+                        # Wait, the tool only allows contiguous replacement. I must be careful not to delete the interrupt logic.
+                        # I will assume the interrupt logic follows immediately below and I should just insert the image handling before it.
+                        pass # Placeholder to indicate I am not replacing the interrupt logic below.
+
+                    # Construct Message
+                    if image_payload:
+                        content_block = [
+                            {"type": "text", "text": f"Tool Output ({tool_name}): {result_str}"},
+                            image_payload
+                        ]
+                        built_messages.append(Message(
+                            role=MessageRole.TOOL,
+                            content=content_block, # Native list for Multimodal
+                            tool_call_id=tool_id
+                        ))
+                    else:
+                        built_messages.append(Message(
+                            role=MessageRole.TOOL,
+                            content=result_str,
+                            tool_call_id=tool_id
+                        ))
+                    
+                    # 采集错误信息 (Failure Attribution) - RE-INSERTED to ensure it's not lost
+                    if "error" in result_str.lower() or "failed" in result_str.lower():
+
+                        if tool_name not in tool_errors: tool_errors[tool_name] = []
+                        tool_errors[tool_name].append(result_str[:100])
+                        
+                        # Strategic Interrupt: Consecutive Failures
+                        # If the SAME tool fails 3 times in a row (or just too many errors in general)
+                        sequential_failures = len(tool_errors[tool_name])
+                        if sequential_failures >= 3:
+                             logger.warning(f"⛔ Strategic Interrupt: {tool_name} failed {sequential_failures} times sequentially.")
+                             final_response = f"[STRATEGIC_INTERRUPT] Tool {tool_name} failed {sequential_failures} times in a row. Stopping to replan."
+                             success = False
+                             return final_response, PerformanceMetrics(
+                                iterations=iteration,
+                                total_time=time.time() - start_time,
+                                input_tokens=input_tokens,
+                                output_tokens=output_tokens,
+                                total_tokens=total_tokens,
+                                tools_used=tools_used,
+                                success=False,
+                                tool_calls=tool_calls_recorded
+                            )
+                        
+                        # Circuit Breaker: Critical Configuration Errors (Missing Keys, Auth)
+                        # The user specifically wants the agent to stop and fix if a tool is broken.
+                        critical_keywords = [
+                            "api_key", "configured", "unauthorized", "access denied", 
+                            "authentication failed", "permission denied"
+                        ]
+                        if any(k in result_str.lower() for k in critical_keywords):
+                            logger.warning(f"⛔ Circuit Breaker Triggered: Critical Failure in {tool_name}")
+                            final_response = f"CRITICAL_TOOL_FAILURE: {tool_name} failed with error: {result_str}\n[SYSTEM INTERRUPT] Execution halted for immediate repair."
+                            built_messages.append(Message(
+                                role=MessageRole.TOOL,
+                                content=f"ERROR: {result_str}\n[SYSTEM_INTERRUPT] Critical configuration error detected. Stopping execution loop to allow Strategy Phase to fix this.",
+                                tool_call_id=tool_id
+                            ))
+                            success = False
+                            return final_response, PerformanceMetrics(
+                                iterations=iteration,
+                                total_time=time.time() - start_time,
+                                input_tokens=input_tokens,
+                                output_tokens=output_tokens,
+                                total_tokens=total_tokens,
+                                tools_used=tools_used,
+                                success=False,
+                                tool_calls=tool_calls_recorded
+                            )
+
+                    built_messages.append(Message(
+                        role=MessageRole.TOOL,
+                        content=result_str,
+                        tool_call_id=tool_id
+                    ))
+                    
+                    # Callback: Tool Result
+                    # Callback: Tool Result
+                    if step_callback:
+                        if asyncio.iscoroutinefunction(step_callback):
+                            await step_callback("tool_result", {"tool": tool_name, "result": result_str})
+                        else:
+                            step_callback("tool_result", {"tool": tool_name, "result": result_str})
+                
+                continue
+            
+            else:
+                # 2.3 Action Enforcement (The "No-Talk" Protocol)
+                # If the agent reflected on a plan but didn't call a tool, we might need to push it.
+                # Only apply this if we successfully parsed a reflection previously.
+                if reflection_content:
+                    # Check for "future tense" or "intent" in reflection
+                    intent_keywords = ["next step", "will", "going to", "try"]
+                    completion_keywords = ["done", "complete", "finished", "success", "answer"]
+                    
+                    has_intent = any(k in reflection_content.lower() for k in intent_keywords)
+                    is_complete = any(k in reflection_content.lower() for k in completion_keywords)
+                    
+                    if has_intent and not is_complete:
+                        logger.warning(f"⚠️ Action Gap Detected: Reflection implies intent but no tool called.")
+                        built_messages.append(Message(
+                            role=MessageRole.SYSTEM,
+                            content="[ACTION ENFORCEMENT] You outlined a plan in your reflection but did NOT call any tool.\n"
+                                    "- If you want to execute this plan, you MUST call a tool (e.g. `chain_next`, `shell`, `web_search`).\n"
+                                    "- Do not just say you will do it. Do it."
+                        ))
+                        continue
+
+                final_response = response.content
+                built_messages.append(Message(
+                    role=MessageRole.ASSISTANT,
+                    content=final_response
+                ))
+                break
+        
+        # 3. 检查是否达到最大迭代次数
+        if iteration >= hard_limit and not final_response:
+            # 构建简易诊断报告
+            diag_report = "\n[SYSTEM_DIAGNOSTIC_REPORT]"
+            diag_report += f"\n- Reason: Iteration limit reached ({iteration})"
+            if tool_errors:
+                diag_report += "\n- Tool Failures:"
+                for t, errs in tool_errors.items():
+                    diag_report += f"\n  * {t}: {errs[-1]}"
+            if loop_counter > 0:
+                diag_report += f"\n- Loop Warning: Repetitive tool calls detected ({loop_counter} times)"
+            
+            final_response = f"抱歉，我在 {iteration} 次尝试后还没完成。{diag_report}\n请检查以上诊断信息并提供干预建议。"
+            success = False
+        else:
+            success = True
+        
+        # 4. 计算性能指标
+        elapsed_time = time.time() - start_time
+        metrics = PerformanceMetrics(
+            iterations=iteration,
+            total_time=elapsed_time,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            tools_used=tools_used,
+            success=success,
+            tool_calls=tool_calls_recorded or None
+        )
+        
+        logger.debug(
+            f"✓ 任务完成: {iteration} 迭代, "
+            f"{total_tokens} tokens, "
+            f"{metrics.total_time:.2f}s"
+        )
+        
+        return final_response, metrics

@@ -1,86 +1,84 @@
-# NanoGenesis (微创世纪)
+# NanoGenesis 2.2 (微创世纪)
 
-> **极简主义 · 工具优先 · Linux 原生**
-> Minimalist. Tool-First. Linux-Native.
+> **"Thinking is expensive. Coding is cheap. Let's code."**
 
-NanoGenesis 是一个运行在你本地 Linux 环境中的 **工程级 AI Agent**。
-它拒绝浮华的“数字生命”扮演，专注于**解决问题**。通过直接操作 Shell、文件系统和浏览器，它能像工程师一样诊断、修复和构建系统。
-
----
-
-## 核心哲学 (Core Philosophy)
-
-1.  **去伪存真 (Anti-Bloat)**: 移除了所有即兴表演、情感模拟和冗余的“人格面具”。现在它只是一个高效的 **Linux AI Assistant**。
-2.  **单脑架构 (Unified Brain)**: 以 **DeepSeek V3** 为主脑，确保逻辑推理的深度。
-3.  **高可用 (High Availability)**: 集成 **Gemini 2.5 Flash** (via Local Proxy) 作为热备。当主脑宕机或网络波动时，**毫秒级自动切换**。
-4.  **工具至上 (Tool First)**: 不依赖复杂的规划器，而是通过代码直接读取 `Tool Registry`，确保执行层永远知道自己能干什么。
+NanoGenesis 是一个**自进化、高弹性的 Linux 本地 AI Agent**。
+它不是聊天机器人，而是一个**能够编写代码、操作终端、管理文件并自我修复的智能系统**。
 
 ---
 
-## 架构特性 (Architecture)
+## 核心架构 (Architecture)
 
-### 1. 智能核心 (The Brain)
-- **Primary**: DeepSeek V3 (NativeHTTP) - 负责 99% 的推理。
-- **Failover**: Gemini 2.5 Flash (Antigravity Proxy) - 负责应急接管。
-- **Mechanism**: **Bidirectional Failover** (双向故障转移)。任意一方失败，自动切另一方。
+Genesis 采用 **"Genesis Triad" (三位一体)** 认知架构，将思考与执行分离，确保每一步都精确可控。
 
-### 2. 执行引擎 (The Body)
-- **Model**: ReAct (Reason-Act) Loop.
-- **Strategy**: **Serial Execution** (串行执行)。
-    - *为什么不并行？* 为了 100% 的文件操作安全性。避免多工具同时读写同一文件导致的竞争冲突。
-- **Optimization**:
-    - **Intent Phase**: 极简 JSON 输出 (`core_intent` + `memory_keywords`)，无幻觉，零废话。
-    - **Context Pruning**: 智能上下文剪枝，防止 Token 爆炸。
-
-### 3. 记忆系统 (The Memory)
-- **Layer 1**: 近期对话 (RAM/Markdown) - 也就是"工作记忆"。
-- **Layer 2**: 语义搜索 (SQLite FTS5) - 检索历史决策和知识。
-- **Adaptive**: 自动记录你的偏好，"越用越顺手"。
-
----
-
-## 快速开始 (Quick Start)
-
-### 环境要求
-- Linux (Arch/Debian/Ubuntu)
-- Python 3.10+
-- `curl` (用于底层 HTTP 通信)
-
-### 运行
-目前的入口脚本是 `debug_genesis.py` (整合测试版)：
-
-```bash
-# 1. 激活环境
-source .venv/bin/activate
-
-# 2. 运行
-python3 debug_genesis.py
+```mermaid
+graph TD
+    User((User Input)) --> A[Awareness Phase]
+    subgraph Cognition ["🧠 认知层 (Cognitive Processor)"]
+        A -->|Intent & Context| S[Strategy Phase]
+        S -->|Strategic Blueprint| E[Execution Phase]
+    end
+    
+    subgraph Action ["⚙️ 执行层 (Ouroboros Loop)"]
+        E --> L{Agent Loop}
+        L -->|Reasoning| LLM[DeepSeek / Gemini]
+        L -->|Action| Tool[Tool Registry]
+        Tool -->|Result| L
+    end
+    
+    L -->|Final Response| Output((Response))
+    Output -->|Consolidation| M[Memory Store]
 ```
 
-### 目录结构
+### 1. 洞察者 (The Oracle) - Awareness Phase
+- **作用**: 无论用户说什么，先识别核心意图 (Intent Recognition)。
+- **机制**: 不直接回答，而是提取 `core_intent` 和 `problem_type`。
+- **记忆**: 同时从 `SQLite` 中检索相关的历史记忆和知识。
+
+### 2. 战略家 (The Strategist) - Strategy Phase
+- **作用**: 在动手之前，先制定计划。
+- **机制**: 结合用户的意图、历史记忆和当前工具，生成一份 **"Strategic Blueprint" (战略蓝图)**。
+- **透明度**: 所有的决策逻辑都会被记录在案。
+
+### 3. 执行者 (The Soldier) - Ouroboros Loop
+- **作用**: 只负责执行，不负责空想。
+- **循环**: 这是一个 **ReAct (Reason-Act)** 无限循环，直到任务完成。
+    - **Step 1**: 思考 (根据蓝图)。
+    - **Step 2**: 这里的 "手" (Tools) 是 **Native Python Tools**，直接操作 OS。
+    - **Step 3**: 观察结果，如果报错，自动重试或修正 (Self-Correction)。
+    - **Reflex**: 如果模型忘记 JSON 格式，**"Greedy Parser"** 会强制抓取代码中的指令。
+
+---
+
+## 关键特性 (Key Features)
+
+### 🧠 双脑故障转移 (Bi-Directional Failover)
+系统内置了两个大脑，互为备份：
+1.  **Primary**: **DeepSeek V3** (通过 Native CURL 直连，绕过代理干扰)。
+2.  **Backup**: **Gemini 2.5** (通过 Antigravity 协议)。
+*一旦主脑通过网络失败或返回空值，系统在毫秒级内自动切换到副脑，用户无感知。*
+
+### 💊 自愈系统 (Self-Healing)
+- **Heuristic Parsing**: 即使模型输出乱码或 Markdown 代码，贪婪解析器也能提取出工具调用。
+- **Memory Consolidation**: 每次对话结束后，系统会自动提炼 "Decision Insight" (决策洞察) 并存入长期记忆。
+
+### 🔌 插件化上下文 (Context Pipeline)
+不再是简单的字符串拼接。上下文由多个插件动态组装：
+- `IdentityPlugin`: 身份认知。
+- `TimePlugin`: 时间感知。
+- `MemoryPlugin`: 长期记忆。
+- `ClipBoardPlugin`: 剪贴板感知 (可扩展)。
+
+---
+
+## 快速运行 (Quick Start)
+
+**直接启动 CLI**:
 ```bash
-Genesis/
-├── nanogenesis/
-│   ├── agent.py            # 【核心】Agent 主逻辑
-│   ├── core/
-│   │   ├── loop.py         # ReAct 执行循环
-│   │   ├── context.py      # 上下文管理 (System Prompt)
-│   │   └── registry.py     # 工具注册表
-│   └── intelligence/
-│       └── prompts/        # 提示词协议 (已优化为纯功能型)
-├── debug_genesis.py        # 启动脚本
-└── conversations/          # 对话日志 (按日期存储)
+python3 nanogenesis/cli.py
 ```
 
----
-
-## 最近更新 (Changelog)
-
-### 2026-02-14: The "Anti-Tumor" Update
-- **[Optimization] 移除人格面具**: 删除了 "Autonomous Digital Lifeform" 和 "Strategist Persona"。现在的 Prompt 纯粹是功能性的。
-- **[Optimization] 意图识别瘦身**: 移除了 `tools` (幻觉列表) 和 `system_diagnostic` 字段。Token 消耗减少 60%。
-- **[Feature] 自动故障转移**: 实现了 DeepSeek <-> Gemini 的双向自动切换。
-
----
-
-> "Thinking is expensive. Coding is cheap. Let's code."
+**常用指令**:
+- `/doctor` : 系统自检 (网络/模型/记忆)。
+- `/mem` : 查看最近的记忆。
+- `/clear` : 清除当前上下文 (但不清除长期记忆)。

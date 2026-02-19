@@ -1,0 +1,45 @@
+{
+  "project_name": "Data Pipeline as a Service",
+  "version": "0.1.0",
+  "description": "Autonomous data collection and processing service",
+  "first_validation_targets": [
+    {
+      "name": "ecommerce_price_monitor",
+      "target_url": "https://api.example.com/products",
+      "method": "GET",
+      "data_type": "json",
+      "extraction_rules": {
+        "product_names": "products.*.name",
+        "prices": "products.*.price",
+        "availability": "products.*.in_stock"
+      },
+      "output_format": "csv",
+      "schedule_interval": 3600
+    },
+    {
+      "name": "news_headline_scraper",
+      "target_url": "https://news.ycombinator.com",
+      "method": "GET",
+      "data_type": "html",
+      "extraction_rules": {
+        "headlines": ".titleline > a",
+        "scores": ".score"
+      },
+      "output_format": "json",
+      "schedule_interval": 1800
+    }
+  ],
+  "storage_config": {
+    "output_dir": "./data_output",
+    "backup_dir": "./data_backup",
+    "retention_days": 30
+  },
+  "notification_config": {
+    "email_alerts": false,
+    "webhook_url": null,
+    "alert_thresholds": {
+      "error_rate": 0.1,
+      "data_volume_drop": 0.5
+    }
+  }
+}
