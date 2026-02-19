@@ -99,25 +99,20 @@ class GenesisDaemon:
             
             # Execute one step of autonomy
             try:
-                # We need to expose a method in Agent to handle this.
-                # For now, let's assume agent.autonomous_step exists or we build it here.
-                # Ideally, agent.process() is for user input. We need agent.autonomous_step(mission_context)
-                
-                # Check if we implemented autonomous_step in NanoGenesis? No.
-                # We need to modify NanoGenesis to support this.
-                # Plan:
-                # 1. Update Mission Context
-                # 2. Run agent.process with special flag or call autonomous_step
-                
-                if hasattr(self.agent, "autonomous_step"):
-                     # Check if circuit breaker tripped
-                     if active_mission.error_count >= 5:
-                         logger.warning(f"🛑 Mission '{active_mission.objective}' exceeded error threshold (5). PAUSING.")
-                         self.mission_manager.update_mission(active_mission.id, status="paused", last_error="Auto-Paused: Excessive Errors")
-                         return
+                # Check for circuit breaker (Mission Level)
+                if active_mission.error_count >= 5:
+                    logger.warning(f"🛑 Mission '{active_mission.objective}' exceeded error threshold (5). PAUSING.")
+                    self.mission_manager.update_mission(active_mission.id, status="paused", last_error="Auto-Paused: Excessive Errors")
+                    return
 
+                # Execute Step
+                if hasattr(self.agent, "autonomous_step"):
                      result = await self.agent.autonomous_step(active_mission)
-                     logger.info(f"✅ Mission Step Result: {result}")
+                     
+                     if result.get("status") == "error":
+                         raise RuntimeError(result.get("error"))
+                         
+                     logger.info(f"✅ Mission Step Result: {result.get('tools_executed')} tools, Output: {str(result.get('output'))[:50]}...")
                      
                      # Success - reset error count
                      if active_mission.error_count > 0:

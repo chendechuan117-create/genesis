@@ -135,6 +135,29 @@ class MissionManager:
             
         return mission
 
+    def update_mission(self, mission_id: str, **kwargs):
+        """Update specific fields of a mission"""
+        if not kwargs:
+            return
+            
+        # Ensure updated_at is set if not provided
+        if "updated_at" not in kwargs:
+             kwargs["updated_at"] = datetime.now().isoformat()
+
+        # Construct SQL
+        columns = ", ".join([f"{k} = ?" for k in kwargs.keys()])
+        values = list(kwargs.values())
+        values.append(mission_id)
+        
+        query = f"UPDATE missions SET {columns} WHERE id = ?"
+        
+        conn = self._get_conn()
+        try:
+            with conn:
+                conn.execute(query, values)
+        finally:
+            conn.close()
+
     def get_mission(self, mission_id: str) -> Optional[Mission]:
         """Get a specific mission by ID"""
         conn = self._get_conn()

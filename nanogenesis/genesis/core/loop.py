@@ -132,13 +132,38 @@ class AgentLoop:
             
             # 2.2 检查是否有工具调用 (Acting)
             
-             # Critical Fix: Detect Empty Response (The Silent Failure)
+            # Critical Fix: Detect Empty Response (The Silent Failure)
             if not response.content and not response.tool_calls and not response.reasoning_content:
                  logger.warning(f"⚠️ 收到空响应 (Iteration {iteration}). 触发重试机制...")
-                 built_messages.append(Message(
-                     role=MessageRole.SYSTEM,
-                     content="System Error: You returned an empty response. You MUST output content or a tool call."
-                 ))
+                 
+                 # Context Detox Strategy
+                 # If we are stuck in a retry loop (detected by 'System Error' in history), 
+                 # it means the context is poisoned. We must amputate.
+                 
+                 last_msg = built_messages[-1]
+                 if last_msg.role == MessageRole.SYSTEM and "System Error: You returned an empty response" in last_msg.content:
+                      logger.error(f"☠️ Context Poisoning Detected! (Recursive Empty Response). Amputating recent history...")
+                      # Remove the last 2 turns (The error prompt + The previous "Toxic" input)
+                      # Actually built_messages is local to this loop usually, unless we are modifying self.context
+                      # self.context._message_history is the source of truth.
+                      
+                      # Strategy: Drop the last user/tool message which likely caused this.
+                      if len(self.context._message_history) > 0:
+                          popped = self.context._message_history.pop()
+                          logger.warning(f"🗑️ Dropped Toxic Message: {str(popped.content)[:50]}...")
+                          
+                      # Rebuild messages for next retry
+                      built_messages = await self.context.build_messages(user_input)
+                      built_messages.append(Message(
+                          role=MessageRole.SYSTEM,
+                          content="System Notice: Previous context frame was corrupted and has been dropped. Please retry the last action."
+                      ))
+                 else:
+                      # First offense: Polite retry
+                      built_messages.append(Message(
+                          role=MessageRole.SYSTEM,
+                          content="System Error: You returned an empty response. You MUST output content or a tool call."
+                      ))
                  continue
 
             # 2.1.5 Parse Metacognitive Reflection

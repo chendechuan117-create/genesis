@@ -14,41 +14,56 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "nanogenesis"))
 from genesis.core.factory import GenesisFactory
 
 async def main():
-    print("🚀 Initializing Agent...")
-    # Enable optimization to ensure behavior optimizer is active (though we rely on Protocol here)
+    print("🚀 Initializing Agent for Autonomy Test...")
     agent = GenesisFactory.create_common(enable_optimization=True)
     
-    # 1. Ask a question requiring a NEW tool (Local Browser History)
-    # The agent DOES NOT have a 'read_browser_history' tool. 
-    # It MUST use 'skill_creator' to build one.
-    query = "帮我看看我最近在 Chrome 浏览器里访问了哪些网站？直接读取本地历史记录文件。"
+    # 1. Create a Mock Mission
+    from genesis.core.mission import Mission
+    from datetime import datetime
+    import uuid
     
-    print(f"\n🗣️ User: {query}")
-    print("🤖 Agent is thinking... (Expecting 'skill_creator' call)")
+    now = datetime.now().isoformat()
+    mock_mission = Mission(
+        id=str(uuid.uuid4()),
+        objective="Execute the command 'echo Hello Guardian Mode' using the shell tool.",
+        status="active",
+        created_at=now,
+        updated_at=now,
+        context_snapshot={},
+        error_count=0
+    )
     
-    # Define callback to see what's happening inside the loop
-    def debug_callback(step_type, data):
-        print(f"\n[DEBUG] {step_type}: {data}")
-
-    result = await agent.process(query, step_callback=debug_callback)
+    print(f"\n🎯 Mission: {mock_mission.objective}")
+    print("🤖 Invoking autonomous_step...")
     
-    print(f"\n📝 Final Response:\n{result['response']}\n-------------------")
-    
-    # Analyze Metrics to find skill_creator usage
-    metrics = result.get('metrics')
-    if metrics and metrics.tools_used:
-        print(f"\n🛠️ Tools Used: {metrics.tools_used}")
-        if 'skill_creator' in metrics.tools_used:
-            print("✅ TEST PASS: Agent successfully called 'skill_creator'.")
+    try:
+        # 2. Invoke Autonomous Step
+        # This skips Awareness and goes straight to Strategy -> Execution
+        result = await agent.autonomous_step(mock_mission)
+        
+        print(f"\n✅ Result: {result}")
+        
+        # 3. Verification
+        if result['status'] == 'success':
+            output = result.get('output', "")
+            tools = result.get('tools_executed', 0)
             
-            # Optional: Check if the skill actually works/was created
-            # We can't easily check the *content* of the tool call here without deeper inspection,
-            # but usage is the primary success criteria for autonomy.
+            if tools > 0:
+                print("🌟 SUCCESS: Tool was executed autonomously.")
+            else:
+                print("⚠️ WARNING: No tools executed (Agent might have just answered textually).")
+                
+            if "Hello Guardian Mode" in str(agent.context.get_history_text(limit=2)):
+                 print("🌟 SUCCESS: Expected output found in context.")
+            else:
+                 print("⚠️ WARNING: Expected output not clearly found in immediate context.")
         else:
-            print("❌ TEST FAIL: Agent did NOT use 'skill_creator'.")
-            print(f"It used: {metrics.tools_used}")
-    else:
-        print("❌ TEST FAIL: No tools were used.")
+             print(f"❌ FAILURE: Step returned status {result['status']}")
+
+    except Exception as e:
+        print(f"❌ CRITICAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     asyncio.run(main())

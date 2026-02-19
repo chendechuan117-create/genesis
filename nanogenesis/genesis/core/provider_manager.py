@@ -42,115 +42,109 @@ class ProviderRouter:
 
     def _initialize_providers(self, api_key: str, base_url: str, model: str):
         """Initialize all available providers based on config"""
-        
-        # 1. Primary: OpenRouter (Higher Priority if set) or DeepSeek
-        final_or_key = getattr(self.config, 'openrouter_api_key', None)
-        final_ds_key = api_key or getattr(self.config, 'deepseek_api_key', None)
-        
-        if final_or_key:
-            logger.info(f"初始化 Primary Provider: OpenRouter (Model: {getattr(self.config, 'openrouter_model', 'trinity-large-preview')})")
-            self.providers['deepseek'] = NativeHTTPProvider(
-                api_key=final_or_key,
+        # 1. Initialize Providers based on available config
+        # OpenRouter
+        or_key = getattr(self.config, 'openrouter_api_key', None)
+        if or_key:
+            logger.info(f"Initialized Provider: OpenRouter")
+            # Force use of a free model since user has no credits
+            # utilizing google/gemini-2.0-flash-lite-preview-02-05:free
+            self.providers['openrouter'] = NativeHTTPProvider(
+                api_key=or_key,
                 base_url="https://openrouter.ai/api/v1",
-                default_model=getattr(self.config, 'openrouter_model', "trinity-large-preview")
+                default_model="google/gemini-2.0-flash-lite-preview-02-05:free"
             )
-            # Alias for clarity
-            self.providers['openrouter'] = self.providers['deepseek']
-            
-        elif final_ds_key:
-            logger.info("初始化 Primary Provider: DeepSeek (NativeHTTP)")
+
+        # DeepSeek Native
+        ds_key = api_key or getattr(self.config, 'deepseek_api_key', None)
+        if ds_key:
+            logger.info("Initialized Provider: DeepSeek (Native)")
             self.providers['deepseek'] = NativeHTTPProvider(
-                api_key=final_ds_key,
-                base_url=base_url,
-                default_model=model or "deepseek/deepseek-chat"
+                api_key=ds_key,
+                base_url="https://api.deepseek.com/v1",
+                default_model="deepseek-chat"
             )
-        
-        # Add OpenAI Support
-        openai_key = getattr(self.config, 'openai_api_key', None)
-        if openai_key:
-            logger.info("初始化 Provider: OpenAI")
+
+        # OpenAI
+        oa_key = getattr(self.config, 'openai_api_key', None)
+        if oa_key:
+            logger.info("Initialized Provider: OpenAI")
             self.providers['openai'] = NativeHTTPProvider(
-                api_key=openai_key,
+                api_key=oa_key,
                 base_url="https://api.openai.com/v1",
                 default_model="gpt-4o"
             )
 
-        if LITELLM_AVAILABLE and not final_ds_key and not final_or_key and not openai_key:
-            logger.info("初始化 Primary Provider: LiteLLM")
-            self.providers['deepseek'] = LiteLLMProvider(
-                api_key=api_key,
-                base_url=base_url,
-                default_model=model or "deepseek/deepseek-chat"
-            )
+        # Antigravity (Local/Proxy)
+        # Use config if available, otherwise fallback to defaults (but don't hardcode valid keys)
+        ag_key = getattr(self.config, 'antigravity_key', "default-local-key") 
+        ag_url = getattr(self.config, 'antigravity_url', "http://127.0.0.1:8045/v1")
         
-        # 2. Backup: Gemini (via Proxy)
-        final_gemini_key = getattr(self.config, 'gemini_api_key', None)
-        final_gemini_url = getattr(self.config, 'gemini_base_url', "http://127.0.0.1:8045/v1")
-        
-        if final_gemini_key:
-            logger.info(f"初始化 Backup Provider: Gemini (Proxy at {final_gemini_url})")
-            self.providers['gemini'] = NativeHTTPProvider(
-                api_key=final_gemini_key,
-                base_url=final_gemini_url,
-                default_model="gemini-1.5-flash" 
-            )
-            
-        # 3. Extension: Antigravity Tools
-        # Explicit initialization for Antigravity as a distinct provider source
-        logger.info("初始化 Extension Provider: Antigravity Tools")
+        logger.info(f"Initialized Provider: Antigravity (Local/Proxy at {ag_url})")
         self.providers['antigravity'] = NativeHTTPProvider(
-            api_key="sk-8bf1cea5032d4ec0bfd421630814bff0",
-            base_url="http://127.0.0.1:8045/v1",
+            api_key=ag_key,
+            base_url=ag_url,
             default_model="gemini-2.5-flash"
         )
-
+        
+        # 2. Determine Activation & Failover Order
+        # Default Priority: OpenRouter -> DeepSeek -> OpenAI -> Antigravity
+        self.failover_order = ['openrouter', 'deepseek', 'openai', 'antigravity']
+        
+        # Set Active
+        self.active_provider_name = 'antigravity' # Default fallback
+        
+        for name in self.failover_order:
+            if name in self.providers:
+                self.active_provider_name = name
+                break
+                
     def _switch_provider(self, target: str):
         """Switch active provider"""
         if target not in self.providers:
-            logger.error(f"Cannot switch to unknown provider: {target}")
-            return
+            # logger.error(f"Cannot switch to unknown provider: {target}")
+            return False
+            
+        if target == self.active_provider_name:
+            return True
             
         logger.warning(f"⚠️ Switching Provider: {self.active_provider_name} -> {target}")
         self.active_provider_name = target
         self.active_provider = self.providers[target]
+        return True
 
     async def chat_with_failover(self, messages: List[Dict], **kwargs) -> Any:
-        """Wrapper for chat with auto-failover"""
+        """Wrapper for chat with dynamic failover"""
         if not self.active_provider:
              raise RuntimeError("No active provider available")
 
+        # Try active first
         try:
             return await self.active_provider.chat(messages=messages, **kwargs)
         except Exception as e:
-            # Generic Failover Logic
-            available = list(self.providers.keys())
-            current = self.active_provider_name
+            logger.error(f"Provider {self.active_provider_name} Failed: {e}")
             
-            # Determine backup candidate
-            backup = None
-            if current == 'deepseek':
-                # Prefer openai (stable), then antigravity (experimental), then gemini
-                if 'openai' in self.providers: backup = 'openai'
-                elif 'antigravity' in self.providers: backup = 'antigravity'
-                elif 'gemini' in self.providers: backup = 'gemini'
-            elif current == 'antigravity':
-                 if 'deepseek' in self.providers: backup = 'deepseek'
-                 elif 'openai' in self.providers: backup = 'openai'
-                 elif 'gemini' in self.providers: backup = 'gemini'
-            elif current == 'openai':
-                 if 'deepseek' in self.providers: backup = 'deepseek'
-                 elif 'antigravity' in self.providers: backup = 'antigravity'
+            # Dynamic Failover
+            current_index = -1
+            try:
+                current_index = self.failover_order.index(self.active_provider_name)
+            except ValueError:
+                pass
+                
+            # Try next providers in the list
+            start_index = current_index + 1
+            for next_provider_name in self.failover_order[start_index:]:
+                if next_provider_name in self.providers:
+                     if self._switch_provider(next_provider_name):
+                         logger.info(f"🔄 Failover Attempt: {next_provider_name}")
+                         try:
+                             return await self.active_provider.chat(messages=messages, **kwargs)
+                         except Exception as e2:
+                             logger.error(f"Backup Provider {next_provider_name} also failed: {e2}")
+                             continue # Try next
             
-            if backup:
-                logger.error(f"Provider {current} Failed: {e}. Failover -> {backup}")
-                self._switch_provider(backup)
-                try:
-                    return await self.active_provider.chat(messages=messages, **kwargs)
-                except Exception as e2:
-                    logger.error(f"Backup Provider {backup} also failed: {e2}")
-                    raise e2
-            else:
-                raise e
+            # If all failed
+            raise e
     
     # Delegate standard provider methods to active provider
     

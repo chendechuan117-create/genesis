@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List
 import logging
 import json
+import asyncio
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -249,7 +250,11 @@ class NanoGenesis:
                     active_jobs = shell_tool.job_manager.list_jobs(active_only=True)
 
             # Delegate to Cognitive Processor
-            step_callback("strategy", "制定战略...")
+            if step_callback:
+                if asyncio.iscoroutinefunction(step_callback):
+                    await step_callback("strategy", "制定战略...")
+                else:
+                    step_callback("strategy", "制定战略...")
             strategic_blueprint = await self.cognition.strategy_phase(
                 user_input=current_input, 
                 oracle_output=oracle_output, 
@@ -448,6 +453,163 @@ class NanoGenesis:
             'optimization_info': optimization_info
         }
 
+    async def autonomous_step(self, active_mission: Any) -> Dict[str, Any]:
+        """
+        Execute a single autonomous step for the daemon.
+        Bypasses Awareness Phase (Intent is known).
+        Uses Metacognition (Entropy) to prevent loops.
+        """
+        import time
+        import os
+        from genesis.core.base import Message, MessageRole
+        # from genesis.core.entropy import EntropyMonitor # Already imported
+        
+        logger.info(f"🤖 Autonomous Step for Mission: {active_mission.objective}")
+        
+        # 0. Setup
+        start_time = time.time()
+        cwd = os.getcwd()
+        
+        # 1. World Model Scan
+        from genesis.core.capability import CapabilityScanner
+        world_model_snapshot = CapabilityScanner.scan()
+        
+        # 2. Entropy Check
+        # Lazy init monitor if not present (simulating process() behavior)
+        if not hasattr(self, 'entropy_monitor'):
+             from genesis.core.entropy import EntropyMonitor
+             self.entropy_monitor = EntropyMonitor(window_size=6)
+
+        # Capture previous state (if any) - actually we capture AFTER execution usually, 
+        # but here we capture the 'before' state or result of 'previous' step.
+        # Let's rely on standard capture at end of loop.
+        
+        entropy_analysis = self.entropy_monitor.analyze_entropy()
+        if entropy_analysis.get('status') == 'stagnant':
+            logger.warning(f"⚠️ Guardian: High Entropy Detected: {entropy_analysis}")
+            
+        # 3. Strategy Phase (The Brain)
+        # We need to construct a 'user_input' that represents the current state/goal
+        # Since there is no user, the 'problem' is the Mission Objective + Last Status
+        
+        last_out = "None"
+        if self.context.get_history_length() > 0:
+             last_out = str(self.context._message_history[-1].content)[:200]
+             
+        current_input = f"Mission: {active_mission.objective}. Status: {active_mission.status}. Last Output: {last_out}"
+        
+        # Retrieve Active Jobs for context
+        active_jobs = []
+        if hasattr(self, 'tools'):
+            shell_tool = self.tools.get('shell')
+            if shell_tool and hasattr(shell_tool, 'job_manager'):
+                active_jobs = shell_tool.job_manager.list_jobs(active_only=True)
+
+        # Build History Text manually
+        history_txt = ""
+        if self.context.get_history_length() > 0:
+             recent = self.context._message_history[-10:]
+             for m in recent:
+                 role = "User" if m.role == MessageRole.USER else "Assistant"
+                 history_txt += f"{role}: {str(m.content)[:100]}\n"
+
+        strategic_plan = await self.cognition.strategy_phase(
+            user_input=current_input,
+            oracle_output={"core_intent": active_mission.objective}, # Mock Oracle
+            user_context=history_txt,
+            active_mission=active_mission,
+            mission_lineage=[], # Could fetch if needed
+            world_model=world_model_snapshot,
+            active_jobs=active_jobs,
+            entropy_analysis=entropy_analysis
+        )
+        
+        # 4. Execution (Single Turn)
+        # We use a simplified loop or just call the LLM directly?
+        # We need to ACT (Helper function or direct LLM call?)
+        # Let's use the core loop mechanism but restricted to 1 turn if possible, 
+        # or just reuse the 'chat' capability.
+        # But 'process' does a lot of wiring. 
+        # For robustness, we'll manually execute the "Thought -> Act" cycle here.
+        
+        # 4.1 Ask LLM for Action
+        # We supplement the strategic plan into the system prompt or history?
+        # Strategy Phase returns a "System Prompt" extension or "Thought"?
+        # Actually strategy_phase returns a STRING response from the Strategist Persona.
+        # We treat that as the 'Plan'.
+        
+        prompt = f"""
+        [AUTONOMOUS MODE]
+        Objective: {active_mission.objective}
+        Strategic Plan: {strategic_plan}
+        
+        Execute the next logical step. Use tools if necessary.
+        """
+        
+        # 4.2 Call LLM (using context pipeline)
+        # We leverage context.build_messages to get System Prompt + History + Our Prompt
+        messages = await self.context.build_messages(user_input=prompt)
+        
+        # Add "Active Jobs" context manually if needed, or rely on strategy_plan
+        # created above which already included it? 
+        # The prompt includes 'strategic_plan' which saw active_jobs.
+        
+        try:
+            # We use the ProviderRouter (self.llm)
+            # Need to convert internal Messages to Dicts for provider
+            provider_messages = [m.to_dict() for m in messages]
+            
+            response = await self.provider_router.chat_with_failover(
+                messages=provider_messages,
+                tools=self.tools.get_definitions(),
+                model=None
+            )
+            
+            # 4.3 Handle Response (Tool Call or Text)
+            # Log raw response
+            self.context.add_to_history(Message(role=MessageRole.ASSISTANT, content=response.content or ""))
+            
+            # Handle Tools
+            tool_outputs = []
+            if getattr(response, 'tool_calls', None):
+                for tool_call in response.tool_calls:
+                    # ToolCall object from base.py is flat: id, name, arguments
+                    t_name = tool_call.name
+                    t_args = tool_call.arguments
+                    if isinstance(t_args, str):
+                        import json
+                        try: t_args = json.loads(t_args)
+                        except: pass
+                        
+                    logger.info(f"🛠️ Guardian Executing: {t_name} {t_args}")
+                    
+                    tool_instance = self.tools.get(t_name)
+                    if tool_instance:
+                        try:
+                            result = await tool_instance.execute(**t_args)
+                        except Exception as e:
+                            result = f"Error: {e}"
+                    else:
+                        result = f"Error: Tool {t_name} not found"
+                        
+                    tool_outputs.append(f"Tool {t_name} result: {result}")
+                    
+                    # Add to history
+                    self.context.add_to_history(Message(role=MessageRole.TOOL, content=str(result), tool_call_id=tool_call.id))
+                    
+                    # Capture Entropy
+                    self.entropy_monitor.capture(str(result), cwd, active_mission.id)
+            
+            return {
+                "status": "success",
+                "output": response.content,
+                "tools_executed": len(tool_outputs)
+            }
+            
+        except Exception as e:
+            logger.error(f"Guardian Step Failed: {e}")
+            return {"status": "error", "error": str(e)}
+
     # Removed _awareness_phase, _strategy_phase, _consolidate_memory logic as they are now in CognitiveProcessor
 
 
@@ -464,56 +626,8 @@ class NanoGenesis:
     # 认知自治 (Cognitive Autonomy)
     # ═══════════════════════════════════════════════════════════
 
-    async def autonomous_step(self, mission) -> str:
-        """
-        Execute a single autonomous step for a given mission.
-        Run by GenesisDaemon in the background.
-        """
-        logger.info(f"🤖 Creating Autonomous Context for Mission: {mission.objective}")
-        
-        # 1. Construct Context
-        # We need to inform the model about its current mission and status.
-        mission_context = f"""
-[MISSION_CONTROL_OVERRIDE]
-You are running in AUTONOMOUS MODE (Guardian Daemon).
-Current Mission Objective: "{mission.objective}"
-Mission Status: {mission.status}
-Context Snapshot: {json.dumps(mission.context_snapshot, ensure_ascii=False)}
 
-TASK:
-1. Review the objective and current context.
-2. Decide the NEXT STEP to advance the mission.
-3. Execute necessary tools (e.g., read code, run tests, write files).
-4. If you need to stop for now, update the context snapshot.
-5. DO NOT wait for user input. You ARE the user.
-"""
-        # 2. Re-use process() but with specific inputs
-        # We simulate a "User" prompt that triggers the agent to act.
-        trigger_prompt = "Status Report: Resuming mission. What is the next immediate action?"
-        
-        # 3. Execution
-        result = await self.process(
-            user_input=trigger_prompt,
-            user_context=mission_context,
-            problem_type="mission",
-            # We don't have a UI callback here, maybe log to file?
-            # step_callback=... (optional)
-        )
-        
-        # 4. Update Mission State
-        if result['success']:
-            # We should update the snapshot with something useful.
-            # Maybe the last tool output or the agent's final thought?
-            new_snapshot = mission.context_snapshot or {}
-            new_snapshot['last_run'] = datetime.datetime.now().isoformat()
-            new_snapshot['last_output'] = result['response'][:200]
-            
-            # TODO: How to persist this back? 
-            # The Daemon has the MissionManager. It should handle the update based on result.
-            # But here we return a string or dict?
-            return result['response']
-        else:
-            raise Exception(f"Autonomous step failed: {result['response']}")
+
 
     async def _memory_replay(self):
         """深度记忆整合 - 记忆回放 (Memory Replay)
