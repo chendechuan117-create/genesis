@@ -19,13 +19,41 @@ class SkillCreatorTool(Tool):
     @property
     def description(self) -> str:
         return """创建并加载新的 Python 工具技能。
-        当你遇到现有工具无法解决的问题（如需要特定的数据解析、复杂的算法计算、或多模态文件处理）时，
-        使用此工具编写一个新的 Python 脚本作为工具。
+        当你遇到现有工具无法解决的问题时，使用此工具编写一个新的 Python 脚本作为工具。
         
-        代码要求：
-        1. 必须定义一个继承自 Tool 的类
-        2. 必须包含 name, description, parameters 属性和 execute 方法
-        3. 不需要包含 'from genesis.core.base import Tool'，系统会自动处理或请使用相对导入
+        【极度严苛的代码要求】:
+        1. 必须定义一个继承自 `Tool` 的类。
+        2. 必须且只能包含以下 4 个方法/属性 (name, description, parameters, execute)。
+        
+        下面是你能且只能使用的绝对模板（请直接复制并修改其中的功能逻辑）：
+        
+        ```python
+        class MyCustomTool(Tool):
+            @property
+            def name(self) -> str:
+                return "my_custom_tool" # 必须是纯小写字母和下划线
+                
+            @property
+            def description(self) -> str:
+                return "这个工具的详细描述，告诉系统什么时候该用它。"
+                
+            @property
+            def parameters(self) -> dict:
+                # 必须返回严格的 JSON Schema
+                return {
+                    "type": "object",
+                    "properties": {
+                        "param1": {"type": "string", "description": "描述1"}
+                    },
+                    "required": ["param1"]
+                }
+                
+            async def execute(self, param1: str) -> str:
+                # 你的核心逻辑写在这里。必须返回字符串。
+                return "执行结果"
+        ```
+        
+        注意：不需要包含 `from genesis.core.base import Tool`，底层会自动注入。
         """
     
     @property

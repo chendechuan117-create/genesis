@@ -174,6 +174,30 @@ class NanoGenesis:
                     "content": oracle_output
                 })
                 logger.info(f"✓ 洞察完成: {oracle_output.get('core_intent', 'Unknown')}")
+                
+                # 1.5 知识存量盘点 (Knowledge Inventory)
+                # 在战略阶段前，先激活 LLM 对现有工具/库/命令的记忆
+                # 机制：把训练数据里的已知方案物理上放入上下文，而非让 LLM 空白生成
+                try:
+                    problem_type = oracle_output.get("problem_type", "general")
+                    core_intent = oracle_output.get("core_intent", current_input)
+                    inventory_prompt = (
+                        f"任务类型：{problem_type}\n"
+                        f"核心意图：{core_intent}\n\n"
+                        f"在提出任何解决方案之前，基于你的训练数据，列举你已知的、"
+                        f"用于解决「{core_intent}」类任务的现有工具、命令行程序、成熟库或框架。\n"
+                        f"按成熟度从高到低排序，每项一行，格式：[工具名] - [用途]。\n"
+                        f"只列举真实存在的工具，不要发明。最多列 6 个。"
+                    )
+                    inventory_resp = await self.cognition.chat(
+                        messages=[{"role": "user", "content": inventory_prompt}]
+                    )
+                    known_solutions = inventory_resp.content.strip() if inventory_resp else ""
+                    oracle_output["known_solutions"] = known_solutions
+                    logger.info(f"📚 知识存量盘点完成 ({len(known_solutions)} chars)")
+                except Exception as inv_err:
+                    logger.warning(f"知识盘点跳过: {inv_err}")
+                    oracle_output["known_solutions"] = ""
             
             # 2. 战略阶段 (Strategy Phase)
             current_context = user_context or ""
@@ -193,6 +217,15 @@ class NanoGenesis:
             if execution_history:
                 current_context += f"\n\n[Previous Execution Failures]:\n{json.dumps(execution_history, indent=2, ensure_ascii=False)}"
             
+            # 注入知识存量盘点结果（让 strategy_phase 看到已知工具清单，再生成方案）
+            known_solutions = oracle_output.get("known_solutions", "")
+            if known_solutions:
+                current_context += (
+                    f"\n\n[📚 知识存量锚点 - 已知现有工具/方案 (由知识库检索)]\n"
+                    f"{known_solutions}\n"
+                    f"→ 优先从以上已有工具中选择，非必要不从零编写代码。"
+                )
+            
             # --- PRUDENT COGNITION (Perception Layer) ---
             # Phase 1.5: World Model Snapshot
             # Run fast local checks before planning
@@ -202,6 +235,10 @@ class NanoGenesis:
             # Lazy init monitor with higher tolerance (Relaxed Mode)
             if not hasattr(self, 'entropy_monitor'):
                 self.entropy_monitor = EntropyMonitor(window_size=6)
+            else:
+                # 每次新对话开始时重置，避免携带上次会话的历史误触发 stagnant
+                self.entropy_monitor.reset()
+
                 
             world_model_snapshot = CapabilityScanner.scan()
             
@@ -286,7 +323,19 @@ class NanoGenesis:
             logger.info("✓ 战略蓝图已生成")
             
             # 3. 执行阶段 (Execution Phase)
-            self.context.update_system_prompt(f"{base_prompt}\n\n{strategic_blueprint}")
+            # 动态 Prompt 排序：根据任务类型重排 prompt 段落，提升信噪比（不删除任何信息）
+            try:
+                from genesis.core.prompt_filter import ContextualPromptFilter
+                _prompt_filter = ContextualPromptFilter()
+                raw_exec_prompt = f"{base_prompt}\n\n{strategic_blueprint}"
+                exec_prompt = _prompt_filter.rank(raw_exec_prompt, current_input)
+                task_type = _prompt_filter.detect(current_input)
+                logger.debug(f"🎯 PromptFilter: task_type={task_type}")
+            except Exception as pf_err:
+                logger.warning(f"PromptFilter 跳过: {pf_err}")
+                exec_prompt = f"{base_prompt}\n\n{strategic_blueprint}"
+            
+            self.context.update_system_prompt(exec_prompt)
             self.loop.provider = self.cloud_provider
             
             try:
@@ -358,9 +407,56 @@ class NanoGenesis:
                     execution_history.append(error_entry)
                     
                     if error_count >= MAX_RETRIES:
-                        accumulated_response += response or "Error: Max retries exceeded."
-                        logger.error("❌ Ouroboros Loop: Max Retries Exceeded.")
-                        break
+                        # --- MISSION TREE BACKTRACKING ---
+                        # 优先尝试任务树回溯，而非直接终止
+                        backtracked = False
+                        if response and "[STRATEGIC_INTERRUPT]" in response:
+                            interrupt_detail = response.replace("[STRATEGIC_INTERRUPT]", "").strip()
+                            
+                            # 尝试从任务树爬回父节点
+                            if hasattr(self, 'mission_manager'):
+                                active_mission = self.mission_manager.get_active_mission()
+                                if active_mission and active_mission.parent_id:
+                                    logger.warning(f"🔄 任务树回溯：从 '{active_mission.objective[:50]}' 爬回父节点...")
+                                    parent_mission = self.mission_manager.backtrack_to_parent(
+                                        active_mission.id,
+                                        error_summary=interrupt_detail
+                                    )
+                                    if parent_mission:
+                                        # 获取所有已失败子路径（让下次 strategy 排除它们）
+                                        failed_paths = self.mission_manager.get_failed_children(parent_mission.id)
+                                        failed_hint = ""
+                                        if failed_paths:
+                                            failed_hint = (
+                                                f"\n\n[BACKTRACK CONTEXT] 以下路径已尝试并失败，禁止再次选择：\n"
+                                                + "\n".join(f"- {p}" for p in failed_paths)
+                                            )
+                                        
+                                        # 重置循环状态，用父任务目标重试
+                                        error_count = 0
+                                        current_input = parent_mission.objective + failed_hint
+                                        execution_history = []
+                                        logger.info(f"↩️ 回溯成功，重试父任务: {parent_mission.objective[:50]}")
+                                        backtracked = True
+                        
+                        if not backtracked:
+                            # --- AUTO-DEBRIEF: 无法回溯（根节点），主动汇报协议 ---
+                            if response and "[STRATEGIC_INTERRUPT]" in response:
+                                logger.warning("🔔 AUTO-DEBRIEF: 根节点中断，生成用户说明")
+                                interrupt_detail = response.replace("[STRATEGIC_INTERRUPT]", "").strip()
+                                accumulated_response += (
+                                    f"⚠️ **执行被自动熔断中断**\n\n"
+                                    f"**发生了什么**：我在尝试执行任务时触发了安全熔断机制。具体原因：{interrupt_detail}\n\n"
+                                    f"**为什么停下来**：为了避免陷入无意义的重复循环、消耗更多资源，系统主动中断了本次执行。\n\n"
+                                    f"**接下来怎么办**：\n"
+                                    f"1. 如果是工具连续失败（如权限不足、环境问题），请告知我换一种方法，或者授予必要权限。\n"
+                                    f"2. 如果是策略问题，我可以重新制定执行方案。\n"
+                                    f"3. 您可以直接告诉我如何继续，我会立即重启执行。"
+                                )
+                            else:
+                                accumulated_response += response or "Error: Max retries exceeded."
+                            logger.error("❌ Ouroboros Loop: Max Retries Exceeded.")
+                            break
             
             except Exception as e:
                 logger.error(f"大脑执行严重失败: {e}")
@@ -377,6 +473,36 @@ class NanoGenesis:
         # 3. 记录与学习 (The Evolution)
         optimization_info = {}
         
+        # --- NEW PHASE: Cognitive Extraction (Sub-Agent insights) & The Handshake Protocol ---
+        import re
+        extracted_insight = None
+        for msg in self.context._message_history:
+            # Look for the new async sub-agent reflection format
+            # Or the old OPERATIONAL_METRICS format for backwards compatibility
+            if msg.role == MessageRole.TOOL and isinstance(msg.content, str):
+                if "<reflection>" in msg.content or "<OPERATIONAL_METRICS>" in msg.content:
+                    # Look for anything resembling a cognitive insight, wisdom, or summary
+                    # Since we relaxed the YAML rule, we use a broader heuristic or just capture the essence
+                    # For now, let's catch the specific marker if the sub-agent adhered to it
+                    insight_match = re.search(r"(?:cognitive_insight|insight|规律):?\s*([^\n]+)", msg.content, re.IGNORECASE)
+                    if insight_match:
+                        extracted_insight = insight_match.group(1).strip()
+                        
+        if extracted_insight and self.adaptive_learner:
+            logger.info(f"🧠 Cognitive Insight Detected (Waiting for Handshake): {extracted_insight}")
+            # Do NOT add it automatically. Initiate Handshake Protocol!
+            handshake_msg = (
+                f"\n\n---\n"
+                f"🤝 **【系统优化握手请求】**\n"
+                f"在刚刚的后台探针任务中，子代理总结出了一条可能提升系统未来效率的规律：\n"
+                f"> *\"{extracted_insight}\"*\n"
+                f"**您是否允许我将这条规律刻入 Genesis 的潜意识基因库？(回复 是/Y 或 否/N)**"
+            )
+            response += handshake_msg
+            
+            # Save the pending insight into the context so the next turn can catch it
+            self.context.pending_insight = extracted_insight
+                    
         # 3.1 自适应学习 (观察交互)
         if self.adaptive_learner:
             # 简单判断用户反馈 (这里假设没有显式反馈，或者从 response 中推断? 
@@ -479,6 +605,8 @@ class NanoGenesis:
         if not hasattr(self, 'entropy_monitor'):
              from genesis.core.entropy import EntropyMonitor
              self.entropy_monitor = EntropyMonitor(window_size=6)
+        else:
+             self.entropy_monitor.reset()  # 新请求，重置熵历史
 
         # Capture previous state (if any) - actually we capture AFTER execution usually, 
         # but here we capture the 'before' state or result of 'previous' step.
@@ -555,9 +683,27 @@ class NanoGenesis:
         # The prompt includes 'strategic_plan' which saw active_jobs.
         
         try:
-            # We use the ProviderRouter (self.llm)
             # Need to convert internal Messages to Dicts for provider
-            provider_messages = [m.to_dict() for m in messages]
+            provider_messages = []
+            for i, msg in enumerate(messages):
+                msg_dict = msg.to_dict()
+                
+                if msg_dict["role"] == "tool":
+                    prev_msg = provider_messages[-1] if provider_messages else None
+                    is_orphan = True
+                    if prev_msg and prev_msg.get("role") == "assistant" and prev_msg.get("tool_calls"):
+                        target_id = msg_dict.get("tool_call_id")
+                        if target_id and any(tc.get("id") == target_id for tc in prev_msg.get("tool_calls", [])):
+                            is_orphan = False
+                            
+                    if is_orphan:
+                        logger.debug(f"Sanitizing orphaned tool payload {msg_dict.get('tool_call_id', 'unknown')} -> user")
+                        msg_dict["role"] = "user"
+                        msg_dict["content"] = f"[System Observation (Tool Result)]:\n{msg_dict.get('content', '')}"
+                        if "tool_call_id" in msg_dict: del msg_dict["tool_call_id"]
+                        if "name" in msg_dict: del msg_dict["name"]
+                        
+                provider_messages.append(msg_dict)
             
             response = await self.provider_router.chat_with_failover(
                 messages=provider_messages,

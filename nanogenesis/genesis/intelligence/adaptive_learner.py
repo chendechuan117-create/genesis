@@ -42,6 +42,9 @@ class InteractionPattern:
     total_interactions: int = 0
     confidence: float = 0.0
 
+    # 进化基因 (Multiplicative Evolution Insights)
+    cognitive_insights: List[str] = field(default_factory=list)
+
 
 class AdaptiveLearner:
     """自适应学习器"""
@@ -211,6 +214,14 @@ class AdaptiveLearner:
         else:
             prompt += "语气：自然对话。\n"
 
+        # Inject Evolution Insights (Multiplicative Evolution)
+        if self.pattern.cognitive_insights:
+            prompt += "\n"
+            prompt += "【Evolutionary Cognitive Insights (Instincts)】\n"
+            prompt += "These are hard-earned abstract principles from your previous clones. ALWAYS adhere to them:\n"
+            for i, insight in enumerate(self.pattern.cognitive_insights, 1):
+                prompt += f"{i}. {insight}\n"
+
         # Force Metacognitive Protocol (CRITICAL FIX)
         prompt += "\n"
         prompt += "【Metacognitive Stream Protocol】\n"
@@ -222,6 +233,16 @@ class AdaptiveLearner:
         
         return prompt
     
+    def add_cognitive_insight(self, insight: str, max_insights: int = 15):
+        """
+        吸收来自子代理的泛化认知规律 (Multiplicative Evolution)
+        """
+        if insight and insight not in self.pattern.cognitive_insights:
+            self.pattern.cognitive_insights.append(insight)
+            if len(self.pattern.cognitive_insights) > max_insights:
+                self.pattern.cognitive_insights.pop(0) # 淘汰最陈旧的本能
+            self._save_pattern()
+
     def get_response_guidelines(self) -> Dict[str, any]:
         """
         获取回复指导原则
@@ -256,6 +277,7 @@ class AdaptiveLearner:
                 'negative_signals': self.pattern.negative_signals,
                 'total_interactions': self.pattern.total_interactions,
                 'confidence': self.pattern.confidence,
+                'cognitive_insights': self.pattern.cognitive_insights,
             },
             'last_updated': datetime.now().isoformat()
         }

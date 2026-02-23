@@ -261,25 +261,40 @@ async def main():
             import time
             start_wall_time = time.time()
             
+            # 定义流式输出状态
+            class StreamState:
+                last_was_stream = False
+            
             # 定义流式输出回调
             async def print_stream(step_type, data):
                 if step_type == "reasoning":
                     # Colorize reasoning (Grey)
                     print(f"\033[90m{data}\033[0m", end="", flush=True)
+                    StreamState.last_was_stream = True
                 elif step_type == "content":
                     # Standard content
                     print(data, end="", flush=True)
+                    StreamState.last_was_stream = True
                 elif step_type == "tool":
+                    if StreamState.last_was_stream:
+                        print() # Break the stream line
+                        StreamState.last_was_stream = False
                     # Tool Call (Cyan)
-                    print(f"\n\033[36m🛠️  调用工具: {data['name']} {json.dumps(data['args'], ensure_ascii=False)}\033[0m")
+                    print(f"\n\033[36m🛠️  调用工具: {data['name']} {json.dumps(data.get('args', {}), ensure_ascii=False)}\033[0m")
                 elif step_type == "tool_result":
+                    if StreamState.last_was_stream:
+                        print()
+                        StreamState.last_was_stream = False
                     # Tool Result (Green)
                     # Truncate long results
-                    res = data['result']
+                    res = data.get('result', '')
                     if len(res) > 200: res = res[:200] + "..."
                     print(f"\033[32m✅ 结果: {res}\033[0m\n")
                 elif step_type == "loop_start":
-                    print(f"\n🔄 思考第 {data} 步...", end="\n", flush=True)
+                    if StreamState.last_was_stream:
+                        print()
+                        StreamState.last_was_stream = False
+                    print(f"\n🔄 思考第 {data} 步...", flush=True)
 
             # 执行处理
             import json

@@ -145,3 +145,32 @@ class ToolRegistry:
         except Exception as e:
             logger.error(f"加载工具文件失败 {path}: {e}")
             return False
+
+class ProviderRegistry:
+    """提供商注册表 - 动态加载和管理不同的大模型提供商工厂"""
+    
+    def __init__(self):
+        # 存储返回 LLMProvider 实例的 Callable 工厂函数
+        self._provider_builders: Dict[str, Any] = {}
+        
+    def register(self, name: str, builder: Any) -> None:
+        """注册一个 Provider 工厂函数"""
+        if name in self._provider_builders:
+            logger.warning(f"提供商工厂 {name} 已存在，将被覆盖")
+            
+        self._provider_builders[name] = builder
+        logger.debug(f"✓ 注册提供商插件: {name}")
+        
+    def unregister(self, name: str) -> None:
+        if name in self._provider_builders:
+            del self._provider_builders[name]
+            
+    def get_builder(self, name: str) -> Optional[Any]:
+        return self._provider_builders.get(name)
+        
+    def list_providers(self) -> List[str]:
+        return list(self._provider_builders.keys())
+
+# 全局单例
+tool_registry = ToolRegistry()
+provider_registry = ProviderRegistry()

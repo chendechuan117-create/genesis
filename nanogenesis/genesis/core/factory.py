@@ -20,19 +20,6 @@ from genesis.optimization.tool_optimizer import ToolUsageOptimizer
 from genesis.optimization.profile_evolution import UserProfileEvolution
 from genesis.intelligence.adaptive_learner import AdaptiveLearner
 
-# Tools
-from genesis.tools.file_tools import (
-    ReadFileTool, WriteFileTool,
-    AppendFileTool, ListDirectoryTool
-)
-from genesis.tools.shell_tool import ShellTool
-from genesis.tools.web_tool import WebSearchTool
-from genesis.tools.browser_tool import BrowserTool
-from genesis.tools.memory_tool import SaveMemoryTool, SearchMemoryTool
-from genesis.tools.skill_creator_tool import SkillCreatorTool
-from genesis.tools.scheduler_tool import SchedulerTool
-from genesis.tools.system_health_tool import SystemHealthTool
-from genesis.tools.douyin_tool import DouyinAnalysisTool
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +44,7 @@ class GenesisFactory:
         Create a standard instance of NanoGenesis with all default components.
         """
         # 1. Configuration & Providers
+        print(">>> Step 1: Init ProviderRouter")
         provider_router = ProviderRouter(
             config=config,
             api_key=api_key,
@@ -66,12 +54,14 @@ class GenesisFactory:
         # Note: Gemini args currently handled by config/router defaults, logic preserved.
 
         # 2. Memory Systems
+        print(">>> Step 2: Init Memory Systems")
         memory = SQLiteMemoryStore()
         session_manager = SessionManager()
         from genesis.core.mission import MissionManager
         mission_manager = MissionManager()
         
         # 3. Context & Tools
+        print(">>> Step 3: Init Context & Tools")
         tools = ToolRegistry()
         context = SimpleContextBuilder()
         context.set_provider(
@@ -81,6 +71,7 @@ class GenesisFactory:
         )
 
         # 4. Optimization Components
+        print(">>> Step 4: Init Optimization Components")
         optimization_components = {}
         if enable_optimization:
             optimization_components['prompt_optimizer'] = PromptOptimizer(
@@ -101,21 +92,26 @@ class GenesisFactory:
             tools.register(ChainNextTool())
         
         # 5. Scheduler
+        print(">>> Step 5: Init Scheduler")
         scheduler = AgencyScheduler(tools)
         
         # 6. Trust Anchor
+        print(">>> Step 6: Init Trust Anchor")
         trust_anchor = TrustAnchorManager()
 
         # 7. Register Standard Tools
+        print(">>> Step 7: Register Standard Tools")
         GenesisFactory._register_standard_tools(tools, memory, scheduler, provider_router, context)
 
         # 8. Meta-Cognition Protocols
+        print(">>> Step 8: Load Protocols")
         meta_protocol, intent_prompt = GenesisFactory._load_protocols()
 
         # 9. Cognition
         # Note: CognitiveProcessor depends on `chat_func`.
         # Since we are constructing NanoGenesis, and NanoGenesis usually holds the `chat_with_failover`.
         # However, with providing `provider_router`, we can pass `provider_router.chat_with_failover` directly!
+        print(">>> Step 9: Init Cognition")
         cognition = CognitiveProcessor(
             chat_func=provider_router.chat_with_failover,
             memory=memory,
@@ -125,6 +121,7 @@ class GenesisFactory:
         )
 
         # 10. Assemble Agent
+        print(">>> Step 10: Assemble Agent")
         agent = NanoGenesis(
             user_id=user_id,
             config=config,
@@ -145,6 +142,7 @@ class GenesisFactory:
         # 11. Post-Construction Initialization
         # (Start session, load history, etc. - previously in __init__)
         
+        print(">>> Step 11: Post-Construction Initialization")
         # Restore session
         if session_manager.restore_last_session_sync():
             logger.info(f"🔄 [Factory] Restored session: {session_manager.session_id}")
@@ -159,6 +157,32 @@ class GenesisFactory:
     @staticmethod
     def _register_standard_tools(tools: ToolRegistry, memory: SQLiteMemoryStore, scheduler: AgencyScheduler, provider_router: ProviderRouter, context: SimpleContextBuilder):
         try:
+            # First, register some highly coupled core tools that need specific dependencies
+            # We keep these few as explicit internal injections until a DI framework is robust enough
+            from genesis.tools.memory_tool import SaveMemoryTool, SearchMemoryTool
+            from genesis.tools.skill_creator_tool import SkillCreatorTool
+            from genesis.tools.scheduler_tool import SchedulerTool
+            from genesis.tools.system_health_tool import SystemHealthTool
+            
+            tools.register(SaveMemoryTool(memory))
+            tools.register(SearchMemoryTool(memory))
+            tools.register(SkillCreatorTool(tools))
+            tools.register(SchedulerTool(scheduler))
+            tools.register(SystemHealthTool(provider_router, memory, tools, context, scheduler))
+            
+            # Now, explicitly register all standard decoupled tools from the tools directory
+            from genesis.tools.file_tools import ReadFileTool, WriteFileTool, AppendFileTool, ListDirectoryTool
+            from genesis.tools.shell_tool import ShellTool
+            from genesis.tools.web_tool import WebSearchTool
+            from genesis.tools.browser_tool import BrowserTool
+            from genesis.tools.douyin_tool import DouyinAnalysisTool
+            
+            # Sub-Agent Tool Registration
+            from genesis.tools.spawn_sub_agent_tool import SpawnSubAgentTool
+            from genesis.tools.check_sub_agent_tool import CheckSubAgentTool
+            tools.register(SpawnSubAgentTool())
+            tools.register(CheckSubAgentTool())
+            
             tools.register(ReadFileTool())
             tools.register(WriteFileTool())
             tools.register(AppendFileTool())
@@ -166,13 +190,13 @@ class GenesisFactory:
             tools.register(ShellTool(use_sandbox=False))
             tools.register(WebSearchTool())
             tools.register(BrowserTool())
-            tools.register(SaveMemoryTool(memory))
-            tools.register(SearchMemoryTool(memory))
-            tools.register(SkillCreatorTool(tools))
-            tools.register(SchedulerTool(scheduler))
-            tools.register(SystemHealthTool(provider_router, memory, tools, context, scheduler))
             tools.register(DouyinAnalysisTool())
-            logger.info(f"✓ [Factory] Registered {len(tools)} tools")
+            
+            # Vision (Visual Cortex)
+            from genesis.tools.visual_tool import VisualTool
+            tools.register(VisualTool())
+            
+            logger.info(f"✓ [Factory] Explicitly Registered {len(tools)} standard tools")
         except Exception as e:
             logger.warning(f"Error registering tools: {e}")
 

@@ -222,3 +222,59 @@ class MissionManager:
             return [self._row_to_mission(row) for row in cursor.fetchall()]
         finally:
             conn.close()
+
+    def backtrack_to_parent(self, failed_mission_id: str, error_summary: str = "") -> Optional[Mission]:
+        """
+        任务树回溯：将当前失败的任务标记为 failed，并重新激活父节点任务。
+        
+        这是贝叶斯回溯的核心行为：
+          当前路径失败 → 爬回父节点 → 父节点重新 active → agent 用另一条路重试
+        
+        Args:
+            failed_mission_id : 失败任务的 ID
+            error_summary     : 错误摘要，写入 last_error 供下次 strategy_phase 参考
+        
+        Returns:
+            父节点 Mission，如果是根节点则返回 None（无法再回溯）
+        """
+        failed = self.get_mission(failed_mission_id)
+        if not failed:
+            return None
+
+        # 1. 标记当前任务为失败，记录原因
+        self.update_mission(
+            failed_mission_id,
+            status="failed",
+            last_error=error_summary[:500] if error_summary else "STRATEGIC_INTERRUPT",
+            error_count=failed.error_count + 1
+        )
+
+        # 2. 尝试爬回父节点
+        if not failed.parent_id:
+            return None  # 已是根节点，无法再回溯
+
+        parent = self.get_mission(failed.parent_id)
+        if not parent:
+            return None
+
+        # 3. 重新激活父节点，让 agent 在父节点上下文中重新 strategy_phase
+        self.update_mission(
+            parent.id,
+            status="active",
+            last_error=f"子任务失败回溯: {failed.objective[:100]} → {error_summary[:200]}"
+        )
+
+        return self.get_mission(parent.id)
+
+    def get_failed_children(self, parent_mission_id: str) -> List[str]:
+        """返回指定父节点下所有已失败的子任务目标（供 strategy_phase 排除这些路径）"""
+        conn = self._get_conn()
+        try:
+            cursor = conn.execute(
+                "SELECT objective FROM missions WHERE parent_id = ? AND status = 'failed'",
+                (parent_mission_id,)
+            )
+            return [row['objective'] for row in cursor.fetchall()]
+        finally:
+            conn.close()
+

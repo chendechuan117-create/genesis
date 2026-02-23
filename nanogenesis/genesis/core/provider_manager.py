@@ -3,7 +3,9 @@ import logging
 import asyncio
 from typing import Dict, Any, List, Optional
 from genesis.core.provider import LiteLLMProvider, NativeHTTPProvider, LITELLM_AVAILABLE, MockLLMProvider
-
+from genesis.core.registry import provider_registry
+# Ensure providers are loaded
+import genesis.providers
 logger = logging.getLogger(__name__)
 
 class ProviderRouter:
@@ -41,55 +43,47 @@ class ProviderRouter:
                  self._switch_provider('mock')
 
     def _initialize_providers(self, api_key: str, base_url: str, model: str):
-        """Initialize all available providers based on config"""
-        # 1. Initialize Providers based on available config
-        # OpenRouter
-        or_key = getattr(self.config, 'openrouter_api_key', None)
-        if or_key:
-            logger.info(f"Initialized Provider: OpenRouter")
-            # Force use of a free model since user has no credits
-            # utilizing google/gemini-2.0-flash-lite-preview-02-05:free
-            self.providers['openrouter'] = NativeHTTPProvider(
-                api_key=or_key,
-                base_url="https://openrouter.ai/api/v1",
-                default_model="google/gemini-2.0-flash-lite-preview-02-05:free"
-            )
-
-        # DeepSeek Native
-        ds_key = api_key or getattr(self.config, 'deepseek_api_key', None)
-        if ds_key:
-            logger.info("Initialized Provider: DeepSeek (Native)")
-            self.providers['deepseek'] = NativeHTTPProvider(
-                api_key=ds_key,
-                base_url="https://api.deepseek.com/v1",
-                default_model="deepseek-chat"
-            )
-
-        # OpenAI
-        oa_key = getattr(self.config, 'openai_api_key', None)
-        if oa_key:
-            logger.info("Initialized Provider: OpenAI")
-            self.providers['openai'] = NativeHTTPProvider(
-                api_key=oa_key,
-                base_url="https://api.openai.com/v1",
-                default_model="gpt-4o"
-            )
-
-        # Antigravity (Local/Proxy)
-        # Use config if available, otherwise fallback to defaults (but don't hardcode valid keys)
-        ag_key = getattr(self.config, 'antigravity_key', "default-local-key") 
-        ag_url = getattr(self.config, 'antigravity_url', "http://127.0.0.1:8045/v1")
+        """Initialize all available providers based on the dynamically registered factories"""
         
-        logger.info(f"Initialized Provider: Antigravity (Local/Proxy at {ag_url})")
-        self.providers['antigravity'] = NativeHTTPProvider(
-            api_key=ag_key,
-            base_url=ag_url,
-            default_model="gemini-2.5-flash"
-        )
+        # 1. Iterate over registry and attempt to build providers
+        for name in provider_registry.list_providers():
+            builder = provider_registry.get_builder(name)
+            if builder:
+                try:
+                    # Provide the config object; the builder decides if it has enough credentials to instantiate
+                    provider_instance = builder(self.config)
+                    # We only add it if the builder returned an instance 
+                    # (some builders might return None if API keys are strictly missing, though NativeHTTPProvider allows None keys)
+                    if provider_instance:
+                        if name == "deepseek" and api_key:
+                             # Legacy override support for explicit runtime keys
+                             provider_instance.api_key = api_key
+                        
+                        # Only officially activate it if the key exists or it's a local/mock provider
+                        # (To maintain the original logic where only configured providers are added to the active pool)
+                        is_valid = False
+                        if name == "deepseek" and getattr(self.config, 'deepseek_api_key', None): is_valid = True
+                        if name == "openai" and getattr(self.config, 'openai_api_key', None): is_valid = True
+                        if name == "openrouter" and getattr(self.config, 'openrouter_api_key', None): is_valid = True
+                        
+                        # Consumable Registration
+                        if name == "siliconflow" and getattr(self.config, 'siliconflow_api_key', None): is_valid = True
+                        if name == "dashscope" and getattr(self.config, 'dashscope_api_key', None): is_valid = True
+                        if name == "qianfan" and getattr(self.config, 'qianfan_api_key', None): is_valid = True
+                        if name == "zhipu" and getattr(self.config, 'zhipu_api_key', None): is_valid = True
+                        
+                        if name == "antigravity": is_valid = True # Local proxy always valid
+                        
+                        if is_valid or api_key:
+                             self.providers[name] = provider_instance
+                             logger.info(f"Initialized Provider from Registry: {name}")
+                             
+                except Exception as e:
+                    logger.warning(f"Failed to build provider plugin '{name}': {e}")
         
         # 2. Determine Activation & Failover Order
-        # Default Priority: OpenRouter -> DeepSeek -> OpenAI -> Antigravity
-        self.failover_order = ['openrouter', 'deepseek', 'openai', 'antigravity']
+        # User Request: Prioritize DeepSeek (Stable/Native) -> OpenRouter (Free Fallback) -> Antigravity
+        self.failover_order = ['deepseek', 'openrouter', 'openai', 'antigravity']
         
         # Set Active
         self.active_provider_name = 'antigravity' # Default fallback
@@ -152,4 +146,15 @@ class ProviderRouter:
         return await self.chat_with_failover(*args, **kwargs)
         
     def get_active_provider(self):
+        return self.active_provider
+
+    def get_consumable_provider(self):
+        """Returns the first available cheap/free provider from the consumables pool"""
+        consumable_order = ['siliconflow', 'dashscope', 'zhipu', 'qianfan']
+        for name in consumable_order:
+            if name in self.providers:
+                logger.info(f"🧬 Selected Consumable Provider: {name}")
+                return self.providers[name]
+                
+        logger.warning("No Consumable Provider found! Falling back to active provider (May consume premium tokens!)")
         return self.active_provider

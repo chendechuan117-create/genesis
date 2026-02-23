@@ -25,11 +25,15 @@ class NativeHTTPProvider(BaseLLMProvider):
         self,
         api_key: Optional[str] = None,
         base_url: Optional[str] = "https://api.deepseek.com/v1",
-        default_model: str = "deepseek-chat"
+        default_model: str = "deepseek-chat",
+        connect_timeout: int = 10,
+        request_timeout: int = 120
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip('/') if base_url else "https://api.deepseek.com/v1"
         self.default_model = default_model
+        self.connect_timeout = connect_timeout
+        self.request_timeout = request_timeout
     
     def get_default_model(self) -> str:
         """获取默认模型"""
@@ -137,12 +141,39 @@ class NativeHTTPProvider(BaseLLMProvider):
         import ast
         
         tool_calls = []
-        # Find all python code blocks
-        # Find all python-like code blocks (python, py, or even unlabelled if clearly code)
-        # We look for explicit python/py tags first to be safe
-        code_blocks = re.findall(r"```(?:python|py)\s*(.*?)```", content, re.DOTALL | re.IGNORECASE)
+        # Find all code blocks (python, json, or generic)
+        # Capture the content inside ```...```
+        code_blocks = re.findall(r"```(?:\w*)\s*(.*?)```", content, re.DOTALL | re.IGNORECASE)
         
         for block in code_blocks:
+            # Strategy 1: Try parsing as JSON Action (DeepSeek Native)
+            try:
+                data = json.loads(block)
+                if isinstance(data, dict):
+                     name = data.get("action") or data.get("tool") or data.get("name") or data.get("tool_name")
+                     if name:
+                         # Heuristic mapping for arguments
+                         if "args" in data:
+                             args = data["args"]
+                         elif "arguments" in data:
+                             args = data["arguments"]
+                         elif "command" in data:
+                             # Flatten command into args if it's a single command string
+                             args = {"command": data["command"]}
+                         else:
+                             # Assume remaining keys are arguments
+                             args = {k: v for k, v in data.items() if k not in ("action", "tool", "name", "tool_name")}
+                             
+                         tool_calls.append(ToolCall(
+                             id=f"call_json_{len(tool_calls)}",
+                             name=name,
+                             arguments=args
+                         ))
+                         continue # Succesfully parsed as JSON, skip AST
+            except:
+                pass
+
+            # Strategy 2: Try parsing as Python Code (Original Logic)
             try:
                 # Parse the code block into an AST
                 tree = ast.parse(block)
@@ -228,8 +259,6 @@ class NativeHTTPProvider(BaseLLMProvider):
              for match in matches:
                  name = match.group(1)
                  args_raw = match.group(2)
-                 name = match.group(1)
-                 args_raw = match.group(2)
                  
                  args = {}
                  try:
@@ -250,6 +279,38 @@ class NativeHTTPProvider(BaseLLMProvider):
                  except:
                      pass
 
+        # Fallback 2: Check for direct JSON action blocks (Common in DeepSeek/Flash)
+        # Pattern: {"action": "tool_name", "command": "arg"} or {"action": "tool_name", "args": {...}}
+        if not tool_calls:
+            try:
+                 # Find valid JSON blocks that contain "action"
+                 # We use a regex to find potental JSONs then search inside
+                 json_blocks = re.findall(r'\{[\s\S]*?\}', content)
+                 for block in json_blocks:
+                     try:
+                         data = json.loads(block)
+                         if isinstance(data, dict):
+                             name = data.pop("action", None) or data.pop("tool", None) or data.pop("name", None) or data.pop("tool_name", None)
+                             if name:
+                                 # Heuristic mapping for arguments
+                                 if "args" in data:
+                                     args = data["args"]
+                                 elif "arguments" in data:
+                                     args = data["arguments"]
+                                 else:
+                                     # Assume remaining keys are arguments
+                                     args = data
+                                     
+                                 tool_calls.append(ToolCall(
+                                     id=f"call_json_action_{len(tool_calls)}",
+                                     name=name,
+                                     arguments=args
+                                 ))
+                     except:
+                         continue
+            except Exception:
+                 pass
+
         if tool_calls:
             logger.info(f"🔍 Heuristically detected {len(tool_calls)} tool calls in content")
             
@@ -261,7 +322,7 @@ class NativeHTTPProvider(BaseLLMProvider):
         
         # 构建 curl 命令 — 移除 --noproxy '*' 以支持系统代理
         # 使用 --data-binary @- 从 stdin 读取数据，避免参数过长问题
-        cmd = ['curl', '-k', '-s', '--connect-timeout', '30', '-X', 'POST', url]
+        cmd = ['curl', '-k', '-s', '--connect-timeout', str(self.connect_timeout), '-X', 'POST', url]
         
         for k, v in headers.items():
             cmd.extend(['-H', f'{k}: {v}'])
@@ -274,7 +335,7 @@ class NativeHTTPProvider(BaseLLMProvider):
                 input=data.decode('utf-8'), # Pass data via stdin
                 capture_output=True,
                 text=True,
-                timeout=120
+                timeout=self.request_timeout
             )
             
             if result.returncode != 0:

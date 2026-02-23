@@ -5,7 +5,7 @@ NanoGenesis 核心基础类
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from enum import Enum
 
 
@@ -21,7 +21,8 @@ class MessageRole(Enum):
 class Message:
     """消息基础类"""
     role: MessageRole
-    content: str
+    # content 支持纯文本(str) 或多模态内容块列表(List[Dict])，用于视觉能力
+    content: Union[str, List[Dict[str, Any]]]
     name: Optional[str] = None
     tool_call_id: Optional[str] = None
     tool_calls: Optional[List[Dict[str, Any]]] = None # 新增支持 assistant 的 tool_calls
@@ -30,7 +31,8 @@ class Message:
         """转换为字典格式"""
         result = {
             "role": self.role.value,
-            "content": self.content
+            # 多模态：list 直传；单模态：str 直传
+            "content": self.content if isinstance(self.content, list) else self.content
         }
         if self.name:
             result["name"] = self.name

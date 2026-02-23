@@ -1,115 +1,89 @@
-# NanoGenesis v2.0 架构拓扑图 (Architecture Topology)
+# Genesis 2.0 系统结构与运作白皮书 (给人类看的版本)
 
-本文档详细描述了 NanoGenesis v2.0 的生物学架构、运作流程及模块映射。
+为了让你（非程序员视角）能一眼看透目前 Genesis 的构成，我们用**“人体的器官”**来做类比，画了一张系统的拓扑结构图。
 
----
+这是目前被我们清洗和固化下来的系统真理地图。
 
-## 🧬 1. 生物学架构概览 (Biological Architecture)
+## 🗺️ 第一部分：系统视觉拓扑图
 
-NanoGenesis 模仿生物体结构，分为三大核心系统：
-
-1.  **神经中枢 (Nervous System)**: 负责感知环境、时间、记忆。
-2.  **双脑认知 (Dual-Brain Cognition)**: 负责反射（快思考）和推理（慢思考）。
-3.  **肢体躯干 (Body & Limbs)**: 负责执行具体操作。
+你可以把下面这段代码复制到在线的 Mermaid 渲染器（比如：https://mermaid.live/ ），就能看到一张直观的流程图。由于它被写在了系统的标准文档里，以后的 AI 也能直接“读懂”这张图的结构逻辑。
 
 ```mermaid
 graph TD
-    User((用户输入)) --> Nervous[神经中枢 (Perception)]
+    classDef brain fill:#f9d0c4,stroke:#333,stroke-width:2px;
+    classDef sense fill:#d4e6f1,stroke:#333,stroke-width:2px;
+    classDef body fill:#d5f5e3,stroke:#333,stroke-width:2px;
+    classDef core fill:#fcf3cf,stroke:#333,stroke-width:2px;
+
+    User([👤 你的指令]) --> Agent[🧠 代理总控 (Agent)]
     
-    subgraph Nervous System [感知层]
-        Nervous --> Time[时间感知]
-        Nervous --> Env[环境感知]
-        Nervous --> Memory[海马体记忆]
-        Config[配置中枢 ConfigManager] -.-> Nervous
-        Nervous --> Compression[压缩协议 CompressionEngine]
+    subgraph 神经与感知层 (感觉器官)
+        Agent --> Context[📝 短期记忆缓冲]
+        Context --> DB[(🗄️ SQLite 长期记忆)]
+        Agent --> Entropy[🌡️ 焦虑监控 (防死循环)]
     end
     
-    Compression --> Meta[多面体元认知 Polyhedron]
-    
-    subgraph Single Brain [认知层]
-        Meta --> Polyhedron[递归多面体 Recursive Polyhedron]
-        Polyhedron -- 缺条件? --> Acquisition[获取环 RECT Loop]
-        Acquisition -- 无法获取? --> Human[人类介入 Human-in-the-Loop]
-        Human -- 提供条件 --> Polyhedron
-        Polyhedron -- 条件完备 --> CloudBrain[云端主脑 DeepSeek-V3]
+    subgraph 认知与决策层 (大脑)
+        Agent --> Loop[🔄 衔尾蛇主循环 (Loop)]
+        Loop --> Provider[☁️ 大模型驱动 (Provider)]
+        Provider --> DeepSeek[[DeepSeek API]]
+        Provider --> LocalLLM[[本地备用模型]]
     end
     
-    CloudBrain --> ToolSelector[工具选择]
-    
-    subgraph Body [执行层]
-        ToolSelector --> Hands[ShellTool (双手)]
-        ToolSelector --> Eyes[BrowserTool (眼睛)]
-        ToolSelector --> Fingers[FileTools (手指)]
-        ToolSelector --> Womb[SkillCreator (工具生成)]
-        
-        Hands --> Host[宿主系统]
-        Eyes --> Web[互联网]
-        Womb --> NewSkill[新技能]
+    subgraph 插件化控制台 (脊髓)
+        Loop --> Registry[📋 插件注册表 (Registry)]
+        Registry -.管理.-> Provider
+        Registry -.管理.-> Tools
     end
     
-    Host --> Feedback[反馈循环]
-    Web --> Feedback
-    Feedback --> Evolution[进化模块 ProfileEvolution]
-    Evolution -.-> CloudBrain
+    subgraph 物理执行层 (躯干与手脚)
+        Tools{🛠️ 工具箱} --> Shell[💻 运行电脑命令 (Shell Tool)]
+        Tools --> Browser[🌐 控制浏览器 (Browser Tool)]
+        Tools --> File[🗂️ 读写文件 (File Tools)]
+    end
+    
+    Loop --> Tools
+    Tools --执行结果--> Context
+    
+    class Agent,Loop brain;
+    class Context,DB,Entropy sense;
+    class Provider,DeepSeek,LocalLLM core;
+    class Tools,Shell,Browser,File body;
 ```
 
 ---
 
-## 🔬 2. 模块节点详解 (Module Nodes)
+## 🏷️ 第二部分：用人话解释核心组件是干嘛的
 
-### A. 神经中枢 (Nervous System)
-| 文件路径 | 模块名称 | 功能描述 | 生物对应 |
-| :--- | :--- | :--- | :--- |
-| `core/config.py` | **ConfigManager** | 零配置启动，自动吸取 OpenClaw/Env 配置。 | **DNA/基因** |
-| `core/context_pipeline.py` | **ContextPipeline** | 组装时间、环境、记忆，构建“世界观”。 | **感觉皮层** |
-| `core/compression.py` | **CompressionEngine** | 历史记录分块压缩，Token 密度优化。 | **神经修剪** |
-| `core/memory_vector.py` | **VectorMemory** | 长期记忆存储与检索 (RAG)。 | **海马体** |
+如果我们把 Genesis 当成一个拥有身体的**赛博数字人**，它的大脑、神经网络、手脚是如何分布在代码里的？
 
-### B. 认知中枢 (The Brain)
-| 文件路径 | 模块名称 | 功能描述 | 生物对应 |
-| :--- | :--- | :--- | :--- |
-| `agent.py` | **AgentLoop** | 核心循环，单脑直连云端 LLM (V3) 进行推理。 | **大脑皮层** |
-| `intelligence/prompts/polyhedron` | **Polyhedron** | **[默认激活]** 处理任务的元认知思维框架。 | **前额叶 (深度思考)** |
+### 1. `agent.py` —— 【灵魂与潜意识总控】
+这是系统的最高入口，相当于人的**灵魂和本能**。
+当你下达一个命令（比如“把我的桌面清理一下”），`agent.py` 负责接客。它会先去翻看历史记忆，看看你以前有没有教过它，然后把这个任务分配给下面的“大脑”去思考。
 
-### C. 躯干与工具 (The Body)
-| 文件路径 | 模块名称 | 功能描述 | 生物对应 |
-| :--- | :--- | :--- | :--- |
-| `tools/shell_tool.py` | **ShellTool** | 执行系统命令 (无沙箱，直连宿主)。 | **双手** |
-| `tools/browser_tool.py` | **BrowserTool** | 打开网页、搜索信息 (native xdg-open)。 | **眼睛/腿** |
-| `tools/file_tools.py` | **FileTools** | 读写文件系统。 | **手指** |
-| `tools/skill_creator_tool.py` | **SkillCreator** | 动态生成 Python 工具代码并热加载。 | **子宫 (繁殖)** |
+### 2. `loop.py` —— 【负责干活的主管大脑】
+这是系统最核心的**发动机舱**（被称为“衔尾蛇循环”）。
+它负责一遍又一遍地做着枯燥的思考流程：
+*   **看一眼任务 -> 查一下大模型 -> 决定用什么工具 -> 执行工具 -> 检查结果有没有报错 -> 带着报错再去问大模型 -> 直到任务完成才停下并汇报给 `agent.py`**。
+*   *(插曲：我们刚修好的那个“上下文导致深层崩溃”的防线，就建在这里。它现在能自动过滤大模型胡言乱语的残渣，防止系统崩溃。)*
 
-### D. 进化系统 (Evolution)
-| 文件路径 | 模块名称 | 功能描述 | 生物对应 |
-| :--- | :--- | :--- | :--- |
-| `optimization/profile_evolution.py` | **ProfileEvolution** | 观察用户习惯，动态调整 System Prompt。 | **神经可塑性** |
+### 3. `provider.py` 与 `provider_manager.py` —— 【大语言模型的嘴巴和耳朵】
+这里负责和 DeepSeek 或其他大白痴 AI 打交道。
+它是语言翻译官，负责把我们系统的复杂格式，翻译成 DeepSeek 能听懂的 API 请求发过去；然后再把 DeepSeek 写出来的、格式经常乱七八糟的乱码，规整地清洗后拿回给 `loop.py` 大脑用。
 
----
+### 4. `registry.py` —— 【防误删的万能插座】
+这是我们即将大力推行的**“拔插式插排”**。
+以前，如果 Genesis 想学一个新工具，大模型会在 `loop.py` 的电线上乱剪乱接硬代码（比如写一大堆 `if 看到 shell 就执行 shell`）。这导致经常把主电线剪断。
+现在有了注册表，**任何新的大模型、新的工具、新的能力，都像是一个 U 盘，只要插进 `registry.py` 这个插排里就能直接用**，绝对不允许去修改和破坏原本干净的 `loop.py`。
 
-## 🌊 3. 运作流程示例 (Operation Flow)
+### 5. `tools/` 文件夹 —— 【真正接触物理世界的手脚】
+大脑 (`loop.py`) 思考得再聪明，没有手脚也干不了活。
+这里都是长相极其标准、独立的具体功能模块。比如 `shell_tool.py` 就是一双可以敲击你电脑键盘的手；`browser_tool.py` 就是一双可以帮你在网页上乱点的眼睛。它们即插即用，受大脑指派。
 
-以 **“帮我打开网页版 Gemini”** 为例：
-
-1.  **启动 (Boot)**: `ConfigManager` 读取宿主代理设置，系统唤醒。
-2.  **感知 (Sensation)**:
-    *   `ContextPipeline` 注入当前时间 (2026-02-08) 和环境 (Linux Desktop)。
-3.  **反射 (Reflex)**:
-    *   本地脑 (`IntentAnalyzer`) 判定：“打开网页”是简单指令，无需元认知规划。
-4.  **认知 (Cognition)**:
-    *   云端脑 (`AgentLoop`) 接收上下文。
-    *   它发现意图是“访问 URL”，并检索到工具箱里有 `BrowserTool`。
-    *   它**不再**尝试编写 Shell 脚本，而是直接生成工具调用：`browser_tool.execute(action="open", url="...")`。
-5.  **执行 (Action)**:
-    *   `BrowserTool` 接收指令，调用底层 OS 接口 (`xdg-open`)。
-    *   浏览器弹出。
-6.  **反馈 (Feedback)**:
-    *   执行结果（“已打开”）回传给大脑。
-    *   `ProfileEvolution` 记录：“用户喜欢使用网页工具”。
+### 6. `context.py` 与 `entropy.py` —— 【短期记事本与防疯癫监控器】
+*   **`context.py`** 就像大脑里的小便签本，记着最近对话的前 10 句话，防止大模型前言不搭后语。
+*   **`entropy.py`** 就像一个测谎仪/心率计。大模型很容易陷入无限死循环（比如连续 50 次尝试同一个错误的密码）。这个模块会在系统陷入僵局时及时喊停，并强行阻断，防止浪费你的钱和计算资源。
 
 ---
 
-## ⚠️ 关键架构变更 (v2.0 vs v1.0)
-
-1.  **去沙箱化 (De-Sandboxing)**: 移除了 `ShellTool` 的 Docker 隔离，允许直接操作宿主。
-2.  **器官专用化 (Specialization)**: 新增 `BrowserTool`，不再强行用 Shell 模拟浏览器操作。
-3.  **零配置 (Zero-Conf)**: 移除了繁琐的 `.env` 依赖，直接复用 OpenClaw 生态。
+> 只要这套大厦的骨架定格下来，未来所有的扩展和修改，**都被限制在只能写具体的子模块卡片（U 盘）上**，而不能再对这套骨架本身“动刀子”了。

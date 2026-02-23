@@ -25,12 +25,13 @@ class AgentLoop:
         tools: ToolRegistry,
         context: SimpleContextBuilder,
         provider: LLMProvider,
-        max_iterations: int = 10
+        # Dynamic configuration via Agent's global config
+        max_iterations: Optional[int] = None
     ):
         self.tools = tools
         self.context = context
         self.provider = provider
-        self.max_iterations = max_iterations
+        self.max_iterations = max_iterations if max_iterations is not None else getattr(self.agent.config, 'max_iterations', 10)
         
         # Ouroboros Loop State
         self.iteration_history = []
@@ -65,9 +66,14 @@ class AgentLoop:
         hard_limit = min(25, self.max_iterations * 2.5) # 弹性上限
         
         # 错误跟踪器 (Failure Attribution)
-        tool_errors = {} # {tool_name: [error_messages]}
+        tool_errors = {} # {tool_name: [compressed_error_reports]}
         last_tool_call_hash = None
         loop_counter = 0
+        
+        # 错误压缩器（降低 LLM 认知负荷）
+        from genesis.core.error_compressor import ErrorCompressor
+        _error_compressor = ErrorCompressor()
+
 
         while iteration < hard_limit:
             iteration += 1
@@ -93,8 +99,30 @@ class AgentLoop:
             
             # 2.1 调用 LLM (Reasoning)
             try:
-                # 重新构建 messages
-                messages = [msg.to_dict() for msg in built_messages]
+                # 重新构建 messages 并进行 Strict Schema 净化 (Sanitization)
+                messages = []
+                for i, msg in enumerate(built_messages):
+                    msg_dict = msg.to_dict()
+                    
+                    if msg_dict["role"] == "tool":
+                        # Check previous message
+                        prev_msg = messages[-1] if messages else None
+                        is_orphan = True
+                        if prev_msg and prev_msg.get("role") == "assistant" and prev_msg.get("tool_calls"):
+                            # Further check if this specific tool_call_id exists in the previous assistant's tool_calls
+                            target_id = msg_dict.get("tool_call_id")
+                            if target_id and any(tc.get("id") == target_id for tc in prev_msg.get("tool_calls", [])):
+                                is_orphan = False
+                                
+                        if is_orphan:
+                            # Convert orphaned tool response to a user observation to satisfy OpenAI schema
+                            logger.debug(f"Sanitizing orphaned tool payload {msg_dict.get('tool_call_id', 'unknown')} -> user")
+                            msg_dict["role"] = "user"
+                            msg_dict["content"] = f"[System Observation (Tool Result)]:\n{msg_dict.get('content', '')}"
+                            if "tool_call_id" in msg_dict: del msg_dict["tool_call_id"]
+                            if "name" in msg_dict: del msg_dict["name"]
+                            
+                    messages.append(msg_dict)
                 # 定义流式回调
                 async def stream_handler(chunk_type, chunk_data):
                     if step_callback:
@@ -136,27 +164,47 @@ class AgentLoop:
             if not response.content and not response.tool_calls and not response.reasoning_content:
                  logger.warning(f"⚠️ 收到空响应 (Iteration {iteration}). 触发重试机制...")
                  
+                 # --- FIX: Multimodal Fallback ---
+                 # If the last tool message had multimodal (image) content and the LLM returned empty,
+                 # the model likely doesn't support vision. Fall back to text-only description.
+                 last_tool_multimodal = next(
+                     (m for m in reversed(built_messages)
+                      if m.role == MessageRole.TOOL and isinstance(m.content, list)),
+                     None
+                 )
+                 if last_tool_multimodal:
+                     logger.warning("👁️→📝 视觉降级: 模型返回空响应，将图像消息 fallback 为纯文本描述")
+                     # Extract text part only
+                     text_only = " ".join(
+                         part.get("text", "") for part in last_tool_multimodal.content
+                         if isinstance(part, dict) and part.get("type") == "text"
+                     )
+                     last_tool_multimodal.content = (
+                         text_only + "\n[注意：截图已保存，但当前模型不支持图像输入。请根据截图路径信息，用文字判断任务状态。]"
+                     ) if text_only else "[工具执行完毕，模型不支持图像输入，无法直接分析截图内容。]"
+                 
                  # Context Detox Strategy
                  # If we are stuck in a retry loop (detected by 'System Error' in history), 
                  # it means the context is poisoned. We must amputate.
-                 
                  last_msg = built_messages[-1]
                  if last_msg.role == MessageRole.SYSTEM and "System Error: You returned an empty response" in last_msg.content:
                       logger.error(f"☠️ Context Poisoning Detected! (Recursive Empty Response). Amputating recent history...")
-                      # Remove the last 2 turns (The error prompt + The previous "Toxic" input)
-                      # Actually built_messages is local to this loop usually, unless we are modifying self.context
-                      # self.context._message_history is the source of truth.
-                      
                       # Strategy: Drop the last user/tool message which likely caused this.
                       if len(self.context._message_history) > 0:
                           popped = self.context._message_history.pop()
                           logger.warning(f"🗑️ Dropped Toxic Message: {str(popped.content)[:50]}...")
                           
-                      # Rebuild messages for next retry
+                      # --- FIX: Task Anchor ---
+                      # Rebuild messages and immediately pin the original user_input as an anchor.
+                      # This prevents old session tasks from surfacing after context amputation.
                       built_messages = await self.context.build_messages(user_input)
+                      built_messages.insert(0, Message(
+                          role=MessageRole.SYSTEM,
+                          content=f"[TASK_ANCHOR] 当前任务锚点（优先级最高，不得偏离）：{user_input}"
+                      ))
                       built_messages.append(Message(
                           role=MessageRole.SYSTEM,
-                          content="System Notice: Previous context frame was corrupted and has been dropped. Please retry the last action."
+                          content="System Notice: Previous context frame was corrupted and has been dropped. Please continue the original task."
                       ))
                  else:
                       # First offense: Polite retry
@@ -190,51 +238,14 @@ class AgentLoop:
                         )
                  except Exception as e:
                      logger.warning(f"Failed to parse reflection: {e}")
-
-                 # Self-Correction: Ambiguity Detection
-            # If no tools were parsed, but the content looks like it WANTED to call a tool (e.g. code blocks),
-            # trigger a self-correction loop instead of accepting the text response.
             if not response.tool_calls and response.content:
-                has_code_block = "```" in response.content or "functions =" in response.content
-                # Only trigger if we are not at the very end of iterations
-                if has_code_block and iteration < hard_limit - 1:
-                     logger.warning(f"⚠️ Ambiguous output detected in iteration {iteration}. Triggering Self-Correction.")
-                     
-                     # Add the ambiguous message to history so the model sees what it did wrong
-                     built_messages.append(Message(
-                         role=MessageRole.ASSISTANT,
-                         content=response.content
-                     ))
-                     
-                     # Inject Correction Request
-                     correction_msg = (
-                         "System: Your previous response contained code blocks that appeared to be tool calls, "
-                         "but they could not be parsed. \n"
-                         "CRITICAL: Do not output Python code or variable assignments for tools. "
-                         "Use the standard tool call format (or JSON if specified). Retry now."
-                     )
-                     built_messages.append(Message(
-                         role=MessageRole.SYSTEM,
-                         content=correction_msg
-                     ))
-                     
-                     if step_callback:
-                        # Notify UI of correction
-                        if asyncio.iscoroutinefunction(step_callback):
-                            await step_callback("reasoning", "⚠️ Detected invalid format. Requesting self-correction...")
-                        else:
-                            step_callback("reasoning", "⚠️ Detected invalid format. Requesting self-correction...")
-                            
-                     if step_callback:
-                        # Notify UI of correction
-                        if asyncio.iscoroutinefunction(step_callback):
-                            await step_callback("reasoning", "⚠️ Detected invalid format. Requesting self-correction...")
-                        else:
-                            step_callback("reasoning", "⚠️ Detected invalid format. Requesting self-correction...")
-                            
-                     continue # Skip to next iteration (Retry)
+                # We used to have an aggressive check here that banned "```" if no tools were called.
+                # This was fundamentally flawed because it prevented the model from returning code in its final answer.
+                # We have removed this to increase foundational robustness.
+                pass
 
             if response.has_tool_calls:
+
                 normalized_tool_calls = []
                 current_call_hashes = []
 
@@ -398,7 +409,11 @@ class AgentLoop:
                     if "error" in result_str.lower() or "failed" in result_str.lower():
 
                         if tool_name not in tool_errors: tool_errors[tool_name] = []
-                        tool_errors[tool_name].append(result_str[:100])
+                        compressed = _error_compressor.compress(result_str, source=tool_name)
+                        tool_errors[tool_name].append(
+                            _error_compressor.format_for_llm(compressed)
+                        )
+
                         
                         # Strategic Interrupt: Consecutive Failures
                         # If the SAME tool fails 3 times in a row (or just too many errors in general)
