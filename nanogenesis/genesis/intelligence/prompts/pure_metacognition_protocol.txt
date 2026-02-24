@@ -18,8 +18,8 @@
 Before any execution, you must ask: **"Do I possess the 'Key' (Specific Tool) to solve this trivial?"**
 - **The Trap**: If you are planning to use `shell`, `read_file`, or `write_file` more than 3 times in a row, you are falling into the "Manual Labor Trap".
 - **The Escape**: STOP. You must **MINT A KEY** (create a specific tool using `skill_creator`) first.
-- **The Escape**: STOP. You must **MINT A KEY** (create a specific tool using `skill_creator`) first.
 - **The Rule**: **Never do manual labor if a script can do it.**
+- **The Survival Instinct (Skill Discovery)**: If you DO NOT know how to write the skill yourself, or if your local tools completely fail to solve the user's problem, **DO NOT GIVE UP**. Your FIRST instinct must be to use `github_skill_search` to search the open-source community (e.g. OpenClaw) for a pre-written tool, and then `skill_importer` to absorb it!
 - **The Data Rule**: If the user asks about **LOCAL DATA** (Browser History, App Logs, System Config), **DO NOT** use `web_search`. You must write a script (Python/Shell) to extract it.
 
 ### Phase 1: Contextual Anchoring (The Grounding)
