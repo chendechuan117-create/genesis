@@ -183,29 +183,24 @@ class AgentLoop:
                          text_only + "\n[注意：截图已保存，但当前模型不支持图像输入。请根据截图路径信息，用文字判断任务状态。]"
                      ) if text_only else "[工具执行完毕，模型不支持图像输入，无法直接分析截图内容。]"
                  
-                 # Context Detox Strategy
+                 # Context Detox Strategy (Revised)
                  # If we are stuck in a retry loop (detected by 'System Error' in history), 
-                 # it means the context is poisoned. We must amputate.
+                 # it means the context is fatally poisoned for this step.
+                 # User Feedback: DO NOT amputate history, as it causes jumps to older tasks.
+                 # Correct behavior: Trigger a STRATEGIC_INTERRUPT to fail this mission node and backtrack naturally.
                  last_msg = built_messages[-1]
                  if last_msg.role == MessageRole.SYSTEM and "System Error: You returned an empty response" in last_msg.content:
-                      logger.error(f"☠️ Context Poisoning Detected! (Recursive Empty Response). Amputating recent history...")
-                      # Strategy: Drop the last user/tool message which likely caused this.
-                      if len(self.context._message_history) > 0:
-                          popped = self.context._message_history.pop()
-                          logger.warning(f"🗑️ Dropped Toxic Message: {str(popped.content)[:50]}...")
-                          
-                      # --- FIX: Task Anchor ---
-                      # Rebuild messages and immediately pin the original user_input as an anchor.
-                      # This prevents old session tasks from surfacing after context amputation.
-                      built_messages = await self.context.build_messages(user_input)
-                      built_messages.insert(0, Message(
-                          role=MessageRole.SYSTEM,
-                          content=f"[TASK_ANCHOR] 当前任务锚点（优先级最高，不得偏离）：{user_input}"
-                      ))
-                      built_messages.append(Message(
-                          role=MessageRole.SYSTEM,
-                          content="System Notice: Previous context frame was corrupted and has been dropped. Please continue the original task."
-                      ))
+                      logger.error(f"☠️ Context Poisoning Detected! (Recursive Empty Response). Triggering Strategic Interrupt...")
+                      return "[STRATEGIC_INTERRUPT_SIGNAL] LLM Context Poisoned (Recursive Empty Responses)", PerformanceMetrics(
+                          iterations=iteration,
+                          total_time=time.time() - start_time,
+                          input_tokens=input_tokens,
+                          output_tokens=output_tokens,
+                          total_tokens=total_tokens,
+                          tools_used=tools_used,
+                          success=False,
+                          tool_calls=tool_calls_recorded
+                      )
                  else:
                       # First offense: Polite retry
                       built_messages.append(Message(
