@@ -29,7 +29,7 @@ class BrowserTool(Tool):
     - 无桌面时（systemd 服务）：用 curl 抓取网页内容并返回摘要
     """
     name = "browser_tool"
-    description = "用于打开网页或在浏览器中搜索。当用户要求访问某个网站或搜索信息时，优先使用此工具。"
+    description = "【警告：低优先级物理操作】用于在目标机器真实的桌面浏览器（如 Chrome/Edge）中打开网页。除非用户明确要求『在我的浏览器中打开』或『模拟人工点击』，否则绝对不要用此工具进行信息搜索！普通的搜索信息任务请一律使用高效的 `web_search` 工具！"
     parameters = {
         "type": "object",
         "properties": {

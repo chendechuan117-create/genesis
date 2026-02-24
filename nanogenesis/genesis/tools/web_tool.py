@@ -25,12 +25,12 @@ class WebSearchTool(Tool):
     
     @property
     def description(self) -> str:
-        return """在网络上搜索信息。
+        return """【最高优先级的信息采集工具】用于在网络上快速检索未知的事实、新闻、文档和代码问题。
         
-注意：
-- 返回搜索结果摘要
-- 包含标题、链接、描述
-- 最多返回指定数量的结果"""
+【核心规则】：
+1. 当你需要“搜索”、“上网找找”、“查一下”任何信息时，**必须第一时间、首选使用本工具**！
+2. 绝对不要使用 browser_tool 进行普通的网页搜索，browser_tool 只用于需要物理桌面浏览器交互的特殊场景。
+3. 本工具使用高并发无头 API 后台搜索，速度极快且不会卡死。"""
     
     @property
     def parameters(self) -> Dict[str, Any]:
