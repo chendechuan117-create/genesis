@@ -166,14 +166,32 @@ class NanoGenesis:
             
             # 1. 洞察阶段 (Awareness Phase)
             if loop_count == 1:
+                # 选项感知扩展：当用户输入是单字母/数字时，尝试还原其选项上下文
+                awareness_input = self._expand_option_input(current_input)
+                
+                # 取最近 3 条对话历史，作为 Oracle 的上下文锚点
+                # 解决 awareness_phase 为孤立 LLM 调用、无法感知上轮对话的问题
+                _recent_ctx = []
+                try:
+                    if hasattr(self, 'context') and self.context:
+                        _hist = self.context.get_history()
+                        for _m in _hist[-6:]:  # 最近 6 条（3轮对话）
+                            _role = getattr(_m, 'role', None) or (_m.get('role') if isinstance(_m, dict) else None)
+                            _content = getattr(_m, 'content', None) or (_m.get('content') if isinstance(_m, dict) else None)
+                            if _role in ('user', 'assistant') and _content:
+                                _recent_ctx.append({'role': _role, 'content': str(_content)})
+                except Exception:
+                    pass
+                
                 # Delegate to Cognitive Processor
-                oracle_output = await self.cognition.awareness_phase(current_input)
+                oracle_output = await self.cognition.awareness_phase(awareness_input, recent_context=_recent_ctx)
                 self.reasoning_log.append({
                     "timestamp": time.time(),
                     "stage": "AWARENESS",
                     "content": oracle_output
                 })
                 logger.info(f"✓ 洞察完成: {oracle_output.get('core_intent', 'Unknown')}")
+
                 
                 # 1.5 知识存量盘点 (Knowledge Inventory)
                 # 在战略阶段前，先激活 LLM 对现有工具/库/命令的记忆
@@ -913,8 +931,62 @@ Output JSON only:
         else:
             return 'unknown'
     
+    def _expand_option_input(self, user_input: str) -> str:
+        """
+        选项感知扩展器 (Option Context Expander)
+
+        当用户输入是单字母/数字（如 'c'、'2'）时，检查最近的 assistant 消息
+        是否包含结构化选项菜单（选项A / 选项B / **A:** 等格式）。
+        如果是，则在 user_input 前面拼入选项上下文，让 awareness_phase 能正确解析。
+
+        非选项回复场景不受影响（返回原 user_input）。
+        """
+        stripped = user_input.strip()
+        # 只对极短的回复（1-2个字符）做扩展
+        if len(stripped) > 2:
+            return user_input
+
+        option_char = stripped.lower()
+        is_option_like = (
+            (len(option_char) == 1 and option_char in 'abcde12345')
+            or option_char in ('a', 'b', 'c', 'd', 'e', '1', '2', '3', '4', '5')
+        )
+        if not is_option_like:
+            return user_input
+
+        # 从 context 里找最近的 assistant 消息
+        last_assistant_msg = ""
+        try:
+            if hasattr(self, 'context') and self.context:
+                history = self.context.get_history()  # 返回 Message 列表
+                for msg in reversed(history):
+                    role = getattr(msg, 'role', None) or (msg.get('role') if isinstance(msg, dict) else None)
+                    content = getattr(msg, 'content', None) or (msg.get('content') if isinstance(msg, dict) else None)
+                    if role == 'assistant' and content:
+                        last_assistant_msg = content
+                        break
+        except Exception:
+            return user_input
+
+        # 检查是否包含选项菜单关键词
+        menu_signals = ['选项A', '选项B', '选项C', '**A:', '**B:', '**C:', '**1.', '**2.', '**3.', 'option a', 'option b']
+        has_menu = any(sig.lower() in last_assistant_msg.lower() for sig in menu_signals)
+        if not has_menu:
+            return user_input
+
+        # 拼入上下文
+        expanded = (
+            f"[上下文：你在上一条回复中给出了以下选项菜单]\n"
+            f"{last_assistant_msg[:800]}\n\n"
+            f"[用户回复：{user_input.strip().upper()}]\n"
+            f"用户选择了选项 {user_input.strip().upper()}，请按该选项执行。"
+        )
+        logger.debug(f"🔧 选项感知：扩展输入 '{user_input}' → 包含菜单上下文")
+        return expanded
+
     def _check_and_optimize(self) -> Dict[str, Any]:
         """Check if self-optimization is needed"""
+
         if not self.enable_optimization:
             return {}
         # For now, just return basic stats or delegate to components

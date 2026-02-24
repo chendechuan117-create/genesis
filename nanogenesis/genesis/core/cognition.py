@@ -28,7 +28,11 @@ class CognitiveProcessor:
         self.meta_protocol = meta_protocol
         self.tools = tools_registry
 
-    async def awareness_phase(self, user_input: str) -> Dict[str, Any]:
+    async def awareness_phase(
+        self,
+        user_input: str,
+        recent_context: list = None,   # 最近 N 条对话记录 [{"role": ..., "content": ...}]
+    ) -> Dict[str, Any]:
         """第一人格：洞察者 (The Oracle) - 意图识别与资源扫描"""
         if not self.intent_prompt:
             return {"core_intent": "General Request", "problem_type": "general", "resource_map": {}}
@@ -36,12 +40,24 @@ class CognitiveProcessor:
         # 填充模板
         prompt = self.intent_prompt.replace("{{user_input}}", user_input)
         
+        # 构建消息列表：先注入近期对话历史作为锚点，再发出意图解析请求
+        messages = []
+        if recent_context:
+            # 把最近几条对话放在前面，作为 Oracle 的上下文锚点
+            for msg in recent_context:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                if content and role in ("user", "assistant"):
+                    messages.append({"role": role, "content": str(content)[:600]})
+        messages.append({"role": "user", "content": prompt})
+        
         try:
             # 这是一个轻量级调用
             response = await self.chat(
-                messages=[{"role": "user", "content": prompt}],
+                messages=messages,
                 response_format={"type": "json_object"} if "json" in prompt.lower() else None
             )
+
             
             # 解析 JSON 输出
             content = response.content
