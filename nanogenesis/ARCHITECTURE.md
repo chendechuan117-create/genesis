@@ -27,8 +27,14 @@ Genesis 系统的代码物理分布遵循严格的“**核心引擎驱动 + 动�
 
 ### 🛠️ 工具与躯体 (Tools & Skills)
 *   `nanogenesis/genesis/tools/` - **原子级原生工具**：如 `shell_tool.py`, `browser_tool.py`。
+*   `nanogenesis/genesis/tools/spawn_sub_agent_tool.py` & `sub_agent_manager.py` - **异步子代理沙盒**：支持将高容错、长耗时任务剥离给便宜的耗材 API（隔离主脑 Token 消耗）。
+*   `nanogenesis/genesis/tools/skill_importer_tool.py` - **跨框架技能同化器**：负责拉取外部开源 Agent 脚本（如 OpenClaw），经过安全审计后重写为本地原生技能。
+*   `nanogenesis/genesis/tools/github_skill_search_tool.py` - **求生直觉网格**：当原生工具失效时，赋予 Genesis 去 Github 自动寻猎可用组件的基础嗅觉。
 *   `nanogenesis/genesis/skills/` - **复合技能**：由 Agent 动态学习或预制的复杂操作流。
 *   `nanogenesis/genesis/core/sandbox.py` - **执行安全屏障**。
+
+### 🧬 高阶认知与进化体系 (Intelligence & Evolution)
+*   `nanogenesis/genesis/intelligence/adaptive_learner.py` - **潜意识组装与认知折叠**：吸收子代理带回的《操作复盘 (Cognitive Insights)》，通过握手协议（Handshake Protocol）确认后，无缝融合进主脑的 System Prompt 中，实现永久基因变异。
 
 ### 💾 记忆、感知与信号处理 (Memory, Entropy & Signal)
 *   `nanogenesis/genesis/core/context.py` - **短期上下文缓冲**：管理与当前任务紧密相关的系统、历史和用户消息。
@@ -39,7 +45,7 @@ Genesis 系统的代码物理分布遵循严格的“**核心引擎驱动 + 动�
 *   `nanogenesis/genesis/core/mission.py` - **任务上下文树 (MissionManager)**：以 SQLite 为持久层，维护带 `parent_id / depth / error_count` 的层级任务树（Mission Context Tree）。**核心行为**：当 `STRATEGIC_INTERRUPT` 触发后，在 `agent.py` 中调用 `backtrack_to_parent()` 将失败任务标记，并重新激活父节点任务，同时注入 `[BACKTRACK CONTEXT]`（已失败路径列表）到 `current_input`，让下一轮 `strategy_phase` 自动排除这些路径，实现**主动自愈而非被动中断**。根节点中断时才退化为 AUTO-DEBRIEF。
 
 ### 🌐 外部接口 (External Adapters)
-*   `nanogenesis/qq_adapter.py` - **QQ Bot 接入层**：通过 `botpy` SDK 接入 QQ 开放平台，支持频道 @消息 / 私信 / 群消息三种类型路由至 Genesis 处理。单例 Agent 模式，`on_ready` 时异步预热（180s 超时），消息处理超时 300s。
+*   `nanogenesis/qq_adapter.py` - **QQ Bot 接入层**：通过 `botpy` SDK 接入 QQ 开放平台，支持频道 @消息 / 私信 / 群消息三种类型路由至 Genesis 处理。单例 Agent 模式，`on_ready` 时异步预热（180s 超时），由于它有自己的事件循环，通常作为长驻守护进程（Daemon）运行。
 
 ---
 
