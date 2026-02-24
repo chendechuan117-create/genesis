@@ -642,3 +642,21 @@ class MockLLMProvider(BaseLLMProvider):
     
     def get_default_model(self) -> str:
         return "mock-model"
+
+class SambaNovaProvider(NativeHTTPProvider):
+    """SambaNova Cloud 提供商 - 极速 Llama 推理"""
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = "https://api.sambanova.ai/v1",
+        default_model: str = "Meta-Llama-3.1-70B-Instruct",
+        connect_timeout: int = 10,
+        request_timeout: int = 120
+    ):
+        super().__init__(
+            api_key=api_key,
+            base_url=base_url,
+            default_model=default_model,
+            connect_timeout=connect_timeout,
+            request_timeout=request_timeout
+        )

@@ -67,6 +67,7 @@ class ProviderRouter:
                         if name == "openrouter" and getattr(self.config, 'openrouter_api_key', None): is_valid = True
                         
                         # Consumable Registration
+                        if name == "sambanova" and getattr(self.config, 'sambanova_api_key', None): is_valid = True
                         if name == "siliconflow" and getattr(self.config, 'siliconflow_api_key', None): is_valid = True
                         if name == "dashscope" and getattr(self.config, 'dashscope_api_key', None): is_valid = True
                         if name == "qianfan" and getattr(self.config, 'qianfan_api_key', None): is_valid = True
@@ -150,7 +151,7 @@ class ProviderRouter:
 
     def get_consumable_provider(self):
         """Returns the first available cheap/free provider from the consumables pool"""
-        consumable_order = ['siliconflow', 'dashscope', 'zhipu', 'qianfan']
+        consumable_order = ['sambanova', 'siliconflow', 'dashscope', 'zhipu', 'qianfan']
         for name in consumable_order:
             if name in self.providers:
                 logger.info(f"🧬 Selected Consumable Provider: {name}")
