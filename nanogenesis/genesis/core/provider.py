@@ -175,8 +175,11 @@ class NativeHTTPProvider(BaseLLMProvider):
 
             # Strategy 2: Try parsing as Python Code (Original Logic)
             try:
-                # Parse the code block into an AST
-                tree = ast.parse(block)
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", SyntaxWarning)
+                    # Parse the code block into an AST
+                    tree = ast.parse(block)
                 for node in ast.walk(tree):
                     # Pattern 1: Function Call -> tool_name(arg=val)
                     if isinstance(node, ast.Call):
