@@ -70,16 +70,33 @@ class WebSearchTool(Tool):
                 "max_results": min(num_results, 10)
             }
             
-            data = json.dumps(payload).encode('utf-8')
-            req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+            # 使用 curl 代替 urllib，因为 urllib 原生不支持 socks5 代理，在遇到 https_proxy=socks5:// 时会抛出 Remote end closed
+            import subprocess
             
-            # 使用不验证 SSL 的 context (防止本地证书问题)
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
+            json_payload = json.dumps(payload)
+            curl_cmd = [
+                "curl", "-s", "-X", "POST", url,
+                "-H", "Content-Type: application/json",
+                "-d", json_payload,
+                "--max-time", "30"
+            ]
             
-            with urllib.request.urlopen(req, context=ctx, timeout=30) as response:
-                result_json = json.loads(response.read().decode('utf-8'))
+            # 引入 socks5h 强制远端 DNS 解析，防止被墙
+            import os
+            proxy = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+            if proxy and proxy.startswith("socks5"):
+                proxy = proxy.replace("socks5://", "socks5h://")
+                curl_cmd.extend(["-x", proxy])
+                
+            process = subprocess.run(curl_cmd, capture_output=True, text=True)
+            
+            if process.returncode != 0:
+                return f"Error: 网络请求失败 - curl 退出码 {process.returncode}\n{process.stderr}"
+                
+            try:
+                result_json = json.loads(process.stdout)
+            except json.JSONDecodeError:
+                return f"Error: Tavily API 返回了非法的 JSON - {process.stdout[:200]}"
                 
             results = result_json.get('results', [])
             

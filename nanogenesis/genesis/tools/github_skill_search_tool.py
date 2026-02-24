@@ -51,16 +51,25 @@ class GithubSkillSearchTool(Tool):
         url = f"https://api.github.com/search/code?q={query}&per_page=5"
             
         def _fetch():
-            req = urllib.request.Request(
-                url, 
-                # Github API requires User-Agent
-                headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Genesis-AI-Agent',
-                    'Accept': 'application/vnd.github.v3+json'
-                }
-            )
-            with urllib.request.urlopen(req, timeout=15) as response:
-                return json.loads(response.read().decode('utf-8'))
+            import subprocess
+            import os
+            
+            curl_cmd = [
+                "curl", "-s", "-X", "GET", url,
+                "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Genesis-AI-Agent",
+                "-H", "Accept: application/vnd.github.v3+json",
+                "--max-time", "15"
+            ]
+            
+            proxy = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+            if proxy and proxy.startswith("socks5"):
+                proxy = proxy.replace("socks5://", "socks5h://")
+                curl_cmd.extend(["-x", proxy])
+                
+            process = subprocess.run(curl_cmd, capture_output=True, text=True)
+            if process.returncode != 0:
+                raise Exception(f"curl 失败: 退出码 {process.returncode} - {process.stderr}")
+            return json.loads(process.stdout)
                 
         try:
             data = await asyncio.to_thread(_fetch)
