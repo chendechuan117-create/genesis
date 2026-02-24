@@ -51,7 +51,7 @@ class MissionManager:
         """Ensure schema exists and is migrated"""
         conn = self._get_conn()
         try:
-            # 1. Create Table if not exists
+            # 1. Create missions table if not exists
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS missions (
                     id TEXT PRIMARY KEY,
@@ -68,7 +68,21 @@ class MissionManager:
                 )
             """)
             
-            # 2. Migration: Check for missing columns (for existing DBs)
+            # 2. Create decision_log table — records anchor selection decisions for deep reflection
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS decision_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mission_id TEXT,
+                    created_at TEXT,
+                    problem_type TEXT,
+                    anchor_options TEXT,   -- JSON list of candidate anchors
+                    chosen_anchor TEXT,    -- which anchor was selected
+                    outcome TEXT,          -- 'success' | 'failed' | 'backtracked' | 'pending'
+                    reasoning TEXT         -- brief note on why this anchor was chosen
+                )
+            """)
+            
+            # 3. Migration: Check for missing columns (for existing DBs)
             cursor = conn.execute("PRAGMA table_info(missions)")
             columns = [row['name'] for row in cursor.fetchall()]
             
@@ -81,11 +95,11 @@ class MissionManager:
                 
             conn.commit()
         except Exception as e:
-            # Log error but don't crash, though table creation failure is critical
             print(f"DB Init Error: {e}")
             pass
         finally:
             conn.close()
+
 
     def create_mission(self, objective: str, parent_id: str = None) -> Mission:
         """Create a new active mission (Root or Branch)"""
@@ -278,3 +292,100 @@ class MissionManager:
         finally:
             conn.close()
 
+    # ── 决策日志 (Decision Log) ────────────────────────────────────────────
+
+    def log_decision(
+        self,
+        mission_id: str,
+        problem_type: str,
+        anchor_options: List[str],
+        chosen_anchor: str,
+        reasoning: str = "",
+    ) -> int:
+        """
+        记录一个 strategy_phase 的锚点选择决策。
+
+        Args:
+            mission_id    : 当前任务 ID
+            problem_type  : 任务类型（code / system / media / web / general）
+            anchor_options: 候选锚点列表（来自知识存量盘点）
+            chosen_anchor : 实际选择的锚点/方法摘要
+            reasoning     : 为什么选这个锚点（可选）
+
+        Returns:
+            新插入记录的 rowid
+        """
+        conn = self._get_conn()
+        try:
+            with conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO decision_log
+                        (mission_id, created_at, problem_type, anchor_options, chosen_anchor, outcome, reasoning)
+                    VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                    """,
+                    (
+                        mission_id,
+                        datetime.now().isoformat(),
+                        problem_type,
+                        json.dumps(anchor_options, ensure_ascii=False),
+                        chosen_anchor[:300],
+                        reasoning[:300],
+                    ),
+                )
+                return cursor.lastrowid
+        finally:
+            conn.close()
+
+    def update_decision_outcome(self, decision_id: int, outcome: str) -> None:
+        """
+        更新决策结果。
+
+        Args:
+            decision_id: log_decision() 返回的 rowid
+            outcome    : 'success' | 'failed' | 'backtracked'
+        """
+        conn = self._get_conn()
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE decision_log SET outcome = ? WHERE id = ?",
+                    (outcome, decision_id),
+                )
+        finally:
+            conn.close()
+
+    def get_recent_decisions(self, limit: int = 20) -> List[Dict]:
+        """
+        读取最近 N 条决策记录，用于深度反思。
+        只返回已有结果（非 pending）的记录，因为 pending 还无法用于学习。
+        """
+        conn = self._get_conn()
+        try:
+            cursor = conn.execute(
+                """
+                SELECT id, mission_id, created_at, problem_type,
+                       anchor_options, chosen_anchor, outcome, reasoning
+                FROM decision_log
+                WHERE outcome != 'pending'
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            rows = cursor.fetchall()
+            return [
+                {
+                    "id": r["id"],
+                    "mission_id": r["mission_id"],
+                    "created_at": r["created_at"],
+                    "problem_type": r["problem_type"],
+                    "anchor_options": json.loads(r["anchor_options"] or "[]"),
+                    "chosen_anchor": r["chosen_anchor"],
+                    "outcome": r["outcome"],
+                    "reasoning": r["reasoning"],
+                }
+                for r in rows
+            ]
+        finally:
+            conn.close()

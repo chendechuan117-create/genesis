@@ -322,7 +322,32 @@ class NanoGenesis:
 
             logger.info("✓ 战略蓝图已生成")
             
-            # 3. 执行阶段 (Execution Phase)
+            # --- 决策日志：记录本轮锚点选择 ---
+            _decision_id = None
+            try:
+                if hasattr(self, 'mission_manager') and active_mission:
+                    _anchor_options = []
+                    _known = oracle_output.get("known_solutions", "")
+                    if _known:
+                        # 从知识存量盘点里提取工具名（每行格式 "[工具名] - 用途"）
+                        _anchor_options = [
+                            line.strip().split(" - ")[0].strip("[]").strip()
+                            for line in _known.splitlines()
+                            if line.strip() and " - " in line
+                        ][:6]
+                    _chosen = strategic_blueprint[:150].replace("\n", " ")
+                    _problem_type = oracle_output.get("problem_type", "general")
+                    _decision_id = self.mission_manager.log_decision(
+                        mission_id=active_mission.id,
+                        problem_type=_problem_type,
+                        anchor_options=_anchor_options,
+                        chosen_anchor=_chosen,
+                    )
+                    logger.debug(f"📋 决策已记录 (id={_decision_id}, type={_problem_type})")
+            except Exception as _dl_err:
+                logger.debug(f"决策日志跳过: {_dl_err}")
+            
+
             # 动态 Prompt 排序：根据任务类型重排 prompt 段落，提升信噪比（不删除任何信息）
             try:
                 from genesis.core.prompt_filter import ContextualPromptFilter
@@ -398,6 +423,10 @@ class NanoGenesis:
                     # Mission Accomplished (No chain)
                     accumulated_response += response
                     logger.info("✓ Ouroboros Loop: Mission Accomplished")
+                    # 决策日志：标记成功
+                    if _decision_id is not None and hasattr(self, 'mission_manager'):
+                        try: self.mission_manager.update_decision_outcome(_decision_id, 'success')
+                        except: pass
                     break
                     
                 else:
@@ -431,6 +460,24 @@ class NanoGenesis:
                                                 f"\n\n[BACKTRACK CONTEXT] 以下路径已尝试并失败，禁止再次选择：\n"
                                                 + "\n".join(f"- {p}" for p in failed_paths)
                                             )
+                                        
+                                        # 决策日志：标记回溯（这是深度反思的锚点事件）
+                                        if _decision_id is not None:
+                                            try: self.mission_manager.update_decision_outcome(_decision_id, 'backtracked')
+                                            except: pass
+                                        # 触发锚点级深度反思（非阻塞）
+                                        try:
+                                            adaptive = self.optimization_components.get('adaptive_learner') if hasattr(self, 'optimization_components') else None
+                                            if adaptive and hasattr(adaptive, 'trigger_anchor_reflection'):
+                                                recent_decisions = self.mission_manager.get_recent_decisions(limit=15)
+                                                asyncio.create_task(
+                                                    adaptive.trigger_anchor_reflection(
+                                                        llm_chat_fn=self.cognition.chat,
+                                                        decisions=recent_decisions,
+                                                    )
+                                                )
+                                        except Exception as _ar_err:
+                                            logger.debug(f"锚点反思跳过: {_ar_err}")
                                         
                                         # 重置循环状态，用父任务目标重试
                                         error_count = 0
@@ -559,6 +606,22 @@ class NanoGenesis:
         # Fix Amnesia: Save turn to SQLite SessionManager
         tools_list = final_metrics.tools_used if final_metrics else []
         await self.session_manager.save_turn(user_input, response, tools_list)
+        
+        # ═══ 自适应学习：记录交互 + 按需触发 LLM 反思 ═══
+        try:
+            adaptive = self.optimization_components.get('adaptive_learner') if hasattr(self, 'optimization_components') else None
+            if adaptive:
+                adaptive.observe_interaction(
+                    user_message=user_input,
+                    assistant_response=response[:400],
+                )
+                # 非阻塞触发反思（每 N 次交互执行一次 LLM 自反思调用）
+                if adaptive.should_reflect():
+                    asyncio.create_task(
+                        adaptive.trigger_reflection(llm_chat_fn=self.cognition.chat)
+                    )
+        except Exception as _al_err:
+            logger.debug(f"AdaptiveLearner 跳过: {_al_err}")
         
         # 4. 锚点信任: 标记响应来源 (Anchored Trust)
         tagged_response = response

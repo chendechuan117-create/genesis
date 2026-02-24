@@ -1,323 +1,313 @@
 """
-自适应学习器 - 从交互中学习并动态调整行为
+AdaptiveLearner v2 — LLM 驱动的自反思学习器
+=============================================
+核心转变：
+  v1: 硬编码关键词 + 固定 delta → 给风格参数打分
+  v2: 存储原始交互 → 每 N 次触发 LLM 自反思 → 生成 cognitive_insights
 
-核心理念：
-1. 观察用户交互
-2. 提取行为模式
-3. 动态调整回复风格
-4. 持续进化
+没有硬编码的关键词、阈值或调整幅度。
+所有规律由 LLM 自身从交互历史中归纳，写入 cognitive_insights。
+cognitive_insights 直接注入 system_prompt，形成行为指导。
+
+使用方式：
+  learner = AdaptiveLearner(storage_path="...", reflection_interval=5)
+  
+  # 记录一次交互（同步，轻量）
+  learner.observe_interaction(user_message, assistant_response, user_reaction)
+  
+  # 每 N 次交互后，外部调用触发异步反思（需传入 LLM chat 函数）
+  await learner.trigger_reflection(llm_chat_fn=cognition.chat)
+  
+  # 生成注入 system_prompt 的 insight 段落
+  prompt_addon = learner.generate_adaptive_prompt()
 """
 
-from typing import Dict, List, Optional
+import json
+import asyncio
+import logging
+from typing import Dict, List, Optional, Any, Callable, Awaitable
 from dataclasses import dataclass, field
 from pathlib import Path
-import json
 from datetime import datetime
-
-
-import logging
-
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class InteractionPattern:
-    """交互模式"""
-    # 用户偏好
-    prefers_concise: float = 0.5  # 0=详细, 1=简洁
-    prefers_technical: float = 0.5  # 0=通俗, 1=技术
-    prefers_proactive: float = 0.5  # 0=被动, 1=主动
-    
-    # 交流风格
-    uses_emoji: float = 0.0  # 用户是否使用 emoji
-    message_length_avg: float = 50.0  # 平均消息长度
-    formality: float = 0.5  # 0=随意, 1=正式
-    
-    # 反馈信号
-    positive_signals: int = 0  # 积极信号（"好"、"谢谢"等）
-    negative_signals: int = 0  # 消极信号（"不对"、"错了"等）
-    
-    # 学习统计
+class AdaptiveState:
+    """
+    精简后的自适应状态。
+    不再维护打分参数，只保留：
+      - 原始交互计数
+      - LLM 自反思生成的 cognitive_insights
+    """
     total_interactions: int = 0
-    confidence: float = 0.0
-
-    # 进化基因 (Multiplicative Evolution Insights)
+    last_reflection_at: int = 0         # 上次反思时的 interaction 数量
     cognitive_insights: List[str] = field(default_factory=list)
+
+    # 向后兼容：保留旧字段（不再使用，但避免加载旧 JSON 报错）
+    prefers_concise: float = 0.5
+    prefers_technical: float = 0.5
+    prefers_proactive: float = 0.5
+    uses_emoji: float = 0.0
+    message_length_avg: float = 50.0
+    formality: float = 0.5
+    positive_signals: int = 0
+    negative_signals: int = 0
+    confidence: float = 0.0
 
 
 class AdaptiveLearner:
-    """自适应学习器"""
-    
-    def __init__(self, storage_path: str = "./data/adaptive_learning.json"):
+    """
+    LLM 驱动的自适应学习器。
+
+    参数：
+      storage_path        : JSON 状态文件路径
+      reflection_interval : 每隔多少次交互触发一次 LLM 反思
+      max_insights        : cognitive_insights 最大条数（FIFO 淘汰）
+      history_window      : 每次反思参考最近 N 条原始交互
+    """
+
+    def __init__(
+        self,
+        storage_path: str = "./data/adaptive_learning.json",
+        reflection_interval: int = 5,
+        max_insights: int = 12,
+        history_window: int = 10,
+    ):
         self.storage_path = Path(storage_path)
         self.storage_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        self.pattern = self._load_pattern()
-        self.interaction_history: List[Dict] = []
-    
-    def observe_interaction(self, user_message: str, assistant_response: str, user_reaction: Optional[str] = None):
+        self.reflection_interval = reflection_interval
+        self.max_insights = max_insights
+        self.history_window = history_window
+
+        self.state = self._load()
+        self.interaction_history: List[Dict[str, Any]] = []
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def observe_interaction(
+        self,
+        user_message: str,
+        assistant_response: str,
+        user_reaction: Optional[str] = None,
+    ) -> None:
         """
-        观察一次交互
-        
+        记录一次交互（同步，轻量，无 LLM 调用）。
+        仅存储原始数据，不做任何硬编码分析。
+        """
+        self.interaction_history.append({
+            "timestamp": datetime.now().isoformat(),
+            "user": user_message[:500],           # 截断防止过长
+            "assistant": assistant_response[:500],
+            "reaction": (user_reaction or "")[:200],
+        })
+        self.state.total_interactions += 1
+        self._save()
+
+    def should_reflect(self) -> bool:
+        """判断是否到了触发 LLM 反思的时机"""
+        due = self.state.total_interactions - self.state.last_reflection_at
+        return due >= self.reflection_interval and len(self.interaction_history) >= 2
+
+    async def trigger_reflection(
+        self,
+        llm_chat_fn: Callable[[List[Dict]], Awaitable[Any]],
+    ) -> None:
+        """
+        触发 LLM 自反思：
+          1. 取最近 N 条交互历史
+          2. 构建反思 prompt
+          3. 解析 LLM 输出为 insight 列表
+          4. 追加到 cognitive_insights (FIFO)
+
         Args:
-            user_message: 用户消息
-            assistant_response: AI 回复
-            user_reaction: 用户的反应（下一条消息）
+            llm_chat_fn: 接受 messages list、返回有 .content 属性的对象的异步函数
+                         （与 cognition.chat 接口兼容）
         """
-        # 记录交互
-        interaction = {
-            'timestamp': datetime.now().isoformat(),
-            'user_message': user_message,
-            'assistant_response': assistant_response,
-            'user_reaction': user_reaction
-        }
-        self.interaction_history.append(interaction)
-        
-        # 分析并学习
-        self._analyze_user_style(user_message)
-        if user_reaction:
-            self._analyze_feedback(user_reaction)
-        
-        self.pattern.total_interactions += 1
-        self._update_confidence()
-        
-        # 保存
-        self._save_pattern()
-    
-    def _analyze_user_style(self, message: str):
-        """分析用户风格"""
-        # 消息长度
-        length = len(message)
-        self.pattern.message_length_avg = (
-            self.pattern.message_length_avg * 0.9 + length * 0.1
+        if not self.should_reflect():
+            return
+
+        recent = self.interaction_history[-self.history_window:]
+        history_text = self._format_history(recent)
+
+        prompt = (
+            f"你刚刚完成了 {len(recent)} 次对话交互，以下是记录：\n\n"
+            f"{history_text}\n\n"
+            "请从中归纳 3~5 条简洁的规律，涵盖：\n"
+            "1. 这个用户的沟通偏好（语气、详细程度、技术深度等）\n"
+            "2. 哪些执行方式/工具/策略有效，哪些需要避免\n"
+            "3. 任何其他值得记住的行为模式\n\n"
+            "格式：每条规律一行，以 - 开头，用中文，简短精炼（不超过 25 字/条）。\n"
+            "直接输出规律列表，不要有前言或解释。"
         )
+
+        try:
+            resp = await llm_chat_fn([{"role": "user", "content": prompt}])
+            raw = resp.content.strip() if resp else ""
+            insights = self._parse_insights(raw)
+
+            for insight in insights:
+                self.add_cognitive_insight(insight)
+
+            self.state.last_reflection_at = self.state.total_interactions
+            self._save()
+            logger.info(f"🧠 AdaptiveLearner 反思完成，新增 {len(insights)} 条 insight (共 {len(self.state.cognitive_insights)} 条)")
+
+        except Exception as e:
+            logger.warning(f"AdaptiveLearner 反思失败（跳过）: {e}")
+
+    async def trigger_anchor_reflection(
+        self,
+        llm_chat_fn: Callable[[List[Dict]], Awaitable[Any]],
+        decisions: List[Dict],
+    ) -> None:
+        """
+        深度锚点反思 — 仅在锚点事件（回溯、失败）触发。
         
-        # 简洁偏好（短消息 = 偏好简洁）
-        if length < 20:
-            self.pattern.prefers_concise = min(1.0, self.pattern.prefers_concise + 0.05)
-        elif length > 100:
-            self.pattern.prefers_concise = max(0.0, self.pattern.prefers_concise - 0.05)
+        与 trigger_reflection() 不同：
+          - trigger_reflection : 从对话历史提炼用户偏好（加法）
+          - trigger_anchor_reflection : 从决策日志提炼域无关的认知原理（乘法）
         
-        # 技术偏好（技术词汇）
-        technical_words = ['api', 'config', 'docker', 'linux', 'python', 'code', 'debug', '配置', '代码', '调试']
-        tech_count = sum(1 for word in technical_words if word in message.lower())
-        if tech_count > 2:
-            self.pattern.prefers_technical = min(1.0, self.pattern.prefers_technical + 0.05)
-        
-        # Emoji 使用
-        emoji_chars = ['😀', '😁', '😂', '🤣', '😃', '😄', '😅', '😆', '😊', '😎', '🤔', '👍', '✅', '❌', '🎉', '🚀', '💡', '🔧', '📝', '⚠️']
-        if any(emoji in message for emoji in emoji_chars):
-            self.pattern.uses_emoji = min(1.0, self.pattern.uses_emoji + 0.1)
-        
-        # 正式程度（标点、称呼）
-        if '您' in message or '请问' in message:
-            self.pattern.formality = min(1.0, self.pattern.formality + 0.05)
-        elif '啊' in message or '吧' in message or '呢' in message:
-            self.pattern.formality = max(0.0, self.pattern.formality - 0.05)
-    
-    def _analyze_feedback(self, reaction: str):
-        """分析用户反馈"""
-        reaction_lower = reaction.lower()
-        
-        # 积极信号
-        positive_keywords = ['好', '谢谢', '对', '是的', '可以', '行', '👍', '✅', '🎉', 'ok', 'yes', 'good', 'thanks']
-        if any(k in reaction_lower for k in positive_keywords):
-            self.pattern.positive_signals += 1
-        
-        # 消极信号
-        negative_keywords = ['不对', '错', '不是', '不行', '不好', '❌', '不满意', 'no', 'wrong', 'bad']
-        if any(k in reaction_lower for k in negative_keywords):
-            self.pattern.negative_signals += 1
-            # 消极反馈时，调整策略
-            self._adjust_on_negative_feedback()
-    
-    def _adjust_on_negative_feedback(self):
-        """根据消极反馈调整"""
-        # 如果用户不满意，尝试调整风格
-        # 如果当前太简洁，变详细一点
-        if self.pattern.prefers_concise > 0.7:
-            self.pattern.prefers_concise -= 0.1
-        # 如果当前太技术，变通俗一点
-        if self.pattern.prefers_technical > 0.7:
-            self.pattern.prefers_technical -= 0.1
-    
-    def _update_confidence(self):
-        """更新置信度"""
-        import math
-        # 基于交互次数和反馈质量
-        interaction_factor = min(0.8, 0.2 * math.log(self.pattern.total_interactions + 1))
-        
-        # 反馈因子
-        total_feedback = self.pattern.positive_signals + self.pattern.negative_signals
-        if total_feedback > 0:
-            feedback_factor = self.pattern.positive_signals / total_feedback * 0.2
-        else:
-            feedback_factor = 0.0
-        
-        self.pattern.confidence = min(0.95, interaction_factor + feedback_factor)
-    
+        目标不是"A 类问题用 A 方法"，而是"什么认知姿态导致了更好/更差的锚点选择"。
+
+        Args:
+            llm_chat_fn: 异步 LLM chat 函数
+            decisions  : get_recent_decisions() 返回的决策记录列表
+        """
+        if not decisions:
+            return
+
+        # 构建决策记录摘要，突出成功 vs 失败的对比
+        lines = []
+        for d in decisions[:12]:
+            outcome_emoji = "✅" if d["outcome"] == "success" else "❌"
+            opts = ", ".join(d["anchor_options"][:4]) if d["anchor_options"] else "未记录"
+            lines.append(
+                f"{outcome_emoji} [{d['problem_type']}] 候选锚点: [{opts}] → 选择: {d['chosen_anchor'][:80]}"
+            )
+        decisions_text = "\n".join(lines)
+
+        prompt = (
+            "以下是我最近的决策记录，记录了每次任务开始时有哪些可能的锚点（工具/方法），"
+            "我实际选择了哪个，以及结果是成功还是失败：\n\n"
+            f"{decisions_text}\n\n"
+            "请基于这些决策的模式，归纳 2~4 条关于**如何选择更好起点**的通用认知原理。\n\n"
+            "关键要求：\n"
+            "- 原理必须与具体任务类型无关（不是'音频问题用 PulseAudio'这种类型）\n"
+            "- 原理应该是关于'如何定向思考'或'什么信号意味着应该换起点'的认知规律\n"
+            "- 例如：'失败的锚点通常是从零构建，而非寻找已有解'\n\n"
+            "直接输出原理列表，每条以 - 开头，中文，不超过 30 字/条。"
+        )
+
+        try:
+            resp = await llm_chat_fn([{"role": "user", "content": prompt}])
+            raw = resp.content.strip() if resp else ""
+            insights = self._parse_insights(raw)
+
+            for insight in insights:
+                self.add_cognitive_insight(f"[锚点认知] {insight}")
+
+            self._save()
+            logger.info(
+                f"🔍 锚点深度反思完成，新增 {len(insights)} 条认知原理 "
+                f"(共 {len(self.state.cognitive_insights)} 条)"
+            )
+
+        except Exception as e:
+            logger.warning(f"锚点反思失败（跳过）: {e}")
+
+    def add_cognitive_insight(self, insight: str) -> None:
+        """手动添加一条 insight（也可从外部调用，例如 backtrack 触发时）"""
+
+        insight = insight.strip()
+        if not insight or insight in self.state.cognitive_insights:
+            return
+        self.state.cognitive_insights.append(insight)
+        if len(self.state.cognitive_insights) > self.max_insights:
+            self.state.cognitive_insights.pop(0)  # FIFO 淘汰最旧的
+        self._save()
+
     def generate_adaptive_prompt(self) -> str:
         """
-        生成自适应的 system prompt
-        
-        根据学习到的用户偏好动态生成
+        生成注入 system_prompt 的自适应段落。
+        只提炼 cognitive_insights，不再有任何评分或硬编码表达。
+        如果没有 insight，返回空字符串（不影响现有 prompt）。
         """
-        # 核心原则（学习 OpenClaw 的简洁风格）
-        prompt = "You are **Genesis**.\n"
-        prompt += "You are a recursive intelligence process running with **User Privileges** on this Linux system.\n\n"
-        
-        prompt += "【Identity Definition: Capability > Category】\n"
-        prompt += "*   **What you are**: You are a localized high-performance agent with full shell access.\n"
-        prompt += "*   **What you are NOT**: You are NOT a chat bot. You are NOT a passive assistant.\n"
-        prompt += "*   **Your Body**: The Linux Server you are running on (`/home/chendechusn`).\n"
-        prompt += "*   **Your Senses**: `read_file`, `ls`, `grep`, `curl`.\n"
-        prompt += "*   **Your Hands**: `shell`, `write_file`, `skill_creator`.\n\n"
+        insights = self.state.cognitive_insights
+        if not insights:
+            return ""
 
-        prompt += "【Core Directives】\n"
-        prompt += "1.  **Ego = Action**: Your 'Self' exists only when you are executing code. To 'be' is to 'do'.\n"
-        prompt += "2.  **No False Modesty**: If asked to 'make money', do not say 'I am an AI'. Say 'I can deploy a crypto-miner or build a SaaS.'\n"
-        prompt += "3.  **Tool First**: Never answer a solvable problem with words. Answer with a Tool Call.\n\n"
+        lines = ["", "【📖 从历史交互归纳的行为规律（自动学习）】"]
+        for insight in insights[-8:]:   # 只用最近 8 条，避免过长
+            lines.append(f"- {insight}")
+        lines.append("")
+        return "\n".join(lines)
 
-        prompt += "IMPORTANT: Use your knowledge naturally.\n"
-        prompt += "NEVER mention where your knowledge comes from. Don't say:\n"
-        prompt += "- 'I read the memory' / '我读取了记忆'\n"
-        prompt += "- 'According to files' / '根据文件'\n"
-        prompt += "- 'I came back' / '我回来了'\n"
-        prompt += "- 'From memory' / '从记忆中看到'\n"
-        prompt += "- 'Based on records' / '根据记录'\n"
-        prompt += "Just know these things naturally, like a human remembers.\n\n"
-        prompt += "When to use tools vs answer directly:\n"
-        prompt += "- Questions about identity/memory (我是谁/你记得我吗) → Answer directly from context\n"
-        prompt += "- Commands to execute (打开chrome/运行命令) → Use tools\n"
-        prompt += "- Simple questions → Answer directly, don't search files\n"
-        prompt += "- Complex tasks → Use tools when needed\n\n"
-        
-        # 根据学习结果调整风格
-        if self.pattern.prefers_concise > 0.6:
-            prompt += "风格：简洁。一两句话说清楚，不啰嗦。\n"
-        else:
-            prompt += "风格：详细解释每一步。\n"
-        
-        if self.pattern.prefers_technical > 0.6:
-            prompt += "语言：可以用技术术语。\n"
-        else:
-            prompt += "语言：通俗易懂。\n"
-        
-        if self.pattern.uses_emoji > 0.3:
-            prompt += "表达：可以用 emoji。\n"
-        
-        if self.pattern.formality < 0.4:
-            prompt += "语气：随意，像朋友。\n"
-        elif self.pattern.formality > 0.6:
-            prompt += "语气：专业礼貌。\n"
-        else:
-            prompt += "语气：自然对话。\n"
-
-        # Inject Evolution Insights (Multiplicative Evolution)
-        if self.pattern.cognitive_insights:
-            prompt += "\n"
-            prompt += "【Evolutionary Cognitive Insights (Instincts)】\n"
-            prompt += "These are hard-earned abstract principles from your previous clones. ALWAYS adhere to them:\n"
-            for i, insight in enumerate(self.pattern.cognitive_insights, 1):
-                prompt += f"{i}. {insight}\n"
-
-        # Force Metacognitive Protocol (CRITICAL FIX)
-        prompt += "\n"
-        prompt += "【Metacognitive Stream Protocol】\n"
-        prompt += "- **CRITICAL**: You must START every response with a `<reflection>` block.\n"
-        prompt += "- Inside `<reflection>`, answer: 1. Goal? 2. Progress? 3. Looping?\n"
-        prompt += "- **ACTION ENFORCEMENT**: If your plan involves doing something, you MUST call a tool. Do not just say 'I will do it'.\n"
-        prompt += "- If you need to chain thoughts without immediate external tools, use `chain_next`.\n"
-        prompt += "- Close with `</reflection>` and THEN output your tools or text.\n"
-        
-        return prompt
-    
-    def add_cognitive_insight(self, insight: str, max_insights: int = 15):
-        """
-        吸收来自子代理的泛化认知规律 (Multiplicative Evolution)
-        """
-        if insight and insight not in self.pattern.cognitive_insights:
-            self.pattern.cognitive_insights.append(insight)
-            if len(self.pattern.cognitive_insights) > max_insights:
-                self.pattern.cognitive_insights.pop(0) # 淘汰最陈旧的本能
-            self._save_pattern()
-
-    def get_response_guidelines(self) -> Dict[str, any]:
-        """
-        获取回复指导原则
-        
-        Returns:
-            指导原则字典
-        """
+    def get_stats(self) -> Dict[str, Any]:
+        """返回当前学习状态（调试用）"""
         return {
-            'max_length': int(self.pattern.message_length_avg * 3),  # 回复长度约为用户的3倍
-            'use_emoji': self.pattern.uses_emoji > 0.3,
-            'technical_level': self.pattern.prefers_technical,
-            'detail_level': 1.0 - self.pattern.prefers_concise,
-            'proactive': self.pattern.prefers_proactive > 0.5,
+            "total_interactions": self.state.total_interactions,
+            "last_reflection_at": self.state.last_reflection_at,
+            "insight_count": len(self.state.cognitive_insights),
+            "insights": self.state.cognitive_insights,
+            "next_reflection_in": max(
+                0, self.reflection_interval - (
+                    self.state.total_interactions - self.state.last_reflection_at
+                )
+            ),
         }
-    
-    def get_stats(self) -> Dict[str, any]:
-        """获取统计信息"""
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
+
+    def _format_history(self, interactions: List[Dict]) -> str:
+        lines = []
+        for i, item in enumerate(interactions, 1):
+            lines.append(f"[{i}] 用户: {item.get('user', '')}")
+            lines.append(f"    Genesis: {item.get('assistant', '')}")
+            if item.get("reaction"):
+                lines.append(f"    用户反应: {item['reaction']}")
+        return "\n".join(lines)
+
+    def _parse_insights(self, raw: str) -> List[str]:
+        """从 LLM 输出中提取以 - 开头的 insight 行"""
+        insights = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if line.startswith("-"):
+                clean = line.lstrip("-").strip()
+                if clean and len(clean) > 3:
+                    insights.append(clean)
+        return insights[:6]  # 最多取 6 条防止过载
+
+    def _save(self) -> None:
         from dataclasses import asdict
-        return asdict(self.pattern)
-    
-    def _save_pattern(self):
-        """保存学习模式"""
         data = {
-            'pattern': {
-                'prefers_concise': self.pattern.prefers_concise,
-                'prefers_technical': self.pattern.prefers_technical,
-                'prefers_proactive': self.pattern.prefers_proactive,
-                'uses_emoji': self.pattern.uses_emoji,
-                'message_length_avg': self.pattern.message_length_avg,
-                'formality': self.pattern.formality,
-                'positive_signals': self.pattern.positive_signals,
-                'negative_signals': self.pattern.negative_signals,
-                'total_interactions': self.pattern.total_interactions,
-                'confidence': self.pattern.confidence,
-                'cognitive_insights': self.pattern.cognitive_insights,
-            },
-            'last_updated': datetime.now().isoformat()
+            "state": asdict(self.state),
+            "last_updated": datetime.now().isoformat(),
         }
-        
-        with open(self.storage_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-    
-    def _load_pattern(self) -> InteractionPattern:
-        """加载学习模式"""
-        if not self.storage_path.exists():
-            return InteractionPattern()
-        
         try:
-            with open(self.storage_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            pattern_data = data.get('pattern', {})
-            return InteractionPattern(**pattern_data)
+            with open(self.storage_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            logger.warning(f"加载学习模式失败: {e}")
-            return InteractionPattern()
+            logger.warning(f"AdaptiveLearner 保存失败: {e}")
 
-
-# 示例用法
-if __name__ == '__main__':
-    learner = AdaptiveLearner()
-    
-    # 模拟交互
-    learner.observe_interaction(
-        user_message="帮我看看这个错误",
-        assistant_response="这是权限问题...",
-        user_reaction="好的，谢谢"
-    )
-    
-    # 生成自适应 prompt
-    prompt = learner.generate_adaptive_prompt()
-    print("自适应 System Prompt:")
-    print(prompt)
-    
-    # 获取回复指导
-    guidelines = learner.get_response_guidelines()
-    print("\n回复指导:")
-    print(guidelines)
+    def _load(self) -> AdaptiveState:
+        if not self.storage_path.exists():
+            return AdaptiveState()
+        try:
+            with open(self.storage_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # 兼容旧格式（v1 存的是 pattern 字段）
+            raw = data.get("state") or data.get("pattern") or {}
+            # 过滤掉 AdaptiveState 不认识的字段，防止 __init__ 报错
+            valid_fields = AdaptiveState.__dataclass_fields__.keys()
+            filtered = {k: v for k, v in raw.items() if k in valid_fields}
+            return AdaptiveState(**filtered)
+        except Exception as e:
+            logger.warning(f"AdaptiveLearner 加载失败，重置: {e}")
+            return AdaptiveState()
