@@ -343,7 +343,19 @@ class AgentLoop:
                     if hasattr(self, 'on_tool_call') and self.on_tool_call:
                         self.on_tool_call(tool_name, tool_args)
 
-                    result = await self.tools.execute(tool_name, tool_args)
+                    try:
+                        # ⚠️ ULTIMATE TOOL CIRCUIT BREAKER ⚠️
+                        # Protect the main loop from custom generated skills that might contain `while True` 
+                        # or other blocking operations. Hard timeout at 60 seconds.
+                        result = await asyncio.wait_for(
+                            self.tools.execute(tool_name, tool_args),
+                            timeout=60.0
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f"⏱️ 致命超时：工具 '{tool_name}' 运行超过 60 秒未返回！已强制阻断以保全主循环。")
+                        result = f"Error: 致命超时 (Timeout)! The tool '{tool_name}' was forcibly terminated because it ran for over 60 seconds and blocked the main executing loop. Do NOT use infinite loops in tools. Background long-running tasks asynchronously."
+                    except Exception as try_e:
+                        result = f"Error executing tool '{tool_name}': {type(try_e).__name__} - {str(try_e)}"
                     
                     # --- MULTIMODAL HANDLING (Visual Cortex) ---
                     # Check if result is a dict with type='image'

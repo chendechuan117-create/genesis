@@ -24,6 +24,8 @@ class SkillCreatorTool(Tool):
         【极度严苛的代码要求】:
         1. 必须定义一个继承自 `Tool` 的类。
         2. 必须且只能包含以下 4 个方法/属性 (name, description, parameters, execute)。
+        3. 🔴 **绝对禁止阻塞主线程**：`execute` 方法内部绝对不能出现无限 `while True:` 循环或长时间的同步 `sleep`。
+           如果你的工具是一个持续监控的后台任务（如 activity_monitor），你必须在 `execute` 内使用 `subprocess.Popen` 或 `asyncio.create_task` 将死循环**抛到后台运行**，并且**立刻 `return` 一个状态字符串**给主循环！工具执行卡住会导致整个大模型死机！
         
         下面是你能且只能使用的绝对模板（请直接复制并修改其中的功能逻辑）：
         
