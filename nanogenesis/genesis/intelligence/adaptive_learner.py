@@ -167,11 +167,9 @@ class AdaptiveLearner:
         """
         深度锚点反思 — 仅在锚点事件（回溯、失败）触发。
         
-        与 trigger_reflection() 不同：
-          - trigger_reflection : 从对话历史提炼用户偏好（加法）
-          - trigger_anchor_reflection : 从决策日志提炼域无关的认知原理（乘法）
-        
-        目标不是"A 类问题用 A 方法"，而是"什么认知姿态导致了更好/更差的锚点选择"。
+        两个维度：
+          1. 认知原理提炼：从成功/失败对比提炼域无关的锚点选择原理（乘法）
+          2. 工具效能审计：计算每个工具的成功率，标记高失败率工具（工具箱优化）
 
         Args:
             llm_chat_fn: 异步 LLM chat 函数
@@ -180,7 +178,7 @@ class AdaptiveLearner:
         if not decisions:
             return
 
-        # 构建决策记录摘要，突出成功 vs 失败的对比
+        # ── 1. 构建决策摘要（用于认知原理提炼）──────────────────────────────
         lines = []
         for d in decisions[:12]:
             outcome_emoji = "✅" if d["outcome"] == "success" else "❌"
@@ -190,30 +188,74 @@ class AdaptiveLearner:
             )
         decisions_text = "\n".join(lines)
 
-        prompt = (
-            "以下是我最近的决策记录，记录了每次任务开始时有哪些可能的锚点（工具/方法），"
-            "我实际选择了哪个，以及结果是成功还是失败：\n\n"
+        # ── 2. 计算每个工具的成功率（用于工具审计）───────────────────────────
+        from collections import defaultdict
+        tool_stats: dict = defaultdict(lambda: {"success": 0, "failed": 0, "backtracked": 0})
+        for d in decisions:
+            anchor = d["chosen_anchor"][:40].strip()
+            outcome = d["outcome"]
+            if outcome in tool_stats[anchor]:
+                tool_stats[anchor][outcome] += 1
+        
+        # 只保留有足够样本（≥2次）的工具，并计算失败率
+        audit_lines = []
+        for tool, stats in tool_stats.items():
+            total = stats["success"] + stats["failed"] + stats["backtracked"]
+            if total < 2:
+                continue
+            fail_rate = (stats["failed"] + stats["backtracked"]) / total
+            bar = "⚠️" if fail_rate > 0.5 else ("🔸" if fail_rate > 0.25 else "✅")
+            audit_lines.append(
+                f"{bar} [{tool}] 成功:{stats['success']} 失败:{stats['failed']} 回溯:{stats['backtracked']} "
+                f"(失败率:{fail_rate:.0%})"
+            )
+        audit_text = "\n".join(audit_lines) if audit_lines else "（样本量不足，暂无工具审计数据）"
+
+        # ── 3. 认知原理提炼 prompt ─────────────────────────────────────────
+        principle_prompt = (
+            "以下是我最近的决策记录：\n\n"
             f"{decisions_text}\n\n"
-            "请基于这些决策的模式，归纳 2~4 条关于**如何选择更好起点**的通用认知原理。\n\n"
-            "关键要求：\n"
-            "- 原理必须与具体任务类型无关（不是'音频问题用 PulseAudio'这种类型）\n"
-            "- 原理应该是关于'如何定向思考'或'什么信号意味着应该换起点'的认知规律\n"
-            "- 例如：'失败的锚点通常是从零构建，而非寻找已有解'\n\n"
-            "直接输出原理列表，每条以 - 开头，中文，不超过 30 字/条。"
+            "请归纳 2~3 条**与具体任务无关**的通用认知原理（关于'如何选择更好起点'的思维规律）。\n"
+            "- 不要写'音频用PulseAudio'这种特定解法\n"
+            "- 要写'失败锚点通常是从零构建而非寻找已有解'这种普适原理\n"
+            "每条以 - 开头，中文，不超过 30 字。直接输出列表。"
+        )
+
+        # ── 4. 工具审计 prompt ────────────────────────────────────────────
+        audit_prompt = (
+            "以下是我各个工具/方法的近期执行成功率统计：\n\n"
+            f"{audit_text}\n\n"
+            "请基于这份数据，识别 1~2 个最值得关注的问题，用一句话指明：\n"
+            "  ① 哪个工具失败率最高，可能需要改写或替换\n"
+            "  ② 或者什么类型的锚点选择模式风险最高\n"
+            "每条以 - 开头，中文，不超过 30 字。直接输出列表（没有问题则回复'暂无'）。"
         )
 
         try:
-            resp = await llm_chat_fn([{"role": "user", "content": prompt}])
-            raw = resp.content.strip() if resp else ""
-            insights = self._parse_insights(raw)
+            # 并行两个独立 prompt（都是轻量级调用）
+            import asyncio
+            principle_task = asyncio.create_task(
+                llm_chat_fn([{"role": "user", "content": principle_prompt}])
+            )
+            audit_task = asyncio.create_task(
+                llm_chat_fn([{"role": "user", "content": audit_prompt}])
+            )
+            principle_resp, audit_resp = await asyncio.gather(principle_task, audit_task)
 
-            for insight in insights:
+            # 存入认知原理
+            principle_raw = principle_resp.content.strip() if principle_resp else ""
+            for insight in self._parse_insights(principle_raw):
                 self.add_cognitive_insight(f"[锚点认知] {insight}")
+
+            # 存入工具审计
+            audit_raw = audit_resp.content.strip() if audit_resp else ""
+            if audit_raw and audit_raw != "暂无":
+                for insight in self._parse_insights(audit_raw):
+                    self.add_cognitive_insight(f"[工具审计] {insight}")
 
             self._save()
             logger.info(
-                f"🔍 锚点深度反思完成，新增 {len(insights)} 条认知原理 "
-                f"(共 {len(self.state.cognitive_insights)} 条)"
+                f"🔍 锚点深度反思完成 (共 {len(self.state.cognitive_insights)} 条 insight)"
             )
 
         except Exception as e:
