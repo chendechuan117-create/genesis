@@ -36,6 +36,7 @@ sandbox/
 archive/
 generated_tools/
 .nanogenesis/
+state_snapshots/
 logs/
 conversations/
 *.sqlite

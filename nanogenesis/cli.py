@@ -85,8 +85,15 @@ async def main():
     # REPL 循环
     while True:
         try:
-            user_input = input("\n👤 你: ").strip()
-            
+            # 尝试使用 prompt_toolkit 来支持安全的多行粘贴和自动换行处理 (Bracketed Paste)
+            try:
+                from prompt_toolkit import PromptSession
+                if not hasattr(agent, '_prompt_session'):
+                    agent._prompt_session = PromptSession()
+                user_input = agent._prompt_session.prompt("\n👤 你 (支持多行粘贴): ").strip()
+            except ImportError:
+                user_input = input("\n👤 你: ").strip()
+                
             if not user_input:
                 continue
                 

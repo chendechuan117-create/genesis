@@ -169,6 +169,16 @@ class NanoGenesis:
                 # 选项感知扩展：当用户输入是单字母/数字时，尝试还原其选项上下文
                 awareness_input = self._expand_option_input(current_input)
                 
+                # --- Entity B: Context Packager Phase ---
+                # Packager uses read-only tools to scan the environment and gather precise context
+                # so the Executor doesn't have to waste tokens probing blindly.
+                from genesis.core.packager import ContextPackager
+                packager = ContextPackager(self.cloud_provider)
+                logger.info("📦 Packager Phase: Scouting environment...")
+                
+                mission_payload = await packager.build_payload(awareness_input, step_callback)
+                logger.info(f"📦 Payload Generated ({len(mission_payload)} chars)")
+                
                 # 取最近 3 条对话历史，作为 Oracle 的上下文锚点
                 # 解决 awareness_phase 为孤立 LLM 调用、无法感知上轮对话的问题
                 _recent_ctx = []
@@ -234,6 +244,10 @@ class NanoGenesis:
 
             if execution_history:
                 current_context += f"\n\n[Previous Execution Failures]:\n{json.dumps(execution_history, indent=2, ensure_ascii=False)}"
+            
+            # Inject Mission Payload from Entity B into the Executor's context
+            if loop_count == 1 and 'mission_payload' in locals():
+                current_context += f"\n\n[📦 Context Packager Payload (Entity B)]\n{mission_payload}\n"
             
             # 注入知识存量盘点结果（让 strategy_phase 看到已知工具清单，再生成方案）
             known_solutions = oracle_output.get("known_solutions", "")
@@ -328,27 +342,28 @@ class NanoGenesis:
                 "content": strategic_blueprint
             })
             
+            # --- Decode strategy using the Protocol Decoder (No hardcoded strings!) ---
+            from genesis.intelligence.protocol_decoder import ProtocolDecoder
+            intent_type, intent_content, _ = ProtocolDecoder.decode_strategy(strategic_blueprint)
+
             # --- Clarification Protocol (The Short Circuit) ---
-            if "[CLARIFICATION_REQUIRED]" in strategic_blueprint:
+            if intent_type == "clarification":
                 logger.info("⚠️ 战略阶段请求澄清，中断执行")
                 return {
-                    'response': accumulated_response + ("\n\n" if accumulated_response else "") + strategic_blueprint, 
+                    'response': accumulated_response + ("\n\n" if accumulated_response else "") + intent_content, 
                     'metrics': None,
                     'success': True, 
                     'optimization_info': {'status': 'clarification_requested'}
                 }
 
             # --- 3D Mission Tree: Capability Forge (The Z-Axis Jump) ---
-            if "[CAPABILITY_FORGE]" in strategic_blueprint:
+            if intent_type == "forge":
                 logger.warning("🔨 [自进化触发] 战略阶段判定缺少关键能力，启动 Z 轴分支 (Capability Forge)")
-                
-                # 提取锻造意图
-                forge_intent = strategic_blueprint.split("[CAPABILITY_FORGE]")[1].strip()
                 
                 if hasattr(self, 'mission_manager') and active_mission:
                     # 派生子任务 (Z轴)
                     forge_mission = self.mission_manager.create_mission(
-                        objective=f"[FORGE] 获取新能力: \n{forge_intent}",
+                        objective=f"[FORGE] 获取新能力: \n{intent_content}",
                         parent_id=active_mission.id
                     )
                     active_mission = forge_mission
@@ -358,12 +373,12 @@ class NanoGenesis:
                 current_input = (
                     f"CRITICAL OVERRIDE - CAPABILITY FORGE REQUIRED.\n"
                     f"You must acquire or create a new tool to proceed.\n"
-                    f"Forge Details:\n{forge_intent}\n"
+                    f"Forge Details:\n{intent_content}\n"
                     f"Action Required: Use `skill_creator` to write the script OR `github_skill_search` to find it."
                 )
                 
                 # We log it, but do not exit. We let the loop run the forge task.
-                accumulated_response += f"\n\n[CAPABILITY_FORGE_INITIATED]\n{forge_intent}\n\n"
+                accumulated_response += f"\n\n[CAPABILITY_FORGE_INITIATED]\n{intent_content}\n\n"
                 
                 # Skip the standard loop metrics tracking for this purely internal phase jump
                 # (Or let it run normally so the executor handles it). We let it run normally!
@@ -423,11 +438,11 @@ class NanoGenesis:
                 
                 if metrics.success:
                     # 0. Check for Cognitive Escalation (Strategic Interrupt)
-                    if "[STRATEGIC_INTERRUPT_SIGNAL]" in response:
-                        logger.warning(f"🔄 Strategic Interrupt Received: {response}")
+                    exec_intent_type, clean_msg, _ = ProtocolDecoder.decode_execution(response)
+                    if exec_intent_type == "interrupt":
+                        logger.warning(f"🔄 Strategic Interrupt Received: {clean_msg}")
                         # Force loop back to Strategy Phase
                         # Clean signal for context
-                        clean_msg = response.replace("[STRATEGIC_INTERRUPT_SIGNAL]", "").strip()
                         execution_history.append(f"ESCALATION: {clean_msg}")
                         accumulated_response += f"\n\n[ESCALATION] {clean_msg}\n\n"
                         error_count = 0 # Reset error count as this is a controlled escalation

@@ -478,33 +478,50 @@ class AgentLoop:
                         # For other tools, check if it starts with Error/Exception or contains explicit failure language
                         if "error:" in result_lower or "exception:" in result_lower or result_lower.startswith("error"):
                             is_error = True
+                            
+                    # --- 判断是否为只读/试探性操作 (Operation Purge: 解除探索怯懦) ---
+                    is_exploratory = False
+                    if tool_name in ["read_file", "list_dir", "search_web", "read_url_content", "grep_search", "find_by_name"]:
+                        is_exploratory = True
+                    elif tool_name == "shell" or tool_name == "run_command":
+                        cmd = tool_args.get("command", "") or tool_args.get("CommandLine", "")
+                        if any(cmd.strip().startswith(prefix) for prefix in ["ls", "cat ", "grep ", "find ", "echo", "pwd", "which "]):
+                            is_exploratory = True
                     
                     if is_error:
                         if tool_name not in tool_errors: tool_errors[tool_name] = []
                         
-                        # Try to compress the error to save context window
-                        try:
-                            compressed = _error_compressor.compress(result_str, source=tool_name)
-                            new_error_str = _error_compressor.format_for_llm(compressed)
-                        except:
-                            new_error_str = result_str[:100]
+                        if is_exploratory:
+                            # 试探性动作：跳过高耗时的大模型错误坍缩，直接记入简单错误
+                            new_error_str = result_str[:150]
+                            # 即使错误完全相同，也不重置计数器，但容忍度放宽到 8 次
+                            tool_errors[tool_name].append(new_error_str)
+                            failure_limit = 8
+                        else:
+                            # 实体动作：执行严厉的熵值坍缩与短程阻断
+                            try:
+                                compressed = _error_compressor.compress(result_str, source=tool_name)
+                                new_error_str = _error_compressor.format_for_llm(compressed)
+                            except:
+                                new_error_str = result_str[:100]
+                                
+                            # Entropy-Aware Circuit Breaker (State Delta)
+                            # If the new error is DIFFERENT from the last error, the agent is exploring/learning.
+                            # We reset the sequential counter.
+                            if tool_errors[tool_name]:
+                                last_error = tool_errors[tool_name][-1]
+                                if new_error_str != last_error:
+                                    logger.info(f"🔄 Entropy Delta Detected: Agent encountered a new error for {tool_name}. Resetting failure counter.")
+                                    tool_errors[tool_name] = [] # Reset!
                             
-                        # Entropy-Aware Circuit Breaker (State Delta)
-                        # If the new error is DIFFERENT from the last error, the agent is exploring/learning.
-                        # We reset the sequential counter.
-                        if tool_errors[tool_name]:
-                            last_error = tool_errors[tool_name][-1]
-                            if new_error_str != last_error:
-                                logger.info(f"🔄 Entropy Delta Detected: Agent encountered a new error for {tool_name}. Resetting failure counter.")
-                                tool_errors[tool_name] = [] # Reset!
+                            tool_errors[tool_name].append(new_error_str)
+                            failure_limit = 3
                         
-                        tool_errors[tool_name].append(new_error_str)
-                        
-                        # Strategic Interrupt: Consecutive IDENTICAL Failures
+                        # Strategic Interrupt: Consecutive IDENTICAL/EXPLORATORY Failures
                         sequential_failures = len(tool_errors[tool_name])
-                        if sequential_failures >= 3:
-                             logger.warning(f"⛔ Strategic Interrupt: {tool_name} failed with IDENTICAL errors {sequential_failures} times sequentially.")
-                             final_response = f"[STRATEGIC_INTERRUPT] Tool {tool_name} failed {sequential_failures} times in a row with the exact same error. Stopping to replan."
+                        if sequential_failures >= failure_limit:
+                             logger.warning(f"⛔ Strategic Interrupt: {tool_name} failed {sequential_failures} times (Limit: {failure_limit}).")
+                             final_response = f"[STRATEGIC_INTERRUPT] Tool {tool_name} failed {sequential_failures} times. Exhausted {'exploratory' if is_exploratory else 'identical'} retries. Stopping to replan."
                              success = False
                              return final_response, PerformanceMetrics(
                                 iterations=iteration,
