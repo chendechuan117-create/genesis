@@ -1,0 +1,165 @@
+{
+  "metadata": {
+    "snapshot_name": "genesis_state_snapshot",
+    "timestamp": 1771999374,
+    "timestamp_human": "Wed Feb 25 14:02:54 2026",
+    "genesis_version": "2.0",
+    "capture_scope": "full_runtime_state",
+    "parameters": {
+      "include_memory_dump": true,
+      "compression_level": "gzip"
+    },
+    "tools_registry": {
+      "total_tools": 0,
+      "tool_names": []
+    },
+    "session_history": {
+      "total_sessions": 2,
+      "total_messages": 0
+    },
+    "memory_state": {
+      "memory_entries": 3,
+      "memory_size_kb": 0.3134765625
+    },
+    "config_state": {
+      "config_keys": [
+        "genesis/core/config.py",
+        ".env",
+        "pyproject.toml",
+        "data_pipeline_config.json",
+        "_source",
+        "_timestamp"
+      ],
+      "config_source": "file_based"
+    },
+    "runtime_state": {
+      "process_info": {
+        "pid": 2303034,
+        "ppid": 2303024,
+        "cwd": "/home/chendechusn/Genesis/nanogenesis",
+        "python_executable": "/usr/bin/python3",
+        "command_line": "/home/chendechusn/Genesis/nanogenesis/cli.py",
+        "cpu_percent": 0.0,
+        "memory_rss_mb": 48.44140625,
+        "memory_vms_mb": 203.26171875,
+        "num_threads": 2,
+        "num_fds": 11
+      },
+      "system_resources": {
+        "cpu_count": 20,
+        "cpu_percent_total": 4.5,
+        "memory_total_gb": 31.155532836914062,
+        "memory_available_gb": 12.821304321289062,
+        "memory_percent_used": 58.8,
+        "disk_usage_percent": 24.6
+      }
+    }
+  },
+  "tools_registry": {
+    "registry_class": "ToolRegistry",
+    "registry_available": true,
+    "tools": [],
+    "tool_files": [
+      "file_tools.py",
+      "visual_tool.py",
+      "douyin_tool.py",
+      "replication_tool.py",
+      "sub_agent_manager.py",
+      "github_skill_search_tool.py",
+      "shell_tool.py",
+      "web_tool.py",
+      "check_sub_agent_tool.py",
+      "skill_creator_tool.py",
+      "memory_tool.py",
+      "browser_tool.py",
+      "spawn_sub_agent_tool.py",
+      "system_health_tool.py",
+      "skill_importer_tool.py",
+      "chain_next_tool.py",
+      "scheduler_tool.py"
+    ]
+  },
+  "session_history": {
+    "sessions": [
+      {
+        "session_source": "agent_loop_payload_dump.json",
+        "file_size_bytes": 20262145,
+        "storage_type": "json_dump"
+      },
+      {
+        "session_source": "debug_payload.json",
+        "file_size_bytes": 22671739,
+        "storage_type": "json_dump"
+      }
+    ],
+    "total_sessions": 2
+  },
+  "memory_state": {
+    "memories": [
+      {
+        "cache_file": "cache_dump.json",
+        "file_size_bytes": 52136,
+        "type": "json_cache"
+      },
+      {
+        "cache_file": "data1.json",
+        "file_size_bytes": 17539,
+        "type": "json_cache"
+      },
+      {
+        "cache_file": "data2.json",
+        "file_size_bytes": 17539,
+        "type": "json_cache"
+      }
+    ],
+    "total_memory_sources": 3
+  },
+  "config_state": {
+    "genesis/core/config.py": {
+      "file_size_bytes": 8128,
+      "content_preview": "\"\"\"\n配置管理中枢 - NanoGenesis Nervous System\n实现零配置启动 (Zero-Conf)，自动嗅探宿主环境 (OpenClaw) 和系统变量。\n\"\"\"\n\nimport os\nimport json\nimport logging\nfrom pathlib import Path\nfrom typing import Dict, Optional, Any\nfrom dataclasses import dataclass\n\nlogger = logging.getLogger(__name__)\n\n@dataclass\nclass GlobalConfig:\n    \"\"\"全局配置对象\"\"\"\n    # API Keys\n    deepseek_api_key: Optional[str] = None\n    openai_api_key: Optional[str] = None\n    openrouter_api_key: Optional[str] = None\n    openrouter_model: Optional[str] = \"tri...",
+      "line_count": 225
+    },
+    ".env": {
+      "file_size_bytes": 548,
+      "content_preview": "\n# ==========================================\n# Phase 3: Consumables Pool API Keys\n# ==========================================\nSILICONFLOW_API_KEY=\"sk-apvgtfrihtnamikhagjmqhcrdngiycsrjbmodotneisuyumc\"\nDASHSCOPE_API_KEY=\"sk-e433fba2351b42ea8543c53fd941b554\"\nQIANFAN_API_KEY=\"bce-v3/ALTAK-ENAW1Yxc4o0yULguILrsH/2dad9e47e6659c8696753d07544d58aa701f5e2b\"\nZHIPU_API_KEY=\"5e45a404943b4877b06eea672b64e99f.Dn7Z1rn5s86hwBTu\"\n\n# Web Search\nTAVILY_API_KEY=\"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\"\nSAMBANOVA...",
+      "line_count": 12
+    },
+    "pyproject.toml": {
+      "file_size_bytes": 719,
+      "content_preview": "[project]\nname = \"nanogenesis\"\nversion = \"0.1.0\"\ndescription = \"自进化的轻量级智能 Agent - 融合 nanobot + Genesis + OpenClaw\"\nauthors = [{name = \"NanoGenesis Team\"}]\nreadme = \"README.md\"\nrequires-python = \">=3.10\"\ndependencies = [\n    \"litellm>=1.0.0\",\n    \"loguru>=0.7.0\",\n    \"pydantic>=2.0.0\",\n]\n\n[project.optional-dependencies]\ndev = [\n    \"pytest>=7.0.0\",\n    \"pytest-asyncio>=0.21.0\",\n    \"black>=23.0.0\",\n    \"ruff>=0.1.0\",\n]\n\n[build-system]\nrequires = [\"setuptools>=61.0\"]\nbuild-backend = \"setuptools.bu...",
+      "line_count": 36
+    },
+    "data_pipeline_config.json": {
+      "file_size_bytes": 1178,
+      "content_preview": "{\n  \"project_name\": \"Data Pipeline as a Service\",\n  \"version\": \"0.1.0\",\n  \"description\": \"Autonomous data collection and processing service\",\n  \"first_validation_targets\": [\n    {\n      \"name\": \"ecommerce_price_monitor\",\n      \"target_url\": \"https://api.example.com/products\",\n      \"method\": \"GET\",\n      \"data_type\": \"json\",\n      \"extraction_rules\": {\n        \"product_names\": \"products.*.name\",\n        \"prices\": \"products.*.price\",\n        \"availability\": \"products.*.in_stock\"\n      },\n      \"o...",
+      "line_count": 45
+    },
+    "_source": "file_based",
+    "_timestamp": 1771999374.4588366
+  },
+  "runtime_state": {
+    "process_info": {
+      "pid": 2303034,
+      "ppid": 2303024,
+      "cwd": "/home/chendechusn/Genesis/nanogenesis",
+      "python_executable": "/usr/bin/python3",
+      "command_line": "/home/chendechusn/Genesis/nanogenesis/cli.py",
+      "cpu_percent": 0.0,
+      "memory_rss_mb": 48.44140625,
+      "memory_vms_mb": 203.26171875,
+      "num_threads": 2,
+      "num_fds": 11
+    },
+    "system_resources": {
+      "cpu_count": 20,
+      "cpu_percent_total": 4.5,
+      "memory_total_gb": 31.155532836914062,
+      "memory_available_gb": 12.821304321289062,
+      "memory_percent_used": 58.8,
+      "disk_usage_percent": 24.6
+    },
+    "platform": "Linux-6.12.66-1-lts-x86_64-with-glibc2.42",
+    "python_version": "3.14.2"
+  }
+}

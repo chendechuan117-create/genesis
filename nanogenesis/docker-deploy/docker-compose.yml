@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  nanogenesis:
+    build: .
+    container_name: nanogenesis
+    ports:
+      - "3000:3000"
+    environment:
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - nanogenesis-net
+
+networks:
+  nanogenesis-net:
+    driver: bridge

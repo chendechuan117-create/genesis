@@ -1,0 +1,61 @@
+{
+  "snapshot_name": "consciousness_transfer_demo",
+  "timestamp": 1771998060,
+  "timestamp_human": "Wed Feb 25 13:41:00 2026",
+  "genesis_version": "2.0",
+  "capture_scope": "full_runtime_state",
+  "parameters": {
+    "include_memory_dump": true,
+    "compression_level": "gzip"
+  },
+  "tools_registry": {
+    "total_tools": 0,
+    "tool_names": []
+  },
+  "session_history": {
+    "total_sessions": 2,
+    "total_messages": 0
+  },
+  "memory_state": {
+    "memory_entries": 3,
+    "memory_size_kb": 0.3134765625
+  },
+  "config_state": {
+    "config_keys": [
+      "genesis/core/config.py",
+      ".env",
+      "pyproject.toml",
+      "data_pipeline_config.json",
+      "_source",
+      "_timestamp"
+    ],
+    "config_source": "file_based"
+  },
+  "runtime_state": {
+    "process_info": {
+      "pid": 2303034,
+      "ppid": 2303024,
+      "cwd": "/home/chendechusn/Genesis/nanogenesis",
+      "python_executable": "/usr/bin/python3",
+      "command_line": "/home/chendechusn/Genesis/nanogenesis/cli.py",
+      "cpu_percent": 0.0,
+      "memory_rss_mb": 38.55859375,
+      "memory_vms_mb": 190.11328125,
+      "num_threads": 2,
+      "num_fds": 8
+    },
+    "system_resources": {
+      "cpu_count": 20,
+      "cpu_percent_total": 2.0,
+      "memory_total_gb": 31.155532836914062,
+      "memory_available_gb": 13.022720336914062,
+      "memory_percent_used": 58.2,
+      "disk_usage_percent": 24.6
+    }
+  },
+  "integrity_checks": {
+    "sha256_hash": "d858d1fa806885997250d34545d0bae2f5834b4ac62850a364769fe3abc5b0c4",
+    "snapshot_size_bytes": 6432,
+    "snapshot_size_kb": 6.28125
+  }
+}

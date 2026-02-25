@@ -101,10 +101,10 @@ class SpawnSubAgentTool(Tool):
                     logger.error(f"子代理 {full_name} 后台执行崩溃: {e}")
                     raise e
             
-            # Create asyncio task and hand it over to the Manager
-            coro_task = asyncio.create_task(run_probe())
+            # Hand over the coroutine to the Manager's background thread
+            # Do NOT use asyncio.create_task here, because that binds it to the ephemeral Streamlit loop!
             manager = SubAgentManager()
-            manager.register_task(task_id, coro_task)
+            manager.register_task(task_id, run_probe())
             
             return f"✅ 异步子代理 '{full_name}' 已挂载并开始执行！\n[Task ID]: {task_id}\n\n主脑现在已**彻底解放**。您可以立刻去处理其他任务（或结束当前思考）。当您需要检查结果时，请调用 `check_sub_agent` 并传入 `{task_id}`。"
             

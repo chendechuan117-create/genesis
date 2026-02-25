@@ -181,9 +181,11 @@ class GenesisFactory:
             from genesis.tools.spawn_sub_agent_tool import SpawnSubAgentTool
             from genesis.tools.check_sub_agent_tool import CheckSubAgentTool
             from genesis.skills.system_task_complete import SystemTaskComplete
+            from genesis.tools.evomap_skill_search_tool import EvoMapSkillSearchTool
             tools.register(SpawnSubAgentTool())
             tools.register(CheckSubAgentTool())
             tools.register(SystemTaskComplete())
+            tools.register(EvoMapSkillSearchTool())
             
             tools.register(ReadFileTool())
             tools.register(WriteFileTool())
