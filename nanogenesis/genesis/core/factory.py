@@ -180,8 +180,10 @@ class GenesisFactory:
             # Sub-Agent Tool Registration
             from genesis.tools.spawn_sub_agent_tool import SpawnSubAgentTool
             from genesis.tools.check_sub_agent_tool import CheckSubAgentTool
+            from genesis.skills.system_task_complete import SystemTaskComplete
             tools.register(SpawnSubAgentTool())
             tools.register(CheckSubAgentTool())
+            tools.register(SystemTaskComplete())
             
             tools.register(ReadFileTool())
             tools.register(WriteFileTool())

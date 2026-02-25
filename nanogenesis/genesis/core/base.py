@@ -61,6 +61,7 @@ class LLMResponse:
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    prompt_cache_hit_tokens: int = 0
     
     @property
     def has_tool_calls(self) -> bool:
@@ -71,7 +72,8 @@ class LLMResponse:
         return {
             'prompt_tokens': self.input_tokens,
             'completion_tokens': self.output_tokens,
-            'total_tokens': self.total_tokens
+            'total_tokens': self.total_tokens,
+            'prompt_cache_hit_tokens': self.prompt_cache_hit_tokens
         }
 
 
@@ -206,6 +208,7 @@ class PerformanceMetrics:
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    prompt_cache_hit_tokens: int = 0
     tools_used: List[str] = None
     success: bool = True
     cache_hit: bool = False

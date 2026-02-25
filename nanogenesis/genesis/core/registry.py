@@ -39,8 +39,9 @@ class ToolRegistry:
         return list(self._tools.keys())
     
     def get_definitions(self) -> List[Dict[str, Any]]:
-        """获取所有工具的 Schema 定义"""
-        return [tool.to_schema() for tool in self._tools.values()]
+        """获取所有工具的 Schema 定义 (按字母排序以确保缓存命中)"""
+        definitions = [tool.to_schema() for tool in self._tools.values()]
+        return sorted(definitions, key=lambda x: x["function"]["name"])
     
     async def execute(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """执行工具"""

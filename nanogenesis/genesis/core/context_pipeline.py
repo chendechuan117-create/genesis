@@ -24,6 +24,7 @@ class ContextPlugin(ABC):
     """上下文插件基类"""
     name: str = "base_plugin"
     priority: int = 10  # 越小越靠前
+    category: str = "dynamic" # "static" or "dynamic"
     
     @abstractmethod
     def inject(self, ctx: ContextContext) -> Optional[str]:
@@ -31,9 +32,10 @@ class ContextPlugin(ABC):
         pass
 
 class IdentityPlugin(ContextPlugin):
-    """身份定义插件 (最核心)"""
+    """身份定义插件 (最核心 - Static)"""
     name = "identity"
     priority = 0
+    category = "static"
     
     def __init__(self, system_prompt: str):
         self.system_prompt = system_prompt
@@ -45,6 +47,7 @@ class TimeAwarenessPlugin(ContextPlugin):
     """时间感知插件 (动态 - 放在最后以利用缓存)"""
     name = "time_awareness"
     priority = 100  # 极低优先级，放在 Prompt 末尾
+    category = "dynamic"
     
     def inject(self, ctx: ContextContext) -> str:
         now = datetime.now()
@@ -54,6 +57,7 @@ class EnvironmentPlugin(ContextPlugin):
     """环境感知插件 (静态部分 - System Profile)"""
     name = "environment_static"
     priority = 2
+    category = "static"
     
     def inject(self, ctx: ContextContext) -> str:
         # 仅加载静态系统画像
@@ -82,6 +86,7 @@ class SessionStatePlugin(ContextPlugin):
     """会话状态插件 (动态 - CWD/User)"""
     name = "session_state"
     priority = 99 # 放在时间之前，历史之后
+    category = "dynamic"
     
     def inject(self, ctx: ContextContext) -> str:
         return f"\n[Session State]\nCWD: {os.getcwd()}\nUser: {os.getlogin()}"
@@ -90,6 +95,7 @@ class MemoryPlugin(ContextPlugin):
     """记忆注入插件"""
     name = "memory"
     priority = 5
+    category = "dynamic"
     
     def inject(self, ctx: ContextContext) -> Optional[str]:
         if not ctx.raw_memory:
@@ -104,6 +110,7 @@ class HistorySummariesPlugin(ContextPlugin):
     """历史摘要插件 (Compressed Blocks)"""
     name = "history_summaries"
     priority = 20  # 放在身份之后，记忆之后
+    category = "dynamic"
     
     def inject(self, ctx: ContextContext) -> Optional[str]:
         if not ctx.history_blocks:
@@ -145,14 +152,18 @@ class ContextPipeline:
         self.plugins.append(plugin)
         self.plugins.sort(key=lambda x: x.priority)
         
-    def build_system_context(self, user_input: str, min_priority: int = -999, max_priority: int = 9999, **kwargs) -> str:
-        """构建完整的 System Context"""
+    def build_system_context(self, user_input: str, min_priority: int = -999, max_priority: int = 9999, category: str = None, **kwargs) -> str:
+        """构建完整的 Context 片段（可按静态/动态类别过滤）"""
         ctx = ContextContext(user_input=user_input, **kwargs)
         
         parts = []
         for plugin in self.plugins:
             # Filter by priority
             if not (min_priority <= plugin.priority <= max_priority):
+                continue
+                
+            # Filter by category if specified
+            if category and plugin.category != category:
                 continue
 
             try:

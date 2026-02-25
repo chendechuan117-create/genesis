@@ -338,7 +338,38 @@ class NanoGenesis:
                     'optimization_info': {'status': 'clarification_requested'}
                 }
 
-            logger.info("✓ 战略蓝图已生成")
+            # --- 3D Mission Tree: Capability Forge (The Z-Axis Jump) ---
+            if "[CAPABILITY_FORGE]" in strategic_blueprint:
+                logger.warning("🔨 [自进化触发] 战略阶段判定缺少关键能力，启动 Z 轴分支 (Capability Forge)")
+                
+                # 提取锻造意图
+                forge_intent = strategic_blueprint.split("[CAPABILITY_FORGE]")[1].strip()
+                
+                if hasattr(self, 'mission_manager') and active_mission:
+                    # 派生子任务 (Z轴)
+                    forge_mission = self.mission_manager.create_mission(
+                        objective=f"[FORGE] 获取新能力: \n{forge_intent}",
+                        parent_id=active_mission.id
+                    )
+                    active_mission = forge_mission
+                    logger.info(f"🌿 成功折叠主线，派生能力锻造子任务: {forge_mission.id}")
+                
+                # 告知本轮的 A (Executor) 立即去打造这个工具
+                current_input = (
+                    f"CRITICAL OVERRIDE - CAPABILITY FORGE REQUIRED.\n"
+                    f"You must acquire or create a new tool to proceed.\n"
+                    f"Forge Details:\n{forge_intent}\n"
+                    f"Action Required: Use `skill_creator` to write the script OR `github_skill_search` to find it."
+                )
+                
+                # We log it, but do not exit. We let the loop run the forge task.
+                accumulated_response += f"\n\n[CAPABILITY_FORGE_INITIATED]\n{forge_intent}\n\n"
+                
+                # Skip the standard loop metrics tracking for this purely internal phase jump
+                # (Or let it run normally so the executor handles it). We let it run normally!
+                logger.info("✓ 战略蓝图已变轨为能力锻造指令")
+            else:
+                logger.info("✓ 战略蓝图已生成")
             
             # --- 决策日志：记录本轮锚点选择 ---
             _decision_id = None
@@ -366,19 +397,14 @@ class NanoGenesis:
                 logger.debug(f"决策日志跳过: {_dl_err}")
             
 
-            # 动态 Prompt 排序：根据任务类型重排 prompt 段落，提升信噪比（不删除任何信息）
-            try:
-                from genesis.core.prompt_filter import ContextualPromptFilter
-                _prompt_filter = ContextualPromptFilter()
-                raw_exec_prompt = f"{base_prompt}\n\n{strategic_blueprint}"
-                exec_prompt = _prompt_filter.rank(raw_exec_prompt, current_input)
-                task_type = _prompt_filter.detect(current_input)
-                logger.debug(f"🎯 PromptFilter: task_type={task_type}")
-            except Exception as pf_err:
-                logger.warning(f"PromptFilter 跳过: {pf_err}")
-                exec_prompt = f"{base_prompt}\n\n{strategic_blueprint}"
+            # 移除毁掉缓存的 ContextualPromptFilter (它会打乱段落，破坏 Prefix Hash)
+            # 移除对 system_prompt 的动态注入，保持 system 消息从一开始到最后都是静态的！
             
-            self.context.update_system_prompt(exec_prompt)
+            # 组合所有的动态上下文，塞给最新的一条 user_context，借此来保持系统提示词干净且强命中。
+            final_user_context = f"{user_context}\n\n[战略蓝图]\n{strategic_blueprint}"
+            if _decision_id:
+                final_user_context += f"\n[记录决策ID: {_decision_id} ({_problem_type})]"
+                
             self.loop.provider = self.cloud_provider
             
             try:
@@ -386,7 +412,7 @@ class NanoGenesis:
                 response, metrics = await self.loop.run(
                     user_input=current_input,
                     step_callback=step_callback,
-                    user_context=user_context,
+                    user_context=final_user_context,
                     raw_memory=oracle_output.get("memory_pull", []),
                     **kwargs
                 )
@@ -530,10 +556,61 @@ class NanoGenesis:
                 if error_count >= MAX_RETRIES:
                     return self._error_response(f"System Critical: Cloud Brain Failure - {e}")
 
+        # --- Phase 3: The Packager (Conscious Wrapper) ---
+        # The Stateless Executor has finished. Now we wake up the conversational brain
+        # to look at what the executor did, and package it into a nice response for the user.
+        logger.info("📦 Entering Packager Phase: Generating conversational response based on raw execution data.")
+        
+        packager_prompt = (
+            "You are the Conversational Packager for NanoGenesis.\n"
+            "An unconscious, stateless tool executor has just run a series of actions based on the user's request.\n"
+            f"User Original Request: {current_input}\n"
+            "--------------------\n"
+            "Raw Execution Trace:\n"
+            f"{accumulated_response}\n"
+            "--------------------\n"
+            "Your Task: Read the raw trace above. If the executor succeeded, tell the user what was done in a natural, polite way. "
+            "If the executor failed (e.g. error, missing tools), explain to the user what went wrong and ask how they want to proceed. "
+            "DO NOT HALLUCINATE TOOL CALLS OR ACTIONS THAT ARE NOT IN THE TRACE."
+        )
+        
+        try:
+            # We use cognition.chat to act as the packager, injecting the current conversation memory
+            # so it remembers the user profile and previous chats.
+            packager_messages = []
+            if hasattr(self, 'context') and self.context:
+                if hasattr(self.context, 'system_prompt') and self.context.system_prompt:
+                     packager_messages.append({'role': 'system', 'content': self.context.system_prompt})
+                     
+                _hist = self.context.get_history()
+                for _m in _hist[-10:]:
+                    _role = getattr(_m, 'role', None) or (_m.get('role') if isinstance(_m, dict) else None)
+                    _content = getattr(_m, 'content', None) or (_m.get('content') if isinstance(_m, dict) else None)
+                    if _role in ('user', 'assistant') and _content:
+                         packager_messages.append({'role': _role, 'content': str(_content)})
+                         
+            packager_messages.append({'role': 'user', 'content': packager_prompt})
+            
+            if step_callback:
+                if asyncio.iscoroutinefunction(step_callback):
+                    await step_callback("strategy", "正在整理执行结果并组织语言回答...")
+                else:
+                    step_callback("strategy", "正在整理执行结果并组织语言回答...")
+                    
+            packager_response = await self.cognition.chat(messages=packager_messages)
+            packaged_output = packager_response.content
+        except Exception as e:
+            logger.warning(f"Packager failed to format response: {e}")
+            # Fallback to the raw trace if the packager fails
+            packaged_output = "【执行跟踪日志】\n" + accumulated_response
+
         # --- Memory Update: Append current turn to session context ---
         # 必须手动回写到 context，否则下一轮对话会丢失上下文
         self.context.add_to_history(Message(role=MessageRole.USER, content=user_input))
-        self.context.add_to_history(Message(role=MessageRole.ASSISTANT, content=response))
+        self.context.add_to_history(Message(role=MessageRole.ASSISTANT, content=packaged_output))
+
+        # Re-assign response to packaged_output for the rest of the flow
+        response = packaged_output
 
         # 3. 记录与学习 (The Evolution)
         optimization_info = {}

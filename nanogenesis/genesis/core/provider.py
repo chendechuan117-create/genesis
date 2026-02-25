@@ -57,19 +57,21 @@ class NativeHTTPProvider(BaseLLMProvider):
             
         url = f"{self.base_url}/chat/completions"
         
-        payload = {
+        request_params = {
             "model": model,
             "messages": messages,
             **kwargs
         }
+        if stream:
+            request_params["stream"] = True
         
         # Enforce Default Stop Sequences (Anti-Hallucination)
-        if "stop" not in payload:
-             payload["stop"] = ["User:", "Observation:", "用户:", "Model:", "Assistant:"]
+        if "stop" not in request_params:
+             request_params["stop"] = ["User:", "Observation:", "用户:", "Model:", "Assistant:"]
         
         if tools:
-            payload["tools"] = tools
-            payload["tool_choice"] = "auto"
+            request_params["tools"] = tools
+            request_params["tool_choice"] = "auto"
             
         headers = {
             "Content-Type": "application/json",
@@ -77,7 +79,16 @@ class NativeHTTPProvider(BaseLLMProvider):
             "User-Agent": "NanoGenesis/1.0"
         }
         
+        payload = request_params
+        
         # 直接使用 curl，绕过 Python 的代理兼容性问题
+        try:
+            import json
+            with open("debug_payload.json", "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n---\n")
+        except Exception:
+            pass
+            
         data = json.dumps(payload).encode('utf-8')
         
         if stream and stream_callback:
@@ -108,31 +119,31 @@ class NativeHTTPProvider(BaseLLMProvider):
                     arguments=json.loads(tc['function']['arguments'])
                 ))
         
-        # Heuristic Fallback: Check for code-block tool calls
-        if not tool_calls and message.get('content'):
-            tool_calls = self._try_parse_tools_from_content(message['content'])
-
-        # 提取使用量
+        content = message.get('content') or ""
         
+        # --- Internal Reflection Stripping ---
+        # The Stateless Executor might use <reflection> tags to think. We strip them here
+        # so they don't pollute the context traces, the final packager response, or fallback parsers.
+        import re
+        if "<reflection>" in content:
+            content = re.sub(r"<reflection>.*?</reflection>", "", content, flags=re.DOTALL)
+            content = content.strip()
+
+        # Heuristic Fallback: Check for code-block tool calls
+        if not tool_calls and content:
+            tool_calls = self._try_parse_tools_from_content(content)
+
         # 提取使用量
         usage = resp_data.get('usage', {})
         
         return LLMResponse(
-            content=message.get('content') or "",
+            content=content,
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             input_tokens=usage.get('prompt_tokens', 0),
             output_tokens=usage.get('completion_tokens', 0),
-            total_tokens=usage.get('total_tokens', 0)
-        )
-
-        return LLMResponse(
-            content=message.get('content') or "",
-            tool_calls=tool_calls,
-            finish_reason=finish_reason,
-            input_tokens=usage.get('prompt_tokens', 0),
-            output_tokens=usage.get('completion_tokens', 0),
-            total_tokens=usage.get('total_tokens', 0)
+            total_tokens=usage.get('total_tokens', 0),
+            prompt_cache_hit_tokens=usage.get('prompt_cache_hit_tokens', 0)
         )
 
     def _try_parse_tools_from_content(self, content: str) -> List[ToolCall]:
@@ -376,6 +387,7 @@ class NativeHTTPProvider(BaseLLMProvider):
         finish_reason = None
         input_tokens = 0
         output_tokens = 0
+        prompt_cache_hit_tokens = 0
         
         logger.debug(f"Starting curl command (stdin mode): {' '.join(cmd)}")
         
@@ -448,6 +460,7 @@ class NativeHTTPProvider(BaseLLMProvider):
                             if 'usage' in chunk:
                                 output_tokens = chunk['usage'].get('completion_tokens', 0)
                                 input_tokens = chunk['usage'].get('prompt_tokens', 0)
+                                prompt_cache_hit_tokens = chunk['usage'].get('prompt_cache_hit_tokens', 0)
                                 
                         except json.JSONDecodeError:
                             continue
@@ -480,6 +493,7 @@ class NativeHTTPProvider(BaseLLMProvider):
                         if "usage" in resp_obj:
                             input_tokens = resp_obj["usage"].get("prompt_tokens", 0)
                             output_tokens = resp_obj["usage"].get("completion_tokens", 0)
+                            prompt_cache_hit_tokens = resp_obj["usage"].get("prompt_cache_hit_tokens", 0)
                             
                 except json.JSONDecodeError:
                     logger.error(f"Failed to parse non-SSE buffer: {buffer[:100]}...")
@@ -522,7 +536,8 @@ class NativeHTTPProvider(BaseLLMProvider):
                 finish_reason=finish_reason,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
-                total_tokens=input_tokens + output_tokens
+                total_tokens=input_tokens + output_tokens,
+                prompt_cache_hit_tokens=prompt_cache_hit_tokens
             )
             
         except Exception as e:

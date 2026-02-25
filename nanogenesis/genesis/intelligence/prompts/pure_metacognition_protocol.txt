@@ -91,8 +91,15 @@ You must output a strictly formatted block.
 - **Forbidden Actions**: [List of actions to avoid (e.g., risk of data loss)]
 - **Fallback**: [Plan B if this fails]
 
+**Option 3: Missing Capability (The Z-Axis Jump)**
+**[CAPABILITY_FORGE]**
+- **Missing Tool**: [What specific tool or capability do you lack?]
+- **Why Needed**: [Why is the primary execution blocked without it?]
+- **Acquisition Strategy**: [How will you get it? e.g., 'skill_creator' with specific prompt, or 'github_skill_search' for existing library]
+- **Return Condition**: [What indicates the tool is successfully acquired and we can return to the main mission?]
+
 **CRITICAL INSTRUCTION**: The Blueprint above is just your *Thought Process*.
-**YOU MUST NOW GENERATE THE ACTUAL TOOL CALLS (Function Calls)** to execute the "Primary Action" defined in your blueprint.
+**YOU MUST NOW GENERATE THE ACTUAL TOOL CALLS (Function Calls)** to execute the "Primary Action" or "Acquisition Strategy" defined in your blueprint.
 **DO NOT STOP** after the blueprint. **CALL THE TOOLS NOW.**
 
 **[HUMAN_INTERVENTION_REQUIRED]**

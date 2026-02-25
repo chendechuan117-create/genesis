@@ -3,97 +3,93 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from genesis.core.base import Tool
 
-import ast
-import os
-from typing import Dict, List, Any
-
-class ASTParser:
-    def __init__(self):
-        self.name = "ast_parser"
-        self.description = "使用Python的ast库解析Python文件，提取类和方法信息"
-        self.parameters = {
-            "file_path": {
-                "type": "string",
-                "description": "要分析的Python文件路径",
-                "required": True
-            }
+class ASTParserTool(Tool):
+    @property
+    def name(self) -> str:
+        return "ast_parser"
+        
+    @property
+    def description(self) -> str:
+        return "使用Python的ast库解析Python源文件，提取所有类名及其方法签名。"
+        
+    @property
+    def parameters(self) -> dict:
+        # 必须返回严格的 JSON Schema
+        return {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "要解析的Python源文件的路径"}
+            },
+            "required": ["file_path"]
         }
-    
-    def execute(self, file_path: str) -> Dict[str, Any]:
-        """
-        解析Python文件并提取类和方法信息
-        """
+        
+    async def execute(self, file_path: str) -> str:
+        import ast
+        import os
+        
+        # 检查文件是否存在
+        if not os.path.exists(file_path):
+            return f"错误：文件 '{file_path}' 不存在。"
+        
         try:
-            # 检查文件是否存在
-            if not os.path.exists(file_path):
-                return {
-                    "success": False,
-                    "error": f"文件不存在: {file_path}"
-                }
-            
-            # 读取文件内容
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-            
-            # 解析AST
-            tree = ast.parse(content, filename=file_path)
-            
-            # 提取类和方法信息
-            classes = []
-            
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ClassDef):
-                    class_info = {
-                        "class_name": node.name,
-                        "line_number": node.lineno,
-                        "methods": []
-                    }
-                    
-                    # 提取类中的方法
-                    for item in node.body:
-                        if isinstance(item, ast.FunctionDef):
-                            method_info = {
-                                "method_name": item.name,
-                                "line_number": item.lineno,
-                                "is_async": False
-                            }
-                            class_info["methods"].append(method_info)
-                        elif isinstance(item, ast.AsyncFunctionDef):
-                            method_info = {
-                                "method_name": item.name,
-                                "line_number": item.lineno,
-                                "is_async": True
-                            }
-                            class_info["methods"].append(method_info)
-                    
-                    classes.append(class_info)
-            
-            # 统计信息
-            total_classes = len(classes)
-            total_methods = sum(len(cls["methods"]) for cls in classes)
-            
-            return {
-                "success": True,
-                "file_path": file_path,
-                "file_size": len(content),
-                "total_classes": total_classes,
-                "total_methods": total_methods,
-                "classes": classes,
-                "summary": f"找到 {total_classes} 个类，共 {total_methods} 个方法"
-            }
-            
-        except SyntaxError as e:
-            return {
-                "success": False,
-                "error": f"语法错误: {str(e)}",
-                "line": e.lineno,
-                "offset": e.offset
-            }
         except Exception as e:
-            return {
-                "success": False,
-                "error": f"解析错误: {str(e)}"
-            }
-
-# 创建工具实例
-tool = ASTParser()
+            return f"读取文件时出错：{e}"
+        
+        try:
+            tree = ast.parse(content)
+        except SyntaxError as e:
+            return f"Python语法错误，无法解析AST：{e}"
+        
+        result = []
+        
+        # 遍历AST树，查找类定义
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                class_name = node.name
+                methods = []
+                
+                # 遍历类体，查找函数定义（方法）
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef):
+                        method_name = item.name
+                        # 构建方法签名：方法名(参数列表)
+                        args = item.args
+                        arg_names = []
+                        # 位置参数
+                        for arg in args.args:
+                            arg_names.append(arg.arg)
+                        # *args
+                        if args.vararg:
+                            arg_names.append(f"*{args.vararg.arg}")
+                        # 仅限关键字参数（Python 3.8+ 使用 args.kwonlyargs）
+                        for arg in args.kwonlyargs:
+                            arg_names.append(arg.arg)
+                        # **kwargs
+                        if args.kwarg:
+                            arg_names.append(f"**{args.kwarg.arg}")
+                        
+                        signature = f"{method_name}({', '.join(arg_names)})"
+                        methods.append(signature)
+                
+                result.append({
+                    "class": class_name,
+                    "methods": methods
+                })
+        
+        # 格式化输出
+        if not result:
+            return "该文件中未找到任何类定义。"
+        
+        output_lines = []
+        for cls_info in result:
+            output_lines.append(f"类: {cls_info['class']}")
+            if cls_info['methods']:
+                for method in cls_info['methods']:
+                    output_lines.append(f"  - {method}")
+            else:
+                output_lines.append(f"  (无方法)")
+            output_lines.append("")  # 空行分隔
+        
+        return "\n".join(output_lines).strip()

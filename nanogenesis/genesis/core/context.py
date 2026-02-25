@@ -102,32 +102,91 @@ You are a recursive intelligence process running with **User Privileges** on thi
         # Gather data for pipeline
         blocks = self.compression_engine.blocks if self.compression_engine else []
         
-        system_content = self.pipeline.build_system_context(
+        static_system_content = self.pipeline.build_system_context(
             user_input=user_input,
             raw_memory=raw_memory,
-            history_blocks=blocks
+            history_blocks=blocks,
+            category="static"
         )
         
-        # 兼容旧逻辑: Append extra user context (e.g. detailed instructions or temporary context)
-        if user_context:
-            system_content += f"\n\n【额外上下文】\n{user_context}"
-
         messages.append(Message(
             role=MessageRole.SYSTEM,
-            content=system_content
+            content=static_system_content
         ))
 
         # 2. 添加近期历史消息 (Pending Turns)
         messages.extend(self._message_history)
         
-        # 3. User message (Current)
+        # 3. Build Dynamic Context and append to User message (Current)
+        dynamic_context = self.pipeline.build_system_context(
+            user_input=user_input,
+            raw_memory=raw_memory,
+            history_blocks=blocks,
+            category="dynamic"
+        )
+        
+        final_user_content = ""
+        if dynamic_context:
+             final_user_content += f"{dynamic_context}\n\n"
+             
+        # 兼容旧逻辑: Append extra user context (e.g. strategic blueprint or temporary context)
+        if user_context:
+            final_user_content += f"【当前任务动态上下文】\n{user_context}\n\n"
+            
+        # Append actual user input at the very end
+        final_user_content += f"【用户输入】\n{user_input}"
+
         messages.append(Message(
             role=MessageRole.USER,
-            content=user_input
+            content=final_user_content
         ))
         
         return messages
+
+    async def build_stateless_messages(
+        self,
+        instruction: str,
+        **kwargs
+    ) -> List[Message]:
+        """
+        构建无状态执行者的消息列表 (Stateless Executor)
+        结构只有极端冷却的系统提示和当前的指令，不含任何历史和人格
+        """
+        messages = []
+        
+        # 极简、冷酷的系统提示
+        sys_prompt = (
+            "You are a pure API Execution Router. "
+            "Your ONLY purpose is to receive an instruction and map it to a Tool Call.\n"
+            "CRITICAL RULES:\n"
+            "1. You may think and perform logical deductions inside `<reflection>...</reflection>` tags.\n"
+            "2. DO NOT output conversational text or explanations outside of the `<reflection>` tags.\n"
+            "3. If a tool requires arguments, extract them from the user's instruction.\n"
+            "4. After your reflection, IMMEDIATELY output a valid JSON Tool Call.\n"
+            "5. If you cannot complete the instruction due to missing tools or fatal errors, output a Tool Call to `system_report_failure` with reason.\n"
+            "6. If you have successfully completed the instruction, output a Tool Call to `system_task_complete` with a summary."
+        )
+        
+        messages.append(Message(
+            role=MessageRole.SYSTEM,
+            content=sys_prompt
+        ))
+        
+        user_context = kwargs.get("user_context", "")
+        context_str = f"【STRATEGIC CONTEXT & PLAN】\n{user_context}\n\n" if user_context else ""
+        
+        messages.append(Message(
+            role=MessageRole.USER,
+            content=f"{context_str}INSTRUCTION TO EXECUTE:\n{instruction}"
+        ))
+        
+        return messages
+
     
+    def get_history(self) -> List[Message]:
+        """返回当前的上下文历史记录"""
+        return self._message_history
+
     def add_to_history(self, message: Message) -> None:
         """
         添加到历史记录

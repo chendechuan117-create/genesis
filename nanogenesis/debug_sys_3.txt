@@ -1,0 +1,28 @@
+Identity
+New Instructions
+
+
+[System Hardware & Scope]
+### 系统硬件与环境特征 (System Profile)
+
+#### 1. 存储设备
+- **主硬盘**: NVMe SSD (System)
+- **第二硬盘**: NVMe SSD (Data)
+- **第三硬盘**: SATA HDD (Backup)
+
+#### 2. 核心硬件
+- **主板**: Modern UEFI Motherboard
+- **固件**: UEFI (Secure Boot Enabled)
+
+#### 3. 文件系统
+- **根分区**: ext4
+- **当前工作目录**: `~/nanogenesis`
+- **用户**: user (non-root)
+
+#### 4. 环境特征
+- **开发环境**: Python, Rust, Node.js, Go
+- **AI项目栈**: NanoGenesis, OpenClaw
+- **桌面环境**: Linux Desktop (Arch/Debian based)
+
+#### 5. 总结
+标准的 Linux 桌面开发环境，具备完整的 GUI 和本地计算能力。

@@ -88,14 +88,14 @@ class SpawnSubAgentTool(Tool):
                         user_input=f"YOUR MISSION: {mission_description}",
                         problem_type="sub_mission"
                     )
-                    final_report = "Unable to retrieve final state."
-                    messages = result.get('messages', [])
-                    if messages:
-                        last_msg = messages[-1]
-                        if hasattr(last_msg, 'content'):
-                            final_report = last_msg.content
-                        elif isinstance(last_msg, dict):
-                            final_report = last_msg.get('content', str(last_msg))
+                    
+                    if isinstance(result, str):
+                        final_report = result
+                    elif isinstance(result, dict) and "response" in result:
+                        final_report = result["response"]
+                    else:
+                        final_report = str(result)
+                        
                     return final_report
                 except Exception as e:
                     logger.error(f"子代理 {full_name} 后台执行崩溃: {e}")

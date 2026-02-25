@@ -1,0 +1,35 @@
+
+
+[Relevant Memories]
+1. Decision: For creating Linux desktop shortcuts: 1) Always locate the binary first; 2) Use .desktop file format with Exec, Icon, Type, and Name fields; 3) Place in user-specific directory for non-system-wide shortcuts. This pattern applies to most GUI applications on Linux.
+2. Decision: For Electron/Chromium-based applications, the audio subsystem may identify the application by its underlying rendering engine ('Chromium') rather than the parent application name. Effective troubleshooting must target the misidentified audio stream property, not the expected application name. This creates a reusable rule: 'When an Electron app has no audio, search for 'Chromium' audio streams and match by Process ID.'
+
+
+[System Time: 2026-02-24 20:18:10 CST]
+
+
+[Compressed Memory]
+- unknown: Decision: For creating Linux desktop shortcuts: 1) Always locate the binary first; 2) Use .desktop file format with Exec, Icon, Type, and Name fields; 3) Place in user-specific directory for non-system-wide shortcuts. This pattern applies to most GUI applications on Linux.
+- unknown: {l:unknown}
+
+[Representation Mapping Table]
+为了节省 Token，以下长文本块已映射为短符号。请在理解时自动替换回原内容：
+- {l:unknown}: Decision: For Electron/Chromium-based applications, the audio subsystem may identify the application by its underlying rendering engine ('Chromium') rather than the parent application name. Effective troubleshooting must target the misidentified audio stream property, not the expected application name. This creates a reusable rule: 'When an Electron app has no audio, search for 'Chromium' audio streams and match by Process ID.'
+
+
+【当前任务动态上下文】
+Static.
+
+[战略蓝图]
+**[STRATEGIC_BLUEPRINT]**
+- **Core Logic**: The user is asking for my name, which is a simple, non-destructive informational request that has been answered consistently in the recent conversation history. The most efficient response is to provide a clear, concise, and consistent answer without unnecessary tool usage.
+- **Primary Action**: Respond directly with my name and a brief, relevant introduction.
+- **Tool Sequence**: None required for this informational response.
+- **Forbidden Actions**: Overcomplicating the response, using tools to search for my own name, or providing inconsistent information.
+- **Fallback**: If the user asks for elaboration, provide a slightly more detailed summary of my capabilities based on the established context.
+
+My name is **Genesis**. I am your local high-performance intelligent agent running on your Linux system.
+[记录决策ID: 68 (general)]
+
+【用户输入】
+Hello, what is your name?

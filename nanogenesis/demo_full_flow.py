@@ -7,7 +7,7 @@ from pathlib import Path
 # 添加路径 (Dynamically resolve project root)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from nanogenesis.agent import NanoGenesis
+from genesis.agent import NanoGenesis
 
 # 设置日志
 logging.basicConfig(
@@ -40,13 +40,22 @@ async def main():
     try:
         result = await agent.process(problem, user_context=context)
         
-        print("\n✅ 执行完成")
+        print(f"\n✅ 执行完成")
         print("=" * 60)
         
         # 检查是否生成了优化信息
         opt_info = result.get('optimization_info', {})
         if opt_info:
             print(f"自优化信息: {opt_info}")
+            
+        metrics = result.get('metrics')
+        if metrics:
+            print("\n📊 性能指标:")
+            print(f"- Iterations: {metrics.iterations}")
+            print(f"- Total Time: {metrics.total_time:.2f}s")
+            print(f"- Input Tokens: {metrics.input_tokens}")
+            print(f"- Cache Hit Tokens: {metrics.prompt_cache_hit_tokens} (🎯 New!)")
+            print(f"- Output Tokens: {metrics.output_tokens}")
             
         print(f"\n最终响应:\n{result['response']}")
         

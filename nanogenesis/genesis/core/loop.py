@@ -53,10 +53,20 @@ class AgentLoop:
         input_tokens = 0
         output_tokens = 0
         total_tokens = 0
+        prompt_cache_hit_tokens = 0
         tool_calls_recorded = []
         
-        # 1. 构建初始上下文
-        built_messages = await self.context.build_messages(user_input, **context_kwargs)
+        # 1. 构建初始上下文 (Stateless Protocol)
+        # We pass ONLY the tactical instruction, ignoring user context/history
+        instruction = context_kwargs.get("user_context", user_input)
+        if "[战略蓝图]" in instruction:
+             # Extract just the blueprint if possible
+             try:
+                 instruction = instruction.split("[战略蓝图]")[1].split("[记录决策ID:")[0].strip()
+             except:
+                 pass
+                 
+        built_messages = await self.context.build_stateless_messages(instruction)
         messages = [msg.to_dict() for msg in built_messages]
         
         # 2. ReAct 循环 (Elastic Endurance)
@@ -132,6 +142,18 @@ class AgentLoop:
                              else:
                                  step_callback("reasoning", chunk_data)
                 
+                # --- DEBUG DUMP ---
+                import json
+                import os
+                dump_file = "agent_loop_payload_dump.json"
+                dump_data = {
+                    "messages": messages,
+                    "tools": [t for t in self.tools.get_definitions()] if iteration < hard_limit else None
+                }
+                with open(dump_file, "a", encoding="utf-8") as _df:
+                    _df.write(json.dumps(dump_data, ensure_ascii=False) + "\n---\n")
+                # ------------------
+                
                 response = await self.provider.chat(
                     messages=messages,
                     tools=[t for t in self.tools.get_definitions()] if iteration < hard_limit else None,
@@ -141,6 +163,7 @@ class AgentLoop:
                 input_tokens += getattr(response, "input_tokens", 0) or 0
                 output_tokens += getattr(response, "output_tokens", 0) or 0
                 total_tokens += getattr(response, "total_tokens", 0) or 0
+                prompt_cache_hit_tokens += getattr(response, "prompt_cache_hit_tokens", 0) or 0
                 
                 # Fallback: If content is empty but reasoning exists (DeepSeek R1 quirk), use reasoning
                 if not response.content and getattr(response, "reasoning_content", None):
@@ -197,6 +220,7 @@ class AgentLoop:
                           input_tokens=input_tokens,
                           output_tokens=output_tokens,
                           total_tokens=total_tokens,
+                          prompt_cache_hit_tokens=prompt_cache_hit_tokens,
                           tools_used=tools_used,
                           success=False,
                           tool_calls=tool_calls_recorded
@@ -227,6 +251,7 @@ class AgentLoop:
                             input_tokens=input_tokens,
                             output_tokens=output_tokens,
                             total_tokens=total_tokens,
+                            prompt_cache_hit_tokens=prompt_cache_hit_tokens,
                             tools_used=tools_used,
                             success=False,
                             tool_calls=tool_calls_recorded
@@ -234,11 +259,23 @@ class AgentLoop:
                  except Exception as e:
                      logger.warning(f"Failed to parse reflection: {e}")
             if not response.tool_calls and response.content:
-                # We used to have an aggressive check here that banned "```" if no tools were called.
-                # This was fundamentally flawed because it prevented the model from returning code in its final answer.
-                # We have removed this to increase foundational robustness.
-                pass
-
+                # [Stateless Architecture Enforcement]
+                # The prompt strictly specifies to output a tool call (even if it's `system_report_failure`).
+                # If the LLM outputs plain text instead of a tool call, it's hallucinating.
+                # We log this and forcefully return to the main agent loop.
+                logger.error(f"⚠️ Action Gap/Hallucination Detected: Expected Tool Call, got clear text.")
+                final_response = f"[STATELESS_EXECUTOR_ERROR] The executor hallucinated a response instead of calling a tool: {response.content[:200]}"
+                return final_response, PerformanceMetrics(
+                    iterations=iteration,
+                    total_time=time.time() - start_time,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    total_tokens=total_tokens,
+                    prompt_cache_hit_tokens=prompt_cache_hit_tokens,
+                    tools_used=tools_used,
+                    success=False,
+                    tool_calls=tool_calls_recorded
+                )
             if response.has_tool_calls:
 
                 normalized_tool_calls = []
@@ -291,8 +328,8 @@ class AgentLoop:
                 call_hash = "|".join(current_call_hashes)
                 if call_hash == last_tool_call_hash:
                     loop_counter += 1
-                    # Strategic Interrupt: If stuck in loop for 3 turns, abort immediately
-                    if loop_counter >= 3:
+                    # Strategic Interrupt: If stuck in loop for 5 turns, abort immediately
+                    if loop_counter >= 5:
                         logger.warning(f"⛔ Strategic Interrupt: Loop Detected ({call_hash})")
                         final_response = f"[STRATEGIC_INTERRUPT] Caught in a loop executing: {call_hash}. Stopping execution to request a new strategy."
                         success = False
@@ -303,6 +340,7 @@ class AgentLoop:
                             input_tokens=input_tokens,
                             output_tokens=output_tokens,
                             total_tokens=total_tokens,
+                            prompt_cache_hit_tokens=prompt_cache_hit_tokens,
                             tools_used=tools_used,
                             success=False,
                             tool_calls=tool_calls_recorded
@@ -331,6 +369,31 @@ class AgentLoop:
 
                     tool_id = tool_call["id"]
                     tools_used.append(tool_name)
+                    
+                    if tool_name == "system_task_complete":
+                        logger.info(f"🏁 Task legally marked as complete by Executor.")
+                        summary = tool_args.get("summary", "")
+                        result_str = f"Task Complete. Summary: {summary}"
+                        
+                        built_messages.append(Message(
+                            role=MessageRole.TOOL,
+                            content=result_str,
+                            tool_call_id=tool_id
+                        ))
+                        
+                        final_response = f"[STATELESS_EXECUTOR_SUCCESS] Task execution finished. Summary: {summary}"
+                        success = True
+                        return final_response, PerformanceMetrics(
+                            iterations=iteration,
+                            total_time=time.time() - start_time,
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            total_tokens=total_tokens,
+                            prompt_cache_hit_tokens=prompt_cache_hit_tokens,
+                            tools_used=tools_used,
+                            success=success,
+                            tool_calls=tool_calls_recorded
+                        )
                     
                     # Callback: Tool Start
                     # Callback: Tool Start
@@ -382,19 +445,7 @@ class AgentLoop:
                                 logger.error(f"Failed to encode image: {e}")
                                 result_str = f"Error encoding screenshot: {e}"
 
-                    # 采集错误信息 (Failure Attribution)
-                    if "error" in result_str.lower() or "failed" in result_str.lower():
-                        if tool_name not in tool_errors: tool_errors[tool_name] = []
-                        tool_errors[tool_name].append(result_str[:100])
-                        
-                        # Strategic Interrupt logic... [Keep existing logic]
-                        # ...
-                        # For brevity in this diff, I am assuming the surrounding logic remains or is re-inserted if I cut it.
-                        # Wait, the tool only allows contiguous replacement. I must be careful not to delete the interrupt logic.
-                        # I will assume the interrupt logic follows immediately below and I should just insert the image handling before it.
-                        pass # Placeholder to indicate I am not replacing the interrupt logic below.
-
-                    # Construct Message
+                    # Construct Message (Append tool result to context)
                     if image_payload:
                         content_block = [
                             {"type": "text", "text": f"Tool Output ({tool_name}): {result_str}"},
@@ -411,23 +462,49 @@ class AgentLoop:
                             content=result_str,
                             tool_call_id=tool_id
                         ))
+
+                    # 采集错误信息 (Failure Attribution)
+                    result_lower = result_str.lower()
+                    is_error = False
                     
-                    # 采集错误信息 (Failure Attribution) - RE-INSERTED to ensure it's not lost
-                    if "error" in result_str.lower() or "failed" in result_str.lower():
-
+                    # More robust error detection (avoids false positives like "No error found")
+                    if tool_name == "shell":
+                        # For shell, only trust explicit failure indicators
+                        if "exit code:" in result_lower and "exit code: 0" not in result_lower:
+                            is_error = True
+                        elif "command not found" in result_lower or "permission denied" in result_lower:
+                            is_error = True
+                    else:
+                        # For other tools, check if it starts with Error/Exception or contains explicit failure language
+                        if "error:" in result_lower or "exception:" in result_lower or result_lower.startswith("error"):
+                            is_error = True
+                    
+                    if is_error:
                         if tool_name not in tool_errors: tool_errors[tool_name] = []
-                        compressed = _error_compressor.compress(result_str, source=tool_name)
-                        tool_errors[tool_name].append(
-                            _error_compressor.format_for_llm(compressed)
-                        )
-
                         
-                        # Strategic Interrupt: Consecutive Failures
-                        # If the SAME tool fails 3 times in a row (or just too many errors in general)
+                        # Try to compress the error to save context window
+                        try:
+                            compressed = _error_compressor.compress(result_str, source=tool_name)
+                            new_error_str = _error_compressor.format_for_llm(compressed)
+                        except:
+                            new_error_str = result_str[:100]
+                            
+                        # Entropy-Aware Circuit Breaker (State Delta)
+                        # If the new error is DIFFERENT from the last error, the agent is exploring/learning.
+                        # We reset the sequential counter.
+                        if tool_errors[tool_name]:
+                            last_error = tool_errors[tool_name][-1]
+                            if new_error_str != last_error:
+                                logger.info(f"🔄 Entropy Delta Detected: Agent encountered a new error for {tool_name}. Resetting failure counter.")
+                                tool_errors[tool_name] = [] # Reset!
+                        
+                        tool_errors[tool_name].append(new_error_str)
+                        
+                        # Strategic Interrupt: Consecutive IDENTICAL Failures
                         sequential_failures = len(tool_errors[tool_name])
                         if sequential_failures >= 3:
-                             logger.warning(f"⛔ Strategic Interrupt: {tool_name} failed {sequential_failures} times sequentially.")
-                             final_response = f"[STRATEGIC_INTERRUPT] Tool {tool_name} failed {sequential_failures} times in a row. Stopping to replan."
+                             logger.warning(f"⛔ Strategic Interrupt: {tool_name} failed with IDENTICAL errors {sequential_failures} times sequentially.")
+                             final_response = f"[STRATEGIC_INTERRUPT] Tool {tool_name} failed {sequential_failures} times in a row with the exact same error. Stopping to replan."
                              success = False
                              return final_response, PerformanceMetrics(
                                 iterations=iteration,
@@ -435,10 +512,15 @@ class AgentLoop:
                                 input_tokens=input_tokens,
                                 output_tokens=output_tokens,
                                 total_tokens=total_tokens,
+                                prompt_cache_hit_tokens=prompt_cache_hit_tokens,
                                 tools_used=tools_used,
                                 success=False,
                                 tool_calls=tool_calls_recorded
                             )
+                    else:
+                        # Reset the sequential error count for this tool on a successful run
+                        if tool_name in tool_errors:
+                            tool_errors[tool_name] = []
                         
                         # Circuit Breaker: Critical Configuration Errors (Missing Keys, Auth)
                         # The user specifically wants the agent to stop and fix if a tool is broken.
@@ -461,6 +543,7 @@ class AgentLoop:
                                 input_tokens=input_tokens,
                                 output_tokens=output_tokens,
                                 total_tokens=total_tokens,
+                                prompt_cache_hit_tokens=prompt_cache_hit_tokens,
                                 tools_used=tools_used,
                                 success=False,
                                 tool_calls=tool_calls_recorded
@@ -483,27 +566,10 @@ class AgentLoop:
                 continue
             
             else:
-                # 2.3 Action Enforcement (The "No-Talk" Protocol)
-                # If the agent reflected on a plan but didn't call a tool, we might need to push it.
-                # Only apply this if we successfully parsed a reflection previously.
-                if reflection_content:
-                    # Check for "future tense" or "intent" in reflection
-                    intent_keywords = ["next step", "will", "going to", "try"]
-                    completion_keywords = ["done", "complete", "finished", "success", "answer"]
-                    
-                    has_intent = any(k in reflection_content.lower() for k in intent_keywords)
-                    is_complete = any(k in reflection_content.lower() for k in completion_keywords)
-                    
-                    if has_intent and not is_complete:
-                        logger.warning(f"⚠️ Action Gap Detected: Reflection implies intent but no tool called.")
-                        built_messages.append(Message(
-                            role=MessageRole.SYSTEM,
-                            content="[ACTION ENFORCEMENT] You outlined a plan in your reflection but did NOT call any tool.\n"
-                                    "- If you want to execute this plan, you MUST call a tool (e.g. `chain_next`, `shell`, `web_search`).\n"
-                                    "- Do not just say you will do it. Do it."
-                        ))
-                        continue
-
+                # 2.3 Action Enforcement 
+                # [Stateless Architecture] We no longer need to check for intents because
+                # any response that reaches here without tool calls has already been caught
+                # by the hallucination detector above.
                 final_response = response.content
                 built_messages.append(Message(
                     role=MessageRole.ASSISTANT,
@@ -536,6 +602,7 @@ class AgentLoop:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total_tokens,
+            prompt_cache_hit_tokens=prompt_cache_hit_tokens,
             tools_used=tools_used,
             success=success,
             tool_calls=tool_calls_recorded or None

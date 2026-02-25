@@ -3,149 +3,93 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from genesis.core.base import Tool
 
-import ast
-import json
-from typing import Dict, List, Any
-
-
-class PythonASTAnalyzer:
-    """Python AST代码分析器"""
-    
-    def __init__(self):
-        self.name = "python_ast_analyzer"
-        self.description = "使用Python AST库分析Python代码结构，提取类和方法信息"
-        self.parameters = {
-            "file_path": {
-                "type": "string",
-                "description": "要分析的Python文件路径",
-                "required": True
-            }
+class PythonASTAnalyzer(Tool):
+    @property
+    def name(self) -> str:
+        return "python_ast_analyzer"
+        
+    @property
+    def description(self) -> str:
+        return "使用 Python 的 ast 模块解析指定 Python 文件，提取所有类名及其方法签名。"
+        
+    @property
+    def parameters(self) -> dict:
+        # 必须返回严格的 JSON Schema
+        return {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "要分析的 Python 文件的绝对或相对路径。"}
+            },
+            "required": ["file_path"]
         }
-    
-    def execute(self, file_path: str) -> Dict[str, Any]:
-        """执行分析"""
+        
+    async def execute(self, file_path: str) -> str:
+        import ast
+        import os
+        
+        # 检查文件是否存在
+        if not os.path.exists(file_path):
+            return f"错误：文件 '{file_path}' 不存在。"
+        
         try:
-            return self._analyze_file(file_path)
+            with open(file_path, 'r', encoding='utf-8') as f:
+                file_content = f.read()
         except Exception as e:
-            return {"error": f"分析失败: {str(e)}"}
-    
-    def _analyze_file(self, file_path: str) -> Dict[str, Any]:
-        """分析Python文件并提取类和方法信息"""
-        with open(file_path, 'r', encoding='utf-8') as f:
-            source_code = f.read()
+            return f"错误：无法读取文件 '{file_path}'。原因：{e}"
         
-        tree = ast.parse(source_code)
+        try:
+            tree = ast.parse(file_content)
+        except SyntaxError as e:
+            return f"错误：文件 '{file_path}' 中存在语法错误，无法解析。原因：{e}"
         
-        result = {
-            "file": file_path,
-            "classes": [],
-            "summary": {
-                "total_classes": 0,
-                "total_methods": 0
-            }
-        }
+        result = []
         
+        # 遍历 AST 树，查找类定义
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef):
-                class_info = self._extract_class_info(node)
-                result["classes"].append(class_info)
-                result["summary"]["total_classes"] += 1
-                result["summary"]["total_methods"] += len(class_info["methods"])
+                class_name = node.name
+                methods = []
+                
+                # 遍历类体，查找函数定义（方法）
+                for item in node.body:
+                    if isinstance(item, ast.FunctionDef):
+                        method_name = item.name
+                        # 构建方法签名（参数列表）
+                        args = item.args
+                        arg_names = []
+                        # 位置参数
+                        for arg in args.args:
+                            arg_names.append(arg.arg)
+                        # 可变位置参数 (*args)
+                        if args.vararg:
+                            arg_names.append(f"*{args.vararg.arg}")
+                        # 关键字参数
+                        for arg in args.kwonlyargs:
+                            arg_names.append(arg.arg)
+                        # 可变关键字参数 (**kwargs)
+                        if args.kwarg:
+                            arg_names.append(f"**{args.kwarg.arg}")
+                        
+                        signature = f"{method_name}({', '.join(arg_names)})"
+                        methods.append(signature)
+                
+                result.append({
+                    "class": class_name,
+                    "methods": methods
+                })
         
-        return result
-    
-    def _extract_class_info(self, class_node: ast.ClassDef) -> Dict[str, Any]:
-        """提取类信息"""
-        class_info = {
-            "name": class_node.name,
-            "line": class_node.lineno,
-            "bases": [],
-            "decorators": [],
-            "methods": []
-        }
+        # 格式化输出
+        if not result:
+            return f"文件 '{file_path}' 中没有找到类定义。"
         
-        # 提取基类
-        for base in class_node.bases:
-            if isinstance(base, ast.Name):
-                class_info["bases"].append(base.id)
-            elif isinstance(base, ast.Attribute):
-                class_info["bases"].append(self._get_attribute_name(base))
+        output_lines = []
+        for cls_info in result:
+            output_lines.append(f"类名: {cls_info['class']}")
+            if cls_info['methods']:
+                for method in cls_info['methods']:
+                    output_lines.append(f"  - {method}")
+            else:
+                output_lines.append(f"  (无方法)")
+            output_lines.append("")  # 空行分隔
         
-        # 提取装饰器
-        for decorator in class_node.decorator_list:
-            if isinstance(decorator, ast.Name):
-                class_info["decorators"].append(decorator.id)
-            elif isinstance(decorator, ast.Call):
-                if isinstance(decorator.func, ast.Name):
-                    class_info["decorators"].append(decorator.func.id)
-        
-        # 提取方法
-        for node in class_node.body:
-            if isinstance(node, ast.FunctionDef):
-                method_info = self._extract_method_info(node)
-                class_info["methods"].append(method_info)
-            elif isinstance(node, ast.AsyncFunctionDef):
-                method_info = self._extract_method_info(node)
-                method_info["is_async"] = True
-                class_info["methods"].append(method_info)
-        
-        return class_info
-    
-    def _extract_method_info(self, func_node: ast.FunctionDef) -> Dict[str, Any]:
-        """提取方法信息"""
-        method_info = {
-            "name": func_node.name,
-            "line": func_node.lineno,
-            "is_async": False,
-            "decorators": [],
-            "args": []
-        }
-        
-        # 提取装饰器
-        for decorator in func_node.decorator_list:
-            if isinstance(decorator, ast.Name):
-                method_info["decorators"].append(decorator.id)
-            elif isinstance(decorator, ast.Call):
-                if isinstance(decorator.func, ast.Name):
-                    method_info["decorators"].append(decorator.func.id)
-        
-        # 提取参数
-        args = func_node.args
-        if args.posonlyargs:
-            method_info["args"].extend([arg.arg for arg in args.posonlyargs])
-        if args.args:
-            method_info["args"].extend([arg.arg for arg in args.args])
-        if args.vararg:
-            method_info["args"].append(f"*{args.vararg.arg}")
-        if args.kwonlyargs:
-            method_info["args"].extend([arg.arg for arg in args.kwonlyargs])
-        if args.kwarg:
-            method_info["args"].append(f"**{args.kwarg.arg}")
-        
-        return method_info
-    
-    def _get_attribute_name(self, node: ast.Attribute) -> str:
-        """获取属性名称"""
-        if isinstance(node.value, ast.Name):
-            return f"{node.value.id}.{node.attr}"
-        elif isinstance(node.value, ast.Attribute):
-            return f"{self._get_attribute_name(node.value)}.{node.attr}"
-        return node.attr
-
-
-# 创建Tool类供系统使用
-class Tool:
-    def __init__(self):
-        self.name = "python_ast_analyzer"
-        self.description = "使用Python AST库分析Python代码结构，提取类和方法信息"
-        self.parameters = {
-            "file_path": {
-                "type": "string",
-                "description": "要分析的Python文件路径",
-                "required": True
-            }
-        }
-    
-    def execute(self, file_path: str) -> Dict[str, Any]:
-        analyzer = PythonASTAnalyzer()
-        return analyzer.execute(file_path)
+        return "\n".join(output_lines)
