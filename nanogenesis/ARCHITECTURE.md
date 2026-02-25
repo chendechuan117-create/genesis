@@ -9,10 +9,10 @@
 Genesis 系统的代码物理分布遵循严格的“**核心引擎驱动 + 动态插件扩展**”结构。
 
 ### 🧠 主轴核心 (The Spine & Brain)
-绝对核心的运转逻辑。**原则上禁止随意修改这些文件中的业务流程，它们的职责仅限于流转和调度**。
-*   `nanogenesis/genesis/agent.py` - **认知主控制器 (Agent Orchestrator)**：系统的总入口，负责生命周期管理、策略调度和宏观任务流转。
-*   `nanogenesis/genesis/core/loop.py` - **衔尾蛇执行门 (Ouroboros Loop)**：真正执行循环的核心。它从 `agent` 接收任务，通过与大模型的交互和工具的调用，完成具体的 Action。**此文件中内置了严格的 Schema 清洗器 (Sanitizer)，禁止任何组件绕过它发送 Tool Payload！**
-*   `nanogenesis/genesis/core/cognition.py` - **认知处理器**：管理反思、策略生成和深度思考协议 (`Polyhedron` 等)。
+绝对核心的运转逻辑。**原则上禁止随意修改这些文件中的业务流程，它们的职责仅限于流转和调度**。本架构严格遵循**“执行与包装硬隔离 (Decoupled Execution from Packaging)”**原则：
+*   `nanogenesis/genesis/agent.py` - **认知主控制器 & 包装器 (Agent Orchestrator & Context Packager)**：系统的总入口。负责生命周期管理、策略调度和宏观任务流转。同时，作为 **Phase 3 Packager**，它负责接收底层无生命特征的执行日志，结合上下文记忆，将其包装为连贯的自然语言回复人类。
+*   `nanogenesis/genesis/core/loop.py` - **无状态执行门 (Stateless Ouroboros Loop)**：真正执行循环的苦工。**它被物理剥夺了获取用户上下文和历史对话的能力。** 它的唯一输入是“单步具体指令（如：点击按钮）”，唯一输出是严谨的 JSON Tool Call 操作记录。此机制旨在彻底消灭 LLM 在执行环境交互时的文本“幻觉”与“偷懒心理”。
+*   `nanogenesis/genesis/core/cognition.py` - **认知处理器**：管理反思、策略生成和深度思考协议 (`Polyhedron` 等)。在 Phase 1 (战略阶段)，提炼问题意图并下发给 `loop.py`。
 
 ### 💡 插件化注册骨干 (The Registry Backbone)
 **这是解决误删和级联崩溃的终极方案。** 系统不再依赖硬编码来判断应该调用哪个组件。
