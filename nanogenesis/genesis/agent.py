@@ -25,6 +25,10 @@ from genesis.core.provider_manager import ProviderRouter # Type hinting
 from genesis.core.config import config
 from genesis.core.trust_anchor import TrustAnchorManager
 
+from genesis.core.workshops import WorkshopManager
+from genesis.core.manager import Manager
+from genesis.core.op_executor import OpExecutor
+
 logger = logging.getLogger(__name__)
 
 
@@ -97,7 +101,20 @@ class NanoGenesis:
         # 性能监控 & 日志
         self.metrics_history = []
         self.reasoning_log: list = []
-        
+
+        # --- Genesis V2: Manager + Workshop System ---
+        active_provider = getattr(provider_router, 'get_active_provider', lambda: provider_router)()
+        self.workshops = WorkshopManager()
+        self._v2_executor = OpExecutor(full_registry=self.tools, provider=active_provider)
+        self._v2_manager = Manager(
+            workshops=self.workshops,
+            provider=active_provider,
+            registry=self.tools,
+        )
+        self._v2_manager.set_executor(self._v2_executor)
+        logger.debug("✓ Genesis V2 Manager wired")
+        # --- End V2 wiring ---
+
         logger.debug(f"✓ NanoGenesis 2.0 Agent Assembled")
         self._history_loaded = False
     
@@ -107,16 +124,18 @@ class NanoGenesis:
         user_context: Optional[str] = None,
         problem_type: str = "general",
         step_callback: Optional[Any] = None,
+        use_v2: bool = True,
         **kwargs
     ) -> Dict[str, Any]:
         """
-        处理用户输入（单脑架构 + 纯粹元认知协议 + 流式执行）
-        
-        Refactored for "Body Swap":
-        - 移除 [ACQUISITION_PLAN] 等硬编码分支
-        - 启用 AdaptiveLearner 自适应
-        - 启用 Loop 直接工具调用
+        处理用户输入。
+
+        use_v2=True (default): Genesis V2 路径 — Manager + Workshop + OpExecutor
+        use_v2=False:          Legacy V1 路径  — Ouroboros Loop (保留备用)
         """
+        if use_v2:
+            return await self._process_v2(user_input, step_callback=step_callback)
+        # --- Legacy V1 path below (Ouroboros Loop) ---
         import time
         process_start_time = time.time()
         
@@ -1198,6 +1217,69 @@ Output JSON only:
     def get_reasoning_log(self) -> list:
         """获取决策推理日志 (Decision Transparency)"""
         return self.reasoning_log
+
+    # ─── Genesis V2 Entry Point ──────────────────────────────────────────────────
+
+    async def _process_v2(self, user_input: str, step_callback: Optional[Any] = None) -> Dict[str, Any]:
+        """
+        Genesis V2 执行路径。
+        路由决策（chat vs task）完全由 Manager._decide_route() 负责，无硬编码分类逻辑。
+        """
+        import time
+        start = time.time()
+
+        # 提取最近对话上下文（最多 8 条，每条截 200 字）
+        recent_context = ""
+        try:
+            if hasattr(self, "context") and self.context is not None:
+                history = self.context.get_history() if hasattr(self.context, "get_history") else []
+                if history:
+                    lines = []
+                    for msg in history[-8:]:
+                        role = getattr(msg, "role", "unknown")
+                        content = getattr(msg, "content", "") or ""
+                        if content:
+                            lines.append(f"{role}: {str(content)[:200]}")
+                    recent_context = "\n".join(lines)
+        except Exception:
+            pass
+
+        result = await self._v2_manager.process(user_input, step_callback=step_callback, recent_context=recent_context)
+        result["elapsed"] = round(time.time() - start, 2)
+        result.setdefault("path", "v2")
+
+        pending = self.workshops.stats().get("pending_lessons", 0)
+        if pending:
+            result["pending_lessons"] = pending
+            result["pending_lessons_hint"] = (
+                f"有 {pending} 条待审核知识，调用 agent.review_workshop_lessons() 查看"
+            )
+
+        # 兼容 web_ui.py 期望的 result['response'] 字段
+        if result.get("success"):
+            out = result.get("output") or {}
+            result["response"] = (
+                out.get("summary") if isinstance(out, dict) else str(out)
+            ) or "任务已完成"
+            logger.info(
+                f"✅ V2 complete in {result['elapsed']}s "
+                f"(attempts={result.get('attempts', 1)}, "
+                f"tokens={result.get('tokens_used', 0)})"
+            )
+        else:
+            result["response"] = result.get("error") or result.get("message") or "任务执行失败"
+            logger.warning(
+                f"🔴 V2 circuit broken: {result.get('error', 'unknown')} "
+                f"(elapsed={result['elapsed']}s)"
+            )
+        return result
+
+    def review_workshop_lessons(self) -> str:
+        """
+        返回待审核知识队列的可读摘要。
+        用法：print(agent.review_workshop_lessons())
+        """
+        return self.workshops.format_pending_review()
     
     def clear_reasoning_log(self):
         """清空推理日志"""

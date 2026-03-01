@@ -394,7 +394,32 @@ class AgentLoop:
                             success=success,
                             tool_calls=tool_calls_recorded
                         )
-                    
+
+                    if tool_name == "system_report_failure":
+                        reason = tool_args.get("reason", "unknown")
+                        logger.warning(f"🔴 Task reported as failed by Executor: {reason}")
+                        result_str = f"Task Failed. Reason: {reason}"
+
+                        built_messages.append(Message(
+                            role=MessageRole.TOOL,
+                            content=result_str,
+                            tool_call_id=tool_id
+                        ))
+
+                        final_response = f"[STATELESS_EXECUTOR_FAILURE] {reason}"
+                        success = False
+                        return final_response, PerformanceMetrics(
+                            iterations=iteration,
+                            total_time=time.time() - start_time,
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            total_tokens=total_tokens,
+                            prompt_cache_hit_tokens=prompt_cache_hit_tokens,
+                            tools_used=tools_used,
+                            success=success,
+                            tool_calls=tool_calls_recorded
+                        )
+
                     # Callback: Tool Start
                     # Callback: Tool Start
                     if step_callback:
@@ -444,6 +469,19 @@ class AgentLoop:
                             except Exception as e:
                                 logger.error(f"Failed to encode image: {e}")
                                 result_str = f"Error encoding screenshot: {e}"
+
+                    # Callback: Tool Result (fires after execution, with actual result)
+                    if step_callback:
+                        if asyncio.iscoroutinefunction(step_callback):
+                            await step_callback("tool_result", {
+                                "name": tool_name, "args": tool_args,
+                                "result": result_str[:800]
+                            })
+                        else:
+                            step_callback("tool_result", {
+                                "name": tool_name, "args": tool_args,
+                                "result": result_str[:800]
+                            })
 
                     # Construct Message (Append tool result to context)
                     if image_payload:
@@ -542,8 +580,8 @@ class AgentLoop:
                         # Circuit Breaker: Critical Configuration Errors (Missing Keys, Auth)
                         # The user specifically wants the agent to stop and fix if a tool is broken.
                         critical_keywords = [
-                            "api_key", "configured", "unauthorized", "access denied", 
-                            "authentication failed", "permission denied"
+                            "api_key not configured", "unauthorized", "access denied", 
+                            "authentication failed", "permission denied", "invalid api key"
                         ]
                         if any(k in result_str.lower() for k in critical_keywords):
                             logger.warning(f"⛔ Circuit Breaker Triggered: Critical Failure in {tool_name}")
