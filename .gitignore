@@ -8,3 +8,41 @@ __pycache__/
 tmp/
 *.sqlite
 *.db
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.env
+*.pid
+*.log
+.DS_Store
+
+
+# Junk
+archive/
+backups/
+rogue-hero/
+venv/
+__pycache__/
+*.pyc
+*.log
+*.pid
+.DS_Store
+
+
+# Junk
+archive/
+backups/
+rogue-hero/
+venv/
+__pycache__/
+*.pyc
+*.log
+*.pid
+.DS_Store
+.env
+
+
+# Generated
+
