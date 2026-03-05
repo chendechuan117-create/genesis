@@ -115,6 +115,19 @@ source venv/bin/activate  # Windows (WSL): source venv/bin/activate
 pip install -r requirements.txt
 ```
 
+### 3. (可选) 安装 OCR 支持 (Visual Cortex)
+为了让 Genesis 能"读懂"图片中的文字，推荐安装 Tesseract OCR：
+
+**Ubuntu/Debian:**
+```bash
+sudo apt-get install tesseract-ocr
+```
+
+**macOS:**
+```bash
+brew install tesseract
+```
+
 ### 配置 (.env)
 
 ```ini
