@@ -21,6 +21,7 @@ def build_op_spec(
     selection: Dict[str, Any],
     workshops: WorkshopManager,
     attempt: int = 1,
+    sensory_context: str = "",
 ) -> OpSpec:
     """
     将 Manager LLM 的选择 JSON + 车间内容 组装为 OpSpec。
@@ -30,6 +31,7 @@ def build_op_spec(
         selection:   Manager LLM 输出的 JSON，结构见下方说明
         workshops:   WorkshopManager 实例，用于加载选中条目的完整内容
         attempt:     重组次数（熔断计数）
+        sensory_context: 感知信息描述字符串
 
     Selection JSON 期望结构：
     {
@@ -83,6 +85,7 @@ def build_op_spec(
         strategy_hint=strategy_hint,
         expected_output=expected_output,
         attempt_number=attempt,
+        sensory_context=sensory_context,
     )
 
     logger.debug(
@@ -101,5 +104,6 @@ def describe_op_spec(spec: OpSpec) -> str:
         f"  facts:       {len(spec.context_facts)} items\n"
         f"  format:      {list(spec.output_schema.keys())}\n"
         f"  strategy:    {spec.strategy_hint}\n"
-        f"  expected:    {spec.expected_output}"
+        f"  expected:    {spec.expected_output}\n"
+        f"  sensory:     {spec.sensory_context[:100]}..."
     )

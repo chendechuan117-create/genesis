@@ -384,8 +384,21 @@ class Manager:
             selection=selection,
             workshops=self.workshops,
             attempt=attempt,
+            sensory_context=self._build_sensory_context_str(packet),
         )
         return spec
+
+    def _build_sensory_context_str(self, packet: SensoryPacket) -> str:
+        """Helper: Describe attachments for the Executor"""
+        attachments = [item for item in packet.items if item.type != 'text']
+        if not attachments:
+            return ""
+        
+        lines = ["ATTACHED SENSORY DATA (You MUST use this):"]
+        for item in attachments:
+            meta_str = ", ".join(f"{k}={v}" for k, v in item.metadata.items())
+            lines.append(f"- [{item.type.upper()}] Path='{item.content}' ({item.mime_type}) {meta_str}")
+        return "\n".join(lines)
 
     def _build_assembly_prompt(
         self,

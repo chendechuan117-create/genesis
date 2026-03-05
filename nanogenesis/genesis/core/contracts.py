@@ -28,6 +28,7 @@ class OpSpec:
     expected_output: str                    # 成功标准，用于 OpResult.success 判断
     max_iterations: int = 5                 # op 内部最大工具调用次数（防止死循环）
     attempt_number: int = 1                 # 第几次重组尝试（熔断计数用）
+    sensory_context: str = ""               # 感知上下文（附件列表、图片描述等），供 Executor 提示 LLM
 
 
 @dataclass

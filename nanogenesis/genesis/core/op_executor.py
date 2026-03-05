@@ -114,6 +114,9 @@ class OpExecutor:
         isolated_registry = self._build_isolated_registry(spec.tool_ids)
         context = self._build_isolated_context()
         instruction = self._format_instruction(spec)
+        
+        # DEBUG: Log the instruction to see if Sensory Context is present
+        logger.info(f"📝 Op Instruction:\n{instruction[:1000]}...") # Log first 1000 chars
 
         loop = AgentLoop(
             tools=isolated_registry,
@@ -194,10 +197,15 @@ class OpExecutor:
         """将 OpSpec 格式化为执行指令（传入 loop.run 的 user_input）"""
         facts_str = "\n".join(f"  - {f}" for f in spec.context_facts) if spec.context_facts else "  (none)"
         schema_str = json.dumps(spec.output_schema, ensure_ascii=False)
+        
+        sensory_section = ""
+        if spec.sensory_context:
+            sensory_section = f"SENSORY CONTEXT:\n{spec.sensory_context}\n\n"
 
         return (
             f"OBJECTIVE: {spec.objective}\n"
             f"\n"
+            f"{sensory_section}"
             f"AVAILABLE TOOLS: {spec.tool_ids}\n"
             f"\n"
             f"CONTEXT FACTS:\n{facts_str}\n"
