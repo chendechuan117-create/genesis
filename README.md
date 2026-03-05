@@ -123,4 +123,3 @@ python3 discord_bot.py
 
 ## 📄 License
 MIT
-<!-- V2.5 Updated -->
