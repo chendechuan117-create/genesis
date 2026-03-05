@@ -35,9 +35,9 @@ Output ONLY valid JSON. No explanation.
 {"scope": "...", "action": "...", "target": "...", "route": "chat|task"}
 
 - scope: local | network | user | project | web | meta
-- action: install | query | create | modify | delete | monitor | execute | configure
+- action: install | query | create | modify | delete | monitor | execute | configure | analyze
 - target: software | file | service | data | config | tool | media
-- route: "chat" if answerable from knowledge alone, "task" if external action needed
+- route: "chat" if answerable from knowledge alone, "task" if external action needed (including reading attached files)
 
 Only include dimensions that clearly apply. Omit uncertain ones.
 """
@@ -48,6 +48,8 @@ You have a digest of your workshops and dimension-matched metadata below.
 
 Think first. You can answer most questions from your own knowledge and the matched facts.
 Tools are for tasks that genuinely require external action.
+
+**CRITICAL: If the user input contains `[Attached File: ...]`, you MUST choose a tool to process it (e.g. `visual` for images, `read_file` for text). Do not just say you can't see it.**
 
 Output ONLY valid JSON. No explanation, no markdown fences.
 

@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+from pathlib import Path
 import discord
 from dotenv import load_dotenv
 
@@ -47,9 +48,35 @@ async def on_message(message: discord.Message):
 
     # Check if the bot is mentioned
     if client.user in message.mentions:
-        # Extract the actual prompt by removing the bot mention
-        user_intent = message.content.replace(f"<@{client.user.id}>", "").strip()
+        # Extract the actual prompt by removing the bot mention (handle both <@ID> and <@!ID>)
+        content = message.content
+        content = content.replace(f"<@{client.user.id}>", "")
+        content = content.replace(f"<@!{client.user.id}>", "")
+        user_intent = content.strip()
         
+        # Handle Attachments
+        attachments_info = []
+        if message.attachments:
+            upload_dir = Path("runtime/uploads")
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            
+            for attachment in message.attachments:
+                # Use a safe filename
+                safe_filename = f"{message.id}_{attachment.filename}"
+                file_path = (upload_dir / safe_filename).resolve()
+                try:
+                    await attachment.save(file_path)
+                    attachments_info.append(f"[Attached File: {file_path} (Type: {attachment.content_type})]")
+                    logger.info(f"📥 Saved attachment: {file_path}")
+                except Exception as e:
+                    logger.error(f"Failed to save attachment {attachment.filename}: {e}")
+        
+        # Append attachment info to intent
+        if attachments_info:
+            if user_intent:
+                user_intent += "\n\n"
+            user_intent += "\n".join(attachments_info)
+
         if not user_intent:
             await message.reply("嗯？找我什么事？")
             return

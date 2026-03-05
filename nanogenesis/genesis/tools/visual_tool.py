@@ -40,25 +40,60 @@ class VisualTool(Tool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["capture_screenshot"],
-                    "description": "Action to perform"
+                    "enum": ["capture_screenshot", "analyze_image"],
+                    "description": "Action to perform: 'capture_screenshot' to take a picture, 'analyze_image' to inspect an existing image file."
                 },
                 "target": {
                     "type": "string",
-                    "enum": ["adb", "desktop"],
-                    "description": "Target device to capture from. Default: 'adb' if available, else 'desktop'.",
-                    "default": "adb"
+                    "description": "For 'capture_screenshot': 'adb' or 'desktop'. For 'analyze_image': absolute path to the image file."
                 }
             },
             "required": ["action"]
         }
         
-    async def execute(self, action: str, target: str = "adb", **kwargs) -> Any:
+    async def execute(self, action: str, target: str = None, **kwargs) -> Any:
         """Execute visual commands"""
         if action == "capture_screenshot":
-            return self._capture_screenshot(target)
+            return self._capture_screenshot(target or "adb")
+        elif action == "analyze_image":
+            return self._analyze_image(target)
         else:
             return f"Unknown action: {action}"
+
+    def _analyze_image(self, path: str) -> str:
+        """Analyze an image file (Metadata + OCR fallback)"""
+        if not path:
+            return "Error: No image path provided for analysis."
+        
+        p = Path(path)
+        if not p.exists():
+            return f"Error: Image file not found at {path}"
+            
+        try:
+            from PIL import Image
+            img = Image.open(p)
+            info = f"Image Info: Format={img.format}, Size={img.size}, Mode={img.mode}"
+            
+            # Try OCR if available
+            ocr_text = ""
+            try:
+                import pytesseract
+                # Simple check if tesseract is in path
+                import shutil
+                if shutil.which("tesseract"):
+                    text = pytesseract.image_to_string(img).strip()
+                    if text:
+                        ocr_text = f"\n[OCR Detected Text]:\n{text[:1000]}"
+                        if len(text) > 1000: ocr_text += "\n...(truncated)"
+            except Exception:
+                pass # OCR not available, skip
+                
+            return info + ocr_text + "\n(Note: This model cannot natively view pixels, but file properties are verified.)"
+            
+        except ImportError:
+            return "Error: PIL (Pillow) library not installed. Cannot analyze image."
+        except Exception as e:
+            return f"Error analyzing image: {e}"
 
     def _capture_screenshot(self, target: str) -> Dict[str, Any]:
         """Capture screenshot and return Image Payload"""
