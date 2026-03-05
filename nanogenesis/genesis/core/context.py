@@ -143,41 +143,45 @@ You are a recursive intelligence process running with **User Privileges** on thi
         
         return messages
 
+    _DEFAULT_STATELESS_PROMPT = (
+        "You are a pure API Execution Router. "
+        "Your ONLY purpose is to receive an instruction and map it to a Tool Call.\n"
+        "CRITICAL RULES:\n"
+        "1. You may think and perform logical deductions inside `<reflection>...</reflection>` tags.\n"
+        "2. DO NOT output conversational text or explanations outside of the `<reflection>` tags.\n"
+        "3. If a tool requires arguments, extract them from the user's instruction.\n"
+        "4. After your reflection, IMMEDIATELY output a valid JSON Tool Call.\n"
+        "5. If you cannot complete the instruction due to missing tools or fatal errors, output a Tool Call to `system_report_failure` with reason.\n"
+        "6. If you have successfully completed the instruction, output a Tool Call to `system_task_complete` with a summary."
+    )
+
     async def build_stateless_messages(
         self,
         instruction: str,
         **kwargs
     ) -> List[Message]:
         """
-        构建无状态执行者的消息列表 (Stateless Executor)
-        结构只有极端冷却的系统提示和当前的指令，不含任何历史和人格
+        构建消息列表。
+        如果构造时传入了自定义 system_prompt，则使用它（V3 模式）。
+        否则使用默认的无状态执行者提示（V2 OpExecutor 模式）。
         """
         messages = []
         
-        # 极简、冷酷的系统提示
-        sys_prompt = (
-            "You are a pure API Execution Router. "
-            "Your ONLY purpose is to receive an instruction and map it to a Tool Call.\n"
-            "CRITICAL RULES:\n"
-            "1. You may think and perform logical deductions inside `<reflection>...</reflection>` tags.\n"
-            "2. DO NOT output conversational text or explanations outside of the `<reflection>` tags.\n"
-            "3. If a tool requires arguments, extract them from the user's instruction.\n"
-            "4. After your reflection, IMMEDIATELY output a valid JSON Tool Call.\n"
-            "5. If you cannot complete the instruction due to missing tools or fatal errors, output a Tool Call to `system_report_failure` with reason.\n"
-            "6. If you have successfully completed the instruction, output a Tool Call to `system_task_complete` with a summary."
+        # V3: 如果有自定义身份，使用它；否则用默认的冷酷执行者
+        is_custom_identity = (
+            self.system_prompt 
+            and "You are Genesis" in self.system_prompt
         )
+        sys_prompt = self.system_prompt if is_custom_identity else self._DEFAULT_STATELESS_PROMPT
         
         messages.append(Message(
             role=MessageRole.SYSTEM,
             content=sys_prompt
         ))
         
-        user_context = kwargs.get("user_context", "")
-        context_str = f"【STRATEGIC CONTEXT & PLAN】\n{user_context}\n\n" if user_context else ""
-        
         messages.append(Message(
             role=MessageRole.USER,
-            content=f"{context_str}INSTRUCTION TO EXECUTE:\n{instruction}"
+            content=instruction
         ))
         
         return messages

@@ -23,9 +23,9 @@ if not TOKEN:
     logger.error("No DISCORD_BOT_TOKEN found in environment variables.")
     exit(1)
 
-# 3. Setup Genesis V2 Agent
-logger.info("Initializing Genesis V2 Agent...")
-agent = GenesisFactory.create_v2()
+# 3. Setup Genesis V3 Agent
+logger.info("Initializing Genesis V3 Agent...")
+agent = GenesisFactory.create_v3()
 
 # 4. Setup Discord Client
 intents = discord.Intents.default()
@@ -84,17 +84,13 @@ async def on_message(message: discord.Message):
 
         try:
             async with message.channel.typing():
-                # --- V2 Architecture: Use SensoryCortex ---
-                cortex = SensoryCortex()
-                packet = await cortex.perceive(
-                    text_input=user_intent,
-                    attachments=attachment_paths,
-                    source="discord",
-                    context_id=str(message.channel.id)
-                )
+                # V3: Pass text directly. If attachments exist, mention paths.
+                full_input = user_intent
+                if attachment_paths:
+                    files_str = "\n".join(f"  - {p}" for p in attachment_paths)
+                    full_input += f"\n\n[Attached files saved locally:\n{files_str}]"
 
-                # Process with Genesis V2 (Agent accepts packet now)
-                result = await agent.process(packet, use_v2=True)
+                result = await agent.process(full_input)
                 response = result.get("response", "...")
 
                 # Chunk response if too long

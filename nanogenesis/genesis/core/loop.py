@@ -259,10 +259,31 @@ class AgentLoop:
                  except Exception as e:
                      logger.warning(f"Failed to parse reflection: {e}")
             if not response.tool_calls and response.content:
-                # [Stateless Architecture Enforcement]
+                # Check if we're in Genesis identity mode (V3) — text responses are allowed
+                is_genesis_identity = any(
+                    "You are Genesis" in (m.content or "")
+                    for m in built_messages
+                    if m.role == MessageRole.SYSTEM
+                )
+                if is_genesis_identity:
+                    # V3 mode: text response = final answer, task complete
+                    logger.info(f"✅ Genesis responded with text ({len(response.content)} chars)")
+                    final_response = response.content
+                    success = True
+                    return final_response, PerformanceMetrics(
+                        iterations=iteration,
+                        total_time=time.time() - start_time,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        total_tokens=total_tokens,
+                        prompt_cache_hit_tokens=prompt_cache_hit_tokens,
+                        tools_used=tools_used,
+                        success=True,
+                        tool_calls=tool_calls_recorded
+                    )
+                # [Stateless Architecture Enforcement] (V2 OpExecutor mode)
                 # The prompt strictly specifies to output a tool call (even if it's `system_report_failure`).
                 # If the LLM outputs plain text instead of a tool call, it's hallucinating.
-                # We log this and forcefully return to the main agent loop.
                 logger.error(f"⚠️ Action Gap/Hallucination Detected: Expected Tool Call, got clear text.")
                 final_response = f"[STATELESS_EXECUTOR_ERROR] The executor hallucinated a response instead of calling a tool: {response.content[:200]}"
                 return final_response, PerformanceMetrics(

@@ -192,6 +192,56 @@ class GenesisFactory:
         return agent
 
     @staticmethod
+    def create_v3(
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        model: str = "deepseek/deepseek-chat",
+    ):
+        """
+        Genesis V3 — 自组织智能体。
+        极简架构：ReAct Loop + 自管理车间。
+        没有 Manager/OpExecutor，没有维度语言，没有预设学习步骤。
+        """
+        from genesis.v3.agent import GenesisV3
+
+        logger.info(">>> V3 Factory: Init Provider")
+        provider_router = ProviderRouter(
+            config=config, api_key=api_key, base_url=base_url, model=model
+        )
+
+        logger.info(">>> V3 Factory: Register Tools")
+        tools = ToolRegistry()
+
+        # 只注册 Genesis 真正需要的工具，干净利落
+        try:
+            from genesis.tools.file_tools import ReadFileTool, WriteFileTool, AppendFileTool, ListDirectoryTool
+            from genesis.tools.shell_tool import ShellTool
+            from genesis.tools.web_tool import WebSearchTool
+            from genesis.tools.visual_tool import VisualTool
+            from genesis.tools.workshop_tool import WorkshopTool
+            from genesis.tools.skill_creator_tool import SkillCreatorTool
+
+            tools.register(ReadFileTool())
+            tools.register(WriteFileTool())
+            tools.register(AppendFileTool())
+            tools.register(ListDirectoryTool())
+            tools.register(ShellTool(use_sandbox=False))
+            tools.register(WebSearchTool())
+            tools.register(VisualTool())
+            tools.register(WorkshopTool())
+            tools.register(SkillCreatorTool(tools))
+        except Exception as e:
+            logger.error(f"V3 tool registration failed: {e}")
+
+        provider = provider_router.get_active_provider()
+        agent = GenesisV3(
+            tools=tools,
+            provider=provider,
+        )
+        logger.info(f"✓ Genesis V3 ready ({len(tools)} tools)")
+        return agent
+
+    @staticmethod
     def _register_standard_tools(tools: ToolRegistry, memory: SQLiteMemoryStore, scheduler: AgencyScheduler, provider_router: ProviderRouter, context: SimpleContextBuilder):
         try:
             # First, register some highly coupled core tools that need specific dependencies
@@ -221,12 +271,12 @@ class GenesisFactory:
             # Sub-Agent Tool Registration
             from genesis.tools.spawn_sub_agent_tool import SpawnSubAgentTool
             from genesis.tools.check_sub_agent_tool import CheckSubAgentTool
-            from genesis.skills.system_task_complete import SystemTaskComplete
+            # from genesis.skills.system_task_complete import SystemTaskComplete  <-- REMOVED: Legacy/Missing
             from genesis.tools.evomap_skill_search_tool import EvoMapSkillSearchTool
             from genesis.tools.github_commits_tool import GithubCommitsTool
             tools.register(SpawnSubAgentTool())
             tools.register(CheckSubAgentTool())
-            tools.register(SystemTaskComplete())
+            # tools.register(SystemTaskComplete())  <-- REMOVED
             tools.register(EvoMapSkillSearchTool())
             tools.register(GithubCommitsTool())
             
