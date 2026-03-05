@@ -35,10 +35,12 @@ client = discord.Client(intents=intents)
 # Keep track of running tasks to avoid overlapping execution in the same channel
 running_tasks = set()
 
+GENESIS_VERSION = "V3.0"
+
 @client.event
 async def on_ready():
     logger.info(f"✅ Logged in as {client.user} (ID: {client.user.id})")
-    logger.info("Genesis 7*24h daemon is ready and listening for mentions.")
+    logger.info(f"Genesis {GENESIS_VERSION} daemon is ready and listening for mentions.")
 
 @client.event
 async def on_message(message: discord.Message):
