@@ -1,4 +1,4 @@
-# Genesis V2.5 (NanoGenesis) 🌱
+# Genesis V2.5 (NanoGenesis) 🌱 [Updated] # Genesis V2.5 (NanoGenesis) 🌱
 
 **基于维度语言架构（Dimensional Language Architecture）的本地化 AI 代理**
 
