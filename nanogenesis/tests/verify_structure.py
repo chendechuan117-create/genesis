@@ -2,7 +2,7 @@
 import sys
 from pathlib import Path
 
-# Add CWD to sys.path (Assuming running from /home/chendechusn/Genesis/nanogenesis)
+# Add CWD to sys.path (Assuming running from project root)
 sys.path.insert(0, str(Path.cwd()))
 
 def verify():

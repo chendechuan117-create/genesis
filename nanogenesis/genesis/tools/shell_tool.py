@@ -22,7 +22,7 @@ class ShellTool(Tool):
     
     def __init__(
         self, 
-        timeout: int = 30, 
+        timeout: int = 120, 
         use_sandbox: bool = False,
         workspace_path: str = None,
         job_manager = None
@@ -63,12 +63,11 @@ class ShellTool(Tool):
     
     @property
     def description(self) -> str:
-        base_desc = """执行 Shell 命令。支持同步执行 (execute) 和异步任务 (spawn/poll)。
+        base_desc = """Execute shell commands. Supports sync (execute) and async (spawn/poll).
         
-        Capabilities:
-        1. execute(cmd): 同步阻塞执行，等待结果。
-        2. spawn(cmd): 异步启动后台任务，立即返回 Job ID。
-        3. poll(job_id): 检查异步任务状态和输出。
+        - execute(cmd): Run and wait for result (up to 120s). Use for most commands.
+        - spawn(cmd): Start background job, returns Job ID immediately. Use for long tasks (builds, large downloads, servers).
+        - poll(job_id): Check background job status and output.
         """
         if self.use_sandbox:
             base_desc += "\n- 🛡️ 运行在 Docker 沙箱隔离环境中"
@@ -165,102 +164,102 @@ class ShellTool(Tool):
             if not command: return "Error: execute action requires 'command'"
             return await self._execute_sync(command, cwd, is_daemon)
 
-    async def _execute_sync(self, command: str, cwd: str = None, is_daemon: bool = False) -> str:
-        """原有同步执行逻辑 (Internal)"""
-        try:
-            # 沙箱执行
-            if self.use_sandbox and self.sandbox:
-                cmd_to_run = command
-                if cwd:
-                    # 在沙箱中切换目录
-                    cmd_to_run = f"cd {cwd} && {command}"
-                
-                code, stdout, stderr = self.sandbox.exec_command(cmd_to_run, timeout=self.timeout)
-                
-                # 格式化结果
-                result = [f"命令(Sandbox): {command}"]
-                if cwd:
-                    result.append(f"目录: {cwd}")
-                result.append(f"退出码: {code}")
-                
-                if stdout:
-                    result.append(f"\n标准输出:\n{stdout}")
-                if stderr:
-                    result.append(f"\n标准错误:\n{stderr}")
-                
-                if code != 0:
-                    result.append(f"\n⚠️  命令执行失败（退出码 {code}）")
-                else:
-                    result.append("\n✓ 命令执行成功")
-                
-                return "\n".join(result)
+    # 自动识别可能耗时较长的命令模式
+    _LONG_RUNNING_PATTERNS = (
+        'install', 'update', 'upgrade', 'build', 'compile', 'make',
+        'download', 'clone', 'pull', 'push', 'deploy', 'pip ', 'npm ',
+        'cargo ', 'yarn ', 'pacman -S', 'apt ', 'yay ', 'paru ',
+        'docker ', 'wget ', 'curl -o', 'curl -O',
+    )
 
-            # 宿主机执行 (原有逻辑)
+    async def _execute_sync(self, command: str, cwd: str = None, is_daemon: bool = False) -> str:
+        """执行命令。长命令自动 spawn+poll，短命令同步等待。"""
+        try:
             # 安全检查
             dangerous_patterns = ['rm -rf /', 'dd if=', 'mkfs', ':(){:|:&};:']
             if any(pattern in command for pattern in dangerous_patterns):
                 return f"Error: 拒绝执行危险命令: {command}"
-            
+
+            # 沙箱执行
+            if self.use_sandbox and self.sandbox:
+                cmd_to_run = f"cd {cwd} && {command}" if cwd else command
+                code, stdout, stderr = self.sandbox.exec_command(cmd_to_run, timeout=self.timeout)
+                return self._format_result(command, cwd, code, stdout, stderr)
+
             # 设置工作目录
             work_dir = None
             if cwd:
                 work_dir = Path(cwd).expanduser().resolve()
                 if not work_dir.exists():
                     return f"Error: 工作目录不存在: {cwd}"
-            
-            # 执行命令
+
+            # 常驻服务检测
+            known_daemons = ('scrcpy', 'server', 'daemon', 'npm start', 'python -m http.server')
+            if is_daemon or any(d in command for d in known_daemons):
+                return self.spawn_job(command, str(work_dir or '.'))
+
+            # 长命令自动检测：先快速等待，超时后自动转 spawn+poll
+            is_long = any(p in command.lower() for p in self._LONG_RUNNING_PATTERNS)
+            quick_timeout = 10 if is_long else self.timeout
+
             process = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=work_dir
             )
-            
-            # 等待完成（带超时）
+
             try:
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(),
-                    timeout=self.timeout
+                    timeout=quick_timeout
                 )
             except asyncio.TimeoutError:
-                # Daemon Mercy Logic: Don't kill if explicitly marked OR matches known pattern
-                known_daemons = ['scrcpy', 'server', 'daemon', 'npm start', 'python -m http.server']
-                detected_daemon = any(d in command for d in known_daemons)
-                
-                if not is_daemon and not detected_daemon:
+                if not is_long:
+                    # 普通命令超时 → 终止
                     try:
                         process.kill()
-                    except:
+                    except Exception:
                         pass
-                    return f"[TIMEOUT_WARNING] 命令超时（{self.timeout}秒）。进程已被终止。如果这是常驻服务，请设置 is_daemon=True。"
-                else:
-                    # Detach and let it run
-                    reason = "参数指定" if is_daemon else "自动检测"
-                    return f"[TIMEOUT_GUARD] [{reason}] 检测到常驻服务 ({command})。命令超时但**未终止进程**。它应在后台继续运行。"
-            
-            # 解码输出
+                    return f"[TIMEOUT] 命令超时（{quick_timeout}秒），已终止。"
+
+                # 长命令超时 → 继续等待（最多 5 分钟）
+                logger.info(f"⏳ 长命令检测：{command[:60]}... 延长等待")
+                try:
+                    stdout, stderr = await asyncio.wait_for(
+                        process.communicate(), timeout=290  # 剩余 ~290s（总共 ~300s）
+                    )
+                    stdout_text = stdout.decode('utf-8', errors='replace')
+                    stderr_text = stderr.decode('utf-8', errors='replace')
+                    return self._format_result(command, cwd, process.returncode, stdout_text, stderr_text)
+                except asyncio.TimeoutError:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                    return f"[TIMEOUT] 命令执行超过 5 分钟，已终止。"
+
             stdout_text = stdout.decode('utf-8', errors='replace')
             stderr_text = stderr.decode('utf-8', errors='replace')
-            
-            # 格式化结果
-            result = [f"命令: {command}"]
-            if work_dir:
-                result.append(f"目录: {work_dir}")
-            result.append(f"退出码: {process.returncode}")
-            
-            if stdout_text:
-                result.append(f"\n标准输出:\n{stdout_text}")
-            
-            if stderr_text:
-                result.append(f"\n标准错误:\n{stderr_text}")
-            
-            if process.returncode != 0:
-                result.append(f"\n⚠️  命令执行失败（退出码 {process.returncode}）")
-            else:
-                result.append("\n✓ 命令执行成功")
-            
-            return "\n".join(result)
-        
+            return self._format_result(command, cwd, process.returncode, stdout_text, stderr_text)
+
         except Exception as e:
             logger.error(f"执行命令失败: {command}, error: {e}")
             return f"Error: 执行命令失败 - {str(e)}"
+
+    @staticmethod
+    def _format_result(command: str, cwd, code: int, stdout: str, stderr: str) -> str:
+        """统一格式化命令执行结果。"""
+        result = [f"命令: {command}"]
+        if cwd:
+            result.append(f"目录: {cwd}")
+        result.append(f"退出码: {code}")
+        if stdout:
+            result.append(f"\n标准输出:\n{stdout}")
+        if stderr:
+            result.append(f"\n标准错误:\n{stderr}")
+        if code != 0:
+            result.append(f"\n⚠️  命令执行失败（退出码 {code}）")
+        else:
+            result.append("\n✓ 命令执行成功")
+        return "\n".join(result)

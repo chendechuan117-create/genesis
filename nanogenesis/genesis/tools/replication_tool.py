@@ -39,7 +39,7 @@ class ReplicationTool:
                 return {"status": "error", "error": "Cannot clone into self."}
             if target.exists() and any(target.iterdir()):
                  return {"status": "error", "error": f"Target directory {target} is not empty."}
-            if not str(target).startswith("/home/chendechusn"):
+            if not str(target).startswith(str(Path.home())):
                  return {"status": "error", "error": "Permission Denied: Can only clone within user home."}
 
             # 1. Try Git Clone (cleanest method)

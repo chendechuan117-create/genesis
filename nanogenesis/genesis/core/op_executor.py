@@ -25,6 +25,34 @@ logger = logging.getLogger(__name__)
 
 # ─── Virtual System Tools (loop.py 期望存在) ──────────────────────────────────
 
+class _SystemTaskCompleteTool(Tool):
+    """让 LLM 合法地标记任务完成并退出 op（loop.py 按名拦截，execute 不会被调用）"""
+
+    @property
+    def name(self) -> str:
+        return "system_task_complete"
+
+    @property
+    def description(self) -> str:
+        return "Mark the task as successfully completed and return a summary of results."
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "A concise summary of what was accomplished and the key findings"
+                }
+            },
+            "required": ["summary"]
+        }
+
+    async def execute(self, summary: str = "") -> str:
+        return f"[STATELESS_EXECUTOR_SUCCESS] {summary}"
+
+
 class _SystemReportFailureTool(Tool):
     """让 LLM 合法地报告失败并退出 op"""
 
@@ -150,6 +178,7 @@ class OpExecutor:
             else:
                 logger.warning(f"Tool '{name}' not found in registry, skipping")
 
+        isolated.register(_SystemTaskCompleteTool())
         isolated.register(_SystemReportFailureTool())
         return isolated
 
@@ -175,12 +204,10 @@ class OpExecutor:
             f"\n"
             f"STRATEGY: {spec.strategy_hint}\n"
             f"\n"
-            f"OUTPUT FORMAT REQUIRED: {schema_str}\n"
             f"SUCCESS CRITERION: {spec.expected_output}\n"
             f"\n"
-            f"Use the available tools to complete the objective. "
-            f"When done, call system_task_complete with a summary. "
-            f"If you cannot complete it, call system_report_failure with a reason."
+            f"When done: call system_task_complete(summary=...). "
+            f"If impossible: call system_report_failure(reason=...).\n"
         )
 
     def _parse_result(

@@ -6,19 +6,8 @@ from typing import Optional
 from genesis.agent import NanoGenesis
 from genesis.core.registry import ToolRegistry
 from genesis.core.context import SimpleContextBuilder
-from genesis.memory import SQLiteMemoryStore, SessionManager
-from genesis.core.cognition import CognitiveProcessor
-from genesis.core.scheduler import AgencyScheduler
 from genesis.core.provider_manager import ProviderRouter
 from genesis.core.config import config
-from genesis.core.trust_anchor import TrustAnchorManager
-from genesis.tools.chain_next_tool import ChainNextTool
-
-from genesis.optimization.prompt_optimizer import PromptOptimizer
-from genesis.optimization.behavior_optimizer import BehaviorOptimizer
-from genesis.optimization.tool_optimizer import ToolUsageOptimizer
-from genesis.optimization.profile_evolution import UserProfileEvolution
-from genesis.intelligence.adaptive_learner import AdaptiveLearner
 
 
 logger = logging.getLogger(__name__)
@@ -42,7 +31,20 @@ class GenesisFactory:
     ) -> NanoGenesis:
         """
         Create a standard instance of NanoGenesis with all default components.
+        NOTE: Requires V1 modules (intelligence/, optimization/) to be on sys.path.
         """
+        # V1-only imports (lazy to avoid breaking V2-only mode)
+        from genesis.memory import SQLiteMemoryStore, SessionManager
+        from genesis.core.cognition import CognitiveProcessor
+        from genesis.core.scheduler import AgencyScheduler
+        from genesis.core.trust_anchor import TrustAnchorManager
+        from genesis.tools.chain_next_tool import ChainNextTool
+        from genesis.optimization.prompt_optimizer import PromptOptimizer
+        from genesis.optimization.behavior_optimizer import BehaviorOptimizer
+        from genesis.optimization.tool_optimizer import ToolUsageOptimizer
+        from genesis.optimization.profile_evolution import UserProfileEvolution
+        from genesis.intelligence.adaptive_learner import AdaptiveLearner
+
         # 1. Configuration & Providers
         print(">>> Step 1: Init ProviderRouter")
         provider_router = ProviderRouter(
@@ -155,6 +157,41 @@ class GenesisFactory:
         return agent
 
     @staticmethod
+    def create_v2(
+        user_id: str = "default_user",
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        model: str = "deepseek/deepseek-chat",
+    ) -> NanoGenesis:
+        """
+        V2 精简模式 — 只初始化 Manager + Workshop + OpExecutor 需要的组件。
+        跳过 V1 的 Cognition / Optimization / Mission / Memory 系统。
+        """
+        logger.info(">>> V2 Factory: Init ProviderRouter")
+        provider_router = ProviderRouter(
+            config=config, api_key=api_key, base_url=base_url, model=model
+        )
+
+        logger.info(">>> V2 Factory: Init Tools & Context")
+        tools = ToolRegistry()
+        context = SimpleContextBuilder()
+
+        # 注册标准工具（V1/V2 共用）
+        GenesisFactory._register_standard_tools(tools, None, None, provider_router, context)
+
+        logger.info(">>> V2 Factory: Assemble Agent (V2-only)")
+        agent = NanoGenesis(
+            user_id=user_id,
+            config=config,
+            tools=tools,
+            context=context,
+            provider_router=provider_router,
+            enable_optimization=False,
+        )
+        logger.info(f"✓ V2 Agent ready ({len(tools)} tools)")
+        return agent
+
+    @staticmethod
     def _register_standard_tools(tools: ToolRegistry, memory: SQLiteMemoryStore, scheduler: AgencyScheduler, provider_router: ProviderRouter, context: SimpleContextBuilder):
         try:
             # First, register some highly coupled core tools that need specific dependencies
@@ -164,11 +201,15 @@ class GenesisFactory:
             from genesis.tools.scheduler_tool import SchedulerTool
             from genesis.tools.system_health_tool import SystemHealthTool
             
-            tools.register(SaveMemoryTool(memory))
-            tools.register(SearchMemoryTool(memory))
             tools.register(SkillCreatorTool(tools))
-            tools.register(SchedulerTool(scheduler))
-            tools.register(SystemHealthTool(provider_router, memory, tools, context, scheduler))
+            # V1-only tools (need memory/scheduler)
+            if memory is not None:
+                tools.register(SaveMemoryTool(memory))
+                tools.register(SearchMemoryTool(memory))
+            if scheduler is not None:
+                tools.register(SchedulerTool(scheduler))
+            if memory is not None and scheduler is not None:
+                tools.register(SystemHealthTool(provider_router, memory, tools, context, scheduler))
             
             # Now, explicitly register all standard decoupled tools from the tools directory
             from genesis.tools.file_tools import ReadFileTool, WriteFileTool, AppendFileTool, ListDirectoryTool
@@ -182,10 +223,12 @@ class GenesisFactory:
             from genesis.tools.check_sub_agent_tool import CheckSubAgentTool
             from genesis.skills.system_task_complete import SystemTaskComplete
             from genesis.tools.evomap_skill_search_tool import EvoMapSkillSearchTool
+            from genesis.tools.github_commits_tool import GithubCommitsTool
             tools.register(SpawnSubAgentTool())
             tools.register(CheckSubAgentTool())
             tools.register(SystemTaskComplete())
             tools.register(EvoMapSkillSearchTool())
+            tools.register(GithubCommitsTool())
             
             tools.register(ReadFileTool())
             tools.register(WriteFileTool())

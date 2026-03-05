@@ -31,10 +31,7 @@ st.caption("A multi-dimensional agent execution environment. Paste anything you 
 if "agent" not in st.session_state:
     with st.spinner("Initializing Genesis Core Modules... (This might take a moment)"):
         try:
-            st.session_state.agent = GenesisFactory.create_common(enable_optimization=True)
-            # Boot background tasks
-            if st.session_state.agent.scheduler:
-                asyncio.run(st.session_state.agent.scheduler.start())
+            st.session_state.agent = GenesisFactory.create_v2()
         except Exception as e:
             st.error(f"Failed to bootstrap Genesis: {e}")
             st.stop()
@@ -90,8 +87,8 @@ if user_input:
                     live_status.markdown("**✅ Tool Excution Complete**")
                 
                 elif step_type == "loop_start":
-                    accumulated_log_html += f"<div class='status-text'>--- Ouroboros Loop Iteration {data} ---</div>"
-                    live_status.markdown(f"**🔄 Starting Loop Iteration {data}...**")
+                    accumulated_log_html += f"<div class='status-text'>--- Executor Step {data} ---</div>"
+                    live_status.markdown(f"**🔄 Executor Step {data}...**")
                 
                 elif step_type == "strategy":
                     accumulated_log_html += f"<div class='status-text'>--- Strategy Phase ---</div>"

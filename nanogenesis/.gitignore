@@ -43,7 +43,6 @@ conversations/
 *.db
 *.log
 system_profile.md
-config.py
 
 # Personal/Sensitive
 *.key

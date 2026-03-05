@@ -18,65 +18,74 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from genesis.core.contracts import OpResult, OpSpec
 from genesis.core.op_assembler import build_op_spec, describe_op_spec
-from genesis.core.workshops import WorkshopLesson, WorkshopManager
+from genesis.core.workshops import PatternEntry, WorkshopLesson, WorkshopManager
 
 logger = logging.getLogger(__name__)
 
 # ─── Manager LLM Prompts ────────────────────────────────────────────────────────
 
+_DIMENSION_SYSTEM = """\
+Classify this user request into dimensional tags for metadata lookup.
+Output ONLY valid JSON. No explanation.
+
+{"scope": "...", "action": "...", "target": "...", "route": "chat|task"}
+
+- scope: local | network | user | project | web | meta
+- action: install | query | create | modify | delete | monitor | execute | configure
+- target: software | file | service | data | config | tool | media
+- route: "chat" if answerable from knowledge alone, "task" if external action needed
+
+Only include dimensions that clearly apply. Omit uncertain ones.
+"""
+
 _ASSEMBLY_SYSTEM = """\
-You are the Manager. Your job is to select resources from workshops to build a task spec.
+You are the Genesis Manager (厂长) — the cognitive core of Genesis, a local AI agent.
+You have a digest of your workshops and dimension-matched metadata below.
+
+Think first. You can answer most questions from your own knowledge and the matched facts.
+Tools are for tasks that genuinely require external action.
+
 Output ONLY valid JSON. No explanation, no markdown fences.
 
-Required JSON format:
+Chat reply — you can fully address this from your own thinking + matched facts:
+{"route": "chat", "response": "<reply in user's language>"}
+
+Task delegation — external action genuinely required:
 {
-  "tool_ids": ["<tool_name>", ...],
-  "fact_ids": ["<fact_id>", ...],
-  "format_name": "<format_name>",
+  "route": "task",
+  "tool_ids": ["<exact tool name from matched tools>", ...],
+  "fact_ids": ["<fact key from matched facts>", ...],
+  "format_name": "<format name>",
   "strategy_hint": "<one sentence>",
   "expected_output": "<success criterion>"
 }
 
-Rules:
-- tool_ids must be exact names from the TOOLS list
-- fact_ids must be exact IDs from the FACTS list
-- format_name must be exact name from FORMATS list
-- Select only what is necessary. Do not include irrelevant tools.
+If work needs doing, delegate it now — do not describe planned actions in a chat reply.
 """
 
-_ROUTE_SYSTEM = """\
-You are the Genesis Manager. Decide: is the user REQUESTING you to take an action, or are they COMMUNICATING something to you?
-
-Output ONLY valid JSON. No explanation, no markdown fences.
-
-{"route": "chat" | "task", "response": "<reply if chat, null if task>"}
-
-- "chat": the user is communicating — sharing information, expressing a preference, asking a question, or making conversation. You respond with language.
-- "task": the user is explicitly requesting you to DO something that requires executing a tool.
-
-Key distinction: "I usually use X" is communicating a preference — not a request to launch X.
-
-For "chat": reply naturally in the user's language.
-For "task": set response to null.
-"""
 
 _EXECUTION_FACTS_SYSTEM = """\
-You are a fact extractor. Extract ONLY literal facts directly observed in these tool execution results.
+You are a fact extractor. Extract ONLY durable state changes from tool execution results.
 Output ONLY valid JSON. No explanation, no markdown fences.
 
 {"facts": [{"key": "...", "value": "...", "category": "...", "source": "<tool>:<command>"}]}
 
-- key: stable snake_case identifier for this fact
-- value: exact string from the tool output, truncated if very long
-- category: choose a natural category that fits the fact
-- source: which tool and command produced this value
+Durable state changes = things that persist after this session:
+- Software installed/removed (package name + version)
+- Files created/deleted/modified (path)
+- Config changed (what was set to what)
+- User accounts/permissions changed
 
-Only include facts specific to this environment, user, or project — not general knowledge the LLM already knows.
-If nothing concrete was observed, return {"facts": []}.
+Do NOT extract:
+- Transient query results (search results, directory listings, disk usage numbers)
+- Information the system already knows (OS name, package manager)
+- One-time command output that won't be relevant next time
+
+If no durable state changed, return {"facts": []}.
 """
 
 _LEARNING_SYSTEM = """\
@@ -100,6 +109,77 @@ Output ONLY valid JSON. No explanation, no markdown fences.
 - For new_pattern: content = {"pattern_name": "...", "context_tags": [...], "approach": "..."}
 - confidence: your honest estimate of how certain this lesson is (0.0–1.0).
 - Only include lessons that are genuinely new or corrective. If nothing, return {"lessons": []}.
+"""
+
+_PACKAGING_SYSTEM = """\
+You are the Genesis Manager (厂长). Your worker just returned raw execution results.
+Synthesize them into a natural, thoughtful response for the user.
+
+- Address the user's original request directly.
+- Extract the most relevant findings; discard noise.
+- Add your own analysis and judgment — you are a thinker, not a relay.
+- Maintain the conversation's flow and tone.
+- Reply in the user's language.
+"""
+
+_META_EVAL_SYSTEM = """\
+You are the Genesis Manager reflecting on an execution trajectory.
+Your task: identify the WRONG ASSUMPTION that led to any detour or failure in the trajectory.
+
+Do not describe what happened. Ask yourself: "Why did I choose that wrong path? What did I assume
+that turned out to be false?" The answer is the principle to remember.
+
+Output ONLY valid JSON. No explanation, no markdown fences.
+
+{
+  "pattern_name": "...",
+  "context_tags": [...],
+  "wrong_assumption": "...",
+  "approach": "..."
+}
+
+- pattern_name: short snake_case identifier for the corrected assumption
+- wrong_assumption: what false belief led to the detour (e.g. "assumed n8n is a system package")
+- approach: the corrected principle (e.g. "n8n is a Node.js app — check software type before choosing package manager")
+- context_tags: when this principle applies
+- If no wrong assumption was made (clean execution), return {}
+"""
+
+_CHAT_LEARNING_SYSTEM = """\
+You are the Genesis Manager. The user just said something in a chat turn (no tool was used).
+Extract any user-shared facts worth storing long-term (name, preferences, habits, identity).
+Output ONLY valid JSON. No explanation, no markdown fences.
+
+{
+  "facts": [
+    {"key": "...", "category": "user_profile", "value": "...", "source": "user_stated"}
+  ]
+}
+
+- Only extract facts the user EXPLICITLY stated about themselves.
+- Do not infer or guess. If nothing was shared, return {"facts": []}.
+- category must be "user_profile".
+"""
+
+_FAILURE_LEARNING_SYSTEM = """\
+You are the Genesis Manager. An op just failed. Extract what went wrong as reusable patterns.
+Output ONLY valid JSON. No explanation, no markdown fences.
+
+{
+  "lessons": [
+    {
+      "lesson_type": "new_pattern|correction",
+      "target_workshop": "metacognition",
+      "content": {"pattern_name": "...", "context_tags": [...], "approach": "..."},
+      "confidence": 0.0-1.0
+    }
+  ]
+}
+
+- Focus on assembly strategy: wrong tool choice, missing context, bad strategy_hint.
+- Do NOT blame the user or external services.
+- Only target_workshop: "metacognition" is valid here.
+- If no pattern can be extracted, return {"lessons": []}.
 """
 
 
@@ -145,23 +225,26 @@ class Manager:
 
         self.workshops.seed_from_registry(self.registry)
 
-        # 路由决策：厂长自己判断是否需要工具
-        route, direct_response = await self._decide_route(user_intent, recent_context)
-        if route == "chat":
-            return {
-                "success": True,
-                "output": {"summary": direct_response},
-                "path": "v2_chat",
-                "tokens_used": 0,
-                "attempts": 0,
-            }
-
         last_error: Optional[str] = None
 
         for attempt in range(1, self.MAX_ATTEMPTS + 1):
-            logger.info(f"🏭 Manager: attempt {attempt}/{self.MAX_ATTEMPTS} — '{user_intent[:60]}'")
+            logger.info(f"🏷️ Manager: attempt {attempt}/{self.MAX_ATTEMPTS} — '{user_intent[:60]}'")
 
-            spec = await self.assemble_op(user_intent, attempt=attempt, last_error=last_error, recent_context=recent_context)
+            result_or_chat = await self.assemble_op(user_intent, attempt=attempt, last_error=last_error, recent_context=recent_context)
+
+            # 厂长决定直接回复（这是厂长的主观判断）
+            if isinstance(result_or_chat, dict) and result_or_chat.get("route") == "chat":
+                logger.info(f"💬 Manager chat: '{user_intent[:40]}'")
+                await self._learn_from_chat(user_intent)
+                return {
+                    "success": True,
+                    "output": {"summary": result_or_chat.get("response", "")},
+                    "path": "v2_chat",
+                    "tokens_used": 0,
+                    "attempts": attempt,
+                }
+
+            spec = result_or_chat
             logger.info(describe_op_spec(spec))
 
             result: OpResult = await self._executor.execute(spec, step_callback=step_callback)
@@ -171,9 +254,12 @@ class Manager:
 
             if result.success:
                 await self._learn_from_result(user_intent, spec, result)
+                await self._meta_evaluate(user_intent, spec, result)
+                await self._optimize_dimensions()
+                packaged = await self._package_result(user_intent, result, recent_context)
                 return {
                     "success": True,
-                    "output": result.final_output,
+                    "output": {"summary": packaged},
                     "tokens_used": result.tokens_used,
                     "attempts": attempt,
                 }
@@ -183,6 +269,8 @@ class Manager:
                 f"⚠️ op attempt {attempt} failed: {result.error} "
                 f"(entropy={'yes' if result.entropy_triggered else 'no'})"
             )
+            await self._learn_from_failure(user_intent, spec, result)
+            await self._meta_evaluate(user_intent, spec, result)
 
             if result.entropy_triggered:
                 logger.error("🔴 Entropy triggered — circuit broken")
@@ -195,33 +283,6 @@ class Manager:
             "circuit_broken": True,
             "message": f"已达最大重试次数（{self.MAX_ATTEMPTS}），需要用户介入",
         }
-
-    # ─── Route Decision ───────────────────────────────────────────────────────────
-
-    async def _decide_route(
-        self, user_intent: str, recent_context: str = ""
-    ) -> tuple:
-        """
-        厂长路由决策：判断是否需要工具执行。
-        无硬编码规则，完全由 LLM 根据意图语义判断。
-
-        Returns:
-            ("chat", response_text) — 直接回复，不走工具链
-            ("task", None)          — 需要工具，继续 OpSpec 流程
-        """
-        user_msg = user_intent[:500]
-        if recent_context:
-            user_msg = f"[Recent context]\n{recent_context[:400]}\n\n[User input]\n{user_intent[:500]}"
-
-        data = await self._call_llm_json(
-            system=_ROUTE_SYSTEM,
-            user=user_msg,
-            fallback={"route": "task", "response": None},
-        )
-        route = data.get("route", "task")
-        response = data.get("response") or ""
-        logger.debug(f"🗺️ Route decision: '{user_intent[:40]}' → {route}")
-        return route, response
 
     # ─── Op Assembly ─────────────────────────────────────────────────────────────
 
@@ -252,32 +313,54 @@ class Manager:
             except Exception as e:
                 logger.debug(f"Capability update skipped for {tool_name}: {e}")
 
+    async def _translate_intent(self, user_intent: str) -> Dict[str, str]:
+        """将用户意图翻译为维度地址（轻量 LLM 调用，~200 tokens）。"""
+        return await self._call_llm_json(
+            system=_DIMENSION_SYSTEM,
+            user=user_intent,
+            fallback={"scope": "local", "action": "execute", "target": "data", "route": "task"},
+        )
+
     async def assemble_op(
         self,
         user_intent: str,
         attempt: int = 1,
         last_error: Optional[str] = None,
         recent_context: str = "",
-    ) -> OpSpec:
+    ) -> Union[Dict, OpSpec]:
         """
-        查询车间索引 → LLM 选择 → op_assembler 组装 OpSpec
+        维度翻译 → 按维度查车间 → LLM 组装 OpSpec。
+        不再全量扫描索引——只看维度匹配的元数据。
         """
-        tool_index = self.workshops.get_tool_index()
-        fact_index = self.workshops.get_fact_index()
-        formats = self.workshops.list_formats()
-        patterns = self.workshops.search_patterns(user_intent, limit=2)
-        capability_profile = self.workshops.get_capability_profile()
+        # Step 1: 翻译意图为维度地址（轻量）
+        dims = await self._translate_intent(user_intent)
+        route = dims.pop("route", "task")
+        logger.info(f"📐 Dimensions: {dims} (route={route})")
 
+        # Step 2: 按维度查匹配的元数据
+        matched_facts = self.workshops.get_by_dimensions("known_info_workshop", dims)
+        matched_tools = self.workshops.get_by_dimensions("tool_workshop", dims)
+        patterns = self.workshops.search_patterns(user_intent, limit=2)
+        formats = self.workshops.list_formats()
+        digest = self.workshops.get_digest()
+
+        # Step 3: 组装 assembly prompt（只含匹配结果，不含全量索引）
         user_message = self._build_assembly_prompt(
-            user_intent, tool_index, fact_index, formats, patterns,
-            attempt, last_error, recent_context, capability_profile
+            user_intent, matched_facts, matched_tools, formats, patterns,
+            attempt, last_error, recent_context, digest
         )
 
+        # 全量工具索引作为 fallback（维度匹配可能漏工具）
+        all_tools = self.workshops.get_tool_index()
         selection = await self._call_llm_json(
             system=_ASSEMBLY_SYSTEM,
             user=user_message,
-            fallback=self._default_selection(tool_index, formats),
+            fallback=self._default_selection(all_tools, formats),
         )
+
+        if selection.get("route") == "chat":
+            logger.debug(f"💬 Assembly routed to chat: '{user_intent[:40]}'")
+            return selection
 
         spec = build_op_spec(
             objective=user_intent,
@@ -290,72 +373,72 @@ class Manager:
     def _build_assembly_prompt(
         self,
         intent: str,
-        tool_index: List[Dict],
-        fact_index: List[Dict],
+        matched_facts: List[Dict],
+        matched_tools: List[Dict],
         formats: List[Dict],
         patterns: List[Any],
         attempt: int,
         last_error: Optional[str],
         recent_context: str = "",
-        capability_profile: Optional[List[Dict]] = None,
+        digest: str = "",
     ) -> str:
-        tools_str = json.dumps(tool_index, ensure_ascii=False, indent=2)
-        facts_str = json.dumps(fact_index, ensure_ascii=False, indent=2)
-        formats_str = json.dumps(formats, ensure_ascii=False, indent=2)
-        patterns_str = (
-            "\n".join(f"- {p.pattern_name}: {p.approach}" for p in patterns)
-            if patterns else "None"
-        )
+        parts = [f"USER INTENT: {intent}", ""]
 
-        parts = [
-            f"USER INTENT: {intent}",
-            f"",
-            f"AVAILABLE TOOLS:\n{tools_str}",
-            f"",
-            f"AVAILABLE FACTS (metadata only):\n{facts_str}",
-            f"",
-            f"AVAILABLE OUTPUT FORMATS:\n{formats_str}",
-            f"",
-            f"RELEVANT PATTERNS:\n{patterns_str}",
-        ]
-
-        if capability_profile:
-            lines = [
-                f"  {p['capability']}: {p['reliability']:.0%} reliability "
-                f"({p['successes']}/{p['total_calls']} calls"
-                + (f", last failure: {p['common_failure'][:60]}" if p.get('common_failure') else "")
-                + ")"
-                for p in capability_profile
-            ]
-            parts += [
-                "",
-                "TOOL RELIABILITY (from execution history — prefer high-reliability tools):",
-                *lines,
-            ]
+        # 馆藏概览（固定 ~20 行，不随数据量增长）
+        if digest:
+            parts += [digest, ""]
 
         if recent_context:
             parts += [
-                f"",
-                f"RECENT CONVERSATION CONTEXT (last few turns):",
-                f"{recent_context[:800]}",
-                f"Use this to understand what the user already discussed.",
+                "RECENT CONVERSATION:",
+                f"{recent_context[:2000]}",
+                "",
             ]
+
+        # 维度匹配的事实（只有相关的，不是全量）
+        if matched_facts:
+            facts_lines = [f"  {f['key']}: {str(f.get('value', ''))[:80]}" for f in matched_facts]
+            parts += [
+                f"MATCHED FACTS ({len(matched_facts)} items):",
+                *facts_lines,
+                "",
+            ]
+
+        if patterns:
+            patterns_str = "\n".join(f"  - {p.pattern_name}: {p.approach[:100]}" for p in patterns)
+            parts += [
+                "STRATEGY PATTERNS:",
+                patterns_str,
+                "",
+            ]
+
+        # 维度匹配的工具 + 全量工具列表（确保不漏）
+        if matched_tools:
+            tool_names = [t["name"] for t in matched_tools]
+            parts.append(f"DIMENSION-MATCHED TOOLS: {tool_names}")
+
+        # 始终提供全量工具列表（作为兜底）
+        all_tools = self.workshops.get_tool_index()
+        all_names = [t["name"] for t in all_tools]
+        parts += [f"ALL AVAILABLE TOOLS: {all_names}", ""]
+
+        parts.append(f"OUTPUT FORMATS: {[f['format_name'] for f in formats]}")
 
         if attempt > 1 and last_error:
             parts += [
-                f"",
+                "",
                 f"PREVIOUS ATTEMPT FAILED (attempt {attempt - 1}):",
                 f"Error: {last_error}",
-                f"Adjust your tool/fact selection to avoid this error.",
             ]
 
         return "\n".join(parts)
 
     def _default_selection(self, tool_index: List[Dict], formats: List[Dict]) -> Dict:
-        """LLM 输出解析失败时的兜底选择：第一个工具 + plain_text 格式"""
+        """LLM 输出解析失败时的底而选择：保守地走 task 路径"""
         tool_ids = [tool_index[0]["name"]] if tool_index else []
         format_name = formats[0]["format_name"] if formats else "plain_text"
         return {
+            "route": "task",
             "tool_ids": tool_ids,
             "fact_ids": [],
             "format_name": format_name,
@@ -364,6 +447,190 @@ class Manager:
         }
 
     # ─── Learning ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _format_trajectory(tool_outputs: List[Dict]) -> str:
+        """将 tool_outputs 格式化为编号步骤序列，供厂长“以史为鉴”。"""
+        if not tool_outputs:
+            return "(no steps)"
+        lines = []
+        for i, step in enumerate(tool_outputs, 1):
+            tool = step.get("tool", "?")
+            args = step.get("args", {})
+            result_str = str(step.get("result", ""))[:200]
+            # 判断步骤成败与否
+            fail_signals = ("error", "fail", "exception", "timeout", "denied", "not found")
+            failed = any(s in result_str.lower() for s in fail_signals)
+            status = "✗ FAIL" if failed else "✓ OK"
+            # 简化 args 展示
+            args_brief = ", ".join(f"{k}={repr(v)[:60]}" for k, v in args.items()) if isinstance(args, dict) else str(args)[:80]
+            lines.append(f"Step {i}: {tool}({args_brief}) → {status}: {result_str[:120]}")
+        return "\n".join(lines)
+
+    async def _meta_evaluate(
+        self, intent: str, spec: OpSpec, result: OpResult
+    ) -> None:
+        """
+        元认知循环——厂长读执行轨迹，从步骤转换中学习。
+        只在轨迹有“弯路”时触发（失败重试、多步绕行、entropy）。
+        直接写入 metacognition_workshop。
+        """
+        trajectory = self._format_trajectory(result.tool_outputs)
+        step_count = len(result.tool_outputs)
+
+        # 只在有弯路时触发分析
+        has_failure = "✗ FAIL" in trajectory
+        has_detour = step_count > 3 or spec.attempt_number > 1 or result.entropy_triggered
+        if not has_failure and not has_detour:
+            return
+
+        try:
+            user_message = (
+                f"TASK: {intent}\n"
+                f"SUCCESS: {result.success}\n"
+                f"TRAJECTORY ({step_count} steps):\n{trajectory}"
+            )
+            data = await self._call_llm_json(
+                system=_META_EVAL_SYSTEM,
+                user=user_message,
+                fallback={},
+            )
+            pattern_name = data.get("pattern_name", "").strip()
+            wrong_assumption = data.get("wrong_assumption", "").strip()
+            approach = data.get("approach", "").strip()
+            if pattern_name and approach:
+                # 把错误假设和修正原则合并存储
+                full_approach = f"[错误假设] {wrong_assumption} → [修正] {approach}" if wrong_assumption else approach
+                self.workshops.add_pattern(PatternEntry(
+                    pattern_name=pattern_name,
+                    context_tags=data.get("context_tags", []),
+                    approach=full_approach,
+                ))
+                logger.info(f"🧠 Reflection: '{pattern_name}' — assumption: {wrong_assumption[:60]}")
+        except Exception as e:
+            logger.warning(f"Meta-evaluation failed (non-critical): {e}")
+
+    async def _optimize_dimensions(self) -> None:
+        """
+        维度自优化：扫描 known_info 中 dimensions='{}' 的条目，
+        用 _CATEGORY_TO_DIMS 回填已知映射，对未知 category 用 LLM 生成新映射。
+        """
+        from genesis.core.workshops import WorkshopManager
+        try:
+            with self.workshops._conn() as conn:
+                # 找到所有空维度的条目
+                rows = conn.execute(
+                    "SELECT DISTINCT category FROM known_info_workshop WHERE dimensions = '{}'"
+                ).fetchall()
+
+            if not rows:
+                return
+
+            unmapped = []
+            for r in rows:
+                cat = r["category"]
+                if cat in self.workshops._CATEGORY_TO_DIMS:
+                    # 已知映射，直接回填
+                    dims = self.workshops._CATEGORY_TO_DIMS[cat]
+                    with self.workshops._conn() as conn:
+                        conn.execute(
+                            "UPDATE known_info_workshop SET dimensions = ? WHERE category = ? AND dimensions = '{}'",
+                            (json.dumps(dims), cat)
+                        )
+                else:
+                    unmapped.append(cat)
+
+            if not unmapped:
+                return
+
+            # 对未知 category 用 LLM 建议维度映射
+            data = await self._call_llm_json(
+                system=(
+                    "Assign dimension tags to these metadata categories.\n"
+                    "Output ONLY valid JSON: {\"mappings\": {\"category\": {\"scope\": \"...\", \"target\": \"...\"}, ...}}\n"
+                    "scope: local|network|user|project|web|meta\n"
+                    "target: software|file|service|data|config|tool|media"
+                ),
+                user=f"Categories to map: {unmapped}",
+                fallback={"mappings": {}},
+            )
+
+            mappings = data.get("mappings", {})
+            with self.workshops._conn() as conn:
+                for cat, dims in mappings.items():
+                    if isinstance(dims, dict) and cat in unmapped:
+                        conn.execute(
+                            "UPDATE known_info_workshop SET dimensions = ? WHERE category = ? AND dimensions = '{}'",
+                            (json.dumps(dims), cat)
+                        )
+                        # 更新运行时映射表（扩展"语言"）
+                        self.workshops._CATEGORY_TO_DIMS[cat] = dims
+                        logger.info(f"📐 Dimension extended: '{cat}' → {dims}")
+
+        except Exception as e:
+            logger.debug(f"Dimension optimization skipped: {e}")
+
+    async def _learn_from_chat(self, user_intent: str) -> None:
+        """
+        用户在 chat 路径分享了信息时，提取并存入 known_info_workshop。
+        只提取用户明确陈述的事实（姓名、偏好、习惯），不做推断。
+        """
+        try:
+            data = await self._call_llm_json(
+                system=_CHAT_LEARNING_SYSTEM,
+                user=f"USER SAID: {user_intent}",
+                fallback={"facts": []},
+            )
+            written = 0
+            for f in data.get("facts", []):
+                key = f.get("key", "").strip()
+                value = f.get("value", "").strip()
+                if key and value:
+                    self.workshops.add_verified_fact(
+                        key=key,
+                        value=value,
+                        category=f.get("category", "user_profile"),
+                        source="user_stated",
+                    )
+                    written += 1
+            if written:
+                logger.info(f"👤 {written} user fact(s) stored from chat turn")
+        except Exception as e:
+            logger.warning(f"Chat learning failed (non-critical): {e}")
+
+    async def _learn_from_failure(
+        self, intent: str, spec: OpSpec, result: OpResult
+    ) -> None:
+        """
+        从失败的 op 中提取组装策略教训，进 pending_lessons。
+        执行层客观信号（capability calibration）已在外层处理，
+        这里只做 LLM 推断的模式提取。
+        """
+        try:
+            user_message = (
+                f"TASK: {intent}\n"
+                f"TOOLS CHOSEN: {spec.tool_ids}\n"
+                f"STRATEGY HINT: {spec.strategy_hint}\n"
+                f"ERROR: {result.error}\n"
+                f"ENTROPY TRIGGERED: {result.entropy_triggered}"
+            )
+            data = await self._call_llm_json(
+                system=_FAILURE_LEARNING_SYSTEM,
+                user=user_message,
+                fallback={"lessons": []},
+            )
+            queued = 0
+            for raw in data.get("lessons", []):
+                try:
+                    lesson = WorkshopLesson(**raw)
+                    self.workshops.apply_lesson(lesson)
+                    queued += 1
+                except Exception as e:
+                    logger.warning(f"Failure lesson parse error: {e} — skipped")
+            if queued:
+                logger.info(f"📥 {queued} failure lesson(s) queued for review")
+        except Exception as e:
+            logger.warning(f"Failure learning step failed (non-critical): {e}")
 
     async def _learn_from_result(
         self, intent: str, spec: OpSpec, result: OpResult
@@ -390,21 +657,15 @@ class Manager:
             logger.warning(f"Inference lesson extraction failed (non-critical): {e}")
 
     async def _extract_execution_facts(self, tool_outputs: List[Dict]) -> None:
-        """路径 A：从工具执行结果中提取字面事实，直接写入 known_info。"""
+        """路径 A：只提取持久化状态变更（安装/删除/配置变更），不提取瞬时查询结果。"""
         if not tool_outputs:
             return
 
-        # 只传原始 tool_outputs，不传任何推断材料
-        tool_records = [
-            {"tool": t["tool"], "args": t.get("args"), "result": t.get("result")}
-            for t in tool_outputs if t.get("result")
-        ]
-        if not tool_records:
-            return
+        trajectory = self._format_trajectory(tool_outputs)
 
         data = await self._call_llm_json(
             system=_EXECUTION_FACTS_SYSTEM,
-            user=f"TOOL EXECUTION RECORDS:\n{json.dumps(tool_records, ensure_ascii=False, default=str)[:2000]}",
+            user=f"EXECUTION TRAJECTORY:\n{trajectory}",
             fallback={"facts": []},
         )
 
@@ -422,7 +683,7 @@ class Manager:
                 written += 1
 
         if written:
-            logger.info(f"✅ {written} execution-verified fact(s) written directly to known_info")
+            logger.info(f"✅ {written} durable fact(s) written to known_info")
 
     async def _extract_inference_lessons(self, intent: str, spec: OpSpec, result: OpResult) -> None:
         """路径 B：LLM 从任务摘要推断策略 lesson，全部进待审队列。"""
@@ -450,7 +711,39 @@ class Manager:
         if queued:
             logger.info(f"📥 {queued} inference lesson(s) queued for review")
 
-    # ─── LLM Helper ──────────────────────────────────────────────────────────────
+    async def _package_result(
+        self, user_intent: str, result: OpResult, recent_context: str = ""
+    ) -> str:
+        """厂长消化 op 原始结果，输出连贯的对话回复。"""
+        raw = str(result.final_output)[:3000]
+        user_msg = f"User's request: {user_intent}\n\nRaw execution results:\n{raw}"
+        if recent_context:
+            user_msg += f"\n\nRecent conversation:\n{recent_context[:1000]}"
+        try:
+            return await self._call_llm_text(
+                system=_PACKAGING_SYSTEM, user=user_msg, fallback=raw
+            )
+        except Exception as e:
+            logger.warning(f"Packaging failed: {e}")
+            return raw
+
+    # ─── LLM Helper ────────────────────────────────────────────────────────────
+
+    async def _call_llm_text(
+        self, system: str, user: str, fallback: str = ""
+    ) -> str:
+        """调用 LLM，返回纯文本。失败时返回 fallback。"""
+        try:
+            response = await self.provider.chat(
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ]
+            )
+            return response.content.strip()
+        except Exception as e:
+            logger.error(f"Manager LLM text call failed: {e}")
+            return fallback
 
     async def _call_llm_json(
         self,

@@ -58,7 +58,7 @@ git push -u origin main
 ```
 
 **此时终端会让你输入用户名和密码：**
-- **Username**: 输入你的 GitHub 用户名 (例如 `chendechusn`)
+- **Username**: 输入你的 GitHub 用户名
 - **Password**: **粘贴你第三步生成的 Token (`ghp_...`)**
   *   *注意：粘贴密码时，屏幕上不会显示任何星号或字符，这是正常的。粘贴后直接回车。*
 

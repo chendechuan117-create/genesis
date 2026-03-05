@@ -57,7 +57,7 @@ async def run_simulation():
 
     # 3. Scenario 2: Memory Save (Vector DB Check)
     print("\n[Scenario 2] Memory Save Test")
-    secret = "Project NanoGenesis is located in /home/chendechusn"
+    secret = "Project NanoGenesis is located in /var/lib/nanogenesis"
     query = f"Please remember this important fact: {secret}"
     try:
         result = await agent.process(query)

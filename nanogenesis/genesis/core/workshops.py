@@ -27,6 +27,31 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
+# ── 工具语义标签映射 ────────────────────────────────────────────────────────────
+# survival = 默认出门物资，每个 OpSpec 自动携带；其余 tag 为概念分类供厂长决策
+_TOOL_TAG_MAP: Dict[str, List[str]] = {
+    "evomap_skill_search":  ["survival", "skill_discovery"],
+    "skill_creator":        ["survival", "tool_creation"],
+    "skill_creator_tool":   ["survival", "tool_creation"],
+    "skill_importer":       ["survival", "tool_creation"],
+    "spawn_sub_agent":      ["survival", "multi_agent"],
+    "check_sub_agent":      ["survival", "multi_agent"],
+    "send_to_sub_agent":    ["survival", "multi_agent"],
+    "get_sub_agent_result": ["survival", "multi_agent"],
+    "read_file":            ["file"],
+    "write_file":           ["file"],
+    "append_file":          ["file"],
+    "list_directory":       ["file"],
+    "shell":                ["shell"],
+    "web_search":           ["web"],
+    "browser":              ["web"],
+    "github_commits":       ["web"],
+    "douyin_analysis":      ["media"],
+    "visual":               ["vision"],
+    "scheduler":            ["scheduling"],
+    "system_health":        ["system"],
+}
+
 
 # ─── Entry Models ──────────────────────────────────────────────────────────────
 
@@ -129,6 +154,7 @@ class WorkshopManager:
                     summary      TEXT NOT NULL DEFAULT '',
                     input_schema TEXT NOT NULL DEFAULT '{}',
                     content      TEXT NOT NULL DEFAULT '',
+                    dimensions   TEXT NOT NULL DEFAULT '{}',
                     last_used    TEXT
                 );
 
@@ -139,7 +165,8 @@ class WorkshopManager:
                     value         TEXT NOT NULL,
                     last_verified TEXT NOT NULL,
                     source        TEXT NOT NULL DEFAULT 'user',
-                    confidence    REAL NOT NULL DEFAULT 1.0
+                    confidence    REAL NOT NULL DEFAULT 1.0,
+                    dimensions    TEXT NOT NULL DEFAULT '{}'
                 );
 
                 CREATE TABLE IF NOT EXISTS metacognition_workshop (
@@ -147,7 +174,8 @@ class WorkshopManager:
                     pattern_name TEXT NOT NULL UNIQUE,
                     context_tags TEXT NOT NULL DEFAULT '[]',
                     approach     TEXT NOT NULL,
-                    usage_count  INTEGER NOT NULL DEFAULT 0
+                    usage_count  INTEGER NOT NULL DEFAULT 0,
+                    dimensions   TEXT NOT NULL DEFAULT '{}'
                 );
 
                 CREATE TABLE IF NOT EXISTS output_format_workshop (
@@ -176,8 +204,131 @@ class WorkshopManager:
                 );
             """)
             conn.commit()
+        self._migrate_dimensions()
         self._seed_default_formats()
         self._cold_start_scan()
+
+    # ─── Dimension Migration & Lookup ─────────────────────────────────────────
+
+    # 从 category/tags 到 dimensions 的默认映射
+    _CATEGORY_TO_DIMS: Dict[str, Dict[str, str]] = {
+        "system":             {"scope": "local", "target": "config"},
+        "system_info":        {"scope": "local", "target": "config"},
+        "environment":        {"scope": "local", "target": "config"},
+        "installed_software": {"scope": "local", "target": "software", "action": "install"},
+        "installed_package":  {"scope": "local", "target": "software", "action": "install"},
+        "user_profile":       {"scope": "user", "target": "data"},
+        "user_info":          {"scope": "user", "target": "data"},
+        "file_system":        {"scope": "local", "target": "file"},
+        "software":           {"scope": "local", "target": "software"},
+    }
+
+    def _migrate_dimensions(self) -> None:
+        """给已有表添加 dimensions 列（如果不存在），并从 category/tags 回填。"""
+        with self._conn() as conn:
+            # 添加列（忽略已存在错误）
+            for table in ("known_info_workshop", "tool_workshop", "metacognition_workshop"):
+                try:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN dimensions TEXT NOT NULL DEFAULT '{{}}'")
+                except Exception:
+                    pass  # 列已存在
+
+            # 回填 known_info 的 dimensions（从 category 映射）
+            rows = conn.execute(
+                "SELECT id, category FROM known_info_workshop WHERE dimensions = '{}'"
+            ).fetchall()
+            for r in rows:
+                dims = self._CATEGORY_TO_DIMS.get(r["category"], {"scope": "general"})
+                conn.execute(
+                    "UPDATE known_info_workshop SET dimensions = ? WHERE id = ?",
+                    (json.dumps(dims), r["id"])
+                )
+
+            # 回填 tool_workshop 的 dimensions（从 tags 映射）
+            rows = conn.execute(
+                "SELECT id, tags FROM tool_workshop WHERE dimensions = '{}'"
+            ).fetchall()
+            for r in rows:
+                tags = json.loads(r["tags"] or "[]")
+                dims = {}
+                if "file" in tags: dims.update({"scope": "local", "target": "file"})
+                elif "web" in tags: dims.update({"scope": "network", "target": "data"})
+                elif "shell" in tags: dims.update({"scope": "local", "action": "execute"})
+                elif "survival" in tags: dims.update({"scope": "meta", "target": "tool"})
+                elif "media" in tags: dims.update({"scope": "local", "target": "media"})
+                if dims:
+                    conn.execute(
+                        "UPDATE tool_workshop SET dimensions = ? WHERE id = ?",
+                        (json.dumps(dims), r["id"])
+                    )
+
+            conn.commit()
+
+    def get_by_dimensions(self, table: str, dims: Dict[str, str]) -> List[Dict[str, Any]]:
+        """按维度匹配查找条目。dims 中的每个 key=value 都必须匹配。"""
+        if not dims:
+            return []
+
+        # SQLite JSON 查询：用 LIKE 匹配每个维度键值对
+        conditions = []
+        params = []
+        for k, v in dims.items():
+            conditions.append("dimensions LIKE ?")
+            params.append(f'%"{k}": "{v}"%')
+
+        where = " AND ".join(conditions)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM {table} WHERE {where}", tuple(params)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_digest(self) -> str:
+        """返回所有车间的摘要——厂长的'馆藏概念'，固定 ~20 行。"""
+        with self._conn() as conn:
+            # known_info: 按 category 聚合，每类取代表性 key
+            fact_cats = conn.execute("""
+                SELECT category, COUNT(*) as cnt,
+                       GROUP_CONCAT(key, ', ') as keys
+                FROM known_info_workshop
+                GROUP BY category ORDER BY cnt DESC
+            """).fetchall()
+
+            # tools: 按 tags 聚合
+            tool_count = conn.execute("SELECT COUNT(*) FROM tool_workshop").fetchone()[0]
+
+            # patterns: 总数 + top 3 by usage
+            pattern_count = conn.execute("SELECT COUNT(*) FROM metacognition_workshop").fetchone()[0]
+            top_patterns = conn.execute(
+                "SELECT pattern_name FROM metacognition_workshop ORDER BY usage_count DESC LIMIT 3"
+            ).fetchall()
+
+            # capability: top 3 most used
+            top_cap = conn.execute(
+                "SELECT capability, reliability, total_calls FROM capability_workshop ORDER BY total_calls DESC LIMIT 3"
+            ).fetchall()
+
+        lines = ["WORKSHOP DIGEST:"]
+
+        # Facts digest
+        lines.append(f"  known_info ({sum(r['cnt'] for r in fact_cats)} facts):")
+        for r in fact_cats[:8]:  # 最多显示 8 个类别
+            keys_preview = ", ".join(r["keys"].split(", ")[:3])
+            lines.append(f"    {r['category']} ({r['cnt']}): {keys_preview}")
+
+        # Tools digest
+        lines.append(f"  tools: {tool_count} registered")
+
+        # Patterns digest
+        top_names = [r["pattern_name"] for r in top_patterns]
+        lines.append(f"  patterns: {pattern_count} (top: {', '.join(top_names) if top_names else 'none'})")
+
+        # Capability digest
+        if top_cap:
+            cap_str = ", ".join(f"{r['capability']}={r['reliability']:.0%}" for r in top_cap)
+            lines.append(f"  capability: {cap_str}")
+
+        return "\n".join(lines)
 
     # ─── Cold-Start Environment Scan ────────────────────────────────────────────
 
@@ -223,6 +374,44 @@ class WorkshopManager:
             self.add_fact(f)
 
         logger.info(f"✓ 冷启动扫描完成：写入 {len(facts)} 条环境事实到 known_info_workshop")
+        self._seed_bootstrap_patterns()
+
+    def _seed_bootstrap_patterns(self) -> None:
+        """
+        首次初始化时向 metacognition_workshop 写入最低限度的启动模式。
+        这些模式是可覆盖的起点，不是硬编码规则。
+        厂长通过执行反馈可以更新或替代它们。
+        """
+        with self._conn() as conn:
+            count = conn.execute("SELECT COUNT(*) FROM metacognition_workshop").fetchone()[0]
+        if count > 0:
+            return
+
+        seeds = [
+            PatternEntry(
+                pattern_name="executor_exit_protocol",
+                context_tags=["any_task", "execution"],
+                approach=(
+                    "After completing the task, call system_task_complete(summary=...) "
+                    "to signal success. If stuck or unable to proceed, call "
+                    "system_report_failure(reason=...). Never generate text output as the final result."
+                ),
+            ),
+            PatternEntry(
+                pattern_name="tool_selection_minimal",
+                context_tags=["assembly", "tool_selection"],
+                approach=(
+                    "Select only the tools strictly necessary for the objective. "
+                    "Prefer tools with higher reliability scores from the capability profile. "
+                    "Avoid selecting tools speculatively."
+                ),
+            ),
+        ]
+
+        for p in seeds:
+            self.add_pattern(p)
+
+        logger.info(f"✓ 冷启动模式种子：写入 {len(seeds)} 条基础模式到 metacognition_workshop")
 
     # ─── Tool Workshop ──────────────────────────────────────────────────────────
 
@@ -313,6 +502,15 @@ class WorkshopManager:
             ).fetchall()
         return [self._row_to_fact(r) for r in rows]
 
+    def get_facts_by_category(self, category: str) -> List[FactEntry]:
+        """返回指定 category 的所有事实条目。"""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM known_info_workshop WHERE category = ?",
+                (category,)
+            ).fetchall()
+        return [self._row_to_fact(r) for r in rows]
+
     def get_fact(self, key: str) -> Optional[FactEntry]:
         with self._conn() as conn:
             row = conn.execute(
@@ -322,14 +520,14 @@ class WorkshopManager:
         return self._row_to_fact(row) if row else None
 
     def get_fact_index(self) -> List[Dict[str, Any]]:
-        """轻量索引 — 返回 key/category/confidence，不含 value（厂长初次浏览用）"""
+        """轻量索引 — 含 value 预览，厂长据此判断是否选入 OpSpec"""
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT id, key, category, last_verified, confidence FROM known_info_workshop"
+                "SELECT id, key, category, value, confidence FROM known_info_workshop"
             ).fetchall()
         return [
             {"id": r["id"], "key": r["key"], "category": r["category"],
-             "last_verified": r["last_verified"], "confidence": r["confidence"]}
+             "value": str(r["value"])[:80], "confidence": r["confidence"]}
             for r in rows
         ]
 
@@ -449,19 +647,29 @@ class WorkshopManager:
     def seed_from_registry(self, registry: Any) -> int:
         """
         首次启动时从 ToolRegistry 自动填充工具车间。
-        按 name 去重，已存在的工具不会重复写入。
+        按 name 去重，已存在的工具不会重复写入；但会补填空 tags。
         """
         _INTERNAL_TOOL_PREFIXES = ("system_",)
         _INTERNAL_TOOL_NAMES = {
-            # V2 system tools
-            "system_health", "system_task_complete", "system_report_failure",
-            # V1 meta-tools (cognitive plumbing, not user-task tools)
-            "save_memory", "chain_next", "context_switch",
-            "spawn_sub_agent", "send_to_sub_agent", "get_sub_agent_result",
+            # V2 system tools (执行管道内部信号，非用户任务工具)
+            "system_task_complete", "system_report_failure",
+            # V1 pure plumbing tools
+            "save_memory", "search_memory", "chain_next", "context_switch",
             "protocol_emit", "trust_anchor", "capability_forge",
         }
 
+        # 清理已入库的纯内部工具（历史遗留）
+        with self._conn() as conn:
+            placeholders = ",".join("?" * len(_INTERNAL_TOOL_NAMES))
+            removed = conn.execute(
+                f"DELETE FROM tool_workshop WHERE name IN ({placeholders})",
+                tuple(_INTERNAL_TOOL_NAMES),
+            ).rowcount
+        if removed:
+            logger.info(f"🧹 清理 {removed} 个内部工具从 tool_workshop")
+
         seeded = 0
+        backfilled = 0
         for tool_name in registry.list_tools():
             tool = registry.get(tool_name)
             if not tool:
@@ -470,22 +678,43 @@ class WorkshopManager:
                 continue
             if any(tool_name.startswith(p) for p in _INTERNAL_TOOL_PREFIXES):
                 continue
-            if self.get_tool(tool_name):
+
+            tags = _TOOL_TAG_MAP.get(tool_name, [])
+            existing = self.get_tool(tool_name)
+            if existing:
+                # 补填空 tags（升级旧数据库）
+                if not existing.tags and tags:
+                    with self._conn() as conn:
+                        conn.execute(
+                            "UPDATE tool_workshop SET tags = ? WHERE name = ?",
+                            (json.dumps(tags), tool_name),
+                        )
+                    backfilled += 1
                 continue
+
             schema = tool.to_schema()
             entry = ToolEntry(
                 name=tool.name,
-                tags=[],
-                summary=tool.description,
+                tags=tags,
+                summary=tool.description[:300],
                 input_schema=schema.get("function", {}).get("parameters", {}),
                 content=""
             )
             self.add_tool(entry)
             seeded += 1
 
-        if seeded:
-            logger.info(f"✓ 工具车间种子完成：新增 {seeded} 个工具条目")
+        if seeded or backfilled:
+            logger.info(f"✓ 工具车间：新增 {seeded} 个，补填 tags {backfilled} 个")
         return seeded
+
+    def get_survival_tools(self) -> List[str]:
+        """返回标记为 survival 的工具名称列表（默认出门物资）。"""
+        with self._conn() as conn:
+            rows = conn.execute("SELECT name, tags FROM tool_workshop").fetchall()
+        return [
+            r["name"] for r in rows
+            if "survival" in json.loads(r["tags"] or "[]")
+        ]
 
     # ─── Capability Workshop ──────────────────────────────────────────────────────
 
@@ -549,21 +778,39 @@ class WorkshopManager:
             last_verified=datetime.now().isoformat()
         )
         self.add_fact(entry)
-        logger.info(f"✓ 执行验证事实写入: [{category}] {key} = {str(value)[:60]}")
+        # 自动分配维度（从 category 映射）
+        dims = self._CATEGORY_TO_DIMS.get(category, {"scope": "general"})
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE known_info_workshop SET dimensions = ? WHERE key = ?",
+                (json.dumps(dims), key)
+            )
+        logger.info(f"✓ 执行验证事实写入: [{category}] {key} = {str(value)[:60]} dims={dims}")
 
     # ─── Lesson Application (Feedback Loop) ─────────────────────────────────────
 
+    AUTO_APPROVE_THRESHOLD = 0.9
+
     def apply_lesson(self, lesson: WorkshopLesson) -> bool:
         """
-        将 op 执行经验放入待审队列。
+        将 op 执行经验写入车间或待审队列。
 
-        所有 LLM 提取的 lesson 一律进 pending_lessons，
-        无论置信度高低——confidence 仅用于排序优先级，不作为自动写入的依据。
-        只有 approve_lesson() 被显式调用后，知识才写入稳定车间。
+        confidence >= AUTO_APPROVE_THRESHOLD: 自动写入稳定车间（防止堵塞）。
+        confidence < AUTO_APPROVE_THRESHOLD: 进 pending_lessons 待人工审核。
 
         Returns:
+            True — 已自动写入稳定车间
             False — 已入队，等待审核
         """
+        if lesson.confidence >= self.AUTO_APPROVE_THRESHOLD:
+            committed = self._commit_lesson(lesson)
+            if committed:
+                logger.info(
+                    f"✅ Lesson 自动放行 (confidence={lesson.confidence:.2f}): "
+                    f"{lesson.lesson_type} → {lesson.target_workshop}"
+                )
+                return True
+
         self._queue_lesson(lesson)
         logger.info(
             f"📥 Lesson 待审 (confidence={lesson.confidence:.2f}): "

@@ -21,16 +21,27 @@ class Mission:
     error_count: int = 0
     last_error: Optional[str] = None
     children: List[str] = None # Runtime hydration only
+    anchor_type: str = "general" # 'logical', 'physical', 'code', 'verification'
+    stability: float = 0.0 # 0.0 (Hypothesis) -> 1.0 (Verified Fact)
+    input_params: Dict[str, Any] = None # Input arguments for the anchor execution
+    expected_output: str = None # Success criteria
+    result_raw: str = None # Raw output from the executor
 
     def __post_init__(self):
         if self.children is None:
             self.children = []
+        if self.input_params is None:
+            self.input_params = {}
 
 class MissionManager:
     """
     Manages high-level missions for the Agent.
     Handles persistence in the 'missions' table.
     Now supports Mission Context Tree (MCT) - Hierarchical Tasks.
+    
+    [Architecture Note 2026-02-28]
+    Aligns with "Pure Metacognition": Missions are ANCHORS.
+    Each Node represents a stable state (or a state attempting to stabilize).
     """
     
     def __init__(self, db_path: str = None):
@@ -64,7 +75,12 @@ class MissionManager:
                     last_error TEXT,
                     parent_id TEXT,
                     root_id TEXT,
-                    depth INTEGER DEFAULT 0
+                    depth INTEGER DEFAULT 0,
+                    anchor_type TEXT DEFAULT 'general',
+                    stability REAL DEFAULT 0.0,
+                    input_params TEXT,
+                    expected_output TEXT,
+                    result_raw TEXT
                 )
             """)
             
@@ -92,6 +108,16 @@ class MissionManager:
                 conn.execute("ALTER TABLE missions ADD COLUMN root_id TEXT")
             if 'depth' not in columns:
                 conn.execute("ALTER TABLE missions ADD COLUMN depth INTEGER DEFAULT 0")
+            if 'anchor_type' not in columns:
+                conn.execute("ALTER TABLE missions ADD COLUMN anchor_type TEXT DEFAULT 'general'")
+            if 'stability' not in columns:
+                conn.execute("ALTER TABLE missions ADD COLUMN stability REAL DEFAULT 0.0")
+            if 'input_params' not in columns:
+                conn.execute("ALTER TABLE missions ADD COLUMN input_params TEXT")
+            if 'expected_output' not in columns:
+                conn.execute("ALTER TABLE missions ADD COLUMN expected_output TEXT")
+            if 'result_raw' not in columns:
+                conn.execute("ALTER TABLE missions ADD COLUMN result_raw TEXT")
                 
             conn.commit()
         except Exception as e:
@@ -101,7 +127,14 @@ class MissionManager:
             conn.close()
 
 
-    def create_mission(self, objective: str, parent_id: str = None) -> Mission:
+    def create_mission(
+        self, 
+        objective: str, 
+        parent_id: str = None, 
+        anchor_type: str = "general",
+        input_params: Dict[str, Any] = None,
+        expected_output: str = None
+    ) -> Mission:
         """Create a new active mission (Root or Branch)"""
         mission_id = str(uuid.uuid4())
         now = datetime.now().isoformat()
@@ -126,7 +159,12 @@ class MissionManager:
             root_id=root_id,
             depth=depth,
             error_count=0,
-            last_error=None
+            last_error=None,
+            anchor_type=anchor_type,
+            stability=0.0, # New anchors are unstable by default
+            input_params=input_params or {},
+            expected_output=expected_output,
+            result_raw=None
         )
         
         conn = self._get_conn()
@@ -136,13 +174,15 @@ class MissionManager:
                     INSERT INTO missions (
                         id, objective, status, context_snapshot, 
                         created_at, updated_at, error_count, last_error,
-                        parent_id, root_id, depth
+                        parent_id, root_id, depth, anchor_type, stability,
+                        input_params, expected_output, result_raw
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     mission.id, mission.objective, mission.status, json.dumps(mission.context_snapshot), 
                     mission.created_at, mission.updated_at, mission.error_count, mission.last_error,
-                    mission.parent_id, mission.root_id, mission.depth
+                    mission.parent_id, mission.root_id, mission.depth, mission.anchor_type, mission.stability,
+                    json.dumps(mission.input_params), mission.expected_output, mission.result_raw
                 ))
         finally:
             conn.close()
@@ -225,7 +265,12 @@ class MissionManager:
             root_id=row['root_id'] if 'root_id' in keys else (row['id'] if not row.get('parent_id') else ""),
             depth=row['depth'] if 'depth' in keys else 0,
             error_count=row['error_count'] or 0,
-            last_error=row['last_error']
+            last_error=row['last_error'],
+            anchor_type=row['anchor_type'] if 'anchor_type' in keys else 'general',
+            stability=row['stability'] if 'stability' in keys else 0.0,
+            input_params=json.loads(row['input_params']) if 'input_params' in keys and row['input_params'] else {},
+            expected_output=row['expected_output'] if 'expected_output' in keys else None,
+            result_raw=row['result_raw'] if 'result_raw' in keys else None
         )
 
     def list_missions(self, limit: int = 5) -> List[Mission]:

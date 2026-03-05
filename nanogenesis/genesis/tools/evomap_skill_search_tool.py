@@ -36,8 +36,8 @@ class EvoMapSkillSearchTool(Tool):
                 },
                 "repo_target": {
                     "type": "string",
-                    "enum": ["all", "openclaw", "evomap"],
-                    "description": "搜索目标库。默认 'all' 会同时搜索两个主流技能库。",
+                    "enum": ["all", "openclaw", "evomap", "github"],
+                    "description": "搜索目标库。'all' 搜索 OpenClaw + EvoMap；'github' 搜索全 GitHub。",
                     "default": "all"
                 }
             },
@@ -55,30 +55,59 @@ class EvoMapSkillSearchTool(Tool):
         elif repo_target == "evomap":
             # EvoMap 源生网络仓库
             full_query = f"{base_query} repo:autogame-17/evolver"
+        elif repo_target == "github":
+            # 全 GitHub 搜索（不限制 org/repo）
+            full_query = base_query
         else:
-            # 双向联合搜索 (由于 GitHub API 限制，我们可以将他们通过 OR 连接，或者搜索比较知名的几个结构)
+            # 双向联合搜索 (OpenClaw + EvoMap)
             full_query = f"{base_query} (org:openclaw OR repo:autogame-17/evolver)"
             
         encoded_query = urllib.parse.quote(full_query)
         url = f"https://api.github.com/search/code?q={encoded_query}&per_page=5"
         
         def _search():
-            req = urllib.request.Request(
-                url, 
-                # 添加一个通用的 User-Agent 否则 GitHub API 会拒绝 403
-                headers={
-                    'User-Agent': 'NanoGenesis-EvoMap-Probe/1.0',
-                    'Accept': 'application/vnd.github.v3+json'
-                }
-            )
+            from genesis.core.config import config
+            import subprocess
+            import os
+            
+            headers = [
+                "-H", "User-Agent: NanoGenesis-EvoMap-Probe/1.0",
+                "-H", "Accept: application/vnd.github.v3+json"
+            ]
+            
+            if config.github_token:
+                headers.extend(["-H", f"Authorization: token {config.github_token}"])
+                
+            curl_cmd = [
+                "curl", "-s", url,
+                "--max-time", "15"
+            ] + headers
+            
+            # Proxy support
+            proxy = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+            if proxy and proxy.startswith("socks5"):
+                proxy = proxy.replace("socks5://", "socks5h://")
+                curl_cmd.extend(["-x", proxy])
+                
             try:
-                with urllib.request.urlopen(req, timeout=10) as response:
-                    return json.loads(response.read().decode('utf-8'))
-            except urllib.error.HTTPError as e:
-                # GitHub Search API 容易受到速率限制 (Rate Limit)
-                if e.code == 403:
-                    return {"error": "GitHub API 速率限制 (Rate Limit Exceeded)。请稍后再试，或者更换搜索策略。"}
-                return {"error": f"HTTP Error {e.code}: {e.reason}"}
+                process = subprocess.run(curl_cmd, capture_output=True, text=True)
+                if process.returncode != 0:
+                    return {"error": f"Curl request failed with exit code {process.returncode}: {process.stderr}"}
+                
+                result_json = json.loads(process.stdout)
+                
+                # Check for GitHub API error messages
+                if "message" in result_json:
+                     if "API rate limit" in result_json["message"] or "rate limit exceeded" in result_json["message"].lower():
+                         return {"error": "GitHub API 速率限制 (Rate Limit Exceeded)。请稍后再试，或者检查 GITHUB_TOKEN 权限。"}
+                     # Only return error if there isn't valid items
+                     if "items" not in result_json:
+                          return {"error": f"GitHub API Error: {result_json['message']}"}
+                          
+                return result_json
+                
+            except json.JSONDecodeError:
+                return {"error": "GitHub API returned invalid JSON"}
             except Exception as e:
                 return {"error": str(e)}
                 
