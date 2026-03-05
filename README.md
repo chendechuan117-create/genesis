@@ -79,20 +79,39 @@ graph TD
 
 ---
 
-## 🛠️ 快速开始
+## � 系统兼容性 (System Compatibility)
 
-### 环境要求
-*   Linux (Ubuntu/Arch/Debian)
-*   Python 3.10+
-*   Git
+| Platform | Support | Notes |
+| :--- | :--- | :--- |
+| **Linux** | ✅ **Native** | Recommended (Ubuntu, Arch, Debian). Best performance. |
+| **macOS** | ✅ **Native** | Fully supported (Apple Silicon & Intel). |
+| **Windows** | ⚠️ **WSL2 Only** | **NOT supported natively**. Requires [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) (Ubuntu). |
 
-### 安装
+> **Why no Windows support?**
+> Genesis relies on Unix-specific kernel features (`fcntl`, `termios`, `SIGKILL` grouping) for safe process management and sandboxing. Windows users **must** use WSL2.
+
+---
+
+## 🛠️ 快速开始 (Quick Start)
+
+### 1. 准备环境
+确保你已安装 Python 3.10+ 和 Git。
+
+### 2. 克隆与安装
 
 ```bash
+# 1. Clone repo
 git clone https://github.com/chendechuan117-create/genesis.git
-cd genesis/nanogenesis
+cd genesis
+
+# 2. Enter core directory
+cd nanogenesis
+
+# 3. Setup Virtual Environment
 python3 -m venv venv
-source venv/bin/activate
+source venv/bin/activate  # Windows (WSL): source venv/bin/activate
+
+# 4. Install Dependencies
 pip install -r requirements.txt
 ```
 
