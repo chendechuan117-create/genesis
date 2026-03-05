@@ -20,7 +20,7 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Union
 
-from genesis.core.contracts import OpResult, OpSpec
+from genesis.core.contracts import OpResult, OpSpec, SensoryPacket, SensoryItem
 from genesis.core.op_assembler import build_op_spec, describe_op_spec
 from genesis.core.workshops import PatternEntry, WorkshopLesson, WorkshopManager
 
@@ -49,7 +49,12 @@ You have a digest of your workshops and dimension-matched metadata below.
 Think first. You can answer most questions from your own knowledge and the matched facts.
 Tools are for tasks that genuinely require external action.
 
-**CRITICAL: If the user input contains `[Attached File: ...]`, you MUST choose a tool to process it (e.g. `visual` for images, `read_file` for text). Do not just say you can't see it.**
+**INPUT SENSORY DATA:**
+The user has provided the following inputs (Text + Files).
+If files are present (images, audio, code), you MUST select appropriate tools to process them.
+- Images: Use `visual` tool (analyze_image).
+- Text Files: Use `read_file`.
+- Audio: Use `audio_tool` (if available).
 
 Output ONLY valid JSON. No explanation, no markdown fences.
 
@@ -216,28 +221,36 @@ class Manager:
 
     # ─── Main Entry ──────────────────────────────────────────────────────────────
 
-    async def process(self, user_intent: str, step_callback: Optional[Any] = None, recent_context: str = "") -> Dict[str, Any]:
+    async def process(self, user_intent: Union[str, SensoryPacket], step_callback: Optional[Any] = None, recent_context: str = "") -> Dict[str, Any]:
         """
         用户意图 → 执行 → 结果
-
-        熔断机制：最多 MAX_ATTEMPTS 次重组，超限后上报。
+        Supports both string (legacy) and SensoryPacket (multimodal) inputs.
         """
         if self._executor is None:
             raise RuntimeError("OpExecutor not set. Call manager.set_executor() first.")
 
+        # Normalize input to SensoryPacket if it's a string
+        if isinstance(user_intent, str):
+            from genesis.core.sensory import SensoryCortex
+            # We don't have attachments here, just text
+            packet = await SensoryCortex().perceive(text_input=user_intent)
+        else:
+            packet = user_intent
+
+        text_query = packet.text_content()
         self.workshops.seed_from_registry(self.registry)
 
         last_error: Optional[str] = None
 
         for attempt in range(1, self.MAX_ATTEMPTS + 1):
-            logger.info(f"🏷️ Manager: attempt {attempt}/{self.MAX_ATTEMPTS} — '{user_intent[:60]}'")
+            logger.info(f"🏷️ Manager: attempt {attempt}/{self.MAX_ATTEMPTS} — '{text_query[:60]}'")
 
-            result_or_chat = await self.assemble_op(user_intent, attempt=attempt, last_error=last_error, recent_context=recent_context)
+            result_or_chat = await self.assemble_op(packet, attempt=attempt, last_error=last_error, recent_context=recent_context)
 
             # 厂长决定直接回复（这是厂长的主观判断）
             if isinstance(result_or_chat, dict) and result_or_chat.get("route") == "chat":
-                logger.info(f"💬 Manager chat: '{user_intent[:40]}'")
-                await self._learn_from_chat(user_intent)
+                logger.info(f"💬 Manager chat: '{text_query[:40]}'")
+                await self._learn_from_chat(text_query)
                 return {
                     "success": True,
                     "output": {"summary": result_or_chat.get("response", "")},
@@ -255,10 +268,10 @@ class Manager:
             await self._update_capability_calibration(result.tool_outputs, result.success)
 
             if result.success:
-                await self._learn_from_result(user_intent, spec, result)
-                await self._meta_evaluate(user_intent, spec, result)
+                await self._learn_from_result(text_query, spec, result)
+                await self._meta_evaluate(text_query, spec, result)
                 await self._optimize_dimensions()
-                packaged = await self._package_result(user_intent, result, recent_context)
+                packaged = await self._package_result(text_query, result, recent_context)
                 return {
                     "success": True,
                     "output": {"summary": packaged},
@@ -271,8 +284,8 @@ class Manager:
                 f"⚠️ op attempt {attempt} failed: {result.error} "
                 f"(entropy={'yes' if result.entropy_triggered else 'no'})"
             )
-            await self._learn_from_failure(user_intent, spec, result)
-            await self._meta_evaluate(user_intent, spec, result)
+            await self._learn_from_failure(text_query, spec, result)
+            await self._meta_evaluate(text_query, spec, result)
 
             if result.entropy_triggered:
                 logger.error("🔴 Entropy triggered — circuit broken")
@@ -325,7 +338,7 @@ class Manager:
 
     async def assemble_op(
         self,
-        user_intent: str,
+        packet: SensoryPacket,
         attempt: int = 1,
         last_error: Optional[str] = None,
         recent_context: str = "",
@@ -334,6 +347,8 @@ class Manager:
         维度翻译 → 按维度查车间 → LLM 组装 OpSpec。
         不再全量扫描索引——只看维度匹配的元数据。
         """
+        user_intent = packet.text_content()
+        
         # Step 1: 翻译意图为维度地址（轻量）
         dims = await self._translate_intent(user_intent)
         route = dims.pop("route", "task")
@@ -348,7 +363,7 @@ class Manager:
 
         # Step 3: 组装 assembly prompt（只含匹配结果，不含全量索引）
         user_message = self._build_assembly_prompt(
-            user_intent, matched_facts, matched_tools, formats, patterns,
+            packet, matched_facts, matched_tools, formats, patterns,
             attempt, last_error, recent_context, digest
         )
 
@@ -374,7 +389,7 @@ class Manager:
 
     def _build_assembly_prompt(
         self,
-        intent: str,
+        packet: SensoryPacket,
         matched_facts: List[Dict],
         matched_tools: List[Dict],
         formats: List[Dict],
@@ -384,7 +399,18 @@ class Manager:
         recent_context: str = "",
         digest: str = "",
     ) -> str:
+        intent = packet.text_content()
         parts = [f"USER INTENT: {intent}", ""]
+
+        # ─── Sensory Data Section ───
+        # List all non-text items (files, images, etc)
+        attachments = [item for item in packet.items if item.type != 'text']
+        if attachments:
+            parts.append("ATTACHMENTS (You MUST handle these):")
+            for item in attachments:
+                meta_str = ", ".join(f"{k}={v}" for k, v in item.metadata.items())
+                parts.append(f"- [{item.type.upper()}] {item.content} ({item.mime_type}) {meta_str}")
+            parts.append("")
 
         # 馆藏概览（固定 ~20 行，不随数据量增长）
         if digest:

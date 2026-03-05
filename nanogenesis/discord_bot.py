@@ -55,7 +55,7 @@ async def on_message(message: discord.Message):
         user_intent = content.strip()
         
         # Handle Attachments
-        attachments_info = []
+        attachment_paths = []
         if message.attachments:
             upload_dir = Path("runtime/uploads")
             upload_dir.mkdir(parents=True, exist_ok=True)
@@ -66,18 +66,12 @@ async def on_message(message: discord.Message):
                 file_path = (upload_dir / safe_filename).resolve()
                 try:
                     await attachment.save(file_path)
-                    attachments_info.append(f"[Attached File: {file_path} (Type: {attachment.content_type})]")
+                    attachment_paths.append(str(file_path))
                     logger.info(f"📥 Saved attachment: {file_path}")
                 except Exception as e:
                     logger.error(f"Failed to save attachment {attachment.filename}: {e}")
         
-        # Append attachment info to intent
-        if attachments_info:
-            if user_intent:
-                user_intent += "\n\n"
-            user_intent += "\n".join(attachments_info)
-
-        if not user_intent:
+        if not user_intent and not attachment_paths:
             await message.reply("嗯？找我什么事？")
             return
 
@@ -87,27 +81,29 @@ async def on_message(message: discord.Message):
             return
 
         running_tasks.add(message.channel.id)
-        
+
         try:
-            # Send initial reaction/message to show we are working on it
-            status_msg = await message.reply("🔄 厂长正在思考和处理...")
-            
-            logger.info(f"Received task from {message.author}: {user_intent}")
-            
-            # Execute through Genesis V2
-            result = await agent.process(user_intent)
-            
-            # Formatting the output
-            if result.get("success"):
-                response_text = result.get("response", "任务完成，但没有返回具体文本。")
-                # Discord max message length is 2000 chars
-                if len(response_text) > 1900:
-                    response_text = response_text[:1900] + "\n...[内容过长已截断]"
-                
-                await status_msg.edit(content=f"✅ **完成**:\n{response_text}")
-            else:
-                error_msg = result.get("response", "未知错误")
-                await status_msg.edit(content=f"❌ **执行失败**:\n{error_msg}")
+            async with message.channel.typing():
+                # --- V2 Architecture: Use SensoryCortex ---
+                cortex = SensoryCortex()
+                packet = await cortex.perceive(
+                    text_input=user_intent,
+                    attachments=attachment_paths,
+                    source="discord",
+                    context_id=str(message.channel.id)
+                )
+
+                # Process with Genesis V2 (Agent accepts packet now)
+                result = await agent.process(packet, use_v2=True)
+                response = result.get("response", "...")
+
+                # Chunk response if too long
+                if len(response) > 2000:
+                    response_chunks = [response[i:i+2000] for i in range(0, len(response), 2000)]
+                    for chunk in response_chunks:
+                        await message.reply(chunk)
+                else:
+                    await message.reply(response)
                 
         except Exception as e:
             logger.error(f"Error processing message: {e}", exc_info=True)

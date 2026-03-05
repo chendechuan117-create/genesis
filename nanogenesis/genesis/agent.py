@@ -120,7 +120,7 @@ class NanoGenesis:
     
     async def process(
         self,
-        user_input: str,
+        user_input: Union[str, Any], # Supports SensoryPacket
         user_context: Optional[str] = None,
         problem_type: str = "general",
         step_callback: Optional[Any] = None,
@@ -263,13 +263,23 @@ class NanoGenesis:
 
     # ─── Genesis V2 Entry Point ──────────────────────────────────────────────────
 
-    async def _process_v2(self, user_input: str, step_callback: Optional[Any] = None) -> Dict[str, Any]:
+    async def _process_v2(self, user_input: Union[str, Any], step_callback: Optional[Any] = None) -> Dict[str, Any]:
         """
         Genesis V2 执行路径。
         路由决策（chat vs task）完全由 Manager._decide_route() 负责，无硬编码分类逻辑。
         """
         import time
         start = time.time()
+
+        # Handle SensoryPacket input for logging
+        loggable_input = user_input
+        if hasattr(user_input, "text_content"):
+            loggable_input = user_input.text_content()
+            if hasattr(user_input, "items"):
+                # Add attachment note
+                count = sum(1 for i in user_input.items if i.type != 'text')
+                if count > 0:
+                    loggable_input += f" [With {count} attachments]"
 
         # 提取最近对话上下文（最多 8 条，每条截 200 字）
         recent_context = ""
@@ -291,7 +301,7 @@ class NanoGenesis:
         # 记录用户消息到对话历史（供下一轮 recent_context 使用）
         try:
             if hasattr(self, "context") and self.context is not None:
-                self.context.add_to_history(Message(role=MessageRole.USER, content=user_input))
+                self.context.add_to_history(Message(role=MessageRole.USER, content=loggable_input))
         except Exception:
             pass
 

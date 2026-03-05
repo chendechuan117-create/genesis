@@ -46,3 +46,29 @@ class OpResult:
     error: Optional[str] = None            # 失败原因（success=False 时填充）
     entropy_triggered: bool = False         # 是否触发了 entropy 熔断
     tokens_used: int = 0                    # 本次 op 消耗的 token 数
+
+
+@dataclass
+class SensoryItem:
+    """
+    Standardized input unit for any modality (Text, Image, Audio, File).
+    """
+    type: str                               # 'text', 'image', 'audio', 'file'
+    content: str                            # The actual text OR absolute file path
+    mime_type: str = "text/plain"           # e.g., 'image/png', 'audio/wav'
+    metadata: Dict[str, Any] = field(default_factory=dict) # OCR text, duration, size, etc.
+
+
+@dataclass
+class SensoryPacket:
+    """
+    A unified container for user inputs, replacing raw strings.
+    The Manager receives this packet, allowing it to "see" multiple modalities naturally.
+    """
+    items: List[SensoryItem]
+    source: str = "unknown"                 # 'discord', 'web', 'terminal'
+    context_id: str = ""                    # Session/Channel ID
+
+    def text_content(self) -> str:
+        """Helper to get the main user text query."""
+        return "\n".join(item.content for item in self.items if item.type == 'text')
