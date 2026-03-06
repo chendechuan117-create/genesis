@@ -1,85 +1,12 @@
-# Genesis V2.5 (NanoGenesis) 🌱
+# Genesis V4 — 白盒认知装配师 (The Glassbox Amplifier) 🔮
 
-**基于维度语言架构（Dimensional Language Architecture）的本地化 AI 代理**
+> **AI 不是替代你思考的黑箱，而是放大你认知的白盒。**
 
-> ⚠️ **Status**: Active Development (V2.5) - [Verified 2026年 03月 05日 星期四 10:36:29 CST]
-
-Genesis 不是另一个基于 RAG 或巨大上下文的聊天机器人。它是一个**基于精确维度索引的行动框架**。它不依赖"模糊搜索"或"运气"来找到工具，而是发明了一套维度语言 `(scope, action, target)`，将自然语言意图翻译为精确的数据库查询指令，像图书管理员一样精准调取技能与记忆。
+Genesis 是一个**面向人类认知增强**的 AI Agent 框架。它的核心理念不是追求 AGI（通用人工智能），而是通过**暴露 AI 的全部思考过程**，让使用者在每一次交互中都能学到新东西。
 
 ---
 
-## 🚀 核心差异 (Why Genesis V2?)
-
-市面上大多数 Agent（包括 OpenClaw）采用的是"大杂烩"策略：把所有工具描述、历史对话、相关文件一股脑塞进 Context，或者用向量检索（RAG）撞运气。
-
-Genesis V2.5 彻底抛弃了这种做法，引入了**维度语言架构**：
-
-### 1. 维度语言 vs 向量检索 (The Dimensional Advantage)
-*   **OpenClaw/传统 RAG**: 用户说"帮我修下网"，RAG 可能会检索到"网球"或"网站开发"，因为它是基于文本相似度的模糊匹配。
-*   **Genesis V2**: 厂长（Manager）将"帮我修下网"翻译为维度坐标 `{"scope": "network", "action": "fix", "target": "config"}`。系统**精确查询**数据库中挂载了这些标签的工具和事实。
-    *   **优势**: 0 幻觉，极低的 Token 消耗，精确度接近 SQL 查询。
-
-### 2. "外科医生"式上下文 (Sterile Context)
-*   **OpenClaw**: 历史对话越长，智商越低。因为错误的尝试和无关的闲聊污染了短期记忆。
-*   **Genesis V2**: 每次行动（Op）都是**全新**的。
-    *   Manager 像外科医生一样，只将当前任务**绝对必要**的 3 个工具和 5 条事实摆在台面上（OpSpec）。
-    *   执行器（Executor）在一个无尘的、无历史包袱的环境中执行。
-    *   执行结束，有价值的信息被提取为**结构化事实（Facts）**存入数据库，废话直接丢弃。
-
-### 3. 元认知闭环 (Meta-Cognition Loop)
-*   **OpenClaw**: 错了就重试，依赖 LLM 的随机性。
-*   **Genesis V2**: 错了会进行**根因分析**。
-    *   它不只是重试，而是会生成一条**模式（Pattern）**存入 `metacognition_workshop`。
-    *   例如："上次我以为 `pacman` 能在 Debian 上用，结果报错了。模式：检查 OS 发行版再选包管理器。"
-    *   下次行动前，Manager 会先阅读这些"错题集"，避免重蹈覆辙。
-
-### 4. 自进化词典 (Self-Optimizing Dictionary)
-*   如果用户提出了一个新的概念（比如 "调试 SambaNova"），而现有维度字典里没有这个分类。
-*   Genesis 不会卡死，而是会**发明**新的维度标签，将其注册到系统中。随着使用，它的维度语言会越来越丰富，越来越懂你的行话。
-
----
-
-## ⚖️ 局限性 (Limitations vs OpenClaw)
-
-虽然 Genesis V2 在精准度和工程化上更强，但在某些方面不如 OpenClaw 这种"直觉型" Agent：
-
-1.  **创意发散能力较弱**:
-    *   OpenClaw 适合"陪聊"或"头脑风暴"，因为它保留了大量上下文涟漪。
-    *   Genesis V2 极其功利，它只想把事做完。如果你跟它聊人生，它可能会试图把你的"人生感悟"翻译成数据库维度，然后发现无法匹配任何工具而感到困惑。
-
-2.  **冷启动摩擦**:
-    *   OpenClaw 丢进去一堆乱七八糟的文档就能跑。
-    *   Genesis V2 需要（自动或手动）将知识结构化。虽然它有自动归档机制，但在没有任何维度数据的初期，它可能不如暴力检索的 Agent 灵活。
-
-3.  **调试复杂度**:
-    *   OpenClaw 出错通常只是 Prompt 没写好。
-    *   Genesis V2 出错可能是：意图翻译错维度了？维度匹配没查到？还是工具本身的 Bug？排查链路更长。
-
----
-
-## 🏗️ 架构概览
-
-```mermaid
-graph TD
-    User["用户: '帮我配置代理'"] --> Translator
-    
-    subgraph Manager ["厂长 (Manager)"]
-        Translator["意图翻译器"] -->|{"scope":"network", ...}| Matcher["维度匹配器"]
-        Matcher <-->|SQL| DB[(Workshops SQLite)]
-        Matcher -->|匹配的Facts/Tools| Assembler["Op装配器"]
-        Digest["馆藏摘要"] --> Assembler
-    end
-    
-    Assembler -->|OpSpec (无尘任务书)| Executor["执行器 (Executor)"]
-    Executor -->|执行结果| Learner["学习机"]
-    
-    Learner -->|新事实| DB
-    Learner -->|新维度| Translator
-```
-
----
-
-## � 系统兼容性 (System Compatibility)
+## ⚖️ 系统兼容性 (System Compatibility)
 
 | Platform | Support | Notes |
 | :--- | :--- | :--- |
@@ -87,12 +14,76 @@ graph TD
 | **macOS** | ✅ **Native** | Fully supported (Apple Silicon & Intel). |
 | **Windows** | ⚠️ **WSL2 Only** | **NOT supported natively**. Requires [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) (Ubuntu). |
 
-> **Why no Windows support?**
-> Genesis relies on Unix-specific kernel features (`fcntl`, `termios`, `SIGKILL` grouping) for safe process management and sandboxing. Windows users **must** use WSL2.
+---
+
+## 💡 核心哲学：用户共生 (Human-AI Co-Evolution)
+
+大多数 AI Agent 追求的是"替你做完一切"。Genesis V4 追求的是**"让你看着它怎么做，然后你变得更强"**。
+
+```
+你提供方向 (新概念、新工具、纠错)
+        ↓
+   ┌─────────────┐
+   │  厂长 G      │ ← 认知装配师
+   │  选择节点    │
+   │  组装管线    │
+   │  暴露全过程  │
+   └──────┬──────┘
+          ↓
+你看到了拆解过程 → 你的架构思维被训练
+          ↓
+   下一次你给出更精准的方向
+          ↓
+       认知飞轮 🔄
+```
+
+**越用越聪明的不是 AI —— 是你。**
 
 ---
 
-## 🛠️ 快速开始 (Quick Start)
+## 🧩 万物皆节点 (Everything is a Node)
+
+Genesis V4 的核心数据结构是**双面节点 (Dual-Faced Node)**：
+
+| 面 | 给谁看 | 用途 | 示例 |
+|---|---|---|---|
+| **A 面** (Machine Payload) | 给 AI 看 | 极度压缩的 JSON，省 Token | `{"name":"web_search","params":["query"]}` |
+| **B 面** (Human Translation) | 给你看 | 自然语言解释，教你这是什么 | `网络搜索引擎：突破知识库限制，实时拉取互联网信息` |
+
+节点分为三类：
+- 🔌 **TOOL** — 能力节点（搜索、执行命令、读写文件...）
+- 🧠 **CONTEXT** — 情境节点（你的偏好、当前项目状态...）
+- 📖 **LESSON** — 经验节点（错题集、踩坑记录...）
+
+---
+
+## 🔧 装配单实拍 (What You Actually See)
+
+当你在 Discord 中 `@genesis 帮我查一下 OpenClaw 的生态`，你会看到：
+
+```
+🔧 [厂长已完成装配]
+目标：探索通过当前令牌访问 OpenClaw 生态的可行性和方法
+
+已加载认知节点：
+  🔌 [SYS_TOOL_WEB_SEARCH] 网络搜索引擎：突破知识库限制，实时拉取互联网信息
+  🔌 [SYS_TOOL_WORKSHOP] 记忆工坊引擎：直接用 SQL 读写长期记忆数据库
+
+执行管线 (Op Sequence)：
+  ⚡ 1. [SYS_TOOL_WEB_SEARCH] 搜索 'OpenClaw skill社区 evomap 生态 访问 令牌'
+  ⚡ 2. [SYS_TOOL_WEB_SEARCH] 搜索 'Genesis Factory Manager V4 连接 OpenClaw API'
+  ⚡ 3. [SYS_TOOL_WORKSHOP] 查询本地数据库
+  ⚡ 4. [INTERNAL] 分析搜索结果，评估可行路径
+
+🟢 [节点激活]: web_search 运行中...
+✅ [web_search 节点反馈]: 结果数: 5 ...
+🟢 [节点激活]: workshop 运行中...
+✅ [workshop 节点反馈]: Workshop has 5 table(s) ...
+```
+
+---
+
+## 📦 快速开始
 
 ### 1. 准备环境
 确保你已安装 Python 3.10+ 和 Git。
@@ -100,58 +91,79 @@ graph TD
 ### 2. 克隆与安装
 
 ```bash
-# 1. Clone repo
+# 1. 克隆仓库
 git clone https://github.com/chendechuan117-create/genesis.git
-cd genesis
+cd genesis/nanogenesis
 
-# 2. Enter core directory
-cd nanogenesis
-
-# 3. Setup Virtual Environment
+# 2. 创建虚拟环境
 python3 -m venv venv
-source venv/bin/activate  # Windows (WSL): source venv/bin/activate
+source venv/bin/activate
 
-# 4. Install Dependencies
+# 3. 安装依赖
 pip install -r requirements.txt
 ```
 
-### 3. (可选) 安装 OCR 支持 (Visual Cortex)
-为了让 Genesis 能"读懂"图片中的文字，推荐安装 Tesseract OCR：
+### 3. 配置 (.env)
 
-**Ubuntu/Debian:**
-```bash
-sudo apt-get install tesseract-ocr
-```
-
-**macOS:**
-```bash
-brew install tesseract
-```
-
-### 配置 (.env)
+在 `nanogenesis/` 目录下创建 `.env` 文件：
 
 ```ini
-# 必须配置
+# 必须：LLM 提供商 (至少配一个)
 DEEPSEEK_API_KEY="sk-..."
 
-# 推荐配置 (用于 Discord 机器人)
+# 推荐：Discord 机器人
 DISCORD_BOT_TOKEN="OT..."
 
-# 可选配置
+# 可选：网络搜索能力
 TAVILY_API_KEY="tvly-..."
 ```
 
-### 启动
+### 4. 启动
 
 ```bash
-# 启动 Web 界面 (推荐)
-streamlit run web_ui.py
-
-# 启动 Discord 守护进程
+# 启动 Discord 机器人 (推荐)
 python3 discord_bot.py
 ```
 
 ---
 
+## 🏛️ 项目结构
+
+目录核心逻辑：系统主要开发和运行环境位于 `nanogenesis/` 目录下。
+
+```
+nanogenesis/
+├── discord_bot.py          # 入口：Discord 交互层 + UI 回调
+├── genesis/
+│   ├── core/               # 底层基座 (Provider, Registry, Base)
+│   ├── v4/                 # ★ V4 白盒架构
+│   │   ├── agent.py        #   GenesisV4 入口
+│   │   ├── loop.py         #   双阶段执行引擎 (蓝图→执行)
+│   │   └── manager.py      #   厂长 G (NodeVault + FactoryManager)
+│   ├── v3/                 # V3 自组织架构 (历史保留)
+│   ├── v2/                 # V2 维度语言架构 (历史保留)
+│   └── tools/              # 9 个基础工具
+└── ~/.nanogenesis/
+    └── workshop_v4.sqlite  # 节点数据库 (A/B 双面)
+```
+
+---
+
+## 🧬 版本进化史
+
+| 版本 | 核心理念 | 状态 |
+|---|---|---|
+| **V1** | Ouroboros 循环 — 尝试让 AI 自我修改代码 | 🪦 已废弃 |
+| **V2** | 厂长-车间-执行器 — 维度语言精确调度 | 📦 存档 |
+| **V3** | 极简 ReAct — 让 AI 自由组织记忆和身份 | 📦 存档 |
+| **V4** | **白盒装配师 — 暴露思考过程，与人共生** | ✅ 当前版本 |
+
+---
+
 ## 📄 License
+
 MIT
+
+---
+
+> *"AI 之于人类，就像回音。基于用户的输入，进行更大波纹的反馈。"*
