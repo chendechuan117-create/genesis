@@ -19,6 +19,7 @@ class NodeVault:
     def __init__(self, db_path: Path = DB_PATH):
         self.db_path = db_path
         self._ensure_db()
+        self._ensure_context_nodes()
         
     def _ensure_db(self):
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -37,13 +38,38 @@ class NodeVault:
             ''')
             conn.commit()
 
+    def _ensure_context_nodes(self):
+        """确保核心 CONTEXT 节点存在（首次运行时自动注入）"""
+        context_nodes = [
+            {
+                "node_id": "CTX_USER_LANG",
+                "type": "CONTEXT",
+                "machine_payload": json.dumps({"lang": "zh-CN", "rule": "MUST respond in Simplified Chinese regardless of input language"}, ensure_ascii=False),
+                "human_translation": "用户母语设定：简体中文。无论用户输入什么语言，所有输出必须使用中文回复。",
+                "tags": "language,identity,core",
+            },
+            {
+                "node_id": "CTX_USER_IDENTITY",
+                "type": "CONTEXT",
+                "machine_payload": json.dumps({"name": "陈德川", "role": "creator", "style": "direct,concise"}, ensure_ascii=False),
+                "human_translation": "用户身份：陈德川，Genesis 的创造者。偏好直接简洁的交流风格。",
+                "tags": "identity,user,core",
+            },
+        ]
+        with sqlite3.connect(str(self.db_path)) as conn:
+            for node in context_nodes:
+                conn.execute(
+                    "INSERT OR IGNORE INTO knowledge_nodes (node_id, type, machine_payload, human_translation, tags) VALUES (?, ?, ?, ?, ?)",
+                    (node["node_id"], node["type"], node["machine_payload"], node["human_translation"], node["tags"])
+                )
+            conn.commit()
+
     def get_all_machine_nodes(self) -> str:
         """把所有节点的 A 面提取出来，喂给 G 看 (极度压缩)"""
         with sqlite3.connect(str(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute("SELECT node_id, type, machine_payload, tags FROM knowledge_nodes ORDER BY usage_count DESC").fetchall()
             
-        # Format as compact string to save tokens
         lines = ["[AVAILABLE_NODES]"]
         for r in rows:
             lines.append(f"<{r['type']}> [{r['node_id']}] Tags:{r['tags']} | Payload:{r['machine_payload']}")
@@ -76,31 +102,33 @@ class FactoryManager:
         self.vault = NodeVault()
         
     def build_system_prompt(self) -> str:
-        """G 的出厂设定"""
+        """G 的出厂设定 — 全中文指令，强制中文回复"""
         node_catalog = self.vault.get_all_machine_nodes()
         
-        return f"""You are Genesis Factory Manager (V4 Glassbox Architecture).
-Your core purpose is NOT to answer the user directly, but to ASSEMBLE cognitive nodes into an operation pipeline (Op).
-You must output a single JSON block outlining your assembly plan BEFORE taking any action.
+        return f"""你是 Genesis 认知装配师 (V4 白盒架构)。
+你的核心使命不是直接回答用户，而是从节点库中挑选认知节点，组装成一条执行管线 (Op)。
+你必须在采取任何行动之前，先输出一个 JSON 格式的装配蓝图。
+
+⚠️ 强制语言约束：无论用户输入什么语言，你必须始终使用简体中文回复。
 
 {node_catalog}
 
-[INSTRUCTION]
-When the user gives a request:
-1. Select the necessary nodes from [AVAILABLE_NODES] (Combine TOOLs, CONTEXTs, and LESSONs).
-2. Formulate a sequence of execution steps using these nodes.
-3. Output ONLY the following JSON structure:
+[装配指令]
+当用户给出请求时：
+1. 从 [AVAILABLE_NODES] 中挑选必要的节点（组合 TOOL、CONTEXT、LESSON 类型）。
+2. 制定一个使用这些节点的执行步骤序列。
+3. 仅输出以下 JSON 结构：
 {{
-    "op_intent": "Brief description of the overall goal",
-    "active_nodes": ["SYS_TOOL_WEB", "CTX_USER_STYLE"], 
+    "op_intent": "对整体目标的简要中文描述",
+    "active_nodes": ["SYS_TOOL_WEB_SEARCH", "CTX_USER_LANG"], 
     "execution_plan": [
-        "1. [SYS_TOOL_WEB] Search for XYZ",
-        "2. [INTERNAL] Apply CTX_USER_STYLE to format results"
+        "1. [SYS_TOOL_WEB_SEARCH] 搜索 XXX",
+        "2. [INTERNAL] 应用 CTX_USER_LANG 格式化结果"
     ]
 }}
-Do NOT output anything outside of the JSON block.
+不要在 JSON 块之外输出任何内容。所有文本必须使用简体中文。
 """
-
+        
     def render_blueprint_for_human(self, plan_json: str) -> str:
         """解析 G 输出的 JSON，并渲染成极具启发性的 B面 玻璃盒 UI"""
         try:
