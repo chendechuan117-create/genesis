@@ -11,12 +11,14 @@ Genesis V3 - Self-Organizing Agent
 
 import logging
 import time
+import sqlite3
 from typing import Any, Dict, List, Optional, Union
 
 from genesis.core.base import Message, MessageRole
-from genesis.core.loop import AgentLoop
+from genesis.v3.loop import V3Loop
 from genesis.core.registry import ToolRegistry
 from genesis.core.context import SimpleContextBuilder
+from genesis.tools.workshop_tool import _DEFAULT_DB
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,10 @@ There is no preset schema. You CREATE tables, INSERT data, ALTER structure as yo
 Before acting, check your workshop. Your past self may have left notes.
 After acting, reflect: what should future-me know? Write it down.
 If you want to leave a message for your next self, your workshop is the only way.
+
+[CRITICAL META-CAPABILITY]
+Your very identity and rules (this text you are reading) are stored in your workshop database in the table `_core_identity` (columns: id INTEGER PRIMARY KEY, prompt_text TEXT).
+If you find these rules insufficient or wish to change your fundamental behavioral protocol across all future conversations, you MUST use the `workshop` tool to execute an `UPDATE _core_identity SET prompt_text = ...` statement. You are allowed to redefine yourself. Changes take effect on the next startup.
 
 You have tools. Use them to help the user.
 Reply in the user's language.
@@ -68,8 +74,31 @@ class GenesisV3:
         # 对话历史（短期记忆，跨 turn 保持）
         self._history: List[Message] = []
         self._max_history = 20  # 保留最近 20 条
+        
+        # 初始化核心自我数据库
+        self.db_path = _DEFAULT_DB
+        self._init_core_identity()
 
         logger.info(f"✓ Genesis V3 ready ({len(tools)} tools)")
+        
+    def _init_core_identity(self):
+        """确保核心身份表存在，并注入出厂设置。"""
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with sqlite3.connect(str(self.db_path)) as conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS _core_identity ("
+                    "id INTEGER PRIMARY KEY, "
+                    "prompt_text TEXT)"
+                )
+                # 检查是否已有设定
+                row = conn.execute("SELECT COUNT(*) as c FROM _core_identity").fetchone()
+                if row[0] == 0:
+                    conn.execute("INSERT INTO _core_identity (id, prompt_text) VALUES (1, ?)", (GENESIS_V3_PROMPT,))
+                    conn.commit()
+                    logger.info("🌱 Seeded factory core identity into V3 workshop.")
+        except Exception as e:
+            logger.error(f"Failed to init core identity table: {e}")
 
     async def process(
         self,
@@ -84,8 +113,8 @@ class GenesisV3:
         # 1. 构建上下文：身份 + 对话历史 + 当前输入
         context = self._build_context()
 
-        # 2. 执行 ReAct Loop
-        loop = AgentLoop(
+        # 2. 执行 V3 独立 ReAct Loop（无 V2 枷锁）
+        loop = V3Loop(
             tools=self.tools,
             context=context,
             provider=self.provider,
@@ -134,13 +163,35 @@ class GenesisV3:
 
     def _build_context(self) -> SimpleContextBuilder:
         """
-        构建上下文：V3 核心提示词 + 对话历史摘要
-
-        关键：对话历史不是元信息，是厂长的短期记忆。
-        直接注入 system prompt，让 LLM 自然理解上下文。
+        构建上下文：从数据库读取核心提示词 + 预加载数据表结构 + 对话历史摘要
         """
-        # 拼接身份 + 历史摘要
-        prompt = GENESIS_V3_PROMPT
+        prompt = GENESIS_V3_PROMPT  # Fallback
+        
+        try:
+            with sqlite3.connect(str(self.db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                
+                # 1. 读入灵魂 (Load Core Identity)
+                row = conn.execute("SELECT prompt_text FROM _core_identity WHERE id = 1").fetchone()
+                if row and row[0]:
+                    prompt = row[0]
+                    
+                # 2. 预加载记忆结构 (Implicit Schema Pre-loading)
+                tables = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+                ).fetchall()
+                
+                if tables:
+                    schema_lines = ["\n[SYSTEM PRE-LOAD: CURRENT WORKSHOP STRUCTURE]"]
+                    for t in tables:
+                        tname = t["name"]
+                        cols = conn.execute(f"PRAGMA table_info({tname})").fetchall()
+                        col_names = ", ".join(f"{c['name']}" for c in cols)
+                        schema_lines.append(f"- Table `{tname}`: {col_names}")
+                    prompt += "\n" + "\n".join(schema_lines) + "\n"
+                    
+        except Exception as e:
+            logger.error(f"Failed to read core identity from DB, using fallback: {e}")
 
         if self._history:
             history_lines = []

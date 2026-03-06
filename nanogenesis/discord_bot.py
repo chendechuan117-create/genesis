@@ -23,9 +23,9 @@ if not TOKEN:
     logger.error("No DISCORD_BOT_TOKEN found in environment variables.")
     exit(1)
 
-# 3. Setup Genesis V3 Agent
-logger.info("Initializing Genesis V3 Agent...")
-agent = GenesisFactory.create_v3()
+# 3. Setup Genesis V4 Agent (The Glassbox Amplifier)
+logger.info("Initializing Genesis V4 Agent...")
+agent = GenesisFactory.create_v4()
 
 # 4. Setup Discord Client
 intents = discord.Intents.default()
@@ -35,7 +35,37 @@ client = discord.Client(intents=intents)
 # Keep track of running tasks to avoid overlapping execution in the same channel
 running_tasks = set()
 
-GENESIS_VERSION = "V3.0"
+GENESIS_VERSION = "V4.0 (Glassbox)"
+
+class DiscordCallback:
+    """处理 V4 运行时回调，向 Discord 发送实时状态更新"""
+    def __init__(self, message: discord.Message):
+        self.message = message
+
+    async def __call__(self, event_type: str, data: dict | str):
+        try:
+            if event_type == "blueprint":
+                # 发送厂长装配单
+                if len(data) > 2000:
+                    chunks = [data[i:i+1990] for i in range(0, len(data), 1990)]
+                    for c in chunks:
+                        await self.message.channel.send(c)
+                else:
+                    await self.message.channel.send(data)
+
+            elif event_type == "tool_start":
+                # 简单提示节点亮起
+                tool_name = data.get("name", "Unknown Node")
+                await self.message.channel.send(f"🟢 **[节点激活]**: `{tool_name}` 运行中...")
+                
+            elif event_type == "tool_result":
+                tool_name = data.get("name", "Unknown Node")
+                result_peek = data.get("result", "")[:200]
+                # 缩短日志以防刷屏
+                await self.message.channel.send(f"✅ **[{tool_name} 节点反馈]**: \n```\n{result_peek}...\n```")
+                
+        except Exception as e:
+            logger.error(f"Callback error: {e}")
 
 @client.event
 async def on_ready():
@@ -92,7 +122,10 @@ async def on_message(message: discord.Message):
                     files_str = "\n".join(f"  - {p}" for p in attachment_paths)
                     full_input += f"\n\n[Attached files saved locally:\n{files_str}]"
 
-                result = await agent.process(full_input)
+                # V4 接入 UI 拦截器
+                ui_callback = DiscordCallback(message)
+                
+                result = await agent.process(full_input, step_callback=ui_callback)
                 response = result.get("response", "...")
 
                 # Chunk response if too long
