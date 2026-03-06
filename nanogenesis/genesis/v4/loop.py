@@ -1,5 +1,6 @@
 """
 Genesis V4 - 白盒执行引擎 (The Glassbox Loop)
+核心：G 看标题组装蓝图 → Op 拉取内容执行 → 沉淀器提取新知识
 """
 
 from typing import List, Dict, Any, Optional
@@ -7,11 +8,10 @@ import logging
 import time
 import json
 import asyncio
-import inspect
 
 from genesis.core.base import Message, MessageRole, LLMResponse, PerformanceMetrics, LLMProvider
 from genesis.core.registry import ToolRegistry
-from genesis.v4.manager import FactoryManager
+from genesis.v4.manager import FactoryManager, Sedimenter
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,7 @@ class V4Loop:
         self.provider = provider
         self.max_iterations = max_iterations
         self.manager = FactoryManager()
+        self.sedimenter = Sedimenter(self.manager.vault, provider)
 
     async def run(
         self,
@@ -39,9 +40,11 @@ class V4Loop:
         V4 的双阶段执行流：
         Phase 1: 强制输出装配蓝图 (JSON) 并渲染给人类
         Phase 2: 依据蓝图执行工具并反馈
+        Post:    沉淀器提取新知识写入节点库
         """
         start_time = time.time()
         tools_used = []
+        tool_results_log = []  # 收集工具结果，给沉淀器用
         input_tokens = 0
         output_tokens = 0
         total_tokens = 0
@@ -56,6 +59,7 @@ class V4Loop:
         iteration = 0
         final_response = ""
         blueprint_shown = False
+        selected_node_ids = []  # G 选中的节点 ID
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -65,13 +69,12 @@ class V4Loop:
 
             logger.info(f"V4 Loop: Iteration {iteration}/{self.max_iterations}")
 
-            # ── 1. 调用 LLM (Assembly / Reasoning) ──
+            # ── 1. 调用 LLM ──
             try:
                 async def stream_handler(chunk_type, chunk_data):
                     if step_callback and chunk_type == "reasoning":
                         await self._call(step_callback, "reasoning", chunk_data)
 
-                # Phase 1: 第一轮不给工具，强迫输出文本蓝图
                 force_text = (iteration == 1)
                 
                 response = await self.provider.chat(
@@ -96,15 +99,30 @@ class V4Loop:
             if response.content:
                 content_str = response.content
 
-                # 在 Phase 1（没有工具调用），尝试解析 JSON 蓝图
+                # Phase 1: 解析 JSON 蓝图
                 if not response.has_tool_calls and "{" in content_str and "}" in content_str and not blueprint_shown:
                     try:
                         json_str = content_str[content_str.find("{"):content_str.rfind("}")+1]
-                        blueprint_ui = self.manager.render_blueprint_for_human(json_str)
+                        plan = json.loads(json_str)
+                        selected_node_ids = plan.get("active_nodes", [])
                         
+                        # 渲染 B 面蓝图给人类
+                        blueprint_ui = self.manager.render_blueprint_for_human(json_str)
                         if step_callback:
                             await self._call(step_callback, "blueprint", blueprint_ui)
                         blueprint_shown = True
+                        
+                        # ★ 关键：拉取选中节点的完整内容，注入到 Op 上下文
+                        node_contents = self.manager.vault.get_multiple_contents(selected_node_ids)
+                        context_injection = ""
+                        if node_contents:
+                            ctx_lines = ["[已加载节点内容]"]
+                            for nid, content in node_contents.items():
+                                ctx_lines.append(f"[{nid}]: {content}")
+                            context_injection = "\n".join(ctx_lines)
+                        
+                        # 更新节点使用权重
+                        self.manager.vault.increment_usage(selected_node_ids)
                             
                         built_messages.append(Message(
                             role=MessageRole.ASSISTANT, 
@@ -112,18 +130,18 @@ class V4Loop:
                         ))
                         built_messages.append(Message(
                             role=MessageRole.USER,
-                            content="[System] Blueprint received. Now execute the plan using the available tools. After completing all steps, provide a final summary response to the user WITHOUT calling any more tools."
+                            content=f"[System] 蓝图已收到。以下是你选中的节点的完整内容，请在执行时参考：\n{context_injection}\n\n请立即用工具执行你的计划。完成所有步骤后，用中文给用户一个最终总结，不要再调用工具。"
                         ))
-                        continue  # 回到循环头，这次带工具
+                        continue
                     except Exception as e:
                         logger.warning(f"Failed to parse blueprint JSON: {e}")
 
-                # 没有工具调用 = 最终回复，结束循环
+                # 纯文本 = 最终回复
                 if not response.has_tool_calls:
                     final_response = content_str
                     break
 
-            # Phase 1 强制文本，万一模型没有输出带 JSON 的内容
+            # Phase 1 强制文本，万一模型没输出 JSON
             if force_text and not blueprint_shown:
                 built_messages.append(Message(
                     role=MessageRole.ASSISTANT,
@@ -131,15 +149,14 @@ class V4Loop:
                 ))
                 built_messages.append(Message(
                     role=MessageRole.USER,
-                    content="[System] Please output your assembly plan as a JSON object with keys: op_intent, active_nodes, execution_plan. Then I will let you use tools."
+                    content='[System] 请输出你的装配蓝图 JSON：{"op_intent":"...", "active_nodes":[...], "execution_plan":[...]}'
                 ))
                 continue
 
-            # ── 3. 工具管线执行 (Execution Phase) ──
+            # ── 3. 工具管线执行 ──
             if response.has_tool_calls:
                 normalized = self._normalize_tool_calls(response.tool_calls, iteration)
 
-                # 记录 assistant 消息（含 tool_calls）
                 built_messages.append(Message(
                     role=MessageRole.ASSISTANT,
                     content=response.content or "",
@@ -173,6 +190,9 @@ class V4Loop:
 
                     result_str = str(result)
                     
+                    # 收集工具结果给沉淀器
+                    tool_results_log.append({"name": tool_name, "result": result_str[:500]})
+                    
                     if step_callback:
                         await self._call(step_callback, "tool_result", {
                             "name": tool_name, 
@@ -185,7 +205,6 @@ class V4Loop:
                         tool_call_id=tool_id,
                     ))
 
-                # 工具执行完毕，回到循环头让 LLM 基于结果产出下一步或最终回复
                 continue
 
             # 空响应兜底
@@ -193,13 +212,23 @@ class V4Loop:
                 logger.warning(f"V4 Loop: Empty response at iteration {iteration}")
                 built_messages.append(Message(
                     role=MessageRole.USER,
-                    content="[System] Empty response. Please provide your answer or use a tool."
+                    content="[System] 空响应。请用中文回复或调用工具。"
                 ))
                 continue
 
         # 兜底
         if iteration >= self.max_iterations and not final_response:
             final_response = f"V4 管线触达 {iteration} 次迭代上限。已装配挂载的节点：{', '.join(set(tools_used))}."
+
+        # ── POST-OP: 知识沉淀 ──
+        try:
+            if tool_results_log:
+                await self.sedimenter.extract_and_store(tool_results_log, user_input, final_response)
+            # 存储本轮对话为节点
+            if final_response and user_input:
+                self.sedimenter.store_conversation(user_input, final_response)
+        except Exception as e:
+            logger.warning(f"Sedimenter post-op failed (non-critical): {e}")
 
         elapsed = time.time() - start_time
         metrics = PerformanceMetrics(
@@ -242,8 +271,7 @@ class V4Loop:
 
     @staticmethod
     async def _call(callback, event_type, data):
-        """统一处理 sync/async callback（兼容 __call__ 类实例）"""
-        import asyncio
+        """统一处理 sync/async callback"""
         result = callback(event_type, data)
         if asyncio.iscoroutine(result):
             await result

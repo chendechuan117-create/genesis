@@ -2,7 +2,6 @@ import os
 import asyncio
 import logging
 from pathlib import Path
-from collections import deque
 import discord
 from dotenv import load_dotenv
 
@@ -36,11 +35,7 @@ client = discord.Client(intents=intents)
 # Keep track of running tasks to avoid overlapping execution in the same channel
 running_tasks = set()
 
-# 对话记忆缓存：按频道 ID 存储最近 10 轮对话 (用户, Agent)
-MAX_HISTORY = 10
-channel_history: dict[int, deque] = {}
-
-GENESIS_VERSION = "V4.1 (Glassbox)"
+GENESIS_VERSION = "V4.2 (Glassbox)"
 
 class DiscordCallback:
     """处理 V4 运行时回调，向 Discord 发送实时状态更新"""
@@ -126,28 +121,11 @@ async def on_message(message: discord.Message):
                     files_str = "\n".join(f"  - {p}" for p in attachment_paths)
                     full_input += f"\n\n[Attached files saved locally:\n{files_str}]"
 
-                # 注入对话历史（最近 N 轮）作为上下文燃料
-                ch_id = message.channel.id
-                if ch_id not in channel_history:
-                    channel_history[ch_id] = deque(maxlen=MAX_HISTORY)
-                
-                history = channel_history[ch_id]
-                if history:
-                    history_lines = ["[近期对话记忆]"]
-                    for h_user, h_agent in history:
-                        history_lines.append(f"用户: {h_user}")
-                        history_lines.append(f"Genesis: {h_agent[:200]}")
-                    history_str = "\n".join(history_lines)
-                    full_input = f"{history_str}\n\n[当前请求]\n{full_input}"
-
-                # V4 接入 UI 拦截器
+                # V4 接入 UI 拦截器（记忆由 Sedimenter 在 loop 内部持久化处理）
                 ui_callback = DiscordCallback(message)
                 
                 result = await agent.process(full_input, step_callback=ui_callback)
                 response = result.get("response", "...")
-                
-                # 存入对话记忆
-                channel_history[ch_id].append((user_intent, response[:500]))
 
                 # Chunk response if too long
                 if len(response) > 2000:
