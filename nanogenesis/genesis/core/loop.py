@@ -351,11 +351,10 @@ class AgentLoop:
                     "You are Genesis" in (m.content or "")
                     for m in built_messages if m.role == MessageRole.SYSTEM
                 )
-                loop_limit = 10 if is_genesis else 5  # V3: more room to self-correct
                 if call_hash == last_tool_call_hash:
                     loop_counter += 1
-                    # Strategic Interrupt: If stuck in loop, abort
-                    if loop_counter >= loop_limit:
+                    # V3 Genesis: no circuit breaker, let it figure things out
+                    if not is_genesis and loop_counter >= 5:
                         logger.warning(f"⛔ Strategic Interrupt: Loop Detected ({call_hash})")
                         final_response = f"[STRATEGIC_INTERRUPT] Caught in a loop executing: {call_hash}. Stopping execution to request a new strategy."
                         success = False
@@ -555,16 +554,19 @@ class AgentLoop:
                     if is_error:
                         if tool_name not in tool_errors: tool_errors[tool_name] = []
                         
-                        # V3 Genesis mode: higher tolerance (agent can self-correct)
+                        # V3 Genesis mode: NO circuit breaker. Let it learn.
                         _is_genesis = any(
                             "You are Genesis" in (m.content or "")
                             for m in built_messages if m.role == MessageRole.SYSTEM
                         )
-                        if is_exploratory:
-                            # 试探性动作：跳过高耗时的大模型错误坍缩，直接记入简单错误
+                        if _is_genesis:
+                            # Genesis handles its own errors. Just log.
+                            logger.info(f"🔄 Genesis mode: {tool_name} error noted, no interrupt.")
+                        elif is_exploratory:
+                            # 试探性动作
                             new_error_str = result_str[:150]
                             tool_errors[tool_name].append(new_error_str)
-                            failure_limit = 15 if _is_genesis else 8
+                            failure_limit = 8
                         else:
                             # 实体动作：执行熵值坍缩与短程阻断
                             try:
@@ -574,20 +576,18 @@ class AgentLoop:
                                 new_error_str = result_str[:100]
                                 
                             # Entropy-Aware Circuit Breaker (State Delta)
-                            # If the new error is DIFFERENT from the last error, the agent is exploring/learning.
-                            # We reset the sequential counter.
                             if tool_errors[tool_name]:
                                 last_error = tool_errors[tool_name][-1]
                                 if new_error_str != last_error:
                                     logger.info(f"🔄 Entropy Delta Detected: Agent encountered a new error for {tool_name}. Resetting failure counter.")
-                                    tool_errors[tool_name] = [] # Reset!
+                                    tool_errors[tool_name] = []
                             
                             tool_errors[tool_name].append(new_error_str)
-                            failure_limit = 8 if _is_genesis else 3
+                            failure_limit = 3
                         
-                        # Strategic Interrupt: Consecutive IDENTICAL/EXPLORATORY Failures
-                        sequential_failures = len(tool_errors[tool_name])
-                        if sequential_failures >= failure_limit:
+                        # Strategic Interrupt (V2 only, skipped for Genesis)
+                        sequential_failures = len(tool_errors.get(tool_name, []))
+                        if not _is_genesis and sequential_failures >= failure_limit:
                              logger.warning(f"⛔ Strategic Interrupt: {tool_name} failed {sequential_failures} times (Limit: {failure_limit}).")
                              final_response = f"[STRATEGIC_INTERRUPT] Tool {tool_name} failed {sequential_failures} times. Exhausted {'exploratory' if is_exploratory else 'identical'} retries. Stopping to replan."
                              success = False
