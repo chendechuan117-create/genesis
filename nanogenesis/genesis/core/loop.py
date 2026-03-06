@@ -347,10 +347,15 @@ class AgentLoop:
 
                 # 检测重复调用 (Loop Detection)
                 call_hash = "|".join(current_call_hashes)
+                is_genesis = any(
+                    "You are Genesis" in (m.content or "")
+                    for m in built_messages if m.role == MessageRole.SYSTEM
+                )
+                loop_limit = 10 if is_genesis else 5  # V3: more room to self-correct
                 if call_hash == last_tool_call_hash:
                     loop_counter += 1
-                    # Strategic Interrupt: If stuck in loop for 5 turns, abort immediately
-                    if loop_counter >= 5:
+                    # Strategic Interrupt: If stuck in loop, abort
+                    if loop_counter >= loop_limit:
                         logger.warning(f"⛔ Strategic Interrupt: Loop Detected ({call_hash})")
                         final_response = f"[STRATEGIC_INTERRUPT] Caught in a loop executing: {call_hash}. Stopping execution to request a new strategy."
                         success = False
@@ -550,14 +555,18 @@ class AgentLoop:
                     if is_error:
                         if tool_name not in tool_errors: tool_errors[tool_name] = []
                         
+                        # V3 Genesis mode: higher tolerance (agent can self-correct)
+                        _is_genesis = any(
+                            "You are Genesis" in (m.content or "")
+                            for m in built_messages if m.role == MessageRole.SYSTEM
+                        )
                         if is_exploratory:
                             # 试探性动作：跳过高耗时的大模型错误坍缩，直接记入简单错误
                             new_error_str = result_str[:150]
-                            # 即使错误完全相同，也不重置计数器，但容忍度放宽到 8 次
                             tool_errors[tool_name].append(new_error_str)
-                            failure_limit = 8
+                            failure_limit = 15 if _is_genesis else 8
                         else:
-                            # 实体动作：执行严厉的熵值坍缩与短程阻断
+                            # 实体动作：执行熵值坍缩与短程阻断
                             try:
                                 compressed = _error_compressor.compress(result_str, source=tool_name)
                                 new_error_str = _error_compressor.format_for_llm(compressed)
@@ -574,7 +583,7 @@ class AgentLoop:
                                     tool_errors[tool_name] = [] # Reset!
                             
                             tool_errors[tool_name].append(new_error_str)
-                            failure_limit = 3
+                            failure_limit = 8 if _is_genesis else 3
                         
                         # Strategic Interrupt: Consecutive IDENTICAL/EXPLORATORY Failures
                         sequential_failures = len(tool_errors[tool_name])
