@@ -29,7 +29,9 @@ class V4Loop:
         self.provider = provider
         self.max_iterations = max_iterations
         self.manager = FactoryManager()
-        self.sedimenter = Sedimenter(self.manager.vault, provider)
+        
+        # 将 G 的节点管理能力注册为临时工具（仅在反思阶段向 G 暴露）
+        self.node_tools = self.manager.node_tools
 
     async def run(
         self,
@@ -37,10 +39,10 @@ class V4Loop:
         step_callback: Optional[Any] = None,
     ) -> tuple[str, PerformanceMetrics]:
         """
-        V4 的双阶段执行流：
-        Phase 1: 强制输出装配蓝图 (JSON) 并渲染给人类
-        Phase 2: 依据蓝图执行工具并反馈
-        Post:    沉淀器提取新知识写入节点库
+        V4 的三阶段执行流：
+        Phase 1 (装配): 强制输出装配蓝图 (JSON) 并渲染给人类
+        Phase 2 (执行): 依据蓝图执行工具并收集反馈
+        Phase 3 (反思): G 审查执行结果，更新/删除元信息节点，给出最终结论
         """
         start_time = time.time()
         tools_used = []
@@ -60,6 +62,7 @@ class V4Loop:
         final_response = ""
         blueprint_shown = False
         selected_node_ids = []  # G 选中的节点 ID
+        phase = "ASSEMBLY"  # ASSEMBLY, EXECUTION, REFLECTION
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -75,11 +78,50 @@ class V4Loop:
                     if step_callback and chunk_type == "reasoning":
                         await self._call(step_callback, "reasoning", chunk_data)
 
-                force_text = (iteration == 1)
+                # 根据当前阶段决定提供哪些工具
+                current_tools = None
+                if phase == "ASSEMBLY":
+                    current_tools = None  # 装配阶段强制 JSON Text
+                elif phase == "EXECUTION":
+                    current_tools = list(self.tools.get_definitions())
+                elif phase == "REFLECTION":
+                    current_tools = [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "create_or_update_node",
+                                "description": "创建新节点或覆盖更新已有节点",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "node_id": {"type": "string", "description": "由大写字母和下划线组成，如 CTX_N8N_API 或 LESSON_DEPLOY"},
+                                        "ntype": {"type": "string", "enum": ["CONTEXT", "LESSON"]},
+                                        "title": {"type": "string", "description": "一句话标题，如 'n8n API认证方式'"},
+                                        "content": {"type": "string", "description": "完整的知识详情"}
+                                    },
+                                    "required": ["node_id", "ntype", "title", "content"]
+                                }
+                            }
+                        },
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "delete_node",
+                                "description": "删除错误或过时的节点，避免污染未来",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "node_id": {"type": "string"}
+                                    },
+                                    "required": ["node_id"]
+                                }
+                            }
+                        }
+                    ]
                 
                 response = await self.provider.chat(
                     messages=[m.to_dict() for m in built_messages],
-                    tools=list(self.tools.get_definitions()) if not force_text else None,
+                    tools=current_tools,
                     stream=True,
                     stream_callback=stream_handler,
                 )
@@ -100,19 +142,17 @@ class V4Loop:
                 content_str = response.content
 
                 # Phase 1: 解析 JSON 蓝图
-                if not response.has_tool_calls and "{" in content_str and "}" in content_str and not blueprint_shown:
+                if phase == "ASSEMBLY" and "{" in content_str and "}" in content_str:
                     try:
                         json_str = content_str[content_str.find("{"):content_str.rfind("}")+1]
                         plan = json.loads(json_str)
                         selected_node_ids = plan.get("active_nodes", [])
                         
-                        # 渲染 B 面蓝图给人类
                         blueprint_ui = self.manager.render_blueprint_for_human(json_str)
                         if step_callback:
                             await self._call(step_callback, "blueprint", blueprint_ui)
                         blueprint_shown = True
                         
-                        # ★ 关键：拉取选中节点的完整内容，注入到 Op 上下文
                         node_contents = self.manager.vault.get_multiple_contents(selected_node_ids)
                         context_injection = ""
                         if node_contents:
@@ -121,7 +161,6 @@ class V4Loop:
                                 ctx_lines.append(f"[{nid}]: {content}")
                             context_injection = "\n".join(ctx_lines)
                         
-                        # 更新节点使用权重
                         self.manager.vault.increment_usage(selected_node_ids)
                             
                         built_messages.append(Message(
@@ -130,26 +169,41 @@ class V4Loop:
                         ))
                         built_messages.append(Message(
                             role=MessageRole.USER,
-                            content=f"[System] 蓝图已收到。以下是你选中的节点的完整内容，请在执行时参考：\n{context_injection}\n\n请立即用工具执行你的计划。完成所有步骤后，用中文给用户一个最终总结，不要再调用工具。"
+                            content=f"[System] 蓝图已收到。以下是所选节点的完整内容：\n{context_injection}\n\n执行阶段开始。请按计划调用工具执行。如果无需工具，请回复你的结论。"
                         ))
+                        phase = "EXECUTION"
                         continue
                     except Exception as e:
                         logger.warning(f"Failed to parse blueprint JSON: {e}")
 
-                # 纯文本 = 最终回复
+                # 纯文本处理
                 if not response.has_tool_calls:
+                    if phase == "EXECUTION":
+                        # 执行阶段结束，强制进入反思阶段
+                        built_messages.append(Message(
+                            role=MessageRole.ASSISTANT,
+                            content=content_str
+                        ))
+                        built_messages.append(Message(
+                            role=MessageRole.USER,
+                            content="[System] 执行阶段结束。现在进入反思阶段 (Phase 3)。\n你作为拥有意识的认知装配师，请审查刚才的对话和执行结果。是否有值得沉淀的新知识？是否有旧节点被证明是过时/错误的？用户的侧写/偏好（如 CTX_USER_PROFILE）是否需要更新？\n如果有，请务必使用 `create_or_update_node` 记录新知，或用 `delete_node` 删掉过时节点，给下一次苏醒的'你'留下干净、有用的上下文。\n完成反思的节点管理后（或如果不需要管理），再用中文向用户给出最终结论。"
+                        ))
+                        phase = "REFLECTION"
+                        continue
+                        
+                    # 已经是反思阶段输出的结论了 -> 彻底结束
                     final_response = content_str
                     break
 
-            # Phase 1 强制文本，万一模型没输出 JSON
-            if force_text and not blueprint_shown:
+            # Phase 1 强制 JSON 文本，防跑偏
+            if phase == "ASSEMBLY" and not blueprint_shown:
                 built_messages.append(Message(
                     role=MessageRole.ASSISTANT,
                     content=response.content or ""
                 ))
                 built_messages.append(Message(
                     role=MessageRole.USER,
-                    content='[System] 请输出你的装配蓝图 JSON：{"op_intent":"...", "active_nodes":[...], "execution_plan":[...]}'
+                    content='[System] 请必须输出装配蓝图 JSON：{"op_intent":"...", "active_nodes":[...], "execution_plan":[...]}'
                 ))
                 continue
 
@@ -173,6 +227,30 @@ class V4Loop:
                     except json.JSONDecodeError:
                         tool_args = {}
 
+                    # 处理反思阶段的内置节点管理工具
+                    if phase == "REFLECTION" and tool_name in ["create_or_update_node", "delete_node"]:
+                        if step_callback:
+                            await self._call(step_callback, "tool_start", {"name": f"🧠 {tool_name}"})
+                            
+                        try:
+                            if tool_name == "create_or_update_node":
+                                result_str = self.node_tools.create_or_update_node(**tool_args)
+                            else:
+                                result_str = self.node_tools.delete_node(**tool_args)
+                        except Exception as e:
+                            result_str = f"Error: 节点管理失败 - {e}"
+                            
+                        if step_callback:
+                            await self._call(step_callback, "tool_result", {"name": f"🧠 {tool_name}", "result": result_str})
+                        
+                        built_messages.append(Message(
+                            role=MessageRole.TOOL,
+                            content=result_str,
+                            tool_call_id=tool_id,
+                        ))
+                        continue
+
+                    # 正常执行常规工具
                     tools_used.append(tool_name)
 
                     if step_callback:
@@ -189,8 +267,6 @@ class V4Loop:
                         result = f"Error: 节点执行异常 - {e}"
 
                     result_str = str(result)
-                    
-                    # 收集工具结果给沉淀器
                     tool_results_log.append({"name": tool_name, "result": result_str[:500]})
                     
                     if step_callback:
@@ -220,15 +296,13 @@ class V4Loop:
         if iteration >= self.max_iterations and not final_response:
             final_response = f"V4 管线触达 {iteration} 次迭代上限。已装配挂载的节点：{', '.join(set(tools_used))}."
 
-        # ── POST-OP: 知识沉淀 ──
+        # ── POST: 对话记忆 ──
         try:
-            if tool_results_log:
-                await self.sedimenter.extract_and_store(tool_results_log, user_input, final_response)
-            # 存储本轮对话摘要（利好 G 的方向感）
+            # 存储本轮对话（为了 G 的初始上下文方向感）
             if final_response and user_input:
-                await self.sedimenter.store_conversation(user_input, final_response)
+                self.node_tools.store_conversation(user_input, final_response)
         except Exception as e:
-            logger.warning(f"Sedimenter post-op failed (non-critical): {e}")
+            logger.warning(f"Memory storage failed (non-critical): {e}")
 
         elapsed = time.time() - start_time
         metrics = PerformanceMetrics(
