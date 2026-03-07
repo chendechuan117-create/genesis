@@ -74,6 +74,14 @@ class WorkshopTool(Tool):
             elif action == "query":
                 return self._run_query(conn, sql)
             elif action == "execute":
+                # Safe DDL Guardrails
+                sql_upper = sql.upper().strip()
+                if "DROP TABLE" in sql_upper or ("DELETE FROM" in sql_upper and "WHERE" not in sql_upper):
+                    return (
+                        "Error: [System Guardrail] Destructive operations (DROP TABLE, bulk DELETE without WHERE) "
+                        "are prohibited to protect core memory. If you want to deprecate data, please use a status flag "
+                        "like `is_deleted = 1` instead."
+                    )
                 return self._run_execute(conn, sql)
             else:
                 return f"Unknown action: {action}"

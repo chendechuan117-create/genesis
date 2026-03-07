@@ -44,14 +44,26 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# Multi-line Chat Input
-user_input = st.chat_input("Enter your complex multiline prompt or paste code here...")
+# Multi-line Chat Input with File Upload
+with st.container():
+    # File Uploader
+    uploaded_files = st.file_uploader("Attach files (Images/Text/Code)", accept_multiple_files=True, key="file_uploader")
+    
+    # Text Input
+    user_input = st.chat_input("Enter your complex multiline prompt or paste code here...")
 
 if user_input:
     # 1. Show user message immediately
     with st.chat_message("user"):
         st.markdown(user_input)
-    st.session_state.messages.append({"role": "user", "content": user_input})
+        if uploaded_files:
+            for f in uploaded_files:
+                st.caption(f"📎 Attached: {f.name} ({f.size} bytes)")
+    
+    st.session_state.messages.append({
+        "role": "user", 
+        "content": user_input + (f" [Attached {len(uploaded_files)} files]" if uploaded_files else "")
+    })
     
     # 2. Assistant Response Placeholder
     with st.chat_message("assistant"):
@@ -99,7 +111,31 @@ if user_input:
 
             try:
                 start_time = time.time()
-                result = await st.session_state.agent.process(user_input, step_callback=step_callback)
+                
+                # --- V2.6 Sensory Cortex Integration ---
+                from genesis.core.sensory import SensoryCortex
+                
+                # Save uploaded files temporarily
+                attachment_paths = []
+                if uploaded_files:
+                    upload_dir = Path("runtime/uploads")
+                    upload_dir.mkdir(parents=True, exist_ok=True)
+                    for up_file in uploaded_files:
+                        save_path = upload_dir / f"{int(time.time())}_{up_file.name}"
+                        with open(save_path, "wb") as f:
+                            f.write(up_file.getbuffer())
+                        attachment_paths.append(str(save_path.absolute()))
+                
+                # Perceive via Cortex
+                cortex = SensoryCortex()
+                packet = await cortex.perceive(
+                    text_input=user_input,
+                    attachments=attachment_paths,
+                    source="web_ui"
+                )
+                
+                # Process Packet
+                result = await st.session_state.agent.process(packet, step_callback=step_callback)
                 end_time = time.time()
                 
                 live_status.empty() # Clear the status spinner
