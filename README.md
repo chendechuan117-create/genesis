@@ -1,169 +1,82 @@
-# Genesis V4 — 白盒认知装配师 (The Glassbox Amplifier) 🔮
+<div align="center">
+  <h1>Genesis V4 — 白盒认知装配师 (The Glassbox AI Agent)</h1>
+  <p>AI 不是替代你思考的黑盒，而是放大你认知的白盒。</p>
+</div>
 
-> **AI 不是替代你思考的黑箱，而是放大你认知的白盒。**
+Genesis V4 并非又一个全自动的“黑盒”黑客工具，而是一个拥有**自我维护意识**、具备**极高透明度**的“认知装配师”。
 
-Genesis 是一个**面向人类认知增强**的 AI Agent 框架。它的核心理念不是追求 AGI（通用人工智能），而是通过**暴露 AI 的全部思考过程**，让使用者在每一次交互中都能学到新东西。
+它被设计为协助开发者、探索互联网、执行脚本的智能实体。它奉行的唯一核心理念是：
+> **“给下一次苏醒的‘我’，留下对‘我’有用的信息。”**
 
----
+## 🌟 核心理念与实用特性
 
-## ⚖️ 系统兼容性 (System Compatibility)
+### 1. 真正的“白箱”架构 (Glassbox) — 伪流式传输
+绝大多数 Agent 的体验是：你给一个任务 -> 漫长的后台工具调用 -> 给你最终结果。这种“黑盒”体验非常糟糕，你根本不知道它是在死机、幻觉，还是真的在干活。
 
-| Platform | Support | Notes |
-| :--- | :--- | :--- |
-| **Linux** | ✅ **Native** | Recommended (Ubuntu, Arch, Debian). Best performance. |
-| **macOS** | ✅ **Native** | Fully supported (Apple Silicon & Intel). |
-| **Windows** | ⚠️ **WSL2 Only** | **NOT supported natively**. Requires [WSL2](https://learn.microsoft.com/en-us/windows/wsl/install) (Ubuntu). |
+Genesis V4 独创了 **[B面装配单]** 机制：
+- 在它开始干活**之前**，它必须先生成一张 `JSON 蓝图`（它打算用哪些节点，它打算怎么分步执行）。
+- 这张图纸会被**立刻渲染并发送给你**（伪流式传输）。
+- 在执行过程中，每调用一个工具，它都会实时报告 `[⚙️ 执行中]` -> `[✅ 成功/失败]`。
+- **你在全盘掌控它的思考和动作**，不再有漫长的盲目等待。
 
----
+### 2. 知识的自我迭代与维护 (Phase 3: 反思)
+市面上的 Agent 往往是“一次性”的，或是强塞一个充满噪音的向量数据库（RAG）。
+Genesis V4 实现了真正的**三阶段执行流**（装配 → 执行 → 反思）：
+- 任务执行完毕后，系统会强制它进入**反思阶段**。
+- 它会审视刚才的执行结果和你的对话，**主动决定**是否调用内置工具去修改自己的“认知节点库”（增删改查）。
+- 它甚至会去主动维护**你的用户侧写**（例如你的编程习惯、偏好）。你今天纠正它的一个错误，明天苏醒的它依然记得。
 
-## 💡 核心哲学：用户共生 (Human-AI Co-Evolution)
-
-大多数 AI Agent 追求的是"替你做完一切"。Genesis V4 追求的是**"让你看着它怎么做，然后你变得更强"**。
-
-```
-你提供方向 (新概念、新工具、纠错)
-        ↓
-   ┌─────────────┐
-   │  厂长 G      │ ← 认知装配师
-   │  选择节点    │
-   │  组装管线    │
-   │  暴露全过程  │
-   └──────┬──────┘
-          ↓
-你看到了拆解过程 → 你的架构思维被训练
-          ↓
-   下一次你给出更精准的方向
-          ↓
-       认知飞轮 🔄
-```
-
-**越用越聪明的不是 AI —— 是你。**
+### 3. DeepSeek 与极致的缓存命中成本
+利用这套分离设计的**双层节点库**（G 只看标题短目录，Op 按需拉取厚重的正文事实），发往大模型的系统提示词前缀极其稳定。
+配合 **DeepSeek API** 等支持 Prefix Caching（上下文缓存）的模型，**它的短期记忆和长线架构不仅便宜，而且极速**。因为前置的设定和记忆几乎 100% 缓存命中，你只需要为它生成的新内容买单。
 
 ---
 
-## 🧩 万物皆节点 (Everything is a Node)
+## 🚀 安装指南
 
-Genesis V4 的核心数据结构是**双面节点 (Dual-Faced Node)**：
+⚠️ **注意：Genesis V4 不是打包好的客户端软件（.exe/.dmg），并且不需要寻找下载链接！它是一个你可以完全掌控源码的 Python 智能体项目。**
 
-| 面 | 给谁看 | 用途 | 示例 |
-|---|---|---|---|
-| **A 面** (Machine Payload) | 给 AI 看 | 极度压缩的 JSON，省 Token | `{"name":"web_search","params":["query"]}` |
-| **B 面** (Human Translation) | 给你看 | 自然语言解释，教你这是什么 | `网络搜索引擎：突破知识库限制，实时拉取互联网信息` |
+### 📍 V4 源码位置
+当前仓库的 V4 独立纯净版本位于：👉 `Genesis/` 文件夹中。（由于历史原因，旧版源码在 `nanogenesis/` 中保留）。
 
-节点分为三类：
-- 🔌 **TOOL** — 能力节点（搜索、执行命令、读写文件...）
-- 🧠 **CONTEXT** — 情境节点（你的偏好、当前项目状态...）
-- 📖 **LESSON** — 经验节点（错题集、踩坑记录...）
+### 方法一：极客推荐 🤖 — 指挥你的 AI 助手帮你配置
+既然我们在使用 AI，为什么不用 AI 来安装 AI？
+把下面这段话复制，发给你的 IDE（如 Cursor, Windsurf）或网页大模型：
 
----
+> "请帮我配置 Genesis V4 环境。
+> 1. 根据这个仓库下 `Genesis/requirements.txt` 的依赖，帮我创建一个干净的虚拟环境并安装好它们。
+> 2. 帮我复制一份 `.env.example`（如果有的话）并告诉我需要填入哪些 API keys（比如 DISCORD_BOT_TOKEN 这是必须的，以及需要的 DeepSeek/其他大模型 Key）。
+> 3. 用 Python 在 `Genesis/` 目录下运行 `discord_bot.py`，或者运行 `Genesis/start.sh`。"
 
-## 🔧 装配单实拍 (What You Actually See)
+### 方法二：手动极简安装
 
-当你在 Discord 中 `@genesis 帮我查一下 OpenClaw 的生态`，你会看到：
+1. **克隆代码并进入 V4 目录**
+   ```bash
+   git clone https://github.com/chendechuan117-create/genesis.git
+   cd genesis/Genesis  # 注意：必须进入 Genesis 文件夹，这里才是 V4 纯净版
+   ```
 
-```
-🔧 [厂长已完成装配]
-目标：探索通过当前令牌访问 OpenClaw 生态的可行性和方法
+2. **创建虚拟环境并安装极简依赖**
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate  # Windows 用户使用 venv\Scripts\activate
+   pip install -r requirements.txt
+   ```
 
-已加载认知节点：
-  🔌 [SYS_TOOL_WEB_SEARCH] 网络搜索引擎：突破知识库限制，实时拉取互联网信息
-  🔌 [SYS_TOOL_WORKSHOP] 记忆工坊引擎：直接用 SQL 读写长期记忆数据库
+3. **配置环境变量**
+   在 `Genesis/` 目录中新建一个 `.env` 文件，填入你的 Token：
+   ```env
+   DISCORD_BOT_TOKEN="your_discord_bot_token_here"
+   # 这里建议填入深度受支持的模型，比如 DEEPSEEK_API_KEY
+   ```
 
-执行管线 (Op Sequence)：
-  ⚡ 1. [SYS_TOOL_WEB_SEARCH] 搜索 'OpenClaw skill社区 evomap 生态 访问 令牌'
-  ⚡ 2. [SYS_TOOL_WEB_SEARCH] 搜索 'Genesis Factory Manager V4 连接 OpenClaw API'
-  ⚡ 3. [SYS_TOOL_WORKSHOP] 查询本地数据库
-  ⚡ 4. [INTERNAL] 分析搜索结果，评估可行路径
-
-🟢 [节点激活]: web_search 运行中...
-✅ [web_search 节点反馈]: 结果数: 5 ...
-🟢 [节点激活]: workshop 运行中...
-✅ [workshop 节点反馈]: Workshop has 5 table(s) ...
-```
-
----
-
-## 📦 快速开始
-
-### 1. 准备环境
-确保你已安装 Python 3.10+ 和 Git。
-
-### 2. 克隆与安装
-
-```bash
-# 1. 克隆仓库
-git clone https://github.com/chendechuan117-create/genesis.git
-cd genesis/nanogenesis
-
-# 2. 创建虚拟环境
-python3 -m venv venv
-source venv/bin/activate
-
-# 3. 安装依赖
-pip install -r requirements.txt
-```
-
-### 3. 配置 (.env)
-
-在 `nanogenesis/` 目录下创建 `.env` 文件：
-
-```ini
-# 必须：LLM 提供商 (至少配一个)
-DEEPSEEK_API_KEY="sk-..."
-
-# 推荐：Discord 机器人
-DISCORD_BOT_TOKEN="OT..."
-
-# 可选：网络搜索能力
-TAVILY_API_KEY="tvly-..."
-```
-
-### 4. 启动
-
-```bash
-# 启动 Discord 机器人 (推荐)
-python3 discord_bot.py
-```
+4. **启动！**
+   ```bash
+   chmod +x start.sh
+   ./start.sh
+   # 或者直接运行: python discord_bot.py
+   ```
 
 ---
 
-## 🏛️ 项目结构
-
-目录核心逻辑：系统主要开发和运行环境位于 `nanogenesis/` 目录下。
-
-```
-nanogenesis/
-├── discord_bot.py          # 入口：Discord 交互层 + UI 回调
-├── genesis/
-│   ├── core/               # 底层基座 (Provider, Registry, Base)
-│   ├── v4/                 # ★ V4 白盒架构
-│   │   ├── agent.py        #   GenesisV4 入口
-│   │   ├── loop.py         #   双阶段执行引擎 (蓝图→执行)
-│   │   └── manager.py      #   厂长 G (NodeVault + FactoryManager)
-│   ├── v3/                 # V3 自组织架构 (历史保留)
-│   ├── v2/                 # V2 维度语言架构 (历史保留)
-│   └── tools/              # 9 个基础工具
-└── ~/.nanogenesis/
-    └── workshop_v4.sqlite  # 节点数据库 (A/B 双面)
-```
-
----
-
-## 🧬 版本进化史
-
-| 版本 | 核心理念 | 状态 |
-|---|---|---|
-| **V1** | Ouroboros 循环 — 尝试让 AI 自我修改代码 | 🪦 已废弃 |
-| **V2** | 厂长-车间-执行器 — 维度语言精确调度 | 📦 存档 |
-| **V3** | 极简 ReAct — 让 AI 自由组织记忆和身份 | 📦 存档 |
-| **V4** | **白盒装配师 — 暴露思考过程，与人共生** | ✅ 当前版本 |
-
----
-
-## 📄 License
-
-MIT
-
----
-
-> *"AI 之于人类，就像回音。基于用户的输入，进行更大波纹的反馈。"*
+*Genesis V4.2 — 献给每一个渴望拥有真正私人助手的赛博工匠。*
