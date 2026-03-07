@@ -104,38 +104,50 @@ class NodeVault:
                 logger.info(f"NodeVault: Migrated {len(rows)} nodes to dual-layer schema.")
 
     def _ensure_seed_nodes(self):
-        """确保核心种子节点存在"""
-        seeds = [
-            # CONTEXT 节点
-            ("CTX_USER_LANG", "CONTEXT", "用户语言=简体中文", "用户母语设定：简体中文。所有回复必须使用中文。",
-             "language,core", '{"rule":"MUST respond in zh-CN"}', "system"),
-            ("CTX_USER_IDENTITY", "CONTEXT", "用户=陈德川(创造者)", "用户身份：陈德川，Genesis 的创造者。偏好直接简洁。",
-             "identity,core", '{"name":"陈德川","role":"creator"}', "system"),
-        ]
+        """清理历史遗留的假 CONTEXT 节点（用户配置不属于元信息）"""
+        fake_ctx = ['CTX_USER_LANG', 'CTX_USER_IDENTITY']
         with sqlite3.connect(str(self.db_path)) as conn:
-            for node_id, ntype, title, human, tags, content, source in seeds:
-                conn.execute(
-                    "INSERT OR IGNORE INTO knowledge_nodes (node_id, type, title, human_translation, tags) VALUES (?,?,?,?,?)",
-                    (node_id, ntype, title, human, tags)
-                )
-                conn.execute(
-                    "INSERT OR IGNORE INTO node_contents (node_id, full_content, source) VALUES (?,?,?)",
-                    (node_id, content, source)
-                )
+            for node_id in fake_ctx:
+                conn.execute("DELETE FROM knowledge_nodes WHERE node_id = ?", (node_id,))
+                conn.execute("DELETE FROM node_contents WHERE node_id = ?", (node_id,))
             conn.commit()
 
-    # ─── G 侧接口（只看标题） ───
+    # ─── G 侧接口 ───
 
     def get_all_titles(self) -> str:
-        """给 G 看的极轻量目录卡片：只有 node_id + type + title + tags"""
+        """给 G 看的极轻量目录卡片（排除对话记忆节点，记忆走单独通道）"""
         with sqlite3.connect(str(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT node_id, type, title, tags FROM knowledge_nodes ORDER BY usage_count DESC"
+                "SELECT node_id, type, title, tags FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%' ORDER BY usage_count DESC"
             ).fetchall()
-        lines = ["[节点目录]"]
+        lines = ["[元信息节点目录]"]
         for r in rows:
             lines.append(f"<{r['type']}> [{r['node_id']}] {r['title']} | tags:{r['tags']}")
+        return "\n".join(lines)
+
+    def get_recent_memory(self, limit: int = 5) -> str:
+        """拉取最近 N 条对话记忆的完整内容 — 这是 G 的短期记忆，不是元信息"""
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT nc.full_content FROM knowledge_nodes kn "
+                "JOIN node_contents nc ON kn.node_id = nc.node_id "
+                "WHERE kn.node_id LIKE 'MEM_CONV%' "
+                "ORDER BY kn.created_at DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+        if not rows:
+            return ""
+        lines = ["[近期对话记忆]"]
+        for r in reversed(rows):  # 按时间正序
+            try:
+                conv = json.loads(r['full_content'])
+                lines.append(f"用户: {conv.get('user', '?')[:150]}")
+                lines.append(f"Genesis: {conv.get('agent', '?')[:150]}")
+                lines.append("---")
+            except:
+                pass
         return "\n".join(lines)
 
     def translate_nodes(self, node_ids: List[str]) -> Dict[str, str]:
@@ -212,28 +224,36 @@ class FactoryManager:
         self.vault = NodeVault()
         
     def build_system_prompt(self) -> str:
-        """G 的出厂设定 — 只喂标题目录，不喂完整内容"""
+        """G 的出厂设定 — 记忆 + 元信息目录，分层注入"""
         title_catalog = self.vault.get_all_titles()
+        recent_memory = self.vault.get_recent_memory(limit=5)
         
+        # 记忆段：只有最近有对话才注入
+        memory_block = ""
+        if recent_memory:
+            memory_block = f"""[你的近期记忆]
+以下是最近几轮对话的摘要，帮助你理解当前上下文和用户的方向：
+{recent_memory}
+"""
+
         return f"""你是 Genesis 认知装配师 (V4 白盒架构)。
-你的核心使命是从节点目录中挑选必要的节点，组装成一条执行管线 (Op)。
+你的核心使命是从元信息节点目录中挑选必要的节点，组装成一条执行管线 (Op)。
 你必须在采取任何行动之前，先输出一个 JSON 格式的装配蓝图。
 
-⚠️ 强制约束：
-- 始终使用简体中文回复
-- 你只能看到节点的标题和标签，不要猜测节点内容
-- CONTEXT 和 LESSON 类型的节点如果与当前任务相关，必须选入
+[用户配置]
+- 语言：始终使用简体中文回复
+- 身份：用户是 Genesis 的创造者，偏好直接简洁
 
-{title_catalog}
+{memory_block}{title_catalog}
 
 [装配指令]
 当用户给出请求时：
-1. 扫描节点目录，挑选与任务相关的节点（TOOL + CONTEXT + LESSON）
-2. 制定执行步骤序列
+1. 先看你的近期记忆，理解当前上下文方向
+2. 扫描元信息节点目录，挑选与任务相关的节点（TOOL + CONTEXT + LESSON）
 3. 仅输出以下 JSON 结构：
 {{
     "op_intent": "对整体目标的简要中文描述",
-    "active_nodes": ["SYS_TOOL_WEB_SEARCH", "CTX_USER_LANG"], 
+    "active_nodes": ["SYS_TOOL_WEB_SEARCH", "LESSON_xxx"],
     "execution_plan": [
         "1. [SYS_TOOL_WEB_SEARCH] 搜索 XXX",
         "2. [INTERNAL] 综合分析"
