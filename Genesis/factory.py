@@ -1,0 +1,54 @@
+"""
+Genesis V4 — 极简工厂
+无 V3 遗留，无冗余依赖
+"""
+
+import logging
+from typing import Optional
+
+from genesis.core.registry import ToolRegistry
+from genesis.core.provider_manager import ProviderRouter
+from genesis.core.config import config
+from genesis.v4.agent import GenesisV4
+
+logger = logging.getLogger(__name__)
+
+
+def create_agent(
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model: str = "deepseek/deepseek-chat",
+) -> GenesisV4:
+    """创建 V4 Agent 实例"""
+    logger.info(">>> V4 Factory: Init Provider")
+    provider_router = ProviderRouter(
+        config=config, api_key=api_key, base_url=base_url, model=model
+    )
+
+    logger.info(">>> V4 Factory: Register Tools")
+    tools = ToolRegistry()
+
+    try:
+        from genesis.tools.file_tools import ReadFileTool, WriteFileTool, AppendFileTool, ListDirectoryTool
+        from genesis.tools.shell_tool import ShellTool
+        from genesis.tools.web_tool import WebSearchTool
+        from genesis.tools.visual_tool import VisualTool
+        from genesis.tools.workshop_tool import WorkshopTool
+        from genesis.tools.skill_creator_tool import SkillCreatorTool
+
+        tools.register(ReadFileTool())
+        tools.register(WriteFileTool())
+        tools.register(AppendFileTool())
+        tools.register(ListDirectoryTool())
+        tools.register(ShellTool(use_sandbox=False))
+        tools.register(WebSearchTool())
+        tools.register(VisualTool())
+        tools.register(WorkshopTool())
+        tools.register(SkillCreatorTool(tools))
+    except Exception as e:
+        logger.error(f"V4 tool registration failed: {e}")
+
+    provider = provider_router.get_active_provider()
+    agent = GenesisV4(tools=tools, provider=provider)
+    logger.info(f"✓ Genesis V4 ready ({len(tools)} tools)")
+    return agent
