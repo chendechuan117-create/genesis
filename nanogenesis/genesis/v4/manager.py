@@ -127,7 +127,7 @@ class NodeVault:
         return "\n".join(lines)
 
     def get_recent_memory(self, limit: int = 5) -> str:
-        """拉取最近 N 条对话记忆的完整内容 — 这是 G 的短期记忆，不是元信息"""
+        """拉取最近 N 条对话摘要 — G 的短期记忆（利好 G 的方向感）"""
         with sqlite3.connect(str(self.db_path)) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
@@ -139,15 +139,15 @@ class NodeVault:
             ).fetchall()
         if not rows:
             return ""
-        lines = ["[近期对话记忆]"]
+        lines = []
         for r in reversed(rows):  # 按时间正序
+            content = r['full_content']
+            # 兼容旧格式（JSON）和新格式（纯文本摘要）
             try:
-                conv = json.loads(r['full_content'])
-                lines.append(f"用户: {conv.get('user', '?')[:150]}")
-                lines.append(f"Genesis: {conv.get('agent', '?')[:150]}")
-                lines.append("---")
-            except:
-                pass
+                conv = json.loads(content)
+                lines.append(f"- {conv.get('user', '?')[:50]} → {conv.get('agent', '?')[:80]}")
+            except (json.JSONDecodeError, TypeError):
+                lines.append(f"- {content}")
         return "\n".join(lines)
 
     def translate_nodes(self, node_ids: List[str]) -> Dict[str, str]:
@@ -370,22 +370,34 @@ class Sedimenter:
         except Exception as e:
             logger.warning(f"Sedimenter: Extraction failed (non-critical): {e}")
 
-    def store_conversation(self, user_msg: str, agent_response: str):
-        """将一轮对话存为 CONTEXT 节点"""
+    async def store_conversation(self, user_msg: str, agent_response: str):
+        """将一轮对话压缩为一句话摘要存入 G 的记忆（利好 G，不是利好 Op）"""
         ts = datetime.now().strftime("%Y%m%d_%H%M")
         node_id = f"MEM_CONV_{ts}"
-        # 标题取用户消息前 20 字
-        title = user_msg[:20].replace("\n", " ")
+        
+        # 让 LLM 生成一句话方向摘要（不含执行细节）
+        summary = user_msg[:30]  # fallback
+        try:
+            resp = await self.provider.chat(
+                messages=[
+                    {"role": "system", "content": "你是摘要器。用一句中文（20字以内）概括这段对话的主题和结论。不要包含工具名称、技术细节、搜索结果。只说'做了什么、结果如何'。"},
+                    {"role": "user", "content": f"用户: {user_msg[:150]}\nGenesis回复: {agent_response[:300]}"}
+                ],
+                tools=None,
+                stream=False,
+            )
+            if resp.content:
+                summary = resp.content.strip().strip('"').strip("'")[:50]
+        except Exception as e:
+            logger.warning(f"Sedimenter: Summary generation failed, using fallback: {e}")
         
         self.vault.create_node(
             node_id=node_id,
             ntype="CONTEXT",
-            title=f"对话记录: {title}",
-            human_translation=f"对话记忆 ({ts}): {title}...",
+            title=summary,
+            human_translation=f"对话记忆 ({ts}): {summary}",
             tags="memory,conversation",
-            full_content=json.dumps({
-                "user": user_msg[:500],
-                "agent": agent_response[:500]
-            }, ensure_ascii=False),
+            full_content=summary,  # G 的记忆只存摘要，不存原始对话
             source="conversation"
         )
+        logger.info(f"Sedimenter: Stored conversation summary → [{node_id}] {summary}")

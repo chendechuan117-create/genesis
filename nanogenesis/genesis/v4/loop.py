@@ -224,9 +224,9 @@ class V4Loop:
         try:
             if tool_results_log:
                 await self.sedimenter.extract_and_store(tool_results_log, user_input, final_response)
-            # 存储本轮对话为节点
+            # 存储本轮对话摘要（利好 G 的方向感）
             if final_response and user_input:
-                self.sedimenter.store_conversation(user_input, final_response)
+                await self.sedimenter.store_conversation(user_input, final_response)
         except Exception as e:
             logger.warning(f"Sedimenter post-op failed (non-critical): {e}")
 
