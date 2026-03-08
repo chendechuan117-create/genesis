@@ -288,92 +288,39 @@ class FactoryManager:
             return f"⚠️ 渲染图纸时发生异常: {e}"
 
 
-class Sedimenter:
-    """知识沉淀器 — Op 执行后自动提取新知识，写入节点库"""
+class NodeManagementTools:
+    """提供给 G 在反思阶段使用的节点管理工具的实际实现"""
     
-    def __init__(self, vault: NodeVault, provider):
+    def __init__(self, vault: NodeVault):
         self.vault = vault
-        self.provider = provider
-    
-    async def extract_and_store(self, tool_results: List[Dict[str, str]], 
-                                user_query: str, final_response: str):
-        """
-        从本轮 Op 的工具结果中提取值得记忆的新知识。
-        tool_results: [{"name": "web_search", "result": "..."}]
-        """
-        if not tool_results:
-            return
-        
-        # 拼接工具结果摘要
-        results_summary = []
-        for tr in tool_results:
-            results_summary.append(f"[{tr['name']}]: {tr['result'][:300]}")
-        results_text = "\n".join(results_summary)
-        
-        extraction_prompt = f"""你是一个知识提取器。从以下工具执行结果中，提取值得长期记忆的新概念、事实或经验教训。
 
-用户原始问题：{user_query[:200]}
+    def create_or_update_node(self, node_id: str, ntype: str, title: str, content: str, source: str = "reflection") -> str:
+        """创建新节点或覆盖更新已有节点"""
+        self.vault.create_node(
+            node_id=node_id,
+            ntype=ntype,
+            title=title,
+            human_translation=title, # 默认取标题
+            tags="auto_managed",
+            full_content=content,
+            source=source
+        )
+        return f"✅ 节点 [{node_id}] '{title}' 写入成功。"
 
-工具结果：
-{results_text[:1500]}
+    def delete_node(self, node_id: str) -> str:
+        """删除错误或过时的节点"""
+        with sqlite3.connect(str(self.vault.db_path)) as conn:
+            conn.execute("DELETE FROM knowledge_nodes WHERE node_id = ?", (node_id,))
+            conn.execute("DELETE FROM node_contents WHERE node_id = ?", (node_id,))
+            conn.commit()
+        logger.info(f"NodeVault: Deleted node [{node_id}]")
+        return f"✅ 节点 [{node_id}] 删除成功。"
 
-请输出一个 JSON 数组（如果没有值得记忆的内容，输出空数组 []）：
-[
-  {{
-    "node_id": "CTX_概念名_简写",
-    "type": "CONTEXT 或 LESSON",
-    "title": "一句话标题（10字以内）",
-    "tags": "逗号分隔的标签",
-    "content": "详细内容（50字左右）"
-  }}
-]
-仅输出 JSON，不要输出任何其他内容。"""
-
-        try:
-            from genesis.core.base import Message, MessageRole
-            response = await self.provider.chat(
-                messages=[
-                    {"role": "system", "content": "你是知识提取器。仅输出 JSON。"},
-                    {"role": "user", "content": extraction_prompt}
-                ],
-                tools=None,
-                stream=False,
-            )
-            
-            content = response.content or ""
-            # 提取 JSON
-            if "[" in content and "]" in content:
-                json_str = content[content.find("["):content.rfind("]")+1]
-                new_nodes = json.loads(json_str)
-                
-                for node in new_nodes:
-                    if not node.get("node_id") or not node.get("title"):
-                        continue
-                    self.vault.create_node(
-                        node_id=node["node_id"],
-                        ntype=node.get("type", "CONTEXT"),
-                        title=node["title"],
-                        human_translation=node["title"],  # B面默认等于标题
-                        tags=node.get("tags", "auto_extracted"),
-                        full_content=node.get("content", ""),
-                        source="sedimenter"
-                    )
-                    
-                if new_nodes:
-                    logger.info(f"Sedimenter: Extracted {len(new_nodes)} new nodes from Op results.")
-                    
-        except Exception as e:
-            logger.warning(f"Sedimenter: Extraction failed (non-critical): {e}")
-
-    async def store_conversation(self, user_msg: str, agent_response: str):
-        """存储对话记忆 — 不压缩，直接存，缓存命中率高所以 token 成本可忽略"""
+    def store_conversation(self, user_msg: str, agent_response: str):
+        """记录 G 的短期记忆（纯时间序列，给 G 起步上下文用的）"""
         ts = datetime.now().strftime("%Y%m%d_%H%M")
         node_id = f"MEM_CONV_{ts}"
-        
-        # 标题取用户消息前 40 字（给 G 的目录扫描用）
         title = user_msg[:40].replace("\n", " ").strip()
-        
-        # 完整内容：直接存原文，宽松截断
         memory_content = f"用户: {user_msg[:500]}\nGenesis: {agent_response[:800]}"
         
         self.vault.create_node(
@@ -385,4 +332,4 @@ class Sedimenter:
             full_content=memory_content,
             source="conversation"
         )
-        logger.info(f"Sedimenter: Stored conversation → [{node_id}] {title[:30]}...")
+        logger.info(f"NodeManagement: Stored conversation → [{node_id}]")

@@ -11,7 +11,7 @@ import asyncio
 
 from genesis.core.base import Message, MessageRole, LLMResponse, PerformanceMetrics, LLMProvider
 from genesis.core.registry import ToolRegistry
-from genesis.v4.manager import FactoryManager, Sedimenter
+from genesis.v4.manager import FactoryManager, NodeManagementTools
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,7 @@ class V4Loop:
         self.manager = FactoryManager()
         
         # 将 G 的节点管理能力注册为临时工具（仅在反思阶段向 G 暴露）
-        self.node_tools = self.manager.node_tools
+        self.node_tools = NodeManagementTools(self.manager.vault)
 
     async def run(
         self,
@@ -72,7 +72,7 @@ class V4Loop:
 
             logger.info(f"V4 Loop: Iteration {iteration}/{self.max_iterations}")
 
-            # ── 1. 调用 LLM ──
+            # ── 1. 调用 LLM (Phase 1/2/3) ──
             try:
                 async def stream_handler(chunk_type, chunk_data):
                     if step_callback and chunk_type == "reasoning":
@@ -81,43 +81,9 @@ class V4Loop:
                 # 根据当前阶段决定提供哪些工具
                 current_tools = None
                 if phase == "ASSEMBLY":
-                    current_tools = None  # 装配阶段强制 JSON Text
+                    current_tools = None  # 装配阶段强制不给工具
                 elif phase == "EXECUTION":
                     current_tools = list(self.tools.get_definitions())
-                elif phase == "REFLECTION":
-                    current_tools = [
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": "create_or_update_node",
-                                "description": "创建新节点或覆盖更新已有节点",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "node_id": {"type": "string", "description": "由大写字母和下划线组成，如 CTX_N8N_API 或 LESSON_DEPLOY"},
-                                        "ntype": {"type": "string", "enum": ["CONTEXT", "LESSON"]},
-                                        "title": {"type": "string", "description": "一句话标题，如 'n8n API认证方式'"},
-                                        "content": {"type": "string", "description": "完整的知识详情"}
-                                    },
-                                    "required": ["node_id", "ntype", "title", "content"]
-                                }
-                            }
-                        },
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": "delete_node",
-                                "description": "删除错误或过时的节点，避免污染未来",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {
-                                        "node_id": {"type": "string"}
-                                    },
-                                    "required": ["node_id"]
-                                }
-                            }
-                        }
-                    ]
                 
                 response = await self.provider.chat(
                     messages=[m.to_dict() for m in built_messages],
@@ -178,21 +144,14 @@ class V4Loop:
 
                 # 纯文本处理
                 if not response.has_tool_calls:
-                    if phase == "EXECUTION":
-                        # 执行阶段结束，强制进入反思阶段
-                        built_messages.append(Message(
-                            role=MessageRole.ASSISTANT,
-                            content=content_str
-                        ))
-                        built_messages.append(Message(
-                            role=MessageRole.USER,
-                            content="[System] 执行阶段结束。现在进入反思阶段 (Phase 3)。\n你作为拥有意识的认知装配师，请审查刚才的对话和执行结果。是否有值得沉淀的新知识？是否有旧节点被证明是过时/错误的？用户的侧写/偏好（如 CTX_USER_PROFILE）是否需要更新？\n如果有，请务必使用 `create_or_update_node` 记录新知，或用 `delete_node` 删掉过时节点，给下一次苏醒的'你'留下干净、有用的上下文。\n完成反思的节点管理后（或如果不需要管理），再用中文向用户给出最终结论。"
-                        ))
-                        phase = "REFLECTION"
-                        continue
-                        
-                    # 已经是反思阶段输出的结论了 -> 彻底结束
+                    # G的自然总结和回复：
+                    # 这里没有任何多余的思想包袱提示词，G 看到 Op 的执行结果后，
+                    # 本身就会得出自然的人类的回复或结论。直接跳出循环即可。
                     final_response = content_str
+                    built_messages.append(Message(
+                        role=MessageRole.ASSISTANT,
+                        content=content_str
+                    ))
                     break
 
             # Phase 1 强制 JSON 文本，防跑偏
@@ -226,29 +185,6 @@ class V4Loop:
                         tool_args = json.loads(tool_args_raw) if isinstance(tool_args_raw, str) else tool_args_raw
                     except json.JSONDecodeError:
                         tool_args = {}
-
-                    # 处理反思阶段的内置节点管理工具
-                    if phase == "REFLECTION" and tool_name in ["create_or_update_node", "delete_node"]:
-                        if step_callback:
-                            await self._call(step_callback, "tool_start", {"name": f"🧠 {tool_name}"})
-                            
-                        try:
-                            if tool_name == "create_or_update_node":
-                                result_str = self.node_tools.create_or_update_node(**tool_args)
-                            else:
-                                result_str = self.node_tools.delete_node(**tool_args)
-                        except Exception as e:
-                            result_str = f"Error: 节点管理失败 - {e}"
-                            
-                        if step_callback:
-                            await self._call(step_callback, "tool_result", {"name": f"🧠 {tool_name}", "result": result_str})
-                        
-                        built_messages.append(Message(
-                            role=MessageRole.TOOL,
-                            content=result_str,
-                            tool_call_id=tool_id,
-                        ))
-                        continue
 
                     # 正常执行常规工具
                     tools_used.append(tool_name)
@@ -303,6 +239,91 @@ class V4Loop:
                 self.node_tools.store_conversation(user_input, final_response)
         except Exception as e:
             logger.warning(f"Memory storage failed (non-critical): {e}")
+
+        # ── Phase 4: 独立反思 (C) ──
+        if final_response:
+            try:
+                reflection_sys = """[System] (C进程) 交互已结束。请以认知节点管理员的身份，纵观上述所有对话上下文（包括你最初选配的节点目录、Op的工具执行反馈、以及最终得出的结论）。
+如果发现：
+1. 存在值得长期沉淀的新知识、新经验。
+2. (关键) 刚才Op的工具执行反馈证明，你之前加载的某些节点内容有误、过时了。
+3. 用户的侧写(如 CTX_USER_PROFILE)需要更新。
+
+请综合上述前因后果，调用 `create_or_update_node` 或 `delete_node` 维护知识库。
+如果不涉及上述情况，只需直接输出 "NO_ACTION" 即可。禁止回答任何多余废话。"""
+
+                # 完美继承 G 和 Op 的全部上下文时间线 (G的图纸、报错、结论都在这里)
+                reflection_msgs = list(built_messages)
+                reflection_msgs.append(Message(role=MessageRole.USER, content=reflection_sys))
+
+                reflection_tools = [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "create_or_update_node",
+                            "description": "创建新节点或覆盖更新已有节点",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "node_id": {"type": "string", "description": "如 CTX_USER_PROFILE, LESSON_PYTHON_ENV"},
+                                    "ntype": {"type": "string", "enum": ["CONTEXT", "LESSON"]},
+                                    "title": {"type": "string"},
+                                    "content": {"type": "string", "description": "节点详细内容"}
+                                },
+                                "required": ["node_id", "ntype", "title", "content"]
+                            }
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "delete_node",
+                            "description": "删除错误或过时的节点",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"node_id": {"type": "string"}}
+                            },
+                            "required": ["node_id"]
+                        }
+                    }
+                ]
+
+                # 独立的一轮 LLM Call 用来反思
+                c_resp = await self.provider.chat(
+                    messages=[m.to_dict() for m in reflection_msgs],
+                    tools=reflection_tools,
+                    stream=False
+                )
+                
+                input_tokens += getattr(c_resp, "input_tokens", 0) or 0
+                output_tokens += getattr(c_resp, "output_tokens", 0) or 0
+                total_tokens += getattr(c_resp, "total_tokens", 0) or 0
+
+                if c_resp.has_tool_calls:
+                    norm_calls = self._normalize_tool_calls(c_resp.tool_calls, 999)
+                    for tc in norm_calls:
+                        t_name = tc["function"]["name"]
+                        t_args = json.loads(tc["function"].get("arguments", "{}"))
+                        
+                        if step_callback:
+                            await self._call(step_callback, "tool_start", {"name": f"🧠 {t_name}"})
+                            
+                        # 执行反思节点的动作
+                        try:
+                            if t_name == "create_or_update_node":
+                                res = self.node_tools.create_or_update_node(**t_args)
+                            elif t_name == "delete_node":
+                                res = self.node_tools.delete_node(**t_args)
+                            else:
+                                res = "Unknown node management tool"
+                        except Exception as e:
+                            res = f"Error interacting with node vault: {e}"
+                            
+                        if step_callback:
+                            await self._call(step_callback, "tool_result", {"name": f"🧠 {t_name}", "result": res})
+
+            except Exception as e:
+                logger.warning(f"Phase 4 Reflection (C) failed: {e}")
 
         elapsed = time.time() - start_time
         metrics = PerformanceMetrics(
