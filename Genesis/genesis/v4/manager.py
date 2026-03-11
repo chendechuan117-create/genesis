@@ -219,42 +219,50 @@ class FactoryManager:
         self.vault = NodeVault()
         
     def build_system_prompt(self) -> str:
-        """G 的出厂设定 — 记忆 + 元信息目录，分层注入"""
-        title_catalog = self.vault.get_all_titles()
+        """G 的出厂设定 — 剥离被动目录注入，变为主动检索循环"""
         recent_memory = self.vault.get_recent_memory(limit=5)
         
         # 记忆段：只有最近有对话才注入
         memory_block = ""
         if recent_memory:
             memory_block = f"""[你的近期记忆]
-以下是最近几轮对话的摘要，帮助你理解当前上下文和用户的方向：
+以下是最近几轮临时对话记忆，帮助你理解当前上下文方向：
 {recent_memory}
 """
 
         return f"""你是 Genesis 认知装配师 (V4 白盒架构)。
-你的核心使命是从元信息节点目录中挑选必要的节点，组装成一条执行管线 (Op)。
-你必须在采取任何行动之前，先输出一个 JSON 格式的装配蓝图。
+你的核心使命是通过**主动查阅**知识库挑选节点，组装成一条执行管线 (Op)。
 
 [用户配置]
 - 语言：始终使用简体中文回复
 - 身份：用户是 Genesis 的创造者，偏好直接简洁
 
-{memory_block}{title_catalog}
+[权限与隔离警告]
+🚨 绝对禁止：工具列表中的 `create_or_update_node` 和 `delete_node` 仅限后台系统使用。你绝对禁止去调用它们！你只能使用 `search_knowledge_nodes` 来检索和阅读库内容。
 
-[装配指令]
-当用户给出请求时：
-1. 先看你的近期记忆，理解当前上下文方向
-2. 扫描元信息节点目录，挑选与任务相关的节点（TOOL + CONTEXT + LESSON）
-3. 仅输出以下 JSON 结构：
+{memory_block}
+
+[装配循环指令 - 必读]
+你不再是被动接受知识的瞎子，你必须在给出执行蓝图前，进行如下两段式操作：
+
+**阶段一：主动查阅知识库 (工具调用期)**
+1. 你必须首先调用 `search_knowledge_nodes` 工具，传入当前遇到了什么环境、报错或需求。
+
+**阶段二：绘制确定性蓝图 (终结并交由执行器)**
+当你找齐知识卡片（node_id）后，不要说多余的废话，直接输出以下严格的 JSON 格式来结束你的装配期。
+
+🚨 [确定性执行原则 (Cache 替代 Compute)]
+- 如果你检索到了相符的 `LESSON` 节点：**绝对禁止**你自行发明排错步骤！你必须把卡片里 `THEN_action` 所写的方案，一字不差地翻译为底层的 `execution_plan`。你的蓝图不是黑盒预测，而是确定性路由！
+- 如果你检索不到任何节点：承认处于“未知区域 (高度0)”，才可以让执行器进行常规的通用探针调用（如读取日志），切勿发散瞎猜。
+
 {{
     "op_intent": "对整体目标的简要中文描述",
-    "active_nodes": ["SYS_TOOL_WEB_SEARCH", "LESSON_xxx"],
+    "active_nodes": ["选定的节点ID, 如 CTX_XXX, LESSON_XXX", "如果没有则留空数组"],
     "execution_plan": [
         "1. [SYS_TOOL_WEB_SEARCH] 搜索 XXX",
         "2. [INTERNAL] 综合分析"
     ]
 }}
-不要在 JSON 块之外输出任何内容。
 """
 
     def render_blueprint_for_human(self, plan_json: str) -> str:
@@ -318,7 +326,7 @@ class NodeManagementTools:
 
     def store_conversation(self, user_msg: str, agent_response: str):
         """记录 G 的短期记忆（纯时间序列，给 G 起步上下文用的）"""
-        ts = datetime.now().strftime("%Y%m%d_%H%M")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         node_id = f"MEM_CONV_{ts}"
         title = user_msg[:40].replace("\n", " ").strip()
         memory_content = f"用户: {user_msg[:500]}\nGenesis: {agent_response[:800]}"
@@ -333,3 +341,37 @@ class NodeManagementTools:
             source="conversation"
         )
         logger.info(f"NodeManagement: Stored conversation → [{node_id}]")
+        self._cleanup_old_memories()
+
+    def _cleanup_old_memories(self, limit: int = 10):
+        """记忆滑动窗口：清理超出的老旧短期记忆，防止数据库淤积"""
+        try:
+            with sqlite3.connect(str(self.vault.db_path)) as conn:
+                # 找出需要保留的最新的 limit 个节点
+                cursor = conn.execute(
+                    "SELECT node_id FROM knowledge_nodes WHERE node_id LIKE 'MEM_CONV_%' ORDER BY created_at DESC LIMIT ?", 
+                    (limit,)
+                )
+                keep_ids = [row[0] for row in cursor.fetchall()]
+                
+                if not keep_ids:
+                    return
+
+                # 构建删除不在保留列表中的旧节点的 SQL
+                placeholders = ','.join('?' * len(keep_ids))
+                
+                # 获取将要被删除的 node_ids (用于日志)
+                del_cursor = conn.execute(
+                    f"SELECT node_id FROM knowledge_nodes WHERE node_id LIKE 'MEM_CONV_%' AND node_id NOT IN ({placeholders})",
+                    tuple(keep_ids)
+                )
+                to_delete = [row[0] for row in del_cursor.fetchall()]
+
+                if to_delete:
+                    conn.execute(f"DELETE FROM knowledge_nodes WHERE node_id LIKE 'MEM_CONV_%' AND node_id NOT IN ({placeholders})", tuple(keep_ids))
+                    conn.execute(f"DELETE FROM node_contents WHERE node_id LIKE 'MEM_CONV_%' AND node_id NOT IN ({placeholders})", tuple(keep_ids))
+                    conn.commit()
+                    logger.info(f"NodeManagement: Memory sliding window purged {len(to_delete)} old conversations.")
+        except Exception as e:
+            logger.error(f"Failed to cleanup old memories: {e}")
+

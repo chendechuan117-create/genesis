@@ -18,11 +18,13 @@ class GenesisV4:
         self,
         tools: ToolRegistry,
         provider: LLMProvider,
-        max_iterations: int = 50,
+        max_iterations: int = 200,
+        enable_logging: bool = True
     ):
         self.tools = tools
         self.provider = provider
         self.max_iterations = max_iterations
+        self.enable_logging = enable_logging
 
     async def process(self, user_input: str, step_callback: Optional[Any] = None) -> Dict[str, Any]:
         """

@@ -23,7 +23,7 @@ class V4Loop:
         self,
         tools: ToolRegistry,
         provider: LLMProvider,
-        max_iterations: int = 50,
+        max_iterations: int = 200, # Changed default from 50 to 200
     ):
         self.tools = tools
         self.provider = provider
@@ -81,7 +81,8 @@ class V4Loop:
                 # 根据当前阶段决定提供哪些工具
                 current_tools = None
                 if phase == "ASSEMBLY":
-                    current_tools = None  # 装配阶段强制不给工具
+                    # 仅授权检索工具给 G
+                    current_tools = [t for t in self.tools.get_definitions() if t["function"]["name"] == "search_knowledge_nodes"]
                 elif phase == "EXECUTION":
                     current_tools = list(self.tools.get_definitions())
                 
@@ -107,64 +108,62 @@ class V4Loop:
             if response.content:
                 content_str = response.content
 
-                # Phase 1: 解析 JSON 蓝图
-                if phase == "ASSEMBLY" and "{" in content_str and "}" in content_str:
+                # Phase 1: 解析 JSON 蓝图 (仅在没有工具调用时，且含有严格图纸键值)
+                if phase == "ASSEMBLY" and not response.has_tool_calls and "{" in content_str and "}" in content_str:
                     try:
                         json_str = content_str[content_str.find("{"):content_str.rfind("}")+1]
                         plan = json.loads(json_str)
-                        selected_node_ids = plan.get("active_nodes", [])
-                        
-                        blueprint_ui = self.manager.render_blueprint_for_human(json_str)
-                        if step_callback:
-                            await self._call(step_callback, "blueprint", blueprint_ui)
-                        blueprint_shown = True
-                        
-                        node_contents = self.manager.vault.get_multiple_contents(selected_node_ids)
-                        context_injection = ""
-                        if node_contents:
-                            ctx_lines = ["[已加载节点内容]"]
-                            for nid, content in node_contents.items():
-                                ctx_lines.append(f"[{nid}]: {content}")
-                            context_injection = "\n".join(ctx_lines)
-                        
-                        self.manager.vault.increment_usage(selected_node_ids)
+                        if "op_intent" in plan or "execution_plan" in plan:
+                            selected_node_ids = plan.get("active_nodes", [])
                             
-                        built_messages.append(Message(
-                            role=MessageRole.ASSISTANT, 
-                            content=content_str
-                        ))
-                        built_messages.append(Message(
-                            role=MessageRole.USER,
-                            content=f"[System] 蓝图已收到。以下是所选节点的完整内容：\n{context_injection}\n\n执行阶段开始。请按计划调用工具执行。如果无需工具，请回复你的结论。"
-                        ))
-                        phase = "EXECUTION"
-                        continue
+                            blueprint_ui = self.manager.render_blueprint_for_human(json_str)
+                            if step_callback:
+                                await self._call(step_callback, "blueprint", blueprint_ui)
+                            blueprint_shown = True
+                            
+                            node_contents = self.manager.vault.get_multiple_contents(selected_node_ids)
+                            context_injection = ""
+                            if node_contents:
+                                ctx_lines = ["[已加载节点内容]"]
+                                for nid, content in node_contents.items():
+                                    ctx_lines.append(f"[{nid}]: {content}")
+                                context_injection = "\n".join(ctx_lines)
+                            
+                            self.manager.vault.increment_usage(selected_node_ids)
+                                
+                            built_messages.append(Message(
+                                role=MessageRole.ASSISTANT, 
+                                content=content_str
+                            ))
+                            built_messages.append(Message(
+                                role=MessageRole.USER,
+                                content=f"[System] 蓝图已收到。以下是所选节点的完整内容：\n{context_injection}\n\n执行阶段开始。请按计划调用执行工具。如果无需进一步执行，请直接回复你的结论。"
+                            ))
+                            phase = "EXECUTION"
+                            continue
                     except Exception as e:
                         logger.warning(f"Failed to parse blueprint JSON: {e}")
 
                 # 纯文本处理
                 if not response.has_tool_calls:
-                    # G的自然总结和回复：
-                    # 这里没有任何多余的思想包袱提示词，G 看到 Op 的执行结果后，
-                    # 本身就会得出自然的人类的回复或结论。直接跳出循环即可。
-                    final_response = content_str
-                    built_messages.append(Message(
-                        role=MessageRole.ASSISTANT,
-                        content=content_str
-                    ))
-                    break
-
-            # Phase 1 强制 JSON 文本，防跑偏
-            if phase == "ASSEMBLY" and not blueprint_shown:
-                built_messages.append(Message(
-                    role=MessageRole.ASSISTANT,
-                    content=response.content or ""
-                ))
-                built_messages.append(Message(
-                    role=MessageRole.USER,
-                    content='[System] 请必须输出装配蓝图 JSON：{"op_intent":"...", "active_nodes":[...], "execution_plan":[...]}'
-                ))
-                continue
+                    if phase == "ASSEMBLY" and not blueprint_shown:
+                        built_messages.append(Message(
+                            role=MessageRole.ASSISTANT,
+                            content=response.content or ""
+                        ))
+                        built_messages.append(Message(
+                            role=MessageRole.USER,
+                            content='[System] 请必须输出装配蓝图 JSON：{"op_intent":"...", "active_nodes":[...], "execution_plan":[...]} 或者调用 search_knowledge_nodes 查阅工具。'
+                        ))
+                        continue
+                    else:
+                        # 正常自然回复 (EXECUTION 阶段收尾)
+                        final_response = content_str
+                        built_messages.append(Message(
+                            role=MessageRole.ASSISTANT,
+                            content=content_str
+                        ))
+                        break
 
             # ── 3. 工具管线执行 ──
             if response.has_tool_calls:
@@ -243,84 +242,76 @@ class V4Loop:
         # ── Phase 4: 独立反思 (C) ──
         if final_response:
             try:
-                reflection_sys = """[System] (C进程) 交互已结束。请以认知节点管理员的身份，纵观上述所有对话上下文（包括你最初选配的节点目录、Op的工具执行反馈、以及最终得出的结论）。
-如果发现：
-1. 存在值得长期沉淀的新知识、新经验。
-2. (关键) 刚才Op的工具执行反馈证明，你之前加载的某些节点内容有误、过时了。
-3. 用户的侧写(如 CTX_USER_PROFILE)需要更新。
+                reflection_sys = """[System] (C进程) 交互已结束。请以认知节点管理员的身份，审查本次执行的管线。
+你有权且**必须**优先调用 `search_knowledge_nodes` 来查阅知识库。
 
-请综合上述前因后果，调用 `create_or_update_node` 或 `delete_node` 维护知识库。
-如果不涉及上述情况，只需直接输出 "NO_ACTION" 即可。禁止回答任何多余废话。"""
+🚨 [只提取 Delta (差值) 原则]
+你绝对禁止将大段的背景流水账、调试过程写入节点！
+你只能像提取数学常数一样，提取管线中**“Op 预期失败与最终成功之间的破局点 (Aha Moment)”**。
+
+请遵循以下原子化双态节点架构规范：
+
+1. [数据结构约束]: 
+   - 如果沉淀状态参数 (CONTEXT)：调用 `record_context_node` 工具，记录纯粹的环境变量赋值或路径定义。
+   - 如果沉淀经验流程 (LESSON)：调用 `record_lesson_node` 工具，按其参数要求精确填入触发条件(verb, noun, context)、执行动作(步骤数组)、以及破局原因。
+   
+2. [查重与旧时代重构]: 想要写入经验前，先调用 search_knowledge_nodes 查重。
+   - 如果你搜到了大段非原子化、混合型旧节点，你有权调用 `delete_node` 将其删除，然后调用上述两个结构化工具拆分为多个合规的原子节点。
+3. [决策]: 若存在高度相关且合规的旧节点，提取最新的破局点综合版本覆盖（重名写入即可覆盖）；若无，创建新节点。
+4. [完结]: 工作完成或无需沉淀时，直接输出 "NO_ACTION" 结束。
+
+🚨 绝对警告: 你只被授权使用节点档案馆工具 (search, record_context, record_lesson, delete)！你不要试图调用普通的业务执行工具。"""
 
                 # 完美继承 G 和 Op 的全部上下文时间线 (G的图纸、报错、结论都在这里)
                 reflection_msgs = list(built_messages)
                 reflection_msgs.append(Message(role=MessageRole.USER, content=reflection_sys))
+                # 独立的一轮 C进程循环 (最多 3 次迭代，支持查重后再写)
+                c_tools = list(self.tools.get_definitions())
+                c_iteration = 0
+                while c_iteration < 3:
+                    c_iteration += 1
+                    c_resp = await self.provider.chat(
+                        messages=[m.to_dict() for m in reflection_msgs],
+                        tools=c_tools,
+                        stream=False
+                    )
+                    
+                    input_tokens += getattr(c_resp, "input_tokens", 0) or 0
+                    output_tokens += getattr(c_resp, "output_tokens", 0) or 0
+                    total_tokens += getattr(c_resp, "total_tokens", 0) or 0
 
-                reflection_tools = [
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "create_or_update_node",
-                            "description": "创建新节点或覆盖更新已有节点",
-                            "parameters": {
-                                "type": "object",
-                                "properties": {
-                                    "node_id": {"type": "string", "description": "如 CTX_USER_PROFILE, LESSON_PYTHON_ENV"},
-                                    "ntype": {"type": "string", "enum": ["CONTEXT", "LESSON"]},
-                                    "title": {"type": "string"},
-                                    "content": {"type": "string", "description": "节点详细内容"}
-                                },
-                                "required": ["node_id", "ntype", "title", "content"]
-                            }
-                        }
-                    },
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": "delete_node",
-                            "description": "删除错误或过时的节点",
-                            "parameters": {
-                                "type": "object",
-                                "properties": {"node_id": {"type": "string"}}
-                            },
-                            "required": ["node_id"]
-                        }
-                    }
-                ]
+                    if c_resp.content:
+                        reflection_msgs.append(Message(role=MessageRole.ASSISTANT, content=c_resp.content, tool_calls=c_resp.tool_calls))
+                    elif c_resp.has_tool_calls:
+                        reflection_msgs.append(Message(role=MessageRole.ASSISTANT, content="", tool_calls=c_resp.tool_calls))
 
-                # 独立的一轮 LLM Call 用来反思
-                c_resp = await self.provider.chat(
-                    messages=[m.to_dict() for m in reflection_msgs],
-                    tools=reflection_tools,
-                    stream=False
-                )
-                
-                input_tokens += getattr(c_resp, "input_tokens", 0) or 0
-                output_tokens += getattr(c_resp, "output_tokens", 0) or 0
-                total_tokens += getattr(c_resp, "total_tokens", 0) or 0
-
-                if c_resp.has_tool_calls:
-                    norm_calls = self._normalize_tool_calls(c_resp.tool_calls, 999)
+                    if not c_resp.has_tool_calls:
+                        logger.info(f"Phase 4 Reflection (C): Concluded. (iters: {c_iteration})")
+                        break
+                    
+                    norm_calls = self._normalize_tool_calls(c_resp.tool_calls, 990 + c_iteration)
                     for tc in norm_calls:
                         t_name = tc["function"]["name"]
+                        t_id = tc["id"]
                         t_args = json.loads(tc["function"].get("arguments", "{}"))
                         
                         if step_callback:
-                            await self._call(step_callback, "tool_start", {"name": f"🧠 {t_name}"})
+                            await self._call(step_callback, "tool_start", {"name": f"🧠 后台反思层清理中: {t_name}"})
                             
-                        # 执行反思节点的动作
                         try:
-                            if t_name == "create_or_update_node":
-                                res = self.node_tools.create_or_update_node(**t_args)
-                            elif t_name == "delete_node":
-                                res = self.node_tools.delete_node(**t_args)
-                            else:
-                                res = "Unknown node management tool"
+                            # Use global tools registry executor
+                            res = await self.tools.execute(t_name, t_args)
                         except Exception as e:
-                            res = f"Error interacting with node vault: {e}"
+                            res = f"Error interacting with node vault tool: {e}"
                             
                         if step_callback:
-                            await self._call(step_callback, "tool_result", {"name": f"🧠 {t_name}", "result": res})
+                            await self._call(step_callback, "tool_result", {"name": f"🧠 后台反思层", "result": res})
+
+                        reflection_msgs.append(Message(
+                            role=MessageRole.TOOL,
+                            content=str(res),
+                            tool_call_id=t_id
+                        ))
 
             except Exception as e:
                 logger.warning(f"Phase 4 Reflection (C) failed: {e}")

@@ -202,13 +202,14 @@ class ShellTool(Tool):
             is_long = any(p in command.lower() for p in self._LONG_RUNNING_PATTERNS)
             quick_timeout = 10 if is_long else self.timeout
 
+            # 正确的开启子进程
             process = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=work_dir
             )
-
+            
             try:
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(),
@@ -229,9 +230,6 @@ class ShellTool(Tool):
                     stdout, stderr = await asyncio.wait_for(
                         process.communicate(), timeout=290  # 剩余 ~290s（总共 ~300s）
                     )
-                    stdout_text = stdout.decode('utf-8', errors='replace')
-                    stderr_text = stderr.decode('utf-8', errors='replace')
-                    return self._format_result(command, cwd, process.returncode, stdout_text, stderr_text)
                 except asyncio.TimeoutError:
                     try:
                         process.kill()
