@@ -247,15 +247,24 @@ class ShellTool(Tool):
 
     @staticmethod
     def _format_result(command: str, cwd, code: int, stdout: str, stderr: str) -> str:
-        """统一格式化命令执行结果。"""
+        """统一格式化命令执行结果（带截断）"""
+        
+        def truncate(text: str, limit: int = 4000) -> str:
+            if not text or len(text) <= limit:
+                return text
+            half = limit // 2
+            return text[:half] + f"\n...[Output Truncated ({len(text) - limit} chars hidden)]...\n" + text[-half:]
+
         result = [f"命令: {command}"]
         if cwd:
             result.append(f"目录: {cwd}")
         result.append(f"退出码: {code}")
+        
         if stdout:
-            result.append(f"\n标准输出:\n{stdout}")
+            result.append(f"\n标准输出:\n{truncate(stdout)}")
         if stderr:
-            result.append(f"\n标准错误:\n{stderr}")
+            result.append(f"\n标准错误:\n{truncate(stderr)}")
+            
         if code != 0:
             result.append(f"\n⚠️  命令执行失败（退出码 {code}）")
         else:

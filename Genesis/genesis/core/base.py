@@ -39,7 +39,25 @@ class Message:
         if self.tool_call_id:
             result["tool_call_id"] = self.tool_call_id
         if self.tool_calls:
-            result["tool_calls"] = self.tool_calls
+            # Format tool_calls strictly to OpenAI spec
+            formatted_tc = []
+            for tc in self.tool_calls:
+                # If it's already in the right format, keep it
+                if "type" in tc and "function" in tc:
+                    formatted_tc.append(tc)
+                else:
+                    # Convert from our internal dict (id, name, arguments)
+                    import json
+                    formatted_tc.append({
+                        "id": tc.get("id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": tc.get("name", ""),
+                            # API expects arguments as string
+                            "arguments": json.dumps(tc.get("arguments", {}), ensure_ascii=False) if isinstance(tc.get("arguments"), dict) else str(tc.get("arguments", ""))
+                        }
+                    })
+            result["tool_calls"] = formatted_tc
         return result
 
 
@@ -143,61 +161,6 @@ class LLMProvider(ABC):
     def get_default_model(self) -> str:
         """获取默认模型"""
         pass
-
-
-class ContextBuilder(ABC):
-    """上下文构建器基类"""
-    
-    @abstractmethod
-    async def build_messages(
-        self,
-        user_input: str,
-        **kwargs
-    ) -> List[Message]:
-        """构建消息列表"""
-        pass
-    
-    @abstractmethod
-    def add_tool_result(
-        self,
-        messages: List[Message],
-        tool_call_id: str,
-        tool_name: str,
-        result: str
-    ) -> List[Message]:
-        """添加工具执行结果"""
-        pass
-
-
-@dataclass
-class Intent:
-    """意图识别结果"""
-    type: str
-    domain: str
-    needs_info: bool
-    confidence: float
-
-
-@dataclass
-class Diagnosis:
-    """诊断结果"""
-    root_cause: str
-    confidence: float
-    suggested_solutions: List[str]
-    evidence: Dict[str, Any]
-
-
-@dataclass
-class Strategy:
-    """策略"""
-    pattern: str
-    root_cause: str
-    solution: str
-    domain: str
-    dead_ends: List[str]
-    confidence: float
-    success_count: int = 0
-    total_count: int = 0
 
 
 @dataclass

@@ -58,9 +58,15 @@ class ReadFileTool(Tool):
             # 读取文件
             content = path.read_text(encoding=encoding)
             
+            # 截断处理 (保留首尾各 4000 字符)
+            limit = 8000
+            if len(content) > limit:
+                half = limit // 2
+                content = content[:half] + f"\n...[File Truncated ({len(content) - limit} chars hidden)]...\n" + content[-half:]
+            
             # 返回结果
             return f"""文件: {path}
-大小: {len(content)} 字符
+大小: {path.stat().st_size} 字符 (显示截断后)
 编码: {encoding}
 
 内容:

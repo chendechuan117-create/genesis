@@ -10,12 +10,6 @@ from .base import LLMProvider as BaseLLMProvider, LLMResponse, ToolCall
 
 logger = logging.getLogger(__name__)
 
-try:
-    import litellm
-    LITELLM_AVAILABLE = True
-except ImportError:
-    LITELLM_AVAILABLE = False
-    logger.debug("litellm 未安装，LLM 功能将不可用")
 
 
 class NativeHTTPProvider(BaseLLMProvider):
@@ -81,14 +75,6 @@ class NativeHTTPProvider(BaseLLMProvider):
         
         payload = request_params
         
-        # 直接使用 curl，绕过 Python 的代理兼容性问题
-        try:
-            import json
-            with open("debug_payload.json", "a", encoding="utf-8") as f:
-                f.write(json.dumps(payload, ensure_ascii=False) + "\n---\n")
-        except Exception:
-            pass
-            
         data = json.dumps(payload).encode('utf-8')
         
         if stream and stream_callback:
@@ -410,6 +396,7 @@ class NativeHTTPProvider(BaseLLMProvider):
             
             async for line_bytes in process.stdout:
                 line = line_bytes.decode('utf-8', errors='replace').strip()
+                logger.debug(f"Stream line: {line}") 
                 if not line:
                     continue
                 
@@ -434,8 +421,8 @@ class NativeHTTPProvider(BaseLLMProvider):
                                 if rc:
                                     reasoning_content.append(rc)
                                     if callback:
-                                        if asyncio.iscoroutinefunction(callback): await callback("reasoning", rc)
-                                        else: callback("reasoning", rc)
+                                        res = callback("reasoning", rc)
+                                        if asyncio.iscoroutine(res): await res
                                         
                             # Content
                             if 'content' in delta:
@@ -443,8 +430,8 @@ class NativeHTTPProvider(BaseLLMProvider):
                                 if c:
                                     full_content.append(c)
                                     if callback:
-                                        if asyncio.iscoroutinefunction(callback): await callback("content", c)
-                                        else: callback("content", c)
+                                        res = callback("content", c)
+                                        if asyncio.iscoroutine(res): await res
                                         
                             # Tool Calls
                             if 'tool_calls' in delta:
@@ -521,6 +508,13 @@ class NativeHTTPProvider(BaseLLMProvider):
                     ))
                 except json.JSONDecodeError:
                     logger.warning(f"Failed to parse tool args: {tc_data['args']}")
+                    # Fallback: Don't drop the tool call! Return raw args wrapped in a dict
+                    # This prevents the loop from thinking it's a pure text response (which triggers early exit)
+                    final_tool_calls.append(ToolCall(
+                        id=tc_data["id"] or f"call_{idx}",
+                        name=tc_data["name"],
+                        arguments={"__raw_args_error__": tc_data["args"]}
+                    ))
             
             # Heuristic Fallback for Streaming: Check full content for code blocks
             final_content = "".join(full_content)
@@ -543,91 +537,6 @@ class NativeHTTPProvider(BaseLLMProvider):
         except Exception as e:
             logger.error(f"Streaming failed: {e}")
             raise
-
-class LiteLLMProvider(BaseLLMProvider):
-    """基于 LiteLLM 的提供商 - 支持多种 LLM"""
-    
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,
-        default_model: str = "deepseek/deepseek-chat"
-    ):
-        if not LITELLM_AVAILABLE:
-            raise ImportError("请安装 litellm: pip install litellm")
-        
-        self.api_key = api_key
-        self.base_url = base_url
-        self.default_model = default_model
-        
-        # 配置 LiteLLM
-        if api_key:
-            litellm.api_key = api_key
-        if base_url:
-            litellm.api_base = base_url
-    
-    async def chat(
-        self,
-        messages: List[Dict[str, Any]],
-        tools: Optional[List[Dict[str, Any]]] = None,
-        model: Optional[str] = None,
-        **kwargs
-    ) -> LLMResponse:
-        """发送聊天请求"""
-        
-        model = model or self.default_model
-        
-        # 构建请求参数
-        request_params = {
-            "model": model,
-            "messages": messages,
-            **kwargs
-        }
-        
-        if tools:
-            request_params["tools"] = tools
-            request_params["tool_choice"] = "auto"
-        
-        try:
-            # 调用 LiteLLM
-            response = await litellm.acompletion(**request_params)
-            
-            # 解析响应
-            message = response.choices[0].message
-            finish_reason = getattr(response.choices[0], "finish_reason", None)
-            
-            # 提取工具调用
-            tool_calls = []
-            if hasattr(message, 'tool_calls') and message.tool_calls:
-                for tc in message.tool_calls:
-                    tool_calls.append(ToolCall(
-                        id=tc.id,
-                        name=tc.function.name,
-                        arguments=json.loads(tc.function.arguments)
-                    ))
-            
-            # 提取使用量
-            prompt_tokens = getattr(response.usage, "prompt_tokens", 0) or 0
-            completion_tokens = getattr(response.usage, "completion_tokens", 0) or 0
-            total_tokens = getattr(response.usage, "total_tokens", 0) or 0
-
-            return LLMResponse(
-                content=message.content or "",
-                tool_calls=tool_calls,
-                finish_reason=finish_reason,
-                input_tokens=prompt_tokens,
-                output_tokens=completion_tokens,
-                total_tokens=total_tokens
-            )
-        
-        except Exception as e:
-            logger.error(f"LLM 调用失败: {e}")
-            raise
-    
-    def get_default_model(self) -> str:
-        """获取默认模型"""
-        return self.default_model
-
 
 class MockLLMProvider(BaseLLMProvider):
     """Mock LLM 提供商 - 用于测试"""

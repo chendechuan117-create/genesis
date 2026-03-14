@@ -51,12 +51,56 @@ class DiscordCallback:
             elif event_type == "tool_start":
                 tool_name = data.get("name", "?")
                 await self.message.channel.send(f"🟢 `{tool_name}` 运行中...")
+            elif event_type == "search_result":
+                # 搜索结果专用格式化：提取节点清单，类似蓝图的「已加载认知节点」风格
+                formatted = self._format_search_result(data)
+                if len(formatted) > 2000:
+                    for i in range(0, len(formatted), 1990):
+                        await self.message.channel.send(formatted[i:i+1990])
+                else:
+                    await self.message.channel.send(formatted)
             elif event_type == "tool_result":
                 tool_name = data.get("name", "?")
                 result_peek = data.get("result", "")[:200]
                 await self.message.channel.send(f"✅ **[{tool_name}]**:\n```\n{result_peek}\n```")
         except Exception as e:
             logger.error(f"Callback error: {e}")
+
+    @staticmethod
+    def _format_search_result(raw: str) -> str:
+        """将搜索结果格式化为类似「已加载认知节点」的直观风格"""
+        lines = raw.strip().split("\n")
+        output = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            # 提取节点行: [语义]/<字面> <TYPE> [NODE_ID] title | tags:...
+            if line.startswith("[语义]") or line.startswith("[字面]"):
+                # 去掉来源标签和 tags 后缀，只保留类型+ID+标题
+                source = "🔮" if line.startswith("[语义]") else "🔤"
+                # 找到 <TYPE> [NODE_ID] title 部分
+                rest = line.split(">", 1)[-1].strip() if ">" in line else line
+                # 提取 [NODE_ID] 和标题（tags之前的部分）
+                if "|" in rest:
+                    rest = rest.split("|")[0].strip()
+                output.append(f"{source} {rest}")
+            elif line.startswith("└─"):
+                # 依赖节点
+                rest = line.split(">", 1)[-1].strip() if ">" in line else line
+                if "|" in rest:
+                    rest = rest.split("|")[0].strip()
+                output.append(f"  🔗 {rest}")
+            elif "未找到" in line or "未命中" in line or "知识库为空" in line:
+                output.append(f"⚠️ {line}")
+            elif line.startswith("🔍"):
+                # 搜索头部，保留查询词
+                output.append(line)
+            # 跳过其他提示行（系统提示等）
+        
+        if not output:
+            return f"🔍 **[知识库检索]**\n⚠️ 无匹配结果"
+        return "🔍 **[知识库检索]**\n" + "\n".join(output)
 
 
 @client.event

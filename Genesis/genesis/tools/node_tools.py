@@ -1,10 +1,8 @@
 import logging
-import sqlite3
 import json
 from typing import Dict, Any, List
 from genesis.core.base import Tool
 from genesis.v4.manager import NodeVault
-import jsonschema
 
 logger = logging.getLogger(__name__)
 
@@ -43,36 +41,83 @@ class SearchKnowledgeNodesTool(Tool):
 
     async def execute(self, keywords: List[str], ntype: str = "ALL") -> str:
         try:
-            with sqlite3.connect(str(self.vault.db_path)) as conn:
-                conn.row_factory = sqlite3.Row
-                query = "SELECT node_id, type, title, tags FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%'"
+            semantic_ids = []
+            if self.vault.vector_engine.is_ready and keywords:
+                query_str = " ".join(keywords)
+                results = self.vault.vector_engine.search(query_str, top_k=5, threshold=0.55)
+                semantic_ids = [r[0] for r in results]
+
+            conn = self.vault._conn
+            with conn:
+                query = "SELECT node_id, type, title, tags, prerequisites, resolves FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%'"
                 params = []
 
                 if ntype != "ALL":
                     query += " AND type = ?"
                     params.append(ntype)
 
-                if keywords:
-                    keyword_conditions = []
-                    for kw in keywords:
-                        keyword_conditions.append("(title LIKE ? OR tags LIKE ? OR node_id LIKE ?)")
-                        kw_like = f"%{kw}%"
-                        params.extend([kw_like, kw_like, kw_like])
-                    if keyword_conditions:
-                        query += " AND (" + " OR ".join(keyword_conditions) + ")"
+                if keywords or semantic_ids:
+                    conditions = []
+                    
+                    # 传统的字面量匹配 (LIKE)
+                    if keywords:
+                        keyword_conditions = []
+                        for kw in keywords:
+                            keyword_conditions.append("(title LIKE ? OR tags LIKE ? OR node_id LIKE ? OR resolves LIKE ?)")
+                            kw_like = f"%{kw}%"
+                            params.extend([kw_like, kw_like, kw_like, kw_like])
+                        if keyword_conditions:
+                            conditions.append("(" + " OR ".join(keyword_conditions) + ")")
+                    
+                    # 降维式的语义向量匹配 (Vector Similarity)
+                    if semantic_ids:
+                        placeholders = ','.join('?' * len(semantic_ids))
+                        conditions.append(f"node_id IN ({placeholders})")
+                        params.extend(semantic_ids)
+
+                    if conditions:
+                        query += " AND (" + " OR ".join(conditions) + ")"
 
                 query += " ORDER BY usage_count DESC LIMIT 15"
-                
                 rows = conn.execute(query, tuple(params)).fetchall()
 
                 if not rows:
-                    return f"❌ 知识库中未找到与 {keywords} 相关的 {ntype} 节点。请尝试其他关键词或直接凭借直觉回答/创建新节点。"
+                    return f"⚠️ [未命中] 未找到与 {keywords} 相关的 {ntype} 节点（字面+语义均无匹配）。当前处于未知区域，请基于通用能力处理。"
 
-                lines = [f"🔍 [知识库搜索结果] 匹配关键词: {keywords}"]
-                for r in rows:
-                    lines.append(f"<{r['type']}> [{r['node_id']}] {r['title']} | tags:{r['tags']}")
+                # Reranker 精排：用 Cross-Encoder 按相关度重新排序
+                query_str = " ".join(keywords) if keywords else ""
+                row_dicts = [dict(r) for r in rows]
+                row_dicts = self.vault.vector_engine.rerank(query_str, row_dicts)
                 
-                lines.append("\n(如需查看某个节点的完整内容，请在生成蓝图时将其加入 active_nodes，或直接开始执行时阅读它。)")
+                # 提取依赖网络 (拔出萝卜带出泥)
+                all_prereq_ids = set()
+                for r in row_dicts:
+                    if r.get('prerequisites'):
+                        for pid in r['prerequisites'].split(','):
+                            all_prereq_ids.add(pid.strip())
+                
+                # 查询依赖节点详情
+                prereq_nodes = []
+                if all_prereq_ids:
+                    placeholders = ','.join('?' * len(all_prereq_ids))
+                    prereq_query = f"SELECT node_id, type, title, tags FROM knowledge_nodes WHERE node_id IN ({placeholders})"
+                    prereq_nodes = conn.execute(prereq_query, tuple(all_prereq_ids)).fetchall()
+
+                # 输出混合展示（按 reranker 相关度排序）
+                lines = [f"🔍 [知识库智能双向搜索] 查询词: {keywords}"]
+                for r in row_dicts:
+                    source_label = "[语义]" if r['node_id'] in semantic_ids else "[字面]"
+                    reqs = f" | reqs:[{r.get('prerequisites', '')}]" if r.get('prerequisites') else ""
+                    res = f" | resolves:[{r.get('resolves', '')}]" if r.get('resolves') else ""
+                    score_label = f" (相关度:{r['rerank_score']:.2f})" if 'rerank_score' in r else ""
+                    lines.append(f"{source_label} <{r['type']}> [{r['node_id']}] {r['title']} | tags:{r.get('tags', '')}{reqs}{res}{score_label}")
+                
+                if prereq_nodes:
+                    lines.append("\n🔗 [图谱自动展开] 发现上述节点存在强依赖的前置环境节点 (Prerequisites)，已自动补充在下方：")
+                    for pr in prereq_nodes:
+                        lines.append(f"  └─ <{pr['type']}> [{pr['node_id']}] {pr['title']} | tags:{pr['tags']}")
+                
+                lines.append("\n(系统提示: 如果你决定使用上述的 LESSON 节点，你**必须**将其对应的前置环境节点也一起放入蓝图的 active_nodes 中！)")
                 return "\n".join(lines)
         except Exception as e:
             logger.error(f"Search failed: {e}")
@@ -151,12 +196,18 @@ class RecordLessonNodeTool(Tool):
                     "items": {"type": "string"},
                     "description": "具体的执行步骤数组，也就是破局点操作"
                 },
-                "because_reason": {"type": "string", "description": "底层原因说明，解释为何这么做，防止Op幻觉猜忌"}
+                "because_reason": {"type": "string", "description": "底层原因说明，解释为何这么做，防止Op幻觉猜忌"},
+                "prerequisites": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "执行此操作强制依赖的前置节点ID数组（通常是 CTX_ 节点）。如果无依赖留空数组。"
+                },
+                "resolves": {"type": "string", "description": "此经验主要解决的具体报错信息或异常现象简述（用于丰富图谱寻找）"}
             },
-            "required": ["node_id", "title", "trigger_verb", "trigger_noun", "trigger_context", "action_steps", "because_reason"]
+            "required": ["node_id", "title", "trigger_verb", "trigger_noun", "trigger_context", "action_steps", "because_reason", "resolves"]
         }
 
-    async def execute(self, node_id: str, title: str, trigger_verb: str, trigger_noun: str, trigger_context: str, action_steps: List[str], because_reason: str) -> str:
+    async def execute(self, node_id: str, title: str, trigger_verb: str, trigger_noun: str, trigger_context: str, action_steps: List[str], because_reason: str, prerequisites: List[str] = None, resolves: str = None) -> str:
         try:
             # 在 Python 层优雅地组装为 JSON 存储给 Op 读取
             lesson_struct = {
@@ -170,6 +221,8 @@ class RecordLessonNodeTool(Tool):
             }
             content = json.dumps(lesson_struct, ensure_ascii=False, indent=2)
 
+            prereq_str = ",".join(prerequisites) if prerequisites else None
+            
             self.vault.create_node(
                 node_id=node_id,
                 ntype="LESSON",
@@ -177,9 +230,11 @@ class RecordLessonNodeTool(Tool):
                 human_translation=title,
                 tags="auto_managed",
                 full_content=content,
-                source="reflection"
+                source="reflection",
+                prerequisites=prereq_str,
+                resolves=resolves
             )
-            return f"✅ LESSON节点 [{node_id}] '{title}' 写入/覆盖成功。"
+            return f"✅ LESSON节点 [{node_id}] '{title}' 写入/覆盖成功。带有了关联图谱。"
         except Exception as e:
             logger.error(f"Lesson node creation failed: {e}")
             return f"Error: {e}"
@@ -211,10 +266,9 @@ class DeleteNodeTool(Tool):
 
     async def execute(self, node_id: str) -> str:
         try:
-            with sqlite3.connect(str(self.vault.db_path)) as conn:
-                conn.execute("DELETE FROM knowledge_nodes WHERE node_id = ?", (node_id,))
-                conn.execute("DELETE FROM node_contents WHERE node_id = ?", (node_id,))
-                conn.commit()
+            self.vault._conn.execute("DELETE FROM knowledge_nodes WHERE node_id = ?", (node_id,))
+            self.vault._conn.execute("DELETE FROM node_contents WHERE node_id = ?", (node_id,))
+            self.vault._conn.commit()
             logger.info(f"NodeVault: Deleted node [{node_id}]")
             return f"✅ 节点 [{node_id}] 删除成功。"
         except Exception as e:

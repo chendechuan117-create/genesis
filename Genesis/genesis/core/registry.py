@@ -176,20 +176,5 @@ class ProviderRegistry:
 tool_registry = ToolRegistry()
 provider_registry = ProviderRegistry()
 
-def build_zhipu(config: Any) -> Optional[Any]:
-    api_key = getattr(config, 'zhipu_api_key', None)
-    if not api_key: return None
-    from genesis.core.provider import NativeHTTPProvider
-    return NativeHTTPProvider(
-        api_key=api_key,
-        base_url="https://open.bigmodel.cn/api/paas/v4",
-        default_model="glm-4-flash"
-    )
-provider_registry.register("zhipu", build_zhipu)
 
-def build_sambanova(config: Any) -> Optional[Any]:
-    api_key = getattr(config, 'sambanova_api_key', None)
-    if not api_key: return None
-    from genesis.core.provider import SambaNovaProvider
-    return SambaNovaProvider(api_key=api_key)
-provider_registry.register("sambanova", build_sambanova)
+# zhipu 和 sambanova 已在 genesis/providers/cloud_providers.py 中统一注册

@@ -28,23 +28,18 @@ class GlobalConfig:
     zhipu_api_key: Optional[str] = None
     
     tavily_api_key: Optional[str] = None
-    telegram_bot_token: Optional[str] = None
-    github_token: Optional[str] = None
     
     # Network & Limits
     http_proxy: Optional[str] = None
     https_proxy: Optional[str] = None
     connect_timeout: int = 15
     request_timeout: int = 120
-    max_iterations: int = 10
     
     # Paths
     workspace_root: Path = Path.cwd()
-    memory_path: Path = Path.cwd() / "memory"
     
     # System
     debug: bool = False
-    language: str = "zh"
 
 class ConfigManager:
     """
@@ -110,19 +105,7 @@ class ConfigManager:
                 if 'deepseek' in providers:
                     self._config.deepseek_api_key = providers['deepseek'].get('apiKey')
             
-            # 提取 Telegram Token
-            if 'channels' in data and 'telegram' in data['channels']:
-                tg = data['channels']['telegram']
-                if tg.get('enabled'):
-                    self._config.telegram_bot_token = tg.get('botToken')
-                    # 如果有专用代理配置
-                    if tg.get('proxy'):
-                         # 优先使用专用代理，或者仅当全局未设置时使用
-                         if not self._config.http_proxy:
-                             self._config.http_proxy = tg.get('proxy')
-                             self._config.https_proxy = tg.get('proxy')
-
-            logger.info("✓ 已从 OpenClaw 继承配置 (API Key, Proxy, Telegram)")
+            logger.info("✓ 已从 OpenClaw 继承配置 (API Key, Proxy)")
             
         except Exception as e:
             logger.warning(f"读取 OpenClaw 配置失败: {e}")
@@ -192,10 +175,6 @@ class ConfigManager:
             
         elif key == "TAVILY_API_KEY":
             self._config.tavily_api_key = val
-        elif key == "TELEGRAM_BOT_TOKEN":
-            self._config.telegram_bot_token = val
-        elif key == "GITHUB_TOKEN":
-            self._config.github_token = val
         elif key in ["HTTP_PROXY", "http_proxy"]:
             self._config.http_proxy = val
         elif key in ["HTTPS_PROXY", "https_proxy"]:

@@ -1,363 +1,359 @@
 """
-Genesis V4 - 白盒执行引擎 (The Glassbox Loop)
-核心：G 看标题组装蓝图 → Op 拉取内容执行 → 沉淀器提取新知识
+Genesis V4 核心执行引擎 (State Machine)
+实现 G-Process (Thinker) -> Op-Process (Executor) -> C-Process (Reflector) 的解耦管线
 """
 
-from typing import List, Dict, Any, Optional
-import logging
-import time
 import json
+import re
+import time
 import asyncio
+import logging
+import traceback
+from typing import List, Dict, Any, Tuple, Optional
 
-from genesis.core.base import Message, MessageRole, LLMResponse, PerformanceMetrics, LLMProvider
+from genesis.core.base import Message, MessageRole, LLMProvider, PerformanceMetrics, ToolCall
 from genesis.core.registry import ToolRegistry
-from genesis.v4.manager import FactoryManager, NodeManagementTools
+from genesis.v4.manager import FactoryManager, NodeVault, NodeManagementTools
 
 logger = logging.getLogger(__name__)
 
-
 class V4Loop:
-    """V4 白盒装配与执行引擎"""
+    """
+    V4 核心管线
+    
+    Phases:
+    1. G_PHASE (大脑): 拥有历史上下文，只能搜索。循环直至输出 Task Payload。
+    2. OP_PHASE (手脚): 纯净上下文，接收 Payload，拥有执行工具，执行完退出。
+    3. C_PHASE (反思): (Post-loop) 仅允许节点管理工具，沉淀知识。
+    """
 
     def __init__(
         self,
         tools: ToolRegistry,
         provider: LLMProvider,
-        max_iterations: int = 200, # Changed default from 50 to 200
+        max_iterations: int = 200,
     ):
         self.tools = tools
         self.provider = provider
         self.max_iterations = max_iterations
-        self.manager = FactoryManager()
         
-        # 将 G 的节点管理能力注册为临时工具（仅在反思阶段向 G 暴露）
-        self.node_tools = NodeManagementTools(self.manager.vault)
+        # 单例管理器
+        self.factory = FactoryManager()
+        self.vault = NodeVault()
+        
+        self.metrics = PerformanceMetrics()
+        
+        # 共享状态（用于最后反思和记忆）
+        self.user_input = ""
+        self.g_messages: List[Message] = []
+        self.op_messages: List[Message] = []
 
-    async def run(
-        self,
-        user_input: str,
-        step_callback: Optional[Any] = None,
-    ) -> tuple[str, PerformanceMetrics]:
-        """
-        V4 的三阶段执行流：
-        Phase 1 (装配): 强制输出装配蓝图 (JSON) 并渲染给人类
-        Phase 2 (执行): 依据蓝图执行工具并收集反馈
-        Phase 3 (反思): G 审查执行结果，更新/删除元信息节点，给出最终结论
-        """
-        start_time = time.time()
-        tools_used = []
-        tool_results_log = []  # 收集工具结果，给沉淀器用
-        input_tokens = 0
-        output_tokens = 0
-        total_tokens = 0
+    async def run(self, user_input: str, step_callback: Any = None) -> Tuple[str, PerformanceMetrics]:
+        """执行主管线 G -> Op -> C"""
+        self.metrics.start_time = time.time()
+        self.user_input = user_input
         
-        # 构建 V4 的初始弹药库 (Manager 出厂指令 + User 输入)
-        system_prompt = self.manager.build_system_prompt()
-        built_messages = [
-            Message(role=MessageRole.SYSTEM, content=system_prompt),
+        final_response = ""
+        
+        try:
+            # === Phase 1: G-Process (大脑构思) ===
+            task_payload = await self._run_g_phase(user_input, step_callback)
+            
+            if not task_payload:
+                final_response = "大脑 (G) 构思失败，无法生成有效任务派发书。"
+                self.metrics.success = False
+            else:
+                # 渲染派发书给用户看
+                rendered = self.factory.render_dispatch_for_human(task_payload)
+                await self._safe_callback(step_callback, "blueprint", rendered)
+                
+                # === Phase 2: Op-Process (瞎子执行) ===
+                final_response = await self._run_op_phase(task_payload, step_callback)
+                
+        except Exception as e:
+            logger.error(f"Pipeline execution error: {traceback.format_exc()}")
+            final_response = f"系统执行异常: {str(e)}"
+            self.metrics.success = False
+            
+        self.metrics.total_time = time.time() - self.metrics.start_time
+        
+        # === Phase 3: C-Process (反思沉淀) ===
+        # 只有在有足够执行动作时才进行反思
+        if len(self.op_messages) > 2:
+            await self._run_c_phase(step_callback)
+            
+        # 保存这轮完整对话作为短期记忆
+        self._save_memory(final_response)
+        
+        return final_response, self.metrics
+
+    async def _run_g_phase(self, user_input: str, step_callback: Any) -> Optional[Dict[str, Any]]:
+        """运行 G-Process，负责搜索和组装任务"""
+        logger.info(">>> Entering Phase 1: G-Process (Thinker)")
+        await self._safe_callback(step_callback, "loop_start", {"phase": "G_PHASE"})
+        
+        g_prompt = self.factory.build_g_prompt()
+        self.g_messages = [
+            Message(role=MessageRole.SYSTEM, content=g_prompt),
             Message(role=MessageRole.USER, content=user_input)
         ]
-
-        iteration = 0
-        final_response = ""
-        blueprint_shown = False
-        selected_node_ids = []  # G 选中的节点 ID
-        phase = "ASSEMBLY"  # ASSEMBLY, EXECUTION, REFLECTION
-
-        while iteration < self.max_iterations:
-            iteration += 1
-
-            if step_callback:
-                await self._call(step_callback, "loop_start", iteration)
-
-            logger.info(f"V4 Loop: Iteration {iteration}/{self.max_iterations}")
-
-            # ── 1. 调用 LLM (Phase 1/2/3) ──
-            try:
-                async def stream_handler(chunk_type, chunk_data):
-                    if step_callback and chunk_type == "reasoning":
-                        await self._call(step_callback, "reasoning", chunk_data)
-
-                # 根据当前阶段决定提供哪些工具
-                current_tools = None
-                if phase == "ASSEMBLY":
-                    # 仅授权检索工具给 G
-                    current_tools = [t for t in self.tools.get_definitions() if t["function"]["name"] == "search_knowledge_nodes"]
-                elif phase == "EXECUTION":
-                    current_tools = list(self.tools.get_definitions())
+        
+        search_tools = [self.tools.get("search_knowledge_nodes")]
+        search_tools = [t for t in search_tools if t]
+        schema = [t.to_schema() for t in search_tools]
+        
+        for i in range(self.max_iterations):
+            response = await self.provider.chat(
+                messages=[m.to_dict() for m in self.g_messages],
+                tools=schema,
+                stream=True,
+                stream_callback=lambda ev, data: self._stream_proxy(step_callback, ev, data)
+            )
+            
+            self._update_metrics(response)
+            
+            self.g_messages.append(Message(
+                role=MessageRole.ASSISTANT,
+                content=response.content,
+                tool_calls=[tc.__dict__ for tc in response.tool_calls] if response.tool_calls else None
+            ))
+            
+            if response.tool_calls:
+                for tc in response.tool_calls:
+                    await self._safe_callback(step_callback, "tool_start", {"name": tc.name, "args": tc.arguments})
+                    
+                    if tc.name == "search_knowledge_nodes":
+                        res = await self.tools.execute(tc.name, tc.arguments)
+                        await self._safe_callback(step_callback, "search_result", {"name": tc.name, "result": res})
+                    else:
+                        res = f"G-Process has no permission to run tool {tc.name}"
+                        
+                    if not self.metrics.tools_used: self.metrics.tools_used = []
+                    self.metrics.tools_used.append(tc.name)
+                    
+                    self.g_messages.append(Message(role=MessageRole.TOOL, content=res, tool_call_id=tc.id, name=tc.name))
+                continue
                 
+            # 纯文本回复，尝试解析 Dispatch Payload
+            payload = self._parse_dispatch_payload(response.content)
+            if payload:
+                logger.info("G-Process successfully created Task Payload.")
+                return payload
+            else:
+                # G 输出了普通文本但没有符合格式，强制提示它交接
+                self.g_messages.append(Message(
+                    role=MessageRole.SYSTEM,
+                    content="你必须输出 ```dispatch ... ``` 格式的任务派发书来将任务交给 Op 执行器。否则流程无法继续。"
+                ))
+                continue
+                
+        logger.warning("G-Process reached max iterations without outputting payload.")
+        return None
+
+    def _parse_dispatch_payload(self, content: str) -> Optional[Dict[str, Any]]:
+        """从 G 的输出中提取 dispatch 块并转换为字典"""
+        match = re.search(r"```dispatch\n(.*?)```", content, re.DOTALL | re.IGNORECASE)
+        if not match:
+            return None
+            
+        block = match.group(1).strip()
+        
+        payload = {
+            "op_intent": "未定义目标",
+            "active_nodes": [],
+            "instructions": ""
+        }
+        
+        # 简单提取，按关键字分割
+        lines = block.split('\n')
+        current_key = None
+        instructions_lines = []
+        
+        for line in lines:
+            if line.startswith("OP_INTENT:"):
+                payload["op_intent"] = line[10:].strip()
+            elif line.startswith("ACTIVE_NODES:"):
+                nodes_str = line[13:].strip()
+                if nodes_str and nodes_str.upper() != "NONE":
+                    payload["active_nodes"] = [n.strip() for n in nodes_str.split(',')]
+            elif line.startswith("INSTRUCTIONS:"):
+                current_key = "instructions"
+            elif current_key == "instructions":
+                instructions_lines.append(line)
+                
+        if instructions_lines:
+            payload["instructions"] = "\n".join(instructions_lines).strip()
+            
+        return payload
+
+    async def _run_op_phase(self, task_payload: Dict[str, Any], step_callback: Any) -> str:
+        """运行 Op-Process，纯粹的执行器"""
+        logger.info(">>> Entering Phase 2: Op-Process (Executor)")
+        await self._safe_callback(step_callback, "loop_start", {"phase": "OP_PHASE"})
+        
+        op_prompt = self.factory.build_op_prompt(task_payload)
+        # Op 只有 system prompt，没有 user prompt (意图在 system 里了)
+        self.op_messages = [Message(role=MessageRole.SYSTEM, content=op_prompt)]
+        
+        # 获取所有执行工具 (除了反思专属的)
+        all_tools = []
+        c_exclusive = ["record_context_node", "record_lesson_node", "delete_node", "search_knowledge_nodes"]
+        
+        for name in self.tools.list_tools():
+            if name not in c_exclusive:
+                t = self.tools.get(name)
+                if t:
+                    all_tools.append(t)
+                    
+        schema = [t.to_schema() for t in all_tools]
+        
+        for i in range(self.max_iterations):
+            response = await self.provider.chat(
+                messages=[m.to_dict() for m in self.op_messages],
+                tools=schema,
+                stream=True,
+                stream_callback=lambda ev, data: self._stream_proxy(step_callback, ev, data)
+            )
+            
+            self._update_metrics(response)
+            
+            self.op_messages.append(Message(
+                role=MessageRole.ASSISTANT,
+                content=response.content,
+                tool_calls=[tc.__dict__ for tc in response.tool_calls] if response.tool_calls else None
+            ))
+            
+            if response.tool_calls:
+                for tc in response.tool_calls:
+                    await self._safe_callback(step_callback, "tool_start", {"name": tc.name, "args": tc.arguments})
+                    
+                    if tc.name in c_exclusive:
+                        res = f"Error: Op-Process 禁止使用工具 {tc.name}"
+                    else:
+                        res = await self.tools.execute(tc.name, tc.arguments)
+                        
+                    await self._safe_callback(step_callback, "tool_result", {"name": tc.name, "result": res})
+                    
+                    if not self.metrics.tools_used: self.metrics.tools_used = []
+                    self.metrics.tools_used.append(tc.name)
+                    
+                    self.op_messages.append(Message(role=MessageRole.TOOL, content=res, tool_call_id=tc.id, name=tc.name))
+                continue
+                
+            # 没有工具调用，Op 结束任务并给出最终结果
+            if not response.content.strip():
+                self.op_messages.append(Message(role=MessageRole.SYSTEM, content="[系统警告] 收到空响应。请继续执行或总结最终结果。"))
+                continue
+                
+            return response.content
+            
+        logger.warning("Op-Process reached max iterations.")
+        return "达到最大迭代次数限制，强制终止。"
+
+    async def _run_c_phase(self, step_callback: Any):
+        """运行 C-Process 反思循环，基于 Op 的执行轨迹"""
+        logger.info(">>> Entering Phase 3: C-Process (Reflector)")
+        
+        summary_lines = ["[Op 执行过程摘要]"]
+        
+        # 从 Op 的轨迹中提取摘要
+        step_idx = 1
+        for m in self.op_messages:
+            if m.role == MessageRole.TOOL:
+                preview = str(m.content)[:200].replace("\n", " ") + "..." if len(str(m.content)) > 200 else str(m.content)
+                summary_lines.append(f"{step_idx}. [TOOL] {m.name} -> {preview}")
+                step_idx += 1
+            elif m.role == MessageRole.ASSISTANT and not m.tool_calls:
+                preview = str(m.content)[:100].replace("\n", " ") + "..."
+                summary_lines.append(f"{step_idx}. [AI Result] {preview}")
+                step_idx += 1
+                
+        execution_summary = "\n".join(summary_lines)
+        
+        reflection_system_prompt = f"""你是 Genesis 的后台反思进程 (C-Process)。
+你的任务是审查以下执行器 (Op) 的 [执行过程摘要]，从中提取高价值的“经验”或“环境上下文”，并将其沉淀到知识库中。
+
+{execution_summary}
+
+[核心原则]
+1. **高价值增量**：只记录 (1) 真正解决了问题的关键步骤 (LESSON) (2) 新发现的固定环境参数/用户偏好 (CONTEXT)。不要记流水账。
+2. **查重优先**：在写入前，先调用 `search_knowledge_nodes` 确认库里是否已经有了。
+3. **机器码原则**：LESSON 的 action_steps 必须是可执行的命令，不能是“检查一下”。
+4. **NO_ACTION**：如果没有值得沉淀的，直接回复 "NO_ACTION"。
+
+[可用工具]
+- search_knowledge_nodes: 查重
+- record_context_node: 记状态/环境
+- record_lesson_node: 记流程/经验
+- delete_node: 删错误节点
+"""
+        c_messages = [Message(role=MessageRole.SYSTEM, content=reflection_system_prompt)]
+        
+        c_tool_names = ["search_knowledge_nodes", "record_context_node", "record_lesson_node", "delete_node"]
+        c_tools = [self.tools.get(n) for n in c_tool_names if self.tools.get(n)]
+        c_schema = [t.to_schema() for t in c_tools]
+        
+        for _ in range(3):
+            try:
                 response = await self.provider.chat(
-                    messages=[m.to_dict() for m in built_messages],
-                    tools=current_tools,
-                    stream=True,
-                    stream_callback=stream_handler,
+                    messages=[m.to_dict() for m in c_messages],
+                    tools=c_schema,
+                    stream=False
                 )
-                input_tokens += getattr(response, "input_tokens", 0) or 0
-                output_tokens += getattr(response, "output_tokens", 0) or 0
-                total_tokens += getattr(response, "total_tokens", 0) or 0
-
-                if not response.content and getattr(response, "reasoning_content", None):
-                    response.content = response.reasoning_content
-
+                
+                content = response.content
+                tool_calls = response.tool_calls
+                
+                c_messages.append(Message(
+                    role=MessageRole.ASSISTANT,
+                    content=content,
+                    tool_calls=[tc.__dict__ for tc in tool_calls] if tool_calls else None
+                ))
+                
+                if "NO_ACTION" in content:
+                    logger.info("C-Process decided NO_ACTION.")
+                    break
+                    
+                if not tool_calls:
+                    break
+                    
+                for tc in tool_calls:
+                    if tc.name not in c_tool_names:
+                        res = f"Error: C-Process 禁止使用工具 {tc.name}"
+                    else:
+                        res = await self.tools.execute(tc.name, tc.arguments)
+                        await self._safe_callback(step_callback, "tool_result", {"name": f"C-Process::{tc.name}", "result": res})
+                    
+                    c_messages.append(Message(role=MessageRole.TOOL, content=res, tool_call_id=tc.id, name=tc.name))
             except Exception as e:
-                logger.error(f"V4 Loop: LLM call failed: {e}", exc_info=True)
-                final_response = f"Error: 认知核心连接失败 - {str(e)[:300]}"
+                logger.error(f"Reflection step failed: {e}")
                 break
 
-            # ── 2. 处理蓝图 / 文本回复 ──
-            if response.content:
-                content_str = response.content
-
-                # Phase 1: 解析 JSON 蓝图 (仅在没有工具调用时，且含有严格图纸键值)
-                if phase == "ASSEMBLY" and not response.has_tool_calls and "{" in content_str and "}" in content_str:
-                    try:
-                        json_str = content_str[content_str.find("{"):content_str.rfind("}")+1]
-                        plan = json.loads(json_str)
-                        if "op_intent" in plan or "execution_plan" in plan:
-                            selected_node_ids = plan.get("active_nodes", [])
-                            
-                            blueprint_ui = self.manager.render_blueprint_for_human(json_str)
-                            if step_callback:
-                                await self._call(step_callback, "blueprint", blueprint_ui)
-                            blueprint_shown = True
-                            
-                            node_contents = self.manager.vault.get_multiple_contents(selected_node_ids)
-                            context_injection = ""
-                            if node_contents:
-                                ctx_lines = ["[已加载节点内容]"]
-                                for nid, content in node_contents.items():
-                                    ctx_lines.append(f"[{nid}]: {content}")
-                                context_injection = "\n".join(ctx_lines)
-                            
-                            self.manager.vault.increment_usage(selected_node_ids)
-                                
-                            built_messages.append(Message(
-                                role=MessageRole.ASSISTANT, 
-                                content=content_str
-                            ))
-                            built_messages.append(Message(
-                                role=MessageRole.USER,
-                                content=f"[System] 蓝图已收到。以下是所选节点的完整内容：\n{context_injection}\n\n执行阶段开始。请按计划调用执行工具。如果无需进一步执行，请直接回复你的结论。"
-                            ))
-                            phase = "EXECUTION"
-                            continue
-                    except Exception as e:
-                        logger.warning(f"Failed to parse blueprint JSON: {e}")
-
-                # 纯文本处理
-                if not response.has_tool_calls:
-                    if phase == "ASSEMBLY" and not blueprint_shown:
-                        built_messages.append(Message(
-                            role=MessageRole.ASSISTANT,
-                            content=response.content or ""
-                        ))
-                        built_messages.append(Message(
-                            role=MessageRole.USER,
-                            content='[System] 请必须输出装配蓝图 JSON：{"op_intent":"...", "active_nodes":[...], "execution_plan":[...]} 或者调用 search_knowledge_nodes 查阅工具。'
-                        ))
-                        continue
-                    else:
-                        # 正常自然回复 (EXECUTION 阶段收尾)
-                        final_response = content_str
-                        built_messages.append(Message(
-                            role=MessageRole.ASSISTANT,
-                            content=content_str
-                        ))
-                        break
-
-            # ── 3. 工具管线执行 ──
-            if response.has_tool_calls:
-                normalized = self._normalize_tool_calls(response.tool_calls, iteration)
-
-                built_messages.append(Message(
-                    role=MessageRole.ASSISTANT,
-                    content=response.content or "",
-                    tool_calls=normalized,
-                ))
-
-                for tc in normalized:
-                    tool_name = tc["function"]["name"]
-                    tool_args_raw = tc["function"].get("arguments") or "{}"
-                    tool_id = tc["id"]
-
-                    try:
-                        tool_args = json.loads(tool_args_raw) if isinstance(tool_args_raw, str) else tool_args_raw
-                    except json.JSONDecodeError:
-                        tool_args = {}
-
-                    # 正常执行常规工具
-                    tools_used.append(tool_name)
-
-                    if step_callback:
-                        await self._call(step_callback, "tool_start", {"name": tool_name})
-                        
-                    try:
-                        result = await asyncio.wait_for(
-                            self.tools.execute(tool_name, tool_args),
-                            timeout=300.0,
-                        )
-                    except asyncio.TimeoutError:
-                        result = f"Error: 耗时过长，被强行中断 (>300s)"
-                    except Exception as e:
-                        result = f"Error: 节点执行异常 - {e}"
-
-                    result_str = str(result)
-                    tool_results_log.append({"name": tool_name, "result": result_str[:500]})
-                    
-                    if step_callback:
-                        await self._call(step_callback, "tool_result", {
-                            "name": tool_name, 
-                            "result": result_str[:500]
-                        })
-
-                    built_messages.append(Message(
-                        role=MessageRole.TOOL,
-                        content=result_str,
-                        tool_call_id=tool_id,
-                    ))
-
-                continue
-
-            # 空响应兜底
-            if not response.content and not response.has_tool_calls:
-                logger.warning(f"V4 Loop: Empty response at iteration {iteration}")
-                built_messages.append(Message(
-                    role=MessageRole.USER,
-                    content="[System] 空响应。请用中文回复或调用工具。"
-                ))
-                continue
-
-        # 兜底
-        if iteration >= self.max_iterations and not final_response:
-            final_response = f"V4 管线触达 {iteration} 次迭代上限。已装配挂载的节点：{', '.join(set(tools_used))}."
-
-        # ── POST: 对话记忆 ──
+    def _save_memory(self, agent_response: str):
+        """保存本次对话到短期记忆"""
         try:
-            # 存储本轮对话（为了 G 的初始上下文方向感）
-            if final_response and user_input:
-                self.node_tools.store_conversation(user_input, final_response)
+            if not self.user_input:
+                return
+            mgmt = NodeManagementTools(self.vault)
+            mgmt.store_conversation(self.user_input, agent_response)
         except Exception as e:
-            logger.warning(f"Memory storage failed (non-critical): {e}")
+            logger.error(f"Failed to save memory: {e}")
 
-        # ── Phase 4: 独立反思 (C) ──
-        if final_response:
-            try:
-                reflection_sys = """[System] (C进程) 交互已结束。请以认知节点管理员的身份，审查本次执行的管线。
-你有权且**必须**优先调用 `search_knowledge_nodes` 来查阅知识库。
+    def _update_metrics(self, response: Any):
+        self.metrics.input_tokens += response.input_tokens
+        self.metrics.output_tokens += response.output_tokens
+        self.metrics.total_tokens += response.total_tokens
+        self.metrics.iterations += 1
 
-🚨 [只提取 Delta (差值) 原则]
-你绝对禁止将大段的背景流水账、调试过程写入节点！
-你只能像提取数学常数一样，提取管线中**“Op 预期失败与最终成功之间的破局点 (Aha Moment)”**。
+    async def _safe_callback(self, callback, event, data):
+        """安全调用回调"""
+        if not callback: return
+        try:
+            res = callback(event, data)
+            if asyncio.iscoroutine(res): await res
+        except Exception as e:
+            logger.error(f"Callback error ({event}): {e}")
 
-请遵循以下原子化双态节点架构规范：
-
-1. [数据结构约束]: 
-   - 如果沉淀状态参数 (CONTEXT)：调用 `record_context_node` 工具，记录纯粹的环境变量赋值或路径定义。
-   - 如果沉淀经验流程 (LESSON)：调用 `record_lesson_node` 工具，按其参数要求精确填入触发条件(verb, noun, context)、执行动作(步骤数组)、以及破局原因。
-   
-2. [查重与旧时代重构]: 想要写入经验前，先调用 search_knowledge_nodes 查重。
-   - 如果你搜到了大段非原子化、混合型旧节点，你有权调用 `delete_node` 将其删除，然后调用上述两个结构化工具拆分为多个合规的原子节点。
-3. [决策]: 若存在高度相关且合规的旧节点，提取最新的破局点综合版本覆盖（重名写入即可覆盖）；若无，创建新节点。
-4. [完结]: 工作完成或无需沉淀时，直接输出 "NO_ACTION" 结束。
-
-🚨 绝对警告: 你只被授权使用节点档案馆工具 (search, record_context, record_lesson, delete)！你不要试图调用普通的业务执行工具。"""
-
-                # 完美继承 G 和 Op 的全部上下文时间线 (G的图纸、报错、结论都在这里)
-                reflection_msgs = list(built_messages)
-                reflection_msgs.append(Message(role=MessageRole.USER, content=reflection_sys))
-                # 独立的一轮 C进程循环 (最多 3 次迭代，支持查重后再写)
-                c_tools = list(self.tools.get_definitions())
-                c_iteration = 0
-                while c_iteration < 3:
-                    c_iteration += 1
-                    c_resp = await self.provider.chat(
-                        messages=[m.to_dict() for m in reflection_msgs],
-                        tools=c_tools,
-                        stream=False
-                    )
-                    
-                    input_tokens += getattr(c_resp, "input_tokens", 0) or 0
-                    output_tokens += getattr(c_resp, "output_tokens", 0) or 0
-                    total_tokens += getattr(c_resp, "total_tokens", 0) or 0
-
-                    if c_resp.content:
-                        reflection_msgs.append(Message(role=MessageRole.ASSISTANT, content=c_resp.content, tool_calls=c_resp.tool_calls))
-                    elif c_resp.has_tool_calls:
-                        reflection_msgs.append(Message(role=MessageRole.ASSISTANT, content="", tool_calls=c_resp.tool_calls))
-
-                    if not c_resp.has_tool_calls:
-                        logger.info(f"Phase 4 Reflection (C): Concluded. (iters: {c_iteration})")
-                        break
-                    
-                    norm_calls = self._normalize_tool_calls(c_resp.tool_calls, 990 + c_iteration)
-                    for tc in norm_calls:
-                        t_name = tc["function"]["name"]
-                        t_id = tc["id"]
-                        t_args = json.loads(tc["function"].get("arguments", "{}"))
-                        
-                        if step_callback:
-                            await self._call(step_callback, "tool_start", {"name": f"🧠 后台反思层清理中: {t_name}"})
-                            
-                        try:
-                            # Use global tools registry executor
-                            res = await self.tools.execute(t_name, t_args)
-                        except Exception as e:
-                            res = f"Error interacting with node vault tool: {e}"
-                            
-                        if step_callback:
-                            await self._call(step_callback, "tool_result", {"name": f"🧠 后台反思层", "result": res})
-
-                        reflection_msgs.append(Message(
-                            role=MessageRole.TOOL,
-                            content=str(res),
-                            tool_call_id=t_id
-                        ))
-
-            except Exception as e:
-                logger.warning(f"Phase 4 Reflection (C) failed: {e}")
-
-        elapsed = time.time() - start_time
-        metrics = PerformanceMetrics(
-            iterations=iteration,
-            total_time=elapsed,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            total_tokens=total_tokens,
-            prompt_cache_hit_tokens=0,
-            tools_used=tools_used,
-            success=True,
-            tool_calls=[]
-        )
-
-        return final_response, metrics
-
-    def _normalize_tool_calls(self, raw_calls, iteration: int) -> List[Dict]:
-        normalized = []
-        for idx, tc in enumerate(raw_calls or []):
-            fid = f"call_{iteration}_{idx}"
-            if isinstance(tc, dict):
-                fn = tc.get("function") or {}
-                name = fn.get("name") or tc.get("name") or ""
-                args_raw = fn.get("arguments") if fn else tc.get("arguments")
-                args_str = json.dumps(args_raw, ensure_ascii=False) if isinstance(args_raw, dict) else (args_raw or "{}")
-                normalized.append({
-                    "id": tc.get("id") or fid,
-                    "type": tc.get("type") or "function",
-                    "function": {"name": name, "arguments": args_str},
-                })
-            else:
-                name = getattr(tc, "name", "")
-                args = getattr(tc, "arguments", {}) or {}
-                normalized.append({
-                    "id": getattr(tc, "id", None) or fid,
-                    "type": "function",
-                    "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)},
-                })
-        return normalized
-
-    @staticmethod
-    async def _call(callback, event_type, data):
-        """统一处理 sync/async callback"""
-        result = callback(event_type, data)
-        if asyncio.iscoroutine(result):
-            await result
+    async def _stream_proxy(self, callback, event, data):
+        """LLM 流式回调代理"""
+        if callback: await self._safe_callback(callback, event, data)

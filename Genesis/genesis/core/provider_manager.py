@@ -2,7 +2,7 @@
 import logging
 import asyncio
 from typing import Dict, Any, List, Optional
-from genesis.core.provider import LiteLLMProvider, NativeHTTPProvider, LITELLM_AVAILABLE, MockLLMProvider
+from genesis.core.provider import NativeHTTPProvider, MockLLMProvider
 from genesis.core.registry import provider_registry
 # Ensure providers are loaded
 import genesis.providers
