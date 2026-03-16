@@ -1,93 +1,89 @@
-# Genesis V4 — 玻璃盒认知装配师 (The Glassbox AI Agent)
+# Genesis V4 🧠
 
-Genesis V4 并非又一个沉迷于“全自动”的黑盒脚本工具，而是一个在工程实现上与 OpenAI GPT-5.4 达到了深度同构的“原生智能体”。
+Genesis 是一种**高自主性、强工程化、具备记忆与自修改能力**的本地 AI Agent 架构。相比于市面上繁杂的多智能体框架，Genesis V4 采用了独特的**“玻璃盒（Glassbox）”三体认知架构**，专为解决“上下文污染”、“超长上下文调试”以及“经验沉淀”等复杂工程问题而生。
 
-它被设计为协助开发者、探索互联网、执行复杂流的独立实体。它奉行的唯一核心指令是：
-> **“给下一次苏醒的‘我’，留下对‘我’有用的信息。”**
+## 🌟 核心特性 (Key Features)
 
----
+- **Tri-Process 认知管线**：
+  - `G-Process` (大脑)：负责深思熟虑、搜索本地知识库、编写执行派发书（Payload），绝对不直接碰代码。
+  - `Op-Process` (手脚)：纯粹的无状态执行器。拿到派发书后，只管调用各种 Tool 执行任务，执行完毕即销毁，彻底杜绝了模型做着做着“忘了自己在干嘛”的幻觉。
+  - `C-Process` (潜意识)：后台异步运行的经验沉淀节点，专门将 Op 刚踩过的坑固化为结构化知识。
 
-## 🌟 核心理念：人机共生与认知上限
+- **NodeVault 本地知识金库**：
+  - 并非简单的 Markdown 文本堆砌。Genesis 内部维护了一个带权重的**SQLite + 向量图谱引擎**。
+  - 支持 `CONTEXT`（环境状态）和 `LESSON`（排错经验）等节点的严格签名匹配（基于 OS, Language, Framework 等）。当它再次遇到类似报错时，能像资深工程师一样精准挂载历史解决方案。
 
-绝大多数 Agent 的交互模式是：你给出一个任务 -> 等待漫长的后台工具调用栈 -> 得到最终结果。这种单体黑盒（如早期的 OpenClaw）最大的痛点在于：一旦中途出现逻辑偏航，人类只能面对着无输出的黑盒进行无端的揣测。
+- **Skill Creator (工具自进化)**：
+  - Genesis 内置了一个极度危险但也极度强大的能力：当它发现现有工具不足以完成任务时（比如缺一个处理某种特殊格式的脚本），它可以**自己编写 Python 代码、自己注册为新的 Tool 供自己使用**。
 
-Genesis V4 独创了 **[B面装配单]** 机制，旨在实现真正的**人机共生**：
-*   **节点可视化**：在它开始干活**之前**，它必须先生成一张 `JSON 蓝图`（声明它提取了哪些经验节点，打算怎么分步执行），这张图纸会被**立刻渲染并发送给你**。
-*   **人类介入点**：可视化的绝对优势在于，你能清晰地看到它的认知“哪里出了错误”。人类可以理解它的意图，并随时纠正它的节点依赖，而不是像面对黑盒一样盲目等待。
-*   **认知的上限**：我们不过度吹嘘 AI 的“自我意识”。**本质上，Agent 框架的底层依然是 AI 模型，而 AI 的本质是人类指令与认知的回声 (Echo)**。它究竟能爆发出多大的潜能，完全取决于人类如何使用它、如何建立知识库。**用户喂给它的认知节点质量，决定了 Genesis 这个空壳智力的绝对上限。**
+- **极简且纯净的内核**：
+  - 零重度框架依赖（没有 LangChain，没有 LlamaIndex）。纯净的底层代码，毫秒级启动，完全白盒可见。
 
----
+## ⚙️ 架构图解
 
-## 🧠 架构解析：GPT-5.4 同构的“三重黑盒”闭环
+```mermaid
+graph TD
+    User((User)) -->|Input| G_Process
+    
+    subgraph "Genesis V4 Core"
+        G_Process[G-Process (Brain)\nSearches Knowledge, Plans Task]
+        Op_Process[Op-Process (Hands)\nExecutes Payload via Tools]
+        C_Process[C-Process (Subconscious)\nReflects & Stores Lessons]
+        
+        NodeVault[(NodeVault\nSQLite + Vector Graph)]
+        
+        G_Process -->|Query| NodeVault
+        G_Process -->|Dispatch Payload| Op_Process
+        Op_Process -->|Execution Results| G_Process
+        Op_Process -.->|Triggers| C_Process
+        C_Process -->|Save Node/Edge| NodeVault
+    end
+    
+    Op_Process -->|Sys Calls| OS_Tools((Local File/Shell Tools))
+```
 
-为了粉碎长文本带来的“上下文爆炸”和“注意力崩溃”宿命，Genesis V4 在本地硬核复现了最前沿的 Reasoning 架构（分离“慢思考”与“快思考”），将系统切割为三个各司其职的独立进程：
+## 🚀 快速开始
 
-### 1. [前额叶] G 进程：主动检索 (对标 GPT-5.4 Tool Search & Upfront Plan)
-*   **拒绝对话盲目投喂**：G 进程不会在开局就被强塞成百上千的知识点噪音。它开局手里只有一把“档案馆钥匙”（`search_knowledge_nodes` 工具）。
-*   **主动打手电**：当收到你的任务时，G 会主动去节点库（NodeVault）里按关键字搜索相关的经验。这在原理上与 **GPT-5.4 最新的 "Tool Search" 机制**如出一辙，极大降低了无用 Token 的消耗。
-*   **蓝图显式化**：找齐知识卡片后，G 会输出严格的 JSON 蓝图指令，这正是 **GPT-5.4 中新近出现的“思维显式化 (Thinking Plan)”**。
+### 1. 环境准备
 
-### 2. [运动皮层] Op 进程：无状态原子执行
-*   拿到 G 的精确图纸后，Op 进程负责毫无思想包袱地干脏活（读写文件、跑代码、搜网页）。
-*   它不维护长期记忆，只看当前这一步该怎么走，以此保证工具调用的极致稳定和准确率。
+Genesis 极其轻量，你需要 Python 3.10+ 环境。
 
-### 3. [海马体] C 进程：记忆巩固与生态自净
-*   **滑动窗口与强制切除**：系统专门加装了记忆隔离机制。它永远只将最近 10 次的对话保留在短期上下文中，一旦逾期将被底层物理抹除，彻底杜绝了聊天框越用越卡的问题。
-*   **查重与内化**：就在记忆被抹除前，**C 进程**会被唤醒。它会被强制要求查阅现有数据库进行“查重”。如果是新工作流，它会将其提炼并覆写进 `CTX_USER_PROFILE` 等永久节点；如果是废话，则直接抛弃。
-*   这套机制在本地完美模拟了大脑的“睡眠期记忆巩固”，实现了数据资产的新陈代谢。
+```bash
+git clone https://github.com/chendechuan117-create/genesis.git
+cd genesis
+pip install -r requirements.txt
+```
 
----
+### 2. 配置密钥
 
-## ⚡ 极高频的缓存命中 (Prefix Caching)
+创建 `.env` 文件并填入你喜欢的模型 API Key。Genesis 原生支持深改、OpenAI 等任意兼容提供商。
 
-利用这套首创的**双层节点库**（G 只检索轻量级节点标题，Op/C 才按需拉取厚重的正文内容），我们极大稳定了发往大模型的系统提示词前缀。
+```bash
+# 复制或创建 .env 文件
+DEEPSEEK_API_KEY=sk-your-key-here
+# 也可以配置免费代理提供商池（如需要）
+SILICONFLOW_API_KEY=sk-xxx
+```
 
-由于核心人设和系统级 Prompt 形成了稳定的“死锁”区块，结合支持 Prefix Caching（上下文缓存）的最顶尖模型，系统的运作变得极其经济高速。
-**根据实机 600万 tokens 级别的压力测试，系统常态化维持着 80% ~ 85% 以上的高速缓存命中率。** 由于命中前缀的 API 费用极低，你相当于低成本拥有了一个随时待命的高维度管家。
+### 3. 运行 Discord Bot 
 
----
+本项目自带了一个完备的 Discord 机器人接口，支持在频道里和 Genesis 进行沉浸式长周期协作。
 
-## 🚀 安装指南
+```bash
+# 在 .env 中追加你的 Discord Token
+DISCORD_BOT_TOKEN=your-bot-token
 
-Genesis V4 被设计为极简且独立。
+# 启动！
+python discord_bot.py
+```
 
-### 方法一：直接指挥你的 AI (Cursor/Windsurf/Gemini等) 帮你安装
-这是最推荐也是最贴合现代开发习惯的方式！把下面这段话复制发给你的 IDE/AI 助手：
+## 🧠 设计哲学 (Philosophy)
 
-> "请帮我配置 Genesis V4 环境。
-> 1. 读取当前目录下的 `requirements.txt` 并帮我创建一个干净的虚拟环境、安装好它们。
-> 2. 帮我复制一份 `.env.example`（如果有的话）并告诉我需要填入哪些 API keys（比如 DISCORD_BOT_TOKEN 这是必须的，以及你需要的 DeepSeek 等大模型 Key）。
-> 3. 用 Python 运行 `discord_bot.py`，或者运行 `start.sh`。"
+1. **大模型的脑容量是有限的，必须“洗脑”**：
+   单体 Agent 在解决复杂 Bug 时，历史记录会迅速堆积大量报错日志和无意义的尝试，导致模型产生幻觉。Genesis 的 `Op-Process` 永远是“失忆”的，它只拿到**当前所需的最小破局点**，从而保持最高智商的执行力。
+2. **真正的记忆不是 RAG 文本，是图谱**：
+   把所有聊天记录灌进向量数据库叫“检索增强”，把“遇到 Nginx 端口冲突 -> 应该执行 `lsof -i:80` -> 杀死进程”这种标准操作流沉淀为有向边，才叫**认知图谱**。
 
-### 方法二：手动安装
+## 📄 许可证
 
-1. **进入代码目录**
-   ```bash
-   git clone https://github.com/chendechuan117-create/genesis.git
-   cd genesis/Genesis  # 进入纯净的 V4 独立版目录
-   ```
-
-2. **创建虚拟环境并安装极简依赖**
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate  # Windows 用户使用 venv\Scripts\activate
-   pip install -r requirements.txt
-   ```
-
-3. **配置环境变量**
-   在目录中新建一个 `.env` 文件，填入你的 Token：
-   ```env
-   DISCORD_BOT_TOKEN="your_discord_bot_token_here"
-   # 强烈建议填入 DEEPSEEK_API_KEY 以获得 80%+ 的极致缓存命中体验
-   ```
-
-4. **启动**
-   ```bash
-   chmod +x start.sh
-   ./start.sh
-   # 或者直接运行: python discord_bot.py
-   ```
-
----
-
-*Genesis V4.2 — “AI 只是回声，人类的认知才是回响的边界。”*
+本项目基于 [MIT License](./LICENSE) 开源。欢迎任何有意思的 PR 和探索！
