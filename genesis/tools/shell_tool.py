@@ -79,8 +79,8 @@ class ShellTool(Tool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["execute", "spawn", "poll", "list_jobs"],
-                    "description": "操作类型：execute(默认同步), spawn(异步启动), poll(检查状态), list_jobs(列出所有)",
+                    "enum": ["execute", "spawn", "poll", "list_jobs", "kill_job", "health_check"],
+                    "description": "操作类型：execute(默认同步), spawn(异步启动), poll(检查状态), list_jobs(列出所有), kill_job(终止任务), health_check(系统诊断)",
                     "default": "execute"
                 },
                 "command": {
@@ -139,7 +139,40 @@ class ShellTool(Tool):
         
         lines = ["Active Jobs:"]
         for j in jobs:
-            lines.append(f"- {j['id']}: {j['command']} [{j['status']}]")
+            dur = j.get("duration_human", "")
+            lines.append(f"- {j['id']}: {j['command']} [{j['status']}] {dur}")
+        return "\n".join(lines)
+
+    def kill_job(self, job_id: str) -> str:
+        if not self.job_manager: return "No JobManager"
+        return self.job_manager.kill_job(job_id)
+
+    def health_check(self) -> str:
+        """System health diagnostics"""
+        if not self.job_manager: return "No JobManager"
+        import json
+        report = self.job_manager.health_check()
+        self.job_manager.cleanup_stale()
+        
+        lines = ["=== Genesis Health Check ==="]
+        lines.append(f"Jobs: {report['jobs_running']} running / {report['jobs_total']} total")
+        
+        sys_info = report.get("system", {})
+        if sys_info.get("mem_usage_pct") is not None:
+            lines.append(f"Memory: {sys_info['mem_usage_pct']}% used ({sys_info.get('mem_available_mb', '?')} MB free)")
+        if sys_info.get("disk_usage_pct") is not None:
+            lines.append(f"Disk: {sys_info['disk_usage_pct']}% used ({sys_info.get('disk_free_gb', '?')} GB free)")
+        if sys_info.get("load_1m") is not None:
+            lines.append(f"Load: {sys_info['load_1m']} / {sys_info['load_5m']} / {sys_info['load_15m']}")
+        
+        zombie = report.get("zombie_check", {})
+        genesis_procs = zombie.get("genesis_processes", [])
+        lines.append(f"Genesis instances: {len(genesis_procs)}")
+        for p in genesis_procs:
+            lines.append(f"  PID {p['pid']} | CPU {p['cpu']}% | MEM {p['mem']}%")
+        if zombie.get("zombie_count", 0) > 0:
+            lines.append(f"⚠️ Zombie processes: {zombie['zombie_count']}")
+        
         return "\n".join(lines)
     
     async def execute(self, command: str = None, action: str = "execute", job_id: str = None, cwd: str = None, is_daemon: bool = False) -> str:
@@ -156,6 +189,13 @@ class ShellTool(Tool):
             
         elif action == "list_jobs":
             return self.list_jobs()
+
+        elif action == "kill_job":
+            if not job_id: return "Error: kill_job action requires 'job_id'"
+            return self.kill_job(job_id)
+
+        elif action == "health_check":
+            return self.health_check()
             
         else: # Default: execute (Synchronous)
             if not command: return "Error: execute action requires 'command'"

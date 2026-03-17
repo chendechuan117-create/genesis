@@ -648,3 +648,56 @@ class CreateNodeEdgeTool(BaseNodeTool):
         except Exception as e:
             logger.error(f"Edge creation failed: {e}")
             return f"Error: {e}"
+class RecordToolNodeTool(BaseNodeTool):
+    """节点管理工具：记录工具节点 (TOOL_NODE)。专属后台 C 进程权限。"""
+
+    @property
+    def name(self) -> str:
+        return "record_tool_node"
+
+    @property
+    def description(self) -> str:
+        return "将 Python 工具源码作为 TOOL 节点记录到认知库中。(仅超级管理员 C 进程 有权限使用)"
+
+    @property
+    def parameters(self) -> Dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "node_id": {"type": "string", "description": "节点ID，格式前缀必须是 TOOL_"},
+                "tool_name": {"type": "string", "description": "工具名称（小写字母和下划线）"},
+                "title": {"type": "string", "description": "工具功能描述"},
+                "source_code": {"type": "string", "description": "Python 源码文本，必须包含一个继承自 Tool 的类定义"},
+                "tags": {"type": "string", "description": "逗号分隔的标签，如 tool,python,skill", "default": "tool,python,skill"},
+                **TRUST_SCHEMA_PROPERTIES
+            },
+            "required": ["node_id", "tool_name", "title", "source_code"]
+        }
+
+    async def execute(self, node_id: str, tool_name: str, title: str, source_code: str, tags: str = "tool,python,skill", metadata_signature: Dict[str, Any] = None, confidence_score: float = None, last_verified_at: str = None, verification_source: str = None) -> str:
+        try:
+            # 验证源码是否包含 Tool 类
+            if "class" not in source_code or "Tool" not in source_code:
+                return "Error: 源码必须包含一个继承自 Tool 的类定义"
+            
+            # 创建工具节点
+            self.vault.create_node(
+                node_id=node_id,
+                ntype="TOOL",
+                title=title,
+                human_translation=f"Python工具: {tool_name}",
+                tags=tags,
+                full_content=source_code,
+                source="skill_creation",
+                metadata_signature=metadata_signature,
+                confidence_score=confidence_score or 0.8,
+                last_verified_at=last_verified_at,
+                verification_source=verification_source
+            )
+            
+            logger.info(f"NodeVault: Recorded tool node [{node_id}] - {tool_name}")
+            return f"✅ 工具节点 [{node_id}] 记录成功。工具名称: {tool_name}"
+            
+        except Exception as e:
+            logger.error(f"Tool node recording failed: {e}")
+            return f"Error: {e}"

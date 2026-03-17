@@ -20,6 +20,15 @@ def _build_openai(config) -> NativeHTTPProvider:
         default_model="gpt-4o"
     )
 
+def _build_gemini(config) -> NativeHTTPProvider:
+    api_key = getattr(config, 'gemini_api_key', None)
+    # Use OpenAI compatibility mode for Gemini API
+    return NativeHTTPProvider(
+        api_key=api_key,
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        default_model="gemini-2.5-flash"
+    )
+
 def _build_openrouter(config) -> NativeHTTPProvider:
     api_key = getattr(config, 'openrouter_api_key', None)
     return NativeHTTPProvider(
@@ -71,6 +80,7 @@ def _build_zhipu(config) -> NativeHTTPProvider:
 
 # Register all standard cloud providers
 provider_registry.register("deepseek", _build_deepseek)
+provider_registry.register("gemini", _build_gemini)
 provider_registry.register("openai", _build_openai)
 provider_registry.register("openrouter", _build_openrouter)
 provider_registry.register("antigravity", _build_antigravity)

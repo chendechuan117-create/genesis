@@ -1,0 +1,82 @@
+"""
+Genesis V4 结构化数据模型 — Pydantic 强类型
+替代代码中到处飞的 Dict[str, Any]，在编码阶段就捕获类型错误。
+"""
+
+from typing import List, Optional, Any, Dict
+from pydantic import BaseModel, Field
+
+
+class DispatchPayload(BaseModel):
+    """G-Process 输出的 Op 派发书"""
+    op_intent: str = Field(default="未定义目标", description="Op 需要完成的目标")
+    active_nodes: List[str] = Field(default_factory=list, description="挂载的知识节点 ID 列表")
+    instructions: str = Field(default="", description="详细执行指令")
+
+
+class OpResult(BaseModel):
+    """Op-Process 的执行结果报告"""
+    status: str = Field(default="UNKNOWN", description="执行状态: SUCCESS / PARTIAL / FAILED / UNKNOWN")
+    summary: str = Field(default="", description="执行摘要")
+    findings: str = Field(default="", description="发现与观察")
+    changes_made: List[str] = Field(default_factory=list, description="修改的文件/资源列表")
+    artifacts: List[str] = Field(default_factory=list, description="产出的制品列表")
+    open_questions: List[str] = Field(default_factory=list, description="未解决的问题")
+    raw_output: str = Field(default="", description="原始 LLM 输出")
+
+
+class CallbackEvent(BaseModel):
+    """UI 回调事件（防止 dict/str 类型混淆）"""
+    event_type: str = Field(description="事件类型: loop_start, tool_start, tool_result, search_result, blueprint, thinking")
+    phase: Optional[str] = Field(default=None, description="当前阶段: G_PHASE / OP_PHASE / C_PHASE")
+    name: Optional[str] = Field(default=None, description="工具名称")
+    args: Optional[Dict[str, Any]] = Field(default=None, description="工具参数")
+    result: Optional[str] = Field(default=None, description="工具结果（始终为 str）")
+
+    @classmethod
+    def from_raw(cls, event_type: str, data: Any) -> "CallbackEvent":
+        """从原始 callback(event, data) 参数安全构造"""
+        if isinstance(data, dict):
+            return cls(
+                event_type=event_type,
+                phase=data.get("phase"),
+                name=data.get("name"),
+                args=data.get("args"),
+                result=str(data.get("result", "")) if "result" in data else None
+            )
+        return cls(event_type=event_type, result=str(data) if data else None)
+
+
+class MetadataSignature(BaseModel):
+    """知识节点的元数据签名"""
+    os_family: Optional[str] = None
+    runtime: Optional[str] = None
+    language: Optional[str] = None
+    framework: Optional[str] = None
+    environment_scope: Optional[str] = None
+    task_kind: Optional[str] = None
+    error_kind: Optional[str] = None
+    validation_status: Optional[str] = None
+    verification_source: Optional[str] = None
+    last_verified_at: Optional[str] = None
+
+    def to_search_dict(self) -> Dict[str, Any]:
+        """转为搜索用的字典（排除 None 值）"""
+        return {k: v for k, v in self.model_dump().items() if v is not None}
+
+
+class ProviderConfig(BaseModel):
+    """LLM 提供商配置"""
+    name: str
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    default_model: str = "deepseek-chat"
+    connect_timeout: int = 10
+    request_timeout: int = 120
+
+
+class TraceInfo(BaseModel):
+    """追踪信息，附加到 LLM 调用上"""
+    trace_id: str = ""
+    phase: str = ""
+    parent_span: Optional[str] = None

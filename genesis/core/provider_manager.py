@@ -1,9 +1,12 @@
 
 import logging
 import asyncio
+import time
 from typing import Dict, Any, List, Optional
 from genesis.core.provider import NativeHTTPProvider, MockLLMProvider
 from genesis.core.registry import provider_registry
+from genesis.core.base import LLMProvider, LLMResponse
+from genesis.core.tracer import Tracer
 # Ensure providers are loaded
 import genesis.providers
 logger = logging.getLogger(__name__)
@@ -12,6 +15,7 @@ logger = logging.getLogger(__name__)
 # "antigravity" (local proxy) is always valid, handled separately
 PROVIDER_KEY_MAP = {
     "deepseek": "deepseek_api_key",
+    "gemini": "gemini_api_key",
     "openai": "openai_api_key",
     "openrouter": "openrouter_api_key",
     "sambanova": "sambanova_api_key",
@@ -19,12 +23,14 @@ PROVIDER_KEY_MAP = {
     "dashscope": "dashscope_api_key",
     "qianfan": "qianfan_api_key",
     "zhipu": "zhipu_api_key",
+    "antigravity": "antigravity_key", # Actually local
 }
 
-class ProviderRouter:
+class ProviderRouter(LLMProvider):
     """
     Provider Router - Manages multiple LLM providers and handles failover.
     Decouples the 'brain' logic from the Agent body.
+    Implements LLMProvider interface so it can be passed directly to Genesis.
     """
     
     def __init__(self, config: Any, api_key: str = None, base_url: str = None, model: str = None):
@@ -78,7 +84,7 @@ class ProviderRouter:
                 logger.warning(f"Failed to build provider plugin '{name}': {e}")
         
         # Determine Activation & Failover Order
-        self.failover_order = ['deepseek', 'openrouter', 'openai', 'antigravity']
+        self.failover_order = ['gemini', 'deepseek', 'openrouter', 'openai', 'antigravity']
         
         self.active_provider_name = 'antigravity'
         for name in self.failover_order:
@@ -100,14 +106,34 @@ class ProviderRouter:
         self.active_provider = self.providers[target]
         return True
 
-    async def chat_with_failover(self, messages: List[Dict], **kwargs) -> Any:
-        """Wrapper for chat with dynamic failover"""
+    async def chat(self, messages: List[Dict], **kwargs) -> Any:
+        """Wrapper for chat with dynamic failover and tracing"""
         if not self.active_provider:
              raise RuntimeError("No active provider available")
 
+        tracer = Tracer.get_instance()
+        trace_id = kwargs.pop("_trace_id", None) or ""
+        trace_phase = kwargs.pop("_trace_phase", "") or ""
+        trace_parent = kwargs.pop("_trace_parent", None)
+        model = kwargs.get("model") or self.get_default_model()
+
+        t0 = time.time()
+
         # Try active first
         try:
-            return await self.active_provider.chat(messages=messages, **kwargs)
+            result = await self.active_provider.chat(messages=messages, **kwargs)
+            dur = (time.time() - t0) * 1000
+            if trace_id:
+                tracer.log_llm_call(
+                    trace_id, parent=trace_parent, phase=trace_phase,
+                    model=model,
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.output_tokens,
+                    total_tokens=result.total_tokens,
+                    duration_ms=dur,
+                    has_tool_calls=result.has_tool_calls
+                )
+            return result
         except Exception as e:
             logger.error(f"Provider {self.active_provider_name} Failed: {e}")
             
@@ -125,18 +151,39 @@ class ProviderRouter:
                      if self._switch_provider(next_provider_name):
                          logger.info(f"🔄 Failover Attempt: {next_provider_name}")
                          try:
-                             return await self.active_provider.chat(messages=messages, **kwargs)
+                             result = await self.active_provider.chat(messages=messages, **kwargs)
+                             dur = (time.time() - t0) * 1000
+                             if trace_id:
+                                 tracer.log_llm_call(
+                                     trace_id, parent=trace_parent, phase=trace_phase,
+                                     model=model + f"(failover:{next_provider_name})",
+                                     input_tokens=result.input_tokens,
+                                     output_tokens=result.output_tokens,
+                                     total_tokens=result.total_tokens,
+                                     duration_ms=dur,
+                                     has_tool_calls=result.has_tool_calls
+                                 )
+                             return result
                          except Exception as e2:
                              logger.error(f"Backup Provider {next_provider_name} also failed: {e2}")
                              continue # Try next
             
+            dur = (time.time() - t0) * 1000
+            if trace_id:
+                tracer.log_llm_call(
+                    trace_id, parent=trace_parent, phase=trace_phase,
+                    model=model, duration_ms=dur,
+                    error=str(e)
+                )
             # If all failed
             raise e
     
     # Delegate standard provider methods to active provider
     
-    async def chat(self, *args, **kwargs):
-        return await self.chat_with_failover(*args, **kwargs)
+    def get_default_model(self) -> str:
+        if self.active_provider:
+            return self.active_provider.get_default_model()
+        return "unknown"
         
     def get_active_provider(self):
         return self.active_provider

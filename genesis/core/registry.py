@@ -4,6 +4,11 @@
 
 from typing import Dict, List, Any, Optional
 import logging
+import importlib.util
+import inspect
+import sys
+import subprocess
+from pathlib import Path
 
 from .base import Tool
 
@@ -15,6 +20,7 @@ class ToolRegistry:
     
     def __init__(self):
         self._tools: Dict[str, Tool] = {}
+        self._cached_definitions: Optional[List[Dict[str, Any]]] = None
     
     def register(self, tool: Tool) -> None:
         """注册工具"""
@@ -22,12 +28,14 @@ class ToolRegistry:
             logger.warning(f"工具 {tool.name} 已存在，将被覆盖")
         
         self._tools[tool.name] = tool
+        self._cached_definitions = None  # Invalidate cache
         logger.debug(f"✓ 注册工具: {tool.name}")
     
     def unregister(self, tool_name: str) -> None:
         """注销工具"""
         if tool_name in self._tools:
             del self._tools[tool_name]
+            self._cached_definitions = None  # Invalidate cache
             logger.debug(f"✓ 注销工具: {tool_name}")
     
     def get(self, tool_name: str) -> Optional[Tool]:
@@ -40,8 +48,12 @@ class ToolRegistry:
     
     def get_definitions(self) -> List[Dict[str, Any]]:
         """获取所有工具的 Schema 定义 (按字母排序以确保缓存命中)"""
+        if self._cached_definitions is not None:
+            return self._cached_definitions
+            
         definitions = [tool.to_schema() for tool in self._tools.values()]
-        return sorted(definitions, key=lambda x: x["function"]["name"])
+        self._cached_definitions = sorted(definitions, key=lambda x: x["function"]["name"])
+        return self._cached_definitions
     
     async def execute(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """执行工具"""
@@ -80,11 +92,6 @@ class ToolRegistry:
 
     def load_from_file(self, file_path: str) -> bool:
         """从文件动态加载工具"""
-        import importlib.util
-        import inspect
-        from pathlib import Path
-        from .base import Tool
-        
         path = Path(file_path)
         if not path.exists():
             logger.error(f"工具文件不存在: {path}")
@@ -96,9 +103,6 @@ class ToolRegistry:
             module = importlib.util.module_from_spec(spec)
             
             # Auto-Dependency Installation Logic
-            import sys
-            import subprocess
-            
             max_retries = 3
             for attempt in range(max_retries):
                 try:
@@ -152,6 +156,91 @@ class ToolRegistry:
             
         except Exception as e:
             logger.error(f"加载工具文件失败 {path}: {e}")
+            return False
+
+    def register_from_source(self, name: str, source_code: str) -> bool:
+        """从源码字符串动态注册工具
+        
+        Args:
+            name: 工具名称
+            source_code: Python 源码字符串，必须包含一个继承自 Tool 的类定义
+            
+        Returns:
+            bool: 是否成功注册
+        """
+        try:
+            # 创建一个唯一的模块名
+            module_name = f"dynamic_tool_{name}"
+            
+            # 编译源码
+            compiled = compile(source_code, f"<dynamic_tool_{name}>", 'exec')
+            
+            # 创建新的模块
+
+            
+            module = type(sys)(
+
+            
+                module_name,
+
+            
+                doc="Dynamically created tool module"
+
+            
+            )
+
+            
+            
+
+            
+            # 注入必要的属性和导入
+
+            
+            module.__file__ = f"<dynamic_tool_{name}>"
+
+            
+            module.__name__ = module_name
+
+            
+            exec("from genesis.core.base import Tool", module.__dict__)
+            
+            # 注入必要的导入
+            exec("from genesis.core.base import Tool", module.__dict__)
+            
+            # 执行编译后的代码
+            exec(compiled, module.__dict__)
+            
+            # 查找 Tool 子类
+            loaded = False
+            for obj_name, obj in inspect.getmembers(module):
+                if (inspect.isclass(obj) and 
+                    issubclass(obj, Tool) and 
+                    obj is not Tool):
+                    
+                    try:
+                        tool_instance = obj()
+                        # 检查工具名称是否匹配
+                        if tool_instance.name != name:
+                            logger.warning(f"工具类中的名称 '{tool_instance.name}' 与请求的名称 '{name}' 不匹配，使用类中的名称")
+                        
+                        self.register(tool_instance)
+                        logger.info(f"✓ 从源码动态注册工具: {tool_instance.name}")
+                        loaded = True
+                        break
+                    except Exception as e:
+                        logger.warning(f"无法实例化动态工具 {obj_name}: {e}")
+            
+            if not loaded:
+                logger.error(f"在源码中未找到有效的 Tool 子类: {name}")
+                return False
+                
+            return True
+            
+        except SyntaxError as e:
+            logger.error(f"源码语法错误 {name}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"从源码注册工具失败 {name}: {e}")
             return False
 
 class ProviderRegistry:

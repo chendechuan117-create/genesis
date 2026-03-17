@@ -17,6 +17,7 @@ class GlobalConfig:
     """全局配置对象"""
     # API Keys
     deepseek_api_key: Optional[str] = None
+    gemini_api_key: Optional[str] = None
     openai_api_key: Optional[str] = None
     openrouter_api_key: Optional[str] = None
     openrouter_model: Optional[str] = "trinity-large-preview"
@@ -28,6 +29,11 @@ class GlobalConfig:
     zhipu_api_key: Optional[str] = None
     
     tavily_api_key: Optional[str] = None
+    
+    # Observability (optional)
+    langfuse_public_key: Optional[str] = None
+    langfuse_secret_key: Optional[str] = None
+    langfuse_host: Optional[str] = "https://cloud.langfuse.com"
     
     # Network & Limits
     http_proxy: Optional[str] = None
@@ -145,6 +151,7 @@ class ConfigManager:
     # ENV_KEY (upper) -> GlobalConfig attribute name
     _KEY_MAP = {
         "DEEPSEEK_API_KEY": "deepseek_api_key",
+        "GEMINI_API_KEY": "gemini_api_key",
         "OPENAI_API_KEY": "openai_api_key",
         "OPENROUTER_API_KEY": "openrouter_api_key",
         "OPENROUTER_MODEL": "openrouter_model",
@@ -153,6 +160,9 @@ class ConfigManager:
         "QIANFAN_API_KEY": "qianfan_api_key",
         "ZHIPU_API_KEY": "zhipu_api_key",
         "TAVILY_API_KEY": "tavily_api_key",
+        "LANGFUSE_PUBLIC_KEY": "langfuse_public_key",
+        "LANGFUSE_SECRET_KEY": "langfuse_secret_key",
+        "LANGFUSE_HOST": "langfuse_host",
         "HTTP_PROXY": "http_proxy",
         "HTTPS_PROXY": "https_proxy",
     }

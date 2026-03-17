@@ -6,6 +6,7 @@ import discord
 from dotenv import load_dotenv
 
 from factory import create_agent
+from genesis.core.models import CallbackEvent
 
 # 1. Logging
 logging.basicConfig(
@@ -42,27 +43,27 @@ class DiscordCallback:
 
     async def __call__(self, event_type: str, data):
         try:
-            if event_type == "blueprint":
-                if len(data) > 2000:
-                    for i in range(0, len(data), 1990):
-                        await self.message.channel.send(data[i:i+1990])
+            evt = CallbackEvent.from_raw(event_type, data)
+
+            if evt.event_type == "blueprint":
+                text = str(data) if not isinstance(data, str) else data
+                if len(text) > 2000:
+                    for i in range(0, len(text), 1990):
+                        await self.message.channel.send(text[i:i+1990])
                 else:
-                    await self.message.channel.send(data)
-            elif event_type == "tool_start":
-                tool_name = data.get("name", "?")
-                await self.message.channel.send(f"🟢 `{tool_name}` 运行中...")
-            elif event_type == "search_result":
-                # 搜索结果专用格式化：提取节点清单，类似蓝图的「已加载认知节点」风格
-                formatted = self._format_search_result(data)
+                    await self.message.channel.send(text)
+            elif evt.event_type == "tool_start":
+                await self.message.channel.send(f"🟢 `{evt.name or '?'}` 运行中...")
+            elif evt.event_type == "search_result":
+                formatted = self._format_search_result(evt.result or "")
                 if len(formatted) > 2000:
                     for i in range(0, len(formatted), 1990):
                         await self.message.channel.send(formatted[i:i+1990])
                 else:
                     await self.message.channel.send(formatted)
-            elif event_type == "tool_result":
-                tool_name = data.get("name", "?")
-                result_peek = data.get("result", "")[:200]
-                await self.message.channel.send(f"✅ **[{tool_name}]**:\n```\n{result_peek}\n```")
+            elif evt.event_type == "tool_result":
+                result_peek = (evt.result or "")[:200]
+                await self.message.channel.send(f"✅ **[{evt.name or '?'}]**:\n```\n{result_peek}\n```")
         except Exception as e:
             logger.error(f"Callback error: {e}")
 
@@ -143,6 +144,7 @@ async def on_message(message: discord.Message):
 
         # 附件处理
         attachment_paths = []
+        image_paths = []
         if message.attachments:
             upload_dir = Path("runtime/uploads")
             upload_dir.mkdir(parents=True, exist_ok=True)
@@ -150,11 +152,14 @@ async def on_message(message: discord.Message):
                 fp = (upload_dir / f"{message.id}_{att.filename}").resolve()
                 try:
                     await att.save(fp)
-                    attachment_paths.append(str(fp))
+                    if att.content_type and att.content_type.startswith('image/'):
+                        image_paths.append(str(fp))
+                    else:
+                        attachment_paths.append(str(fp))
                 except Exception as e:
                     logger.error(f"Attachment save failed: {e}")
 
-        if not user_intent and not attachment_paths:
+        if not user_intent and not attachment_paths and not image_paths:
             await message.reply("嗯？找我什么事？")
             return
 
@@ -192,8 +197,12 @@ async def on_message(message: discord.Message):
                 full_input = f"{channel_ctx}[当前请求]\n{full_input}"
 
                 ui_callback = DiscordCallback(message)
-                result = await agent.process(full_input, step_callback=ui_callback)
+                result = await agent.process(full_input, step_callback=ui_callback, image_paths=image_paths)
                 response = result.get("response", "...")
+                
+                # Discord 不允许发送空消息，增加保底机制
+                if not response or not str(response).strip():
+                    response = "任务已完成，但没有生成可回复的文本内容。"
 
                 if len(response) > 2000:
                     for i in range(0, len(response), 2000):

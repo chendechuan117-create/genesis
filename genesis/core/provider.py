@@ -317,7 +317,15 @@ class NativeHTTPProvider(BaseLLMProvider):
         
         # 构建 curl 命令 — 移除 --noproxy '*' 以支持系统代理
         # 使用 --data-binary @- 从 stdin 读取数据，避免参数过长问题
-        cmd = ['curl', '-k', '-s', '--connect-timeout', str(self.connect_timeout), '-X', 'POST', url]
+        # Add --max-time to prevent indefinite hanging
+        # Add -4 to force IPv4 and avoid IPv6 timeout delays
+        cmd = [
+            'curl', '-k', '-s', '-4',
+            '--connect-timeout', str(self.connect_timeout), 
+            '--max-time', str(self.request_timeout),
+            '-w', '\n%{time_namelookup},%{time_connect},%{time_starttransfer},%{time_total}',
+            '-X', 'POST', url
+        ]
         
         for k, v in headers.items():
             cmd.extend(['-H', f'{k}: {v}'])
@@ -333,11 +341,32 @@ class NativeHTTPProvider(BaseLLMProvider):
                 timeout=self.request_timeout
             )
             
+            # Extract timing metrics from the end of stdout
+            stdout_raw = result.stdout
+            timing_info = "0,0,0,0"
+            if stdout_raw:
+                parts = stdout_raw.rsplit('\n', 1)
+                if len(parts) == 2:
+                    stdout_clean = parts[0]
+                    timing_info = parts[1]
+                else:
+                    stdout_clean = stdout_raw
+            else:
+                stdout_clean = ""
+
+            # Log metrics if slow
+            try:
+                t_dns, t_conn, t_ttfb, t_total = timing_info.split(',')
+                if float(t_total) > 5.0:
+                    logger.warning(f"🐢 Slow Request: DNS={t_dns}s, Conn={t_conn}s, TTFB={t_ttfb}s, Total={t_total}s")
+            except:
+                pass
+
             if result.returncode != 0:
                 raise Exception(f"curl 失败: {result.stderr}")
                 
             try:
-                resp_data = json.loads(result.stdout)
+                resp_data = json.loads(stdout_clean)
                 return self._parse_response(resp_data)
             except json.JSONDecodeError as e:
                 # 记录详细的响应内容以便调试
@@ -354,7 +383,14 @@ class NativeHTTPProvider(BaseLLMProvider):
         """流式 Curl 请求 (Robust Version)"""
         
         # Add -N for no buffer, use --data-binary @- for stdin
-        cmd = ['curl', '-k', '-s', '-N', '--connect-timeout', '30', '-X', 'POST', url]
+        # Add --max-time (self.request_timeout) to prevent infinite hanging on zombie connections
+        # Add -4 to force IPv4
+        cmd = [
+            'curl', '-k', '-s', '-N', '-4',
+            '--connect-timeout', str(self.connect_timeout),
+            '--max-time', str(self.request_timeout),
+            '-X', 'POST', url
+        ]
         for k, v in headers.items():
             cmd.extend(['-H', f'{k}: {v}'])
             

@@ -42,9 +42,18 @@ venv.bak/
 *.db
 runtime/
 
+# Logs and Backup files
+*.log
+*.backup
+*_backup.py
+*_original.py
+*_modified.py
+
 # IDEs
 .idea/
 .vscode/
+.claude/
+.windsurf/
 *.swp
 *.swo
 
@@ -57,3 +66,4 @@ runtime/
 ehthumbs.db
 Thumbs.db
 
+.gitnexus

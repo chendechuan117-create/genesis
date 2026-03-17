@@ -32,6 +32,7 @@ def create_agent(
         from genesis.tools.file_tools import ReadFileTool, WriteFileTool, AppendFileTool, ListDirectoryTool
         from genesis.tools.shell_tool import ShellTool
         from genesis.tools.web_tool import WebSearchTool
+        from genesis.tools.url_tool import ReadUrlTool
         from genesis.tools.skill_creator_tool import SkillCreatorTool
         from genesis.tools.node_tools import SearchKnowledgeNodesTool, RecordContextNodeTool, RecordLessonNodeTool, CreateMetaNodeTool, DeleteNodeTool, CreateGraphNodeTool, CreateNodeEdgeTool
 
@@ -41,6 +42,7 @@ def create_agent(
         tools.register(ListDirectoryTool())
         tools.register(ShellTool(use_sandbox=False))
         tools.register(WebSearchTool())
+        tools.register(ReadUrlTool())
         tools.register(SkillCreatorTool(tools))
         tools.register(SearchKnowledgeNodesTool())
         tools.register(RecordContextNodeTool())
@@ -52,7 +54,7 @@ def create_agent(
     except Exception as e:
         logger.error(f"V4 tool registration failed: {e}")
 
-    provider = provider_router.get_active_provider()
-    agent = GenesisV4(tools=tools, provider=provider)
-    logger.info(f"✓ Genesis V4 ready ({len(tools)} tools)")
+    # 核心改动：把带有 Failover 能力的 Router 直接传给 Agent
+    agent = GenesisV4(tools=tools, provider=provider_router)
+    logger.info(f"✓ Genesis V4 ready ({len(tools)} tools, Failover Enabled)")
     return agent

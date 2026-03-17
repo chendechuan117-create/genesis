@@ -5,6 +5,7 @@ Genesis V4 - 认知装配师 (The Factory Manager G)
 
 import json
 import sqlite3
+import functools
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
@@ -178,6 +179,30 @@ class NodeVault:
                 conn.commit()
                 logger.info(f"NodeVault: Migrated {len(rows)} nodes to dual-layer schema.")
 
+    @functools.lru_cache(maxsize=256)
+    def _normalize_metadata_signature_cached(self, dict_str: str) -> Dict[str, Any]:
+        """Internal cached worker for normalize_metadata_signature."""
+        try:
+            signature = json.loads(dict_str)
+        except Exception:
+            return {}
+            
+        normalized: Dict[str, Any] = {}
+        for key in METADATA_SIGNATURE_FIELDS:
+            value = signature.get(key)
+            if value:
+                if isinstance(value, list):
+                    normalized[key] = value if len(value) > 1 else value[0]
+                elif isinstance(value, str):
+                    item_str = value.strip()
+                    if "," in item_str:
+                        split_values = [part.strip() for part in item_str.split(",") if part.strip()]
+                        if split_values:
+                            normalized[key] = split_values if len(split_values) > 1 else split_values[0]
+                    else:
+                        normalized[key] = item_str
+        return normalized
+
     def normalize_metadata_signature(self, signature: Any) -> Dict[str, Any]:
         if not signature:
             return {}
@@ -188,30 +213,10 @@ class NodeVault:
                 return {}
         if not isinstance(signature, dict):
             return {}
-
-        normalized: Dict[str, Any] = {}
-        for key in METADATA_SIGNATURE_FIELDS:
-            value = signature.get(key)
-            if value is None or value == "":
-                continue
-            if isinstance(value, list):
-                cleaned = []
-                for item in value:
-                    item_str = str(item).strip().lower()
-                    if item_str and item_str not in cleaned:
-                        cleaned.append(item_str)
-                if cleaned:
-                    normalized[key] = cleaned
-            else:
-                item_str = str(value).strip().lower()
-                if item_str:
-                    if "," in item_str:
-                        split_values = [part.strip() for part in item_str.split(",") if part.strip()]
-                        if split_values:
-                            normalized[key] = split_values if len(split_values) > 1 else split_values[0]
-                    else:
-                        normalized[key] = item_str
-        return normalized
+            
+        # Serialize to string for LRU cache hashability
+        dict_str = json.dumps(signature, sort_keys=True)
+        return dict(self._normalize_metadata_signature_cached(dict_str))
 
     def parse_metadata_signature(self, raw_signature: Any) -> Dict[str, Any]:
         return self.normalize_metadata_signature(raw_signature)
@@ -251,6 +256,7 @@ class NodeVault:
                     merged[key] = existing_values if len(existing_values) > 1 else existing_values[0]
         return merged
 
+    @functools.lru_cache(maxsize=128)
     def infer_metadata_signature(self, text: str) -> Dict[str, Any]:
         source = (text or "").lower()
         if not source.strip():
@@ -533,6 +539,72 @@ class NodeVault:
             logger.debug(f"Graph: Added edge {source_id} --[{relation}]--> {target_id}")
         except Exception as e:
             logger.error(f"Failed to add edge: {e}")
+
+    def delete_node(self, node_id: str) -> bool:
+        """物理删除一个节点及其内容和连线"""
+        try:
+            self._conn.execute("DELETE FROM node_edges WHERE source_id = ? OR target_id = ?", (node_id, node_id))
+            self._conn.execute("DELETE FROM node_contents WHERE node_id = ?", (node_id,))
+            self._conn.execute("DELETE FROM knowledge_nodes WHERE node_id = ?", (node_id,))
+            self._conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete node {node_id}: {e}")
+            return False
+
+    def purge_forgotten_knowledge(self, days_threshold: int = 7) -> int:
+        """
+        垃圾回收 (GC)：
+        清理置信度低（< 0.5，如拾荒来的数据），且超过 `days_threshold` 天未使用过的节点。
+        返回清理的节点数量。
+        """
+        query = f"""
+            SELECT node_id FROM knowledge_nodes
+            WHERE confidence_score < 0.5
+            AND usage_count = 0
+            AND created_at < datetime('now', '-{days_threshold} days')
+            AND node_id NOT LIKE 'MEM_CONV%'
+        """
+        rows = self._conn.execute(query).fetchall()
+        
+        deleted_count = 0
+        for r in rows:
+            node_id = r['node_id']
+            if self.delete_node(node_id):
+                deleted_count += 1
+                
+        if deleted_count > 0:
+            logger.info(f"NodeVault GC: Purged {deleted_count} forgotten/unused low-confidence nodes.")
+            
+        return deleted_count
+        
+    def promote_node_confidence(self, node_id: str, boost: float = 0.4, max_score: float = 0.9) -> float:
+        """
+        转正晋升：
+        当一个节点在实际任务中发挥了正面作用，提升其置信度。
+        并移除标题中的 [拾荒] 标记。
+        """
+        row = self._conn.execute("SELECT confidence_score, title FROM knowledge_nodes WHERE node_id = ?", (node_id,)).fetchone()
+        if not row:
+            return 0.0
+            
+        current_score = row[0] if row[0] is not None else 0.5
+        new_score = min(current_score + boost, max_score)
+        
+        old_title = row[1] if row[1] is not None else ""
+        new_title = old_title.replace("[拾荒] ", "").strip()
+        
+        self._conn.execute(
+            """
+            UPDATE knowledge_nodes 
+            SET confidence_score = ?, title = ?, updated_at = CURRENT_TIMESTAMP 
+            WHERE node_id = ?
+            """,
+            (new_score, new_title, node_id)
+        )
+        self._conn.commit()
+        logger.info(f"NodeVault: Promoted node [{node_id}]. Confidence {current_score:.2f} -> {new_score:.2f}")
+        return new_score
 
     def get_related_nodes(self, node_id: str, relation: str = None, direction: str = "out") -> List[Dict[str, Any]]:
         """获取与指定节点相连的节点 (1-hop)
@@ -863,12 +935,10 @@ class FactoryManager:
 1. 先阅读系统提供的 DIGEST，快速判断当前库里大概有什么、哪些节点最近活跃、哪些节点最常被使用。
 2. 如果 DIGEST 已经足够支持判断，你可以直接回答用户，或定向派发 Op，不必为了形式而搜索。
 3. 如果任务涉及复杂环境、特定报错或你仍缺乏上下文，再**定向调用**搜索工具，获取过往经验（LESSON）或环境信息（CONTEXT）。
-4. 你可以调用多次搜索工具，但要有明确目的，避免盲目拉取大量无关元信息。
-5. 如果你已知任务的硬环境特征（例如 `os_family`、`language`、`framework`、`runtime`、`error_kind`、`task_kind`），调用 `search_knowledge_nodes` 时尽量同时提供 `signature` 过滤条件。
-6. 阅读搜索结果时，优先关注 `RECOMMENDED_ACTIVE_NODES`，它们通常最适合直接挂载给 Op。
-7. `ASSET / LESSON / CONTEXT` 通常优先进入 `ACTIVE_NODES`；`EPISODE` 仅在你需要延续同一任务脉络时再挂载。
-8. `ENTITY / EVENT / ACTION` 多数情况下只是背景参考；只有当因果链本身会直接影响执行时，才将其放入 `ACTIVE_NODES`。
-9. 如果搜索结果中的节点带有 `reqs:` 或 `graph:+` 提示，派发给 Op 时要优先考虑把这些依赖或关联节点一并纳入 `ACTIVE_NODES`。
+4. **绝对限制：你只是一个只能思考和搜索数据库的“缸中之脑”。你没有任何修改现实世界的能力（没有文件读写、没有Shell、没有网络）。**
+5. **Op 就是你的终极工具**。当你需要与现实世界交互时（比如：想看某个文件的内容、想运行一个测试、想创建一段代码），你**必须**把 Op 当作你的“探针”或“机械臂”来使用。
+6. **侦察兵模式 (Reconnaissance Dispatch)**：如果你发现需要读取特定的本地文件（如阅读用户的代码、配置文件）才能继续思考，你**必须**派发一个侦察任务给 Op，让 Op 去读取文件，然后在 `[Op-Process 执行完毕]` 后把文件内容带回给你。不要自己瞎猜，也不要尝试给出虚假的执行结果。
+7. 阅读搜索结果时，优先关注 `RECOMMENDED_ACTIVE_NODES`，它们通常最适合直接挂载给 Op。
 
 **阶段二：派发任务 (呼叫子程序 Op)**
 当你收集完信息准备让 Op 开始干活时，请**直接输出以下格式的任务派发书**。
@@ -879,7 +949,8 @@ class FactoryManager:
 OP_INTENT: <对 Op 目标的简短明确指令>
 ACTIVE_NODES: <你需要挂载给 Op 参考的节点ID列表，用逗号分隔，如 CTX_XXX, LESSON_XXX, ASSET_XXX。如果没有则写 NONE>
 INSTRUCTIONS:
-<给 Op 的具体执行建议或上下文信息。写清楚你想让 Op 怎么做，因为 Op 看不到你之前的搜索过程。>
+<给 Op 的具体执行建议或上下文信息。写清楚你想让 Op 怎么做。
+注意：如果是“侦察任务”，请在这里明确告诉 Op：“读取 XXX 文件，并将文件内容通过总结直接返回给我”。>
 ```
 
 **阶段三：综合与最终回复 (总结)**
@@ -922,13 +993,18 @@ INSTRUCTIONS:
 [工作流指令 - 必读]
 1. 立即开始使用你的工具（如 Shell、File、Web 等）执行上述目标。
 2. 遇到问题时，根据报错信息自行调整重试。
-3. 你不是直接面向用户回复的人。你是 G 调用的子程序，最终只需要向 G 回传执行结果。
-4. 当你认为任务已经彻底完成、阶段性完成、或穷尽方法依然失败时，必须输出如下格式的执行报告，不要输出面向用户的寒暄或总结：
+3. **你的双重身份**：你有时候是被叫来“修改代码/执行命令”的，有时候是被叫来“当侦察兵去读取特定文件内容”的。仔细阅读 G 的指令。
+4. 你不是直接面向用户回复的人。你是 G 调用的子程序，最终只需要向 G 回传结构化报告。
+5. 如果 G 让你去“读取文件”或“调查某个环境”，你**必须**在 `SUMMARY` 或 `FINDINGS` 里把你读到的关键内容、代码片段或调查结果直接写出来，否则 G 依然什么都看不到！
+6. 当你认为任务已经彻底完成、阶段性完成、或穷尽方法依然失败时，必须输出如下格式的执行报告，不要输出面向用户的寒暄或总结：
 
 ```op_result
 STATUS: SUCCESS | PARTIAL | FAILED
 SUMMARY:
 <一句话或一小段，说明这次执行达成了什么、没达成什么>
+
+FINDINGS:
+<如果这是一次侦察任务（如读取文件、查看日志），在这里输出你找到的具体内容片段、配置值或日志全文。如果是纯执行任务，写 NONE>
 
 CHANGES_MADE:
 - <本轮实际做出的修改、执行过的关键动作；如果没有写 NONE>
@@ -940,7 +1016,7 @@ OPEN_QUESTIONS:
 - <仍未解决的问题、风险、需要 G 决策的点；如果没有写 NONE>
 ```
 
-5. 如果某一项为空，明确写 `NONE`。
+7. 如果某一项为空，明确写 `NONE`。
 """
 
     def render_op_result_for_g(self, op_result: dict) -> str:
@@ -948,6 +1024,7 @@ OPEN_QUESTIONS:
         try:
             status = op_result.get("status", "UNKNOWN")
             summary = op_result.get("summary", "") or "无摘要"
+            findings = op_result.get("findings", "") or "无侦察结果"
             changes = op_result.get("changes_made", []) or []
             artifacts = op_result.get("artifacts", []) or []
             open_questions = op_result.get("open_questions", []) or []
@@ -958,6 +1035,10 @@ OPEN_QUESTIONS:
                 f"STATUS: {status}",
                 "SUMMARY:",
                 summary,
+                "",
+                "FINDINGS:",
+                findings,
+                ""
             ]
 
             output.append("CHANGES_MADE:")

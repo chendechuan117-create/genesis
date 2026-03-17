@@ -13,6 +13,8 @@ from typing import List, Dict, Any, Tuple, Optional
 
 from genesis.core.base import Message, MessageRole, LLMProvider, PerformanceMetrics, ToolCall
 from genesis.core.registry import ToolRegistry
+from genesis.core.tracer import Tracer
+from genesis.core.models import DispatchPayload, OpResult
 from genesis.v4.manager import FactoryManager, NodeVault, NodeManagementTools
 
 logger = logging.getLogger(__name__)
@@ -37,7 +39,7 @@ class V4Loop:
         self,
         tools: ToolRegistry,
         provider: LLMProvider,
-        max_iterations: int = 200,
+        max_iterations: int = 20,
     ):
         self.tools = tools
         self.provider = provider
@@ -57,15 +59,23 @@ class V4Loop:
         self.execution_reports: List[Dict[str, Any]] = []
         self.inferred_signature: Dict[str, Any] = {}
 
-    async def run(self, user_input: str, step_callback: Any = None) -> Tuple[str, PerformanceMetrics]:
+    async def run(self, user_input: str, step_callback: Any = None, image_paths: Optional[List[str]] = None) -> Tuple[str, PerformanceMetrics]:
         """执行主管线 G -> Op -> G -> C (Subroutine Mode)"""
         self.metrics.start_time = time.time()
         self.user_input = user_input
+        self.image_paths = image_paths or []
         self.g_messages = []
         self.op_messages = []
         self.execution_messages = []
         self.execution_reports = []
         self.inferred_signature = self.vault.infer_metadata_signature(user_input)
+        
+        # === Tracing ===
+        self.tracer = Tracer.get_instance()
+        self.trace_id = self.tracer.start_trace(user_input)
+        self._phase_count = 0
+        self._llm_call_count = 0
+        self._tool_call_count = 0
         
         final_response = ""
         
@@ -80,22 +90,44 @@ class V4Loop:
             
         self.metrics.total_time = time.time() - self.metrics.start_time
         
-        # === Phase 3: C-Process (反思沉淀) ===
-        # 只有在有足够执行动作时才进行反思
-        if self._should_run_c_phase():
-            await self._run_c_phase(step_callback)
-        elif len(self.execution_messages) > 0:
-            logger.info("Skipping C-Process: no high-value reflection signal detected.")
-            
-        # 保存这轮完整对话作为短期记忆
+        # 保存这轮完整对话作为短期记忆（同步，确保记忆不丢）
         self._save_memory(final_response)
         
+        # === Phase 3: C-Process (反思沉淀) — 后台异步，不阻塞用户 ===
+        if self._should_run_c_phase():
+            asyncio.create_task(self._run_c_phase_safe(step_callback))
+            logger.info("C-Process launched in background (non-blocking).")
+        elif len(self.execution_messages) > 0:
+            logger.info("Skipping C-Process: no high-value reflection signal detected.")
+        
+        # === End Trace ===
+        self.tracer.end_trace(
+            self.trace_id,
+            status="completed" if self.metrics.success else "error",
+            final_response=final_response,
+            input_tokens=self.metrics.input_tokens,
+            output_tokens=self.metrics.output_tokens,
+            total_tokens=self.metrics.total_tokens,
+            phase_count=self._phase_count,
+            llm_call_count=self._llm_call_count,
+            tool_call_count=self._tool_call_count
+        )
+        
         return final_response, self.metrics
+
+    async def _run_c_phase_safe(self, step_callback: Any):
+        """后台安全包装器：捕获 C-Process 异常，防止后台任务静默崩溃"""
+        try:
+            await self._run_c_phase(step_callback)
+        except Exception as e:
+            logger.error(f"C-Process background task failed: {e}", exc_info=True)
 
     async def _run_main_loop(self, user_input: str, step_callback: Any) -> str:
         """运行 G-Process 主循环，按需挂起调用 Op"""
         logger.info(">>> Entering Phase 1: G-Process (Thinker)")
         await self._safe_callback(step_callback, "loop_start", {"phase": "G_PHASE"})
+        self._phase_count += 1
+        self._g_span = self.tracer.start_span(self.trace_id, "G_PHASE", span_type="phase", phase="G")
         
         g_prompt = self.factory.build_g_prompt(
             recent_memory=self.vault.get_recent_memory(),
@@ -103,9 +135,27 @@ class V4Loop:
             knowledge_digest=self.vault.get_digest(),
             inferred_signature=self.vault.render_metadata_signature(self.inferred_signature)
         )
+        
+        # Build User Content (Multimodal if images exist)
+        if hasattr(self, 'image_paths') and self.image_paths:
+            import base64
+            user_content = [{"type": "text", "text": user_input}]
+            for path in self.image_paths:
+                try:
+                    with open(path, "rb") as f:
+                        b64_data = base64.b64encode(f.read()).decode('utf-8')
+                        user_content.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64_data}"}
+                        })
+                except Exception as e:
+                    logger.error(f"Failed to read image {path}: {e}")
+        else:
+            user_content = user_input
+
         self.g_messages = [
             Message(role=MessageRole.SYSTEM, content=g_prompt),
-            Message(role=MessageRole.USER, content=user_input)
+            Message(role=MessageRole.USER, content=user_content)
         ]
         
         search_tools = [self.tools.get("search_knowledge_nodes")]
@@ -113,11 +163,13 @@ class V4Loop:
         schema = [t.to_schema() for t in search_tools]
         
         for i in range(self.max_iterations):
+            self._llm_call_count += 1
             response = await self.provider.chat(
                 messages=[m.to_dict() for m in self.g_messages],
                 tools=schema,
                 stream=True,
-                stream_callback=lambda ev, data: self._stream_proxy(step_callback, ev, data)
+                stream_callback=lambda ev, data: self._stream_proxy(step_callback, ev, data),
+                _trace_id=self.trace_id, _trace_phase="G", _trace_parent=self._g_span
             )
             
             self._update_metrics(response)
@@ -131,6 +183,8 @@ class V4Loop:
             if response.tool_calls:
                 for tc in response.tool_calls:
                     await self._safe_callback(step_callback, "tool_start", {"name": tc.name, "args": tc.arguments})
+                    self._tool_call_count += 1
+                    t0 = time.time()
                     
                     if tc.name == "search_knowledge_nodes":
                         search_args = dict(tc.arguments or {})
@@ -143,7 +197,12 @@ class V4Loop:
                         await self._safe_callback(step_callback, "search_result", {"name": tc.name, "result": res})
                     else:
                         res = f"G-Process has no permission to run tool {tc.name}"
-                        
+                    
+                    self.tracer.log_tool_call(
+                        self.trace_id, parent=self._g_span, phase="G",
+                        tool_name=tc.name, tool_args=tc.arguments,
+                        tool_result=str(res), duration_ms=(time.time() - t0) * 1000
+                    )
                     self.metrics.tools_used.append(tc.name)
                     
                     self.g_messages.append(Message(role=MessageRole.TOOL, content=res, tool_call_id=tc.id, name=tc.name))
@@ -185,9 +244,11 @@ class V4Loop:
             else:
                 # G 输出了普通文本且没有 payload，这被视为对用户的直接回复，管线结束
                 logger.info("G-Process provided final response.")
+                self.tracer.end_span(self._g_span)
                 return response.content
                 
         logger.warning("G-Process reached max iterations without finalizing.")
+        self.tracer.end_span(self._g_span, status="timeout")
         return "大脑 (G) 思考达到最大迭代限制。"
 
     def _parse_dispatch_payload(self, content: str) -> Optional[Dict[str, Any]]:
@@ -198,33 +259,29 @@ class V4Loop:
             
         block = match.group(1).strip()
         
-        payload = {
-            "op_intent": "未定义目标",
-            "active_nodes": [],
-            "instructions": ""
-        }
-        
-        # 简单提取，按关键字分割
-        lines = block.split('\n')
-        current_key = None
+        op_intent = "未定义目标"
+        active_nodes = []
         instructions_lines = []
+        current_key = None
         
-        for line in lines:
+        for line in block.split('\n'):
             if line.startswith("OP_INTENT:"):
-                payload["op_intent"] = line[10:].strip()
+                op_intent = line[10:].strip()
             elif line.startswith("ACTIVE_NODES:"):
                 nodes_str = line[13:].strip()
                 if nodes_str and nodes_str.upper() != "NONE":
-                    payload["active_nodes"] = [n.strip() for n in nodes_str.split(',')]
+                    active_nodes = [n.strip() for n in nodes_str.split(',')]
             elif line.startswith("INSTRUCTIONS:"):
                 current_key = "instructions"
             elif current_key == "instructions":
                 instructions_lines.append(line)
-                
-        if instructions_lines:
-            payload["instructions"] = "\n".join(instructions_lines).strip()
-            
-        return payload
+        
+        payload = DispatchPayload(
+            op_intent=op_intent,
+            active_nodes=active_nodes,
+            instructions="\n".join(instructions_lines).strip()
+        )
+        return payload.model_dump()
 
     def _has_dispatch_review_override(self, payload: Dict[str, Any]) -> bool:
         instructions = (payload.get("instructions") or "").strip()
@@ -389,33 +446,34 @@ class V4Loop:
         match = re.search(r"```op_result\n(.*?)```", content, re.DOTALL | re.IGNORECASE)
         block = match.group(1).strip() if match else content.strip()
 
-        result = {
-            "status": "UNKNOWN",
-            "summary": "",
-            "changes_made": [],
-            "artifacts": [],
-            "open_questions": [],
-            "raw_output": content.strip()
-        }
+        status = "UNKNOWN"
+        changes_made: List[str] = []
+        artifacts: List[str] = []
+        open_questions: List[str] = []
 
         current_key = None
         summary_lines: List[str] = []
+        findings_lines: List[str] = []
         section_map = {
             "CHANGES_MADE:": "changes_made",
             "ARTIFACTS:": "artifacts",
             "OPEN_QUESTIONS:": "open_questions"
         }
+        list_buckets = {"changes_made": changes_made, "artifacts": artifacts, "open_questions": open_questions}
 
         for raw_line in block.splitlines():
             line = raw_line.strip()
             if not line:
                 continue
             if line.startswith("STATUS:"):
-                result["status"] = line.split(":", 1)[1].strip() or "UNKNOWN"
+                status = line.split(":", 1)[1].strip() or "UNKNOWN"
                 current_key = None
                 continue
             if line == "SUMMARY:":
                 current_key = "summary"
+                continue
+            if line == "FINDINGS:":
+                current_key = "findings"
                 continue
             if line in section_map:
                 current_key = section_map[line]
@@ -424,24 +482,60 @@ class V4Loop:
             if current_key == "summary":
                 summary_lines.append(line)
                 continue
+            if current_key == "findings":
+                findings_lines.append(line)
+                continue
 
-            if current_key in ["changes_made", "artifacts", "open_questions"]:
+            if current_key in list_buckets:
                 item = line[1:].strip() if line.startswith("-") else line
                 if item and item.upper() != "NONE":
-                    result[current_key].append(item)
+                    list_buckets[current_key].append(item)
 
-        result["summary"] = "\n".join(summary_lines).strip()
+        summary = "\n".join(summary_lines).strip()
+        findings = "\n".join(findings_lines).strip()
 
-        has_structured_signal = match is not None or any(marker in block for marker in ["STATUS:", "SUMMARY:", "CHANGES_MADE:", "ARTIFACTS:", "OPEN_QUESTIONS:"])
+        has_structured_signal = match is not None or any(marker in block for marker in ["STATUS:", "SUMMARY:", "FINDINGS:", "CHANGES_MADE:", "ARTIFACTS:", "OPEN_QUESTIONS:"])
         if not has_structured_signal:
             fallback_summary = block[:300] + ("..." if len(block) > 300 else "")
-            result["status"] = "PARTIAL"
-            result["summary"] = fallback_summary or "Op 返回了空白结果。"
-            result["open_questions"] = ["Op 未按约定输出结构化执行报告，请 G 判断是否需要重新派发。"]
-        elif not result["summary"]:
-            result["summary"] = block[:300] + ("..." if len(block) > 300 else "")
+            status = "PARTIAL"
+            summary = fallback_summary or "Op 返回了空白结果。"
+            open_questions = ["Op 未按约定输出结构化执行报告，请 G 判断是否需要重新派发。"]
+        elif not summary:
+            summary = block[:300] + ("..." if len(block) > 300 else "")
 
-        return result
+        result = OpResult(
+            status=status, summary=summary, findings=findings,
+            changes_made=changes_made, artifacts=artifacts,
+            open_questions=open_questions, raw_output=content.strip()
+        )
+        return result.model_dump()
+
+    def _load_tool_nodes_from_active_nodes(self, active_nodes: List[str]) -> List[str]:
+        """从 active_nodes 中加载 TOOL 节点并动态注册工具"""
+        loaded_tools = []
+        for node_id in active_nodes:
+            if node_id.startswith("TOOL_"):
+                # 获取节点内容
+                source_code = self.vault.get_node_content(node_id)
+                if source_code:
+                    # 从源码中提取工具名称
+                    import re
+                    # 尝试从源码中提取工具名称
+                    tool_name_match = re.search(r'def name\(self\) -> str:\s*return "([^"]+)"', source_code)
+                    if not tool_name_match:
+                        tool_name_match = re.search(r"def name\(self\) -> str:\s*return '([^']+)'", source_code)
+                    if tool_name_match:
+                        tool_name = tool_name_match.group(1)
+                        # 动态注册工具
+                        if self.tools.register_from_source(tool_name, source_code):
+                            loaded_tools.append(tool_name)
+                            logger.info(f"动态注册工具: {tool_name} from {node_id}")
+                        else:
+                            logger.warning(f"动态注册工具失败: {node_id}")
+                    else:
+                        logger.warning(f"无法从 TOOL 节点提取工具名称: {node_id}")
+        return loaded_tools
+
 
     def _get_op_tools(self) -> List[Any]:
         op_tools = []
@@ -512,6 +606,17 @@ class V4Loop:
         """运行 Op-Process，纯粹的执行器"""
         logger.info(">>> Entering Phase 2: Op-Process (Executor)")
         await self._safe_callback(step_callback, "loop_start", {"phase": "OP_PHASE"})
+        self._phase_count += 1
+        op_span = self.tracer.start_span(
+            self.trace_id, "OP_PHASE", span_type="phase", phase="Op",
+            meta={"op_intent": task_payload.get("op_intent", "")}
+        )
+        
+        # === 动态加载 TOOL_NODE ===
+        active_nodes = task_payload.get("active_nodes", [])
+        tool_nodes_loaded = self._load_tool_nodes_from_active_nodes(active_nodes)
+        if tool_nodes_loaded:
+            logger.info(f"动态加载了 {len(tool_nodes_loaded)} 个 TOOL 节点")
         
         op_prompt = self.factory.build_op_prompt(task_payload)
         
@@ -524,11 +629,13 @@ class V4Loop:
         schema = [t.to_schema() for t in all_tools]
         
         for i in range(self.max_iterations):
+            self._llm_call_count += 1
             response = await self.provider.chat(
                 messages=[m.to_dict() for m in self.op_messages],
                 tools=schema,
                 stream=True,
-                stream_callback=lambda ev, data: self._stream_proxy(step_callback, ev, data)
+                stream_callback=lambda ev, data: self._stream_proxy(step_callback, ev, data),
+                _trace_id=self.trace_id, _trace_phase="Op", _trace_parent=op_span
             )
             
             self._update_metrics(response)
@@ -542,12 +649,19 @@ class V4Loop:
             if response.tool_calls:
                 for tc in response.tool_calls:
                     await self._safe_callback(step_callback, "tool_start", {"name": tc.name, "args": tc.arguments})
+                    self._tool_call_count += 1
+                    t0 = time.time()
                     
                     if tc.name in C_EXCLUSIVE_TOOLS:
                         res = f"Error: Op-Process 禁止使用工具 {tc.name}"
                     else:
                         res = await self.tools.execute(tc.name, tc.arguments)
                         
+                    self.tracer.log_tool_call(
+                        self.trace_id, parent=op_span, phase="Op",
+                        tool_name=tc.name, tool_args=tc.arguments,
+                        tool_result=str(res), duration_ms=(time.time() - t0) * 1000
+                    )
                     await self._safe_callback(step_callback, "tool_result", {"name": tc.name, "result": res})
                     
                     self.metrics.tools_used.append(tc.name)
@@ -570,6 +684,7 @@ class V4Loop:
                 (op_result.get("raw_output", "") or "")[:1200]
             )
             self._merge_signature_from_artifacts(op_result.get("artifacts", []) or [])
+            self.tracer.end_span(op_span, status=op_result.get("status", "UNKNOWN"))
             return op_result
             
         logger.warning("Op-Process reached max iterations.")
@@ -584,6 +699,7 @@ class V4Loop:
         }
         self.execution_reports.append(timeout_result)
         self._merge_signature_from_texts(timeout_result.get("summary", ""), "\n".join(timeout_result.get("open_questions", []) or []))
+        self.tracer.end_span(op_span, status="timeout")
         return timeout_result
 
     async def _run_c_phase(self, step_callback: Any):
@@ -591,6 +707,13 @@ class V4Loop:
         logger.info(">>> Entering Phase 3: C-Process (Reflector)")
         
         report_summary = self._build_execution_report_summary()
+        # 检查是否成功，如果有成功迹象，提升被调用节点的置信度
+        if "SUCCESS" in (report_summary or "") or "任务完成" in (report_summary or ""):
+            for node_id in self.execution_active_nodes:
+                self.vault.promote_node_confidence(node_id, boost=0.3)
+                # usage_count 会在加载时自动增加，这里只负责晋升分数
+
+        # 3. 整理执行总结
         summary_lines = ["[Op 执行过程摘要]"]
         
         step_idx = 1
@@ -650,7 +773,7 @@ class V4Loop:
 - `RELATED_TO` (Any <-> Any): 弱相关性
 
 [工作流]
-1. 先判断这轮是否存在明确的长期价值；如果没有，直接回复 `NO_ACTION`。
+1. 先判断这轮是否存在明确的长期价值；如果没有，直接回复 `NO_ACTION`。**特别注意：如果 Op 只是作为侦察兵去读取了一个文件、搜索了一下网络，并没有进行状态修改，这属于“无长期价值的阶段性动作”，直接回复 NO_ACTION。**
 2. 优先选择最小的高价值表示，避免重复写入。同一事实不要同时写成 LESSON、EPISODE 和图谱。
 3. 如果你能从日志中稳定识别环境/任务特征（如 `os_family`、`runtime`、`language`、`framework`、`task_kind`、`error_kind`），在创建节点时尽量同时填写 `metadata_signature`。
 4. 只有当命令输出、日志或明确证据已经确认某事实成立时，才把 `metadata_signature.validation_status` 标为 `validated`；否则优先用 `unverified` 或留空。

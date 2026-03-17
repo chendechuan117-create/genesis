@@ -26,7 +26,7 @@ class GenesisV4:
         self.max_iterations = max_iterations
         self.enable_logging = enable_logging
 
-    async def process(self, user_input: str, step_callback: Optional[Any] = None) -> Dict[str, Any]:
+    async def process(self, user_input: str, step_callback: Optional[Any] = None, image_paths: Optional[List[str]] = None) -> Dict[str, Any]:
         """
         处理单轮会话，V4 的管线：
         1. 交由 V4Loop 运行（强制 JSON Blueprint -> 工具调用序列）
@@ -43,6 +43,7 @@ class GenesisV4:
             final_response, metrics = await loop.run(
                 user_input=user_input,
                 step_callback=step_callback,
+                image_paths=image_paths,
             )
         except Exception as e:
             logger.error(f"V4 execution failed: {e}", exc_info=True)
