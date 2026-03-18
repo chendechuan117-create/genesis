@@ -88,22 +88,9 @@ def _build_groq(config) -> NativeHTTPProvider:
 
 def _build_cloudflare(config) -> NativeHTTPProvider:
     api_key = getattr(config, 'cloudflare_api_key', None)
-    # Cloudflare API has special URL with account ID.
-    # User's token is a general token without embedded account ID.
-    # Actually, a common OpenAI compatibility layer format is https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/v1
-    # But since we just have the token, we can use a known gateway or just a generic template if account ID is missing
-    # To be safe, we assume the user just needs the standard one and might need to configure account id in the future.
-    # However, many standard proxy endpoints like gateway.ai.cloudflare.com are also used.
-    # We will use the standard AI endpoint (assuming user provides standard config later if this fails, or use placeholder)
-    # Actually, user provided: "Cloudflare Workers AI,Kv6LHLOebXOodzaT9lSe6OwrKrMEojV48sm6iW9Q"
-    # We will use the common format. Wait, Librechat says: baseURL: "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/v1"
-    # For now we use a dummy account ID if not found, but actually some workers AI proxies don't need it. 
-    # Let's just use the standard one, and if it fails, user can debug. Wait, actually we can just use the Cloudflare AI Gateway if available, or just standard.
-    # We will use the standard Cloudflare Workers AI URL template.
     return NativeHTTPProvider(
         api_key=api_key,
-        base_url="https://api.cloudflare.com/client/v4/accounts/YOUR_ACCOUNT_ID/ai/v1", # The user will need to replace this or we just provide it. 
-        # But wait! Librechat uses `@cf/meta/llama-3-8b-instruct`. 
+        base_url="https://api.cloudflare.com/client/v4/accounts/2c85cf36f8686813d3d0a5cf5483b1e4/ai/v1",
         default_model="@cf/meta/llama-3.1-8b-instruct"
     )
 
