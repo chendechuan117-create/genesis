@@ -55,6 +55,10 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     "type": "object",
                     "description": "可选的环境/任务签名过滤条件。只填写你确定的字段，如 os_family, language, framework, runtime, error_kind, task_kind。",
                     "properties": {field: {"type": "string", "description": f"{field} 过滤条件"} for field in METADATA_SIGNATURE_FIELDS}
+                },
+                "conversation_context": {
+                    "type": "string",
+                    "description": "可选。最近对话的关键上下文摘要，用于扩展搜索范围。系统会自动注入，G 无需手动填写。"
                 }
             },
             "required": ["keywords"]
@@ -137,18 +141,31 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 score += 2
         return score
 
-    async def execute(self, keywords: List[str], ntype: str = "ALL", signature: Dict[str, Any] = None) -> str:
+    async def execute(self, keywords: List[str], ntype: str = "ALL", signature: Dict[str, Any] = None, conversation_context: str = None) -> str:
         try:
             normalized_signature = self.vault.normalize_metadata_signature(signature)
+            # Query Expansion: 用对话上下文扩展搜索关键词
+            expanded_keywords = list(keywords) if keywords else []
+            if conversation_context and conversation_context.strip():
+                import re
+                # 从对话上下文中提取有意义的关键词片段（去重，不超过 3 个）
+                context_tokens = re.findall(r'[\w\u4e00-\u9fff]{2,}', conversation_context)
+                existing_set = set(k.lower() for k in expanded_keywords)
+                added = 0
+                for token in context_tokens:
+                    if token.lower() not in existing_set and added < 3:
+                        expanded_keywords.append(token)
+                        existing_set.add(token.lower())
+                        added += 1
             semantic_ids = []
-            if self.vault.vector_engine.is_ready and keywords:
-                query_str = " ".join(keywords)
+            if self.vault.vector_engine.is_ready and expanded_keywords:
+                query_str = " ".join(expanded_keywords)
                 results = self.vault.vector_engine.search(query_str, top_k=5, threshold=0.55)
                 semantic_ids = [r[0] for r in results]
 
             conn = self.vault._conn
             with conn:
-                query = "SELECT node_id, type, title, tags, prerequisites, resolves, metadata_signature, usage_count, confidence_score, last_verified_at, verification_source, updated_at FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%'"
+                query = "SELECT node_id, type, title, tags, prerequisites, resolves, metadata_signature, usage_count, usage_success_count, usage_fail_count, confidence_score, last_verified_at, verification_source, updated_at FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%'"
                 params = []
 
                 if ntype != "ALL":
@@ -301,6 +318,11 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                             extras.append(f"verify:{reliability.get('validation_status')}")
                         extras.append(f"trust:{reliability.get('trust_score', 0):.1f}")
                         extras.append(f"fresh:{reliability.get('freshness_label', 'unknown')}")
+                        # Knowledge Arena: 显示胜负战绩
+                        wins = r.get('usage_success_count', 0) or 0
+                        losses = r.get('usage_fail_count', 0) or 0
+                        if wins or losses:
+                            extras.append(f"arena:{wins}W/{losses}L")
                         extra_str = f" | {' | '.join(extras)}" if extras else ""
                         conditional_flag = " [按需挂载]" if self._active_bucket(r) == "conditional" else ""
                         lines.append(f"- [{nid}] <{r['type']}> {r['title']}{conditional_flag} | why:{reason}{extra_str}")

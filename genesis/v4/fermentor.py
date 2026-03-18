@@ -20,9 +20,10 @@ from typing import List, Dict, Any
 sys.path.insert(0, str(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))))
 
 from genesis.core.config import ConfigManager
+from genesis.core.provider_manager import ProviderRouter
 from genesis.core.registry import provider_registry
 from genesis.core.base import Message, MessageRole
-from genesis.core.provider_manager import ProviderRouter
+from genesis.tools.node_tools import CreateNodeEdgeTool, CreateMetaNodeTool
 from genesis.v4.manager import NodeVault, NodeManagementTools
 from genesis.v4.vector_engine import VectorEngine
 
@@ -78,7 +79,7 @@ class FermentorDaemon:
         logger.info("🌟 知识发酵池 (Fermentation Cycle) 启动")
         logger.info("=========================================")
         
-        stats = {"edges_created": 0, "meta_created": 0, "verified": 0}
+        stats = {"edges_created": 0, "meta_created": 0, "hypotheses_generated": 0}
         
         try:
             # 1. 寻找未关联的节点 (Edge Discovery)
@@ -89,12 +90,94 @@ class FermentorDaemon:
             meta = await self._distill_concepts()
             stats["meta_created"] = meta
             
+            # 3. 假设引擎 (Hypothesis Generation)
+            hypotheses = await self._generate_hypotheses()
+            stats["hypotheses_generated"] = hypotheses
+            
         except Exception as e:
             logger.error(f"发酵循环异常: {e}", exc_info=True)
             
         logger.info("=========================================")
-        logger.info(f"🏁 发酵完成. 产生连线: {stats['edges_created']}, 产生新概念: {stats['meta_created']}")
+        logger.info(f"🏁 发酵完成. 连线: {stats['edges_created']}, 概念: {stats['meta_created']}, 假设: {stats['hypotheses_generated']}")
         logger.info("=========================================")
+
+    async def _generate_hypotheses(self) -> int:
+        """
+        假设引擎 (Hypothesis Engine):
+        扫描现有 LESSON，发现知识的空白地带，生成假设（Hypothesis）。
+        这是 Hyperspace AGI 第一阶段的思想。
+        """
+        logger.info("[任务 3/3] 假设引擎 (Hypothesis Generation)...")
+        # 挑选最近或高置信度的 LESSON 节点作为启发源
+        cursor = self.vault._conn.execute(
+            """
+            SELECT node_id, title, resolves, tags 
+            FROM knowledge_nodes 
+            WHERE type = 'LESSON' 
+            ORDER BY confidence_score DESC, RANDOM() 
+            LIMIT 2
+            """
+        )
+        seeds = [dict(r) for r in cursor.fetchall()]
+        
+        if not seeds:
+            logger.info("没有足够的 LESSON 作为假设启发源。")
+            return 0
+            
+        hypotheses_created = 0
+        create_meta_tool = CreateMetaNodeTool()
+        create_meta_tool.vault = self.vault
+        schema = [create_meta_tool.to_schema()]
+        
+        for seed in seeds:
+            logger.info(f"  > 基于节点提出假设: {seed['node_id']} ({seed['title']})")
+            content = self.vault.get_node_content(seed['node_id'])
+            
+            prompt = f"""你是 Genesis 的"假设引擎" (The Speculator)。
+你的任务是阅读已有的经验教训 (LESSON)，并基于它提出一个【未经验证但极具价值的假设】。
+
+启发源：
+ID: {seed['node_id']}
+标题: {seed['title']}
+目标: {seed.get('resolves', '')}
+
+内容:
+{content[:1000]}
+
+指令：
+1. 思考："如果这个教训是真的，那么它在其他领域、其他框架、或更复杂的场景下，是否也适用？" 或者 "这个排错路线是否可以被编写成一个自动化脚本？"
+2. 提出一个具体的、可测试的假设。
+3. 使用 `create_meta_node` 工具，创建一个 `EPISODE` 类型的节点，标题必须以 `[假设] ` 开头。
+4. 在节点内容中详细描述这个假设，以及未来验证这个假设所需的测试步骤。
+5. 标签请包含 `hypothesis,unverified`。
+"""
+            messages = [Message(role=MessageRole.SYSTEM, content=prompt).to_dict()]
+            
+            try:
+                response = await self.provider.chat(messages, tools=schema, stream=False)
+                if response.tool_calls:
+                    for tc in response.tool_calls:
+                        if tc.name == "create_meta_node":
+                            args = tc.arguments
+                            if isinstance(args, str):
+                                import json
+                                args = json.loads(args)
+                            res = await create_meta_tool.execute(**args)
+                            logger.info(f"  -> {res}")
+                            hypotheses_created += 1
+                            
+                            # 建立关联
+                            import json as pyjson
+                            if 'node_id' in args:
+                                self.vault._conn.execute(
+                                    "INSERT OR IGNORE INTO node_edges (source_id, target_id, relation, weight) VALUES (?, ?, ?, ?)",
+                                    (seed['node_id'], args['node_id'], "inspired_hypothesis", 0.7)
+                                )
+                                self.vault._conn.commit()
+            except Exception as e:
+                logger.error(f"  -> 生成假设请求异常: {e}")
+                
+        return hypotheses_created
 
     async def _discover_edges(self) -> int:
         """

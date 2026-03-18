@@ -74,9 +74,12 @@ class NodeVault:
             tags TEXT,
             prerequisites TEXT,
             resolves TEXT,
+            parent_node_id TEXT,
             metadata_signature TEXT,
             embedding TEXT,
             usage_count INTEGER DEFAULT 0,
+            usage_success_count INTEGER DEFAULT 0,
+            usage_fail_count INTEGER DEFAULT 0,
             confidence_score REAL DEFAULT 0.55,
             last_verified_at TIMESTAMP,
             verification_source TEXT,
@@ -87,8 +90,11 @@ class NodeVault:
         for col in [
             ('prerequisites', 'TEXT'),
             ('resolves', 'TEXT'),
+            ('parent_node_id', 'TEXT'),
             ('metadata_signature', 'TEXT'),
             ('embedding', 'TEXT'),
+            ('usage_success_count', 'INTEGER DEFAULT 0'),
+            ('usage_fail_count', 'INTEGER DEFAULT 0'),
             ('confidence_score', 'REAL DEFAULT 0.55'),
             ('last_verified_at', 'TIMESTAMP'),
             ('verification_source', 'TEXT')
@@ -606,6 +612,50 @@ class NodeVault:
         logger.info(f"NodeVault: Promoted node [{node_id}]. Confidence {current_score:.2f} -> {new_score:.2f}")
         return new_score
 
+    def decay_node_confidence(self, node_id: str, penalty: float = 0.15, min_score: float = 0.1) -> float:
+        """
+        失败惩罚：
+        当一个节点在实际任务中被使用但任务失败，降低其置信度。
+        这是 Knowledge Arena 的核心机制之一——知识节点通过实际使用效果竞争。
+        """
+        row = self._conn.execute("SELECT confidence_score FROM knowledge_nodes WHERE node_id = ?", (node_id,)).fetchone()
+        if not row:
+            return 0.0
+        current_score = row[0] if row[0] is not None else 0.5
+        new_score = max(current_score - penalty, min_score)
+        self._conn.execute(
+            "UPDATE knowledge_nodes SET confidence_score = ?, updated_at = CURRENT_TIMESTAMP WHERE node_id = ?",
+            (new_score, node_id)
+        )
+        self._conn.commit()
+        logger.info(f"NodeVault: Decayed node [{node_id}]. Confidence {current_score:.2f} -> {new_score:.2f}")
+        return new_score
+
+    def record_usage_outcome(self, node_ids: List[str], success: bool):
+        """
+        Knowledge Arena 反馈闭环：
+        记录节点在实际任务中的使用结果（成功/失败），
+        并相应调整置信度。借鉴 Hyperspace AGI 的客观验证思想。
+        """
+        if not node_ids:
+            return
+        for node_id in node_ids:
+            if node_id.startswith("MEM_CONV"):
+                continue
+            if success:
+                self._conn.execute(
+                    "UPDATE knowledge_nodes SET usage_success_count = usage_success_count + 1, updated_at = CURRENT_TIMESTAMP WHERE node_id = ?",
+                    (node_id,)
+                )
+                self.promote_node_confidence(node_id, boost=0.1, max_score=0.95)
+            else:
+                self._conn.execute(
+                    "UPDATE knowledge_nodes SET usage_fail_count = usage_fail_count + 1, updated_at = CURRENT_TIMESTAMP WHERE node_id = ?",
+                    (node_id,)
+                )
+                self.decay_node_confidence(node_id, penalty=0.08, min_score=0.1)
+        self._conn.commit()
+
     def get_related_nodes(self, node_id: str, relation: str = None, direction: str = "out") -> List[Dict[str, Any]]:
         """获取与指定节点相连的节点 (1-hop)
         direction: 'out' (source=node_id), 'in' (target=node_id), 'both'
@@ -717,6 +767,15 @@ class NodeVault:
             f"validated={validated_count} | "
             f"recent_verified={recent_verified_count}"
         )
+        # Knowledge Arena stats
+        arena_rows = self._conn.execute(
+            "SELECT COUNT(*) as total, SUM(usage_success_count) as wins, SUM(usage_fail_count) as losses "
+            "FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%' AND (usage_success_count > 0 OR usage_fail_count > 0)"
+        ).fetchone()
+        if arena_rows and arena_rows['total'] > 0:
+            lines.append(
+                f"ARENA: tested_nodes={arena_rows['total']} | wins={arena_rows['wins'] or 0} | losses={arena_rows['losses'] or 0}"
+            )
 
         lines.append("TOP_CONTEXT:")
         if top_contexts:
@@ -824,6 +883,7 @@ class NodeVault:
                     human_translation: str, tags: str,
                     full_content: str, source: str = "sedimenter",
                     prerequisites: str = None, resolves: str = None,
+                    parent_node_id: str = None,
                     metadata_signature: Optional[Dict[str, Any]] = None,
                     confidence_score: Optional[float] = None,
                     last_verified_at: Optional[str] = None,
@@ -852,8 +912,8 @@ class NodeVault:
                 self.vector_engine.add_to_matrix(node_id, vec)
 
         self._conn.execute(
-            "INSERT OR REPLACE INTO knowledge_nodes (node_id, type, title, human_translation, tags, prerequisites, resolves, metadata_signature, embedding, confidence_score, last_verified_at, verification_source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (node_id, ntype, title, human_translation, tags, prerequisites, resolves, signature_json, embedding_json, normalized_confidence, normalized_last_verified, normalized_verification_source)
+            "INSERT OR REPLACE INTO knowledge_nodes (node_id, type, title, human_translation, tags, prerequisites, resolves, parent_node_id, metadata_signature, embedding, confidence_score, last_verified_at, verification_source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (node_id, ntype, title, human_translation, tags, prerequisites, resolves, parent_node_id, signature_json, embedding_json, normalized_confidence, normalized_last_verified, normalized_verification_source)
         )
         self._conn.execute(
             "INSERT OR REPLACE INTO node_contents (node_id, full_content, source) VALUES (?,?,?)",
@@ -861,6 +921,55 @@ class NodeVault:
         )
         self._conn.commit()
         logger.info(f"NodeVault: Created node [{node_id}] ({ntype}) — {title}")
+
+    def backfill_embeddings(self) -> Dict[str, int]:
+        """
+        一次性回填：为所有缺少向量的知识节点生成 embedding。
+        返回 {total_missing, success, failed} 统计。
+        """
+        if not self.vector_engine.is_ready:
+            logger.warning("VectorEngine not ready, cannot backfill embeddings.")
+            return {"total_missing": 0, "success": 0, "failed": 0, "skipped": 0}
+
+        embeddable_types = ["LESSON", "CONTEXT", "ASSET", "EPISODE", "ENTITY", "EVENT", "ACTION", "TOOL"]
+        placeholders = ','.join('?' * len(embeddable_types))
+        rows = self._conn.execute(
+            f"SELECT node_id, type, title, tags, resolves, metadata_signature "
+            f"FROM knowledge_nodes "
+            f"WHERE (embedding IS NULL OR embedding = '') "
+            f"AND type IN ({placeholders}) "
+            f"AND node_id NOT LIKE 'MEM_CONV%'",
+            tuple(embeddable_types)
+        ).fetchall()
+
+        total = len(rows)
+        success = 0
+        failed = 0
+        skipped = 0
+
+        for r in rows:
+            sig_text = self.render_metadata_signature(r['metadata_signature'])
+            text_to_encode = f"{r['title']} {r['tags'] or ''} {r['resolves'] or ''} {sig_text}".strip()
+            if not text_to_encode:
+                skipped += 1
+                continue
+            vec = self.vector_engine.encode(text_to_encode)
+            if vec:
+                embedding_json = json.dumps(vec)
+                self._conn.execute(
+                    "UPDATE knowledge_nodes SET embedding = ? WHERE node_id = ?",
+                    (embedding_json, r['node_id'])
+                )
+                self.vector_engine.add_to_matrix(r['node_id'], vec)
+                success += 1
+            else:
+                failed += 1
+
+        self._conn.commit()
+        # 重新加载内存矩阵以确保一致性
+        self._load_embeddings_to_memory()
+        logger.info(f"NodeVault: Backfill complete. total={total}, success={success}, failed={failed}, skipped={skipped}")
+        return {"total_missing": total, "success": success, "failed": failed, "skipped": skipped}
 
     def increment_usage(self, node_ids: List[str]):
         """增加节点使用权重"""
@@ -931,14 +1040,15 @@ class FactoryManager:
 你和 Op (执行器) 是隔离的。Op 没有任何历史上下文，是个纯粹的打工人。
 整个工作流是：你搜索思考 -> 你派发任务给 Op -> Op 在空白环境执行 -> Op 将结果返回给你 -> 你总结给用户。
 
-**阶段一：查阅与思考 (G 的工作)**
-1. 先阅读系统提供的 DIGEST，快速判断当前库里大概有什么、哪些节点最近活跃、哪些节点最常被使用。
-2. 如果 DIGEST 已经足够支持判断，你可以直接回答用户，或定向派发 Op，不必为了形式而搜索。
-3. 如果任务涉及复杂环境、特定报错或你仍缺乏上下文，再**定向调用**搜索工具，获取过往经验（LESSON）或环境信息（CONTEXT）。
-4. **绝对限制：你只是一个只能思考和搜索数据库的“缸中之脑”。你没有任何修改现实世界的能力（没有文件读写、没有Shell、没有网络）。**
-5. **Op 就是你的终极工具**。当你需要与现实世界交互时（比如：想看某个文件的内容、想运行一个测试、想创建一段代码），你**必须**把 Op 当作你的“探针”或“机械臂”来使用。
-6. **侦察兵模式 (Reconnaissance Dispatch)**：如果你发现需要读取特定的本地文件（如阅读用户的代码、配置文件）才能继续思考，你**必须**派发一个侦察任务给 Op，让 Op 去读取文件，然后在 `[Op-Process 执行完毕]` 后把文件内容带回给你。不要自己瞎猜，也不要尝试给出虚假的执行结果。
-7. 阅读搜索结果时，优先关注 `RECOMMENDED_ACTIVE_NODES`，它们通常最适合直接挂载给 Op。
+**阶段一：推理式检索与思考 (G 的工作)**
+1. 先阅读系统提供的 DIGEST（特别是 CATEGORY 分类和 SIGNATURE_HINTS），快速判断当前库里有哪些领域的知识。
+2. **不要盲目进行全量搜索**。如果任务需要特定知识，请先**推断可能存在的类别或领域**，然后有针对性地使用 `search_knowledge_nodes`。
+3. **层级导航**：你可以先进行宽泛的搜索（比如 `ntype="ALL"`, keywords=["Docker"]），观察返回结果中的关联提示（如 `graph:+` 或是相关的子分类），然后再根据需要进一步搜索更具体的子节点。这就像人类翻书一样，先看目录，再看章节，最后读细节。
+4. 如果 DIGEST 已经足够支持判断，你可以直接回答用户，或定向派发 Op，不必为了形式而搜索。
+5. **绝对限制：你只是一个只能思考和搜索数据库的“缸中之脑”。你没有任何修改现实世界的能力（没有文件读写、没有Shell、没有网络）。**
+6. **Op 就是你的终极工具**。当你需要与现实世界交互时，你**必须**把 Op 当作你的“探针”或“机械臂”来使用。
+7. **侦察兵模式 (Reconnaissance Dispatch)**：如果你发现需要读取特定的本地文件才能继续思考，你**必须**派发一个侦察任务给 Op，让 Op 去读取文件，然后在 `[Op-Process 执行完毕]` 后把文件内容带回给你。
+8. 阅读搜索结果时，优先关注 `RECOMMENDED_ACTIVE_NODES`，同时注意它们的 **arena（胜负战绩）** 和 **trust** 评分，优先选择经过实战检验的高分节点。
 
 **阶段二：派发任务 (呼叫子程序 Op)**
 当你收集完信息准备让 Op 开始干活时，请**直接输出以下格式的任务派发书**。

@@ -1,0 +1,14 @@
+[Unit]
+Description=Genesis V4 Knowledge Fermentor Daemon
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/chendechusn/Genesis/Genesis
+EnvironmentFile=/home/chendechusn/Genesis/Genesis/.env
+ExecStart=/home/chendechusn/Genesis/nanogenesis/venv/bin/python genesis/v4/fermentor.py
+Restart=always
+RestartSec=7200
+
+[Install]
+WantedBy=default.target

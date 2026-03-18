@@ -68,6 +68,7 @@ class V4Loop:
         self.op_messages = []
         self.execution_messages = []
         self.execution_reports = []
+        self.execution_active_nodes: List[str] = []  # Knowledge Arena: 追踪被使用的节点
         self.inferred_signature = self.vault.infer_metadata_signature(user_input)
         
         # === Tracing ===
@@ -193,6 +194,11 @@ class V4Loop:
                                 self.inferred_signature,
                                 search_args.get("signature")
                             )
+                        # Query Expansion: 自动注入对话上下文
+                        if not search_args.get("conversation_context"):
+                            recent = self.vault.get_recent_memory(limit=2)
+                            if recent:
+                                search_args["conversation_context"] = recent[:300]
                         res = await self.tools.execute(tc.name, search_args)
                         await self._safe_callback(step_callback, "search_result", {"name": tc.name, "result": res})
                     else:
@@ -221,6 +227,9 @@ class V4Loop:
                 self._merge_signature_from_texts(payload.get("op_intent", ""), payload.get("instructions", ""))
                 self._merge_signature_from_nodes(payload.get("active_nodes", []))
                 logger.info("G-Process created Task Payload. Invoking Op-Process Subroutine...")
+                # Knowledge Arena: 记录被挂载的知识节点
+                dispatched_nodes = [n for n in payload.get("active_nodes", []) if n and not n.startswith("MEM_CONV")]
+                self.execution_active_nodes.extend(dispatched_nodes)
                 # 渲染派发书给用户看
                 rendered = self.factory.render_dispatch_for_human(payload)
                 await self._safe_callback(step_callback, "blueprint", rendered)
@@ -707,11 +716,22 @@ class V4Loop:
         logger.info(">>> Entering Phase 3: C-Process (Reflector)")
         
         report_summary = self._build_execution_report_summary()
-        # 检查是否成功，如果有成功迹象，提升被调用节点的置信度
-        if "SUCCESS" in (report_summary or "") or "任务完成" in (report_summary or ""):
-            for node_id in self.execution_active_nodes:
-                self.vault.promote_node_confidence(node_id, boost=0.3)
-                # usage_count 会在加载时自动增加，这里只负责晋升分数
+        # Knowledge Arena 反馈闭环: 根据任务结果调整被使用节点的置信度
+        if self.execution_active_nodes:
+            has_success = any(
+                (r.get("status", "") or "").upper() in ["SUCCESS", "PARTIAL"]
+                for r in self.execution_reports
+            )
+            has_failure = any(
+                (r.get("status", "") or "").upper() in ["FAILED"]
+                for r in self.execution_reports
+            )
+            if has_success and not has_failure:
+                self.vault.record_usage_outcome(self.execution_active_nodes, success=True)
+                logger.info(f"Knowledge Arena: +boost for {len(self.execution_active_nodes)} nodes (task SUCCESS)")
+            elif has_failure:
+                self.vault.record_usage_outcome(self.execution_active_nodes, success=False)
+                logger.info(f"Knowledge Arena: -decay for {len(self.execution_active_nodes)} nodes (task FAILED)")
 
         # 3. 整理执行总结
         summary_lines = ["[Op 执行过程摘要]"]
@@ -752,13 +772,19 @@ class V4Loop:
 5. **GRAPH**: 只有在存在明确、高置信因果链时，才创建 `ENTITY / EVENT / ACTION` 节点及其边。
 
 [LESSON 提炼原则]
-- 不要总结“这次用了几个工具”或“先做了什么后做了什么”。
+- 不要总结"这次用了几个工具"或"先做了什么后做了什么"。
 - 要优先问：**到底是哪一个错误假设，导致了这条轨迹？**
 - 一个高价值 LESSON 应该长成：
   - 误判了什么
   - 哪个证据推翻了它
   - 以后再遇到什么信号时，应该先检查什么
 - 如果只是一次性过程，没有可泛化原则，就不要写成 LESSON。
+
+[Knowledge Arena — 必填字段]
+创建 LESSON 时，你**必须**尽量填写以下两个字段：
+- `resolves`: 此 LESSON 解决的具体问题是什么？(如 "docker网络不通", "pip安装ssl报错")
+- `prerequisites`: 此 LESSON 依赖哪些已有节点？(填 node_id，逗号分隔；不确定可留空)
+这两个字段是知识竞争和进化的基础——同一个 `resolves` 目标的多个 LESSON 会通过实际使用效果竞争，胜者置信度上升，败者被自然淘汰。
 
 [图谱节点类型]
 1. **ENTITY (实体)**: 静态对象/工具/服务/配置。
