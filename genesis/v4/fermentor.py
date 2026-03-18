@@ -54,7 +54,7 @@ class FermentorDaemon:
         
         # 如果强制只使用免费池，我们覆盖路由的默认行为
         if use_free_pool_only:
-            free_providers = ["siliconflow", "dashscope", "qianfan", "zhipu"]
+            free_providers = ["siliconflow", "dashscope", "qianfan", "zhipu", "groq", "cloudflare", "zen"]
             available = [p for p in free_providers if p in router.providers]
             
             if not available:

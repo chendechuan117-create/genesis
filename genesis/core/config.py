@@ -27,6 +27,9 @@ class GlobalConfig:
     dashscope_api_key: Optional[str] = None
     qianfan_api_key: Optional[str] = None
     zhipu_api_key: Optional[str] = None
+    groq_api_key: Optional[str] = None
+    cloudflare_api_key: Optional[str] = None
+    zen_api_key: Optional[str] = None
     
     tavily_api_key: Optional[str] = None
     
@@ -159,6 +162,9 @@ class ConfigManager:
         "DASHSCOPE_API_KEY": "dashscope_api_key",
         "QIANFAN_API_KEY": "qianfan_api_key",
         "ZHIPU_API_KEY": "zhipu_api_key",
+        "GROQ_API_KEY": "groq_api_key",
+        "CLOUDFLARE_API_KEY": "cloudflare_api_key",
+        "ZEN_API_KEY": "zen_api_key",
         "TAVILY_API_KEY": "tavily_api_key",
         "LANGFUSE_PUBLIC_KEY": "langfuse_public_key",
         "LANGFUSE_SECRET_KEY": "langfuse_secret_key",

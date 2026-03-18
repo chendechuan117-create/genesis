@@ -67,7 +67,7 @@ class ScavengerDaemon:
     def _init_provider(self, use_free_pool_only: bool) -> ProviderRouter:
         router = ProviderRouter(self.config)
         if use_free_pool_only:
-            free_providers = ["siliconflow", "dashscope", "qianfan", "zhipu"]
+            free_providers = ["siliconflow", "dashscope", "qianfan", "zhipu", "groq", "cloudflare", "zen"]
             available = [p for p in free_providers if p in router.providers]
             
             if not available:
