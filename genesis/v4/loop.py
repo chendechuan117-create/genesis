@@ -25,12 +25,43 @@ C_EXCLUSIVE_TOOLS = frozenset([
     "delete_node", "search_knowledge_nodes", "create_graph_node", "create_node_edge"
 ])
 
+# ── dispatch_to_op 工具 Schema ──────────────────────────────────
+# 这是一个虚拟工具：LLM 看到它的 Schema 并通过 function calling 调用它，
+# 但 loop 层拦截该调用并路由到 Op-Process，而非走普通 tool.execute 路径。
+# 这从协议层（而非字符串层）消除了 "dispatch 意图" 与 "最终回复" 的歧义。
+DISPATCH_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "dispatch_to_op",
+        "description": "派发任务给执行器 Op-Process。当你完成思考和信息收集，需要 Op 去执行具体操作（如读写文件、运行命令、网络请求等）时，调用此工具。调用后系统会挂起你的运行，将参数交给 Op 执行，执行完毕后结果会作为此工具的返回值回传给你。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "op_intent": {
+                    "type": "string",
+                    "description": "对 Op 目标的一句话明确指令"
+                },
+                "active_nodes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "需要挂载给 Op 参考的节点 ID 列表（如 CTX_XXX, LESSON_XXX）。没有则传空数组 []"
+                },
+                "instructions": {
+                    "type": "string",
+                    "description": "给 Op 的详细执行步骤和上下文信息"
+                }
+            },
+            "required": ["op_intent", "instructions"]
+        }
+    }
+}
+
 class V4Loop:
     """
     V4 核心管线
     
     Phases:
-    1. G_PHASE (大脑): 拥有历史上下文，只能搜索。循环直至输出 Task Payload。
+    1. G_PHASE (大脑): 拥有历史上下文，只能搜索和派发。循环直至输出最终回复。
     2. OP_PHASE (手脚): 纯净上下文，接收 Payload，拥有执行工具，执行完退出。
     3. C_PHASE (反思): (Post-loop) 仅允许节点管理工具，沉淀知识。
     """
@@ -89,6 +120,18 @@ class V4Loop:
             final_response = f"系统执行异常: {str(e)}"
             self.metrics.success = False
             
+        # 兜底防护：确保 final_response 永不为空
+        if not final_response or not str(final_response).strip():
+            logger.error(f"CRITICAL: final_response is empty after pipeline. g_messages count: {len(self.g_messages)}, op_messages count: {len(self.op_messages)}, llm_calls: {self._llm_call_count}, tool_calls: {self._tool_call_count}")
+            # 尝试从 g_messages 中提取最后一条 assistant 消息作为备用
+            for msg in reversed(self.g_messages):
+                if msg.role == MessageRole.ASSISTANT and msg.content and msg.content.strip():
+                    final_response = msg.content
+                    logger.info("Recovered response from last assistant message in g_messages.")
+                    break
+            if not final_response or not str(final_response).strip():
+                final_response = "抱歉，我在处理你的请求时遇到了问题，没有生成有效的回复。请再试一次。"
+        
         self.metrics.total_time = time.time() - self.metrics.start_time
         
         # 保存这轮完整对话作为短期记忆（同步，确保记忆不丢）
@@ -161,7 +204,7 @@ class V4Loop:
         
         search_tools = [self.tools.get("search_knowledge_nodes")]
         search_tools = [t for t in search_tools if t]
-        schema = [t.to_schema() for t in search_tools]
+        schema = [t.to_schema() for t in search_tools] + [DISPATCH_TOOL_SCHEMA]
         
         for i in range(self.max_iterations):
             self._llm_call_count += 1
@@ -182,7 +225,17 @@ class V4Loop:
             ))
             
             if response.tool_calls:
+                # ── 分拣：将 dispatch_to_op 从普通工具调用中分离 ──
+                dispatch_tc = None
+                regular_calls = []
                 for tc in response.tool_calls:
+                    if tc.name == "dispatch_to_op":
+                        dispatch_tc = tc
+                    else:
+                        regular_calls.append(tc)
+                
+                # ── 先处理普通工具（search 等）──
+                for tc in regular_calls:
                     await self._safe_callback(step_callback, "tool_start", {"name": tc.name, "args": tc.arguments})
                     self._tool_call_count += 1
                     t0 = time.time()
@@ -210,13 +263,61 @@ class V4Loop:
                         tool_result=str(res), duration_ms=(time.time() - t0) * 1000
                     )
                     self.metrics.tools_used.append(tc.name)
-                    
                     self.g_messages.append(Message(role=MessageRole.TOOL, content=res, tool_call_id=tc.id, name=tc.name))
+                
+                # ── dispatch_to_op: 协议层派发（核心路径）──
+                if dispatch_tc:
+                    payload = {
+                        "op_intent": (dispatch_tc.arguments or {}).get("op_intent", "未定义目标"),
+                        "active_nodes": (dispatch_tc.arguments or {}).get("active_nodes") or [],
+                        "instructions": (dispatch_tc.arguments or {}).get("instructions", "")
+                    }
+                    
+                    # 派发审查
+                    review_message = self._review_task_payload(payload)
+                    if review_message and not self._has_dispatch_review_override(payload):
+                        logger.info("Dispatch reviewer requested payload revision.")
+                        self.g_messages.append(Message(
+                            role=MessageRole.TOOL,
+                            content=f"[Dispatch Review] {review_message}",
+                            tool_call_id=dispatch_tc.id, name="dispatch_to_op"
+                        ))
+                        continue
+                    
+                    payload = self._strip_dispatch_review_override(payload)
+                    self._merge_signature_from_texts(payload.get("op_intent", ""), payload.get("instructions", ""))
+                    self._merge_signature_from_nodes(payload.get("active_nodes", []))
+                    logger.info("G-Process dispatched via tool call. Invoking Op-Process...")
+                    dispatched_nodes = [n for n in payload.get("active_nodes", []) if n and not n.startswith("MEM_CONV")]
+                    self.execution_active_nodes.extend(dispatched_nodes)
+                    
+                    rendered = self.factory.render_dispatch_for_human(payload)
+                    await self._safe_callback(step_callback, "blueprint", rendered)
+                    
+                    # 阻塞调用 Op-Process（_run_op_phase 内部已 append execution_reports）
+                    op_result = await self._run_op_phase(payload, step_callback)
+                    op_result_text = self.factory.render_op_result_for_g(op_result)
+                    signature_text = self.vault.render_metadata_signature(self.inferred_signature)
+                    signature_update_block = f"[任务签名更新]\n{signature_text}\n\n" if signature_text else ""
+                    
+                    # Op 结果作为 dispatch_to_op 的工具返回值回传给 G
+                    self.g_messages.append(Message(
+                        role=MessageRole.TOOL,
+                        content=f"[Op-Process 执行完毕]\n返回结果如下：\n{op_result_text}\n\n{signature_update_block}请基于上述执行结果，继续思考，或向用户输出最终回答。",
+                        tool_call_id=dispatch_tc.id, name="dispatch_to_op"
+                    ))
+                    
+                    logger.info(">>> Resuming G-Process after Op completion")
+                    await self._safe_callback(step_callback, "loop_start", {"phase": "G_PHASE"})
+                
                 continue
                 
-            # 纯文本回复，检查是否包含 Dispatch Payload
+            # ── 纯文本回复路径 ──
+            # 主路径: 无 tool_calls → G 的文本就是对用户的最终回复
+            # 回退路径: 如果文本中仍包含 dispatch 块（LLM 没走 tool call），尝试解析
             payload = self._parse_dispatch_payload(response.content)
             if payload:
+                logger.warning("G-Process used legacy text-based dispatch instead of tool call. Handling as fallback.")
                 review_message = self._review_task_payload(payload)
                 if review_message and not self._has_dispatch_review_override(payload):
                     logger.info("Dispatch reviewer requested payload revision before invoking Op.")
@@ -226,47 +327,62 @@ class V4Loop:
                 payload = self._strip_dispatch_review_override(payload)
                 self._merge_signature_from_texts(payload.get("op_intent", ""), payload.get("instructions", ""))
                 self._merge_signature_from_nodes(payload.get("active_nodes", []))
-                logger.info("G-Process created Task Payload. Invoking Op-Process Subroutine...")
-                # Knowledge Arena: 记录被挂载的知识节点
+                logger.info("G-Process created Task Payload (fallback). Invoking Op-Process Subroutine...")
                 dispatched_nodes = [n for n in payload.get("active_nodes", []) if n and not n.startswith("MEM_CONV")]
                 self.execution_active_nodes.extend(dispatched_nodes)
-                # 渲染派发书给用户看
                 rendered = self.factory.render_dispatch_for_human(payload)
                 await self._safe_callback(step_callback, "blueprint", rendered)
                 
-                # 阻塞调用 Op-Process
                 op_result = await self._run_op_phase(payload, step_callback)
                 op_result_text = self.factory.render_op_result_for_g(op_result)
                 signature_text = self.vault.render_metadata_signature(self.inferred_signature)
                 signature_update_block = f"[任务签名更新]\n{signature_text}\n\n" if signature_text else ""
                 
-                # Op 执行完毕，将结果反馈给 G
                 self.g_messages.append(Message(
                     role=MessageRole.SYSTEM,
                     content=f"[Op-Process 执行完毕]\n返回结果如下：\n{op_result_text}\n\n{signature_update_block}请基于上述执行结果，继续思考，或向用户输出最终回答。"
                 ))
                 
-                # 重新将控制权交还给 G
                 logger.info(">>> Resuming Phase 1: G-Process (Thinker)")
                 await self._safe_callback(step_callback, "loop_start", {"phase": "G_PHASE"})
                 continue
             else:
-                # G 输出了普通文本且没有 payload，这被视为对用户的直接回复，管线结束
-                logger.info("G-Process provided final response.")
-                self.tracer.end_span(self._g_span)
-                return response.content
+                # G 输出了普通文本且没有 dispatch 意图 → 最终回复
+                if response.content and response.content.strip():
+                    logger.info(f"G-Process provided final response. length={len(response.content)}, preview={response.content[:80]!r}")
+                    self.tracer.end_span(self._g_span)
+                    return response.content
+                else:
+                    logger.warning(f"G-Process returned empty content (iter {i}). Retrying.")
+                    if self.g_messages and self.g_messages[-1].role == MessageRole.ASSISTANT:
+                        self.g_messages.pop()
+                    continue
                 
-        logger.warning("G-Process reached max iterations without finalizing.")
+        logger.warning(f"G-Process reached max iterations ({self.max_iterations}) without finalizing.")
         self.tracer.end_span(self._g_span, status="timeout")
-        return "大脑 (G) 思考达到最大迭代限制。"
+        # 尝试从 g_messages 找最后一条有内容的 assistant 消息
+        for msg in reversed(self.g_messages):
+            if msg.role == MessageRole.ASSISTANT and msg.content and msg.content.strip():
+                logger.info("Recovered response from last G assistant message after timeout.")
+                return msg.content
+        return "思考达到最大迭代限制，未能生成回复。"
 
     def _parse_dispatch_payload(self, content: str) -> Optional[Dict[str, Any]]:
         """从 G 的输出中提取 dispatch 块并转换为字典"""
-        match = re.search(r"```dispatch\n(.*?)```", content, re.DOTALL | re.IGNORECASE)
-        if not match:
-            return None
-            
-        block = match.group(1).strip()
+        # 1. 尝试标准代码块提取 (宽松匹配 newline)
+        match = re.search(r"```dispatch\s*(.*?)```", content, re.DOTALL | re.IGNORECASE)
+        
+        block = ""
+        if match:
+            block = match.group(1).strip()
+        else:
+            # 2. 启发式回退：如果没写代码块，但检测到了关键字段，尝试全文解析
+            # 必须同时包含 OP_INTENT: 和 INSTRUCTIONS: 才被视为有效
+            if "OP_INTENT:" in content and "INSTRUCTIONS:" in content:
+                logger.warning("G-Process output dispatch keywords but missed code block. Applying heuristic parsing.")
+                block = content.strip()
+            else:
+                return None
         
         op_intent = "未定义目标"
         active_nodes = []
@@ -665,7 +781,7 @@ class V4Loop:
                         res = f"Error: Op-Process 禁止使用工具 {tc.name}"
                     else:
                         res = await self.tools.execute(tc.name, tc.arguments)
-                        
+                    
                     self.tracer.log_tool_call(
                         self.trace_id, parent=op_span, phase="Op",
                         tool_name=tc.name, tool_args=tc.arguments,
@@ -679,9 +795,17 @@ class V4Loop:
                 continue
                 
             # 没有工具调用，Op 结束任务并给出最终结果
-            if not response.content.strip():
-                self.op_messages.append(Message(role=MessageRole.SYSTEM, content="[系统警告] 收到空响应。请继续执行或总结最终结果。"))
-                continue
+            if not response.content or not response.content.strip():
+                logger.warning(f"Op-Process returned empty content at iter {i}. Treating as incomplete result.")
+                # 不循环等待，直接当作不完整结果返回给 G 判断
+                response = type(response)(
+                    content="```op_result\nSTATUS: PARTIAL\nSUMMARY:\nOp 未能生成执行报告。\nOPEN_QUESTIONS:\n- Op 执行可能遇到问题，请 G 判断是否需要重新派发。\n```",
+                    tool_calls=response.tool_calls,
+                    finish_reason=response.finish_reason,
+                    input_tokens=response.input_tokens,
+                    output_tokens=response.output_tokens,
+                    total_tokens=response.total_tokens
+                )
 
             self.execution_messages.extend(self.op_messages)
             op_result = self._parse_op_result(response.content)
@@ -698,13 +822,20 @@ class V4Loop:
             
         logger.warning("Op-Process reached max iterations.")
         self.execution_messages.extend(self.op_messages)
+        # 提取 Op 已完成的工具调用摘要，让 G 知道 Op 做到了哪里
+        partial_work = []
+        for m in self.op_messages:
+            if m.role == MessageRole.TOOL:
+                preview = str(m.content)[:150].replace("\n", " ")
+                partial_work.append(f"- [{m.name}]: {preview}")
+        partial_summary = "\n".join(partial_work[-6:]) if partial_work else "无已完成步骤"
         timeout_result = {
-            "status": "FAILED",
-            "summary": "达到最大迭代次数限制，Op 被强制终止。",
+            "status": "PARTIAL",
+            "summary": f"Op 达到迭代上限被截断，但已执行 {len(partial_work)} 步工具调用。\n已完成步骤：\n{partial_summary}",
             "changes_made": [],
             "artifacts": [],
-            "open_questions": ["请 G 判断是否需要缩小任务范围后重新派发。"],
-            "raw_output": "达到最大迭代次数限制，强制终止。"
+            "open_questions": [],
+            "raw_output": f"达到最大迭代次数限制，强制终止。已执行 {len(partial_work)} 步。"
         }
         self.execution_reports.append(timeout_result)
         self._merge_signature_from_texts(timeout_result.get("summary", ""), "\n".join(timeout_result.get("open_questions", []) or []))
@@ -825,7 +956,7 @@ class V4Loop:
         c_tools = [self.tools.get(n) for n in c_tool_names if self.tools.get(n)]
         c_schema = [t.to_schema() for t in c_tools]
         
-        for _ in range(5): # 增加迭代次数以允许更复杂的图谱构建
+        for _ in range(30):
             try:
                 response = await self.provider.chat(
                     messages=[m.to_dict() for m in c_messages],

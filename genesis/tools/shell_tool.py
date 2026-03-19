@@ -19,7 +19,7 @@ class ShellTool(Tool):
     
     def __init__(
         self, 
-        timeout: int = 120, 
+        timeout: int = 600, 
         use_sandbox: bool = False,
         workspace_path: str = None,
         job_manager = None
@@ -28,7 +28,7 @@ class ShellTool(Tool):
         初始化
         
         Args:
-            timeout: 命令超时时间（秒）
+            timeout: 命令超时时间（秒），默认 600s
             use_sandbox: 是否使用 Docker 沙箱
             workspace_path: 沙箱工作目录（宿主机路径）
             job_manager: JobManager 实例 (用于异步任务)
@@ -62,7 +62,7 @@ class ShellTool(Tool):
     def description(self) -> str:
         base_desc = """Execute shell commands. Supports sync (execute) and async (spawn/poll).
         
-        - execute(cmd): Run and wait for result (up to 120s). Use for most commands.
+        - execute(cmd): Run and wait for result (up to 600s). Use for most commands.
         - spawn(cmd): Start background job, returns Job ID immediately. Use for long tasks (builds, large downloads, servers).
         - poll(job_id): Check background job status and output.
         """
@@ -265,14 +265,14 @@ class ShellTool(Tool):
                 logger.info(f"⏳ 长命令检测：{command[:60]}... 延长等待")
                 try:
                     stdout, stderr = await asyncio.wait_for(
-                        process.communicate(), timeout=290  # 剩余 ~290s（总共 ~300s）
+                        process.communicate(), timeout=1800  # 长命令最多 30 分钟
                     )
                 except asyncio.TimeoutError:
                     try:
                         process.kill()
                     except Exception:
                         pass
-                    return f"[TIMEOUT] 命令执行超过 5 分钟，已终止。"
+                    return f"[TIMEOUT] 命令执行超过 30 分钟，已终止。"
 
             stdout_text = stdout.decode('utf-8', errors='replace')
             stderr_text = stderr.decode('utf-8', errors='replace')
@@ -284,13 +284,7 @@ class ShellTool(Tool):
 
     @staticmethod
     def _format_result(command: str, cwd, code: int, stdout: str, stderr: str) -> str:
-        """统一格式化命令执行结果（带截断）"""
-        
-        def truncate(text: str, limit: int = 4000) -> str:
-            if not text or len(text) <= limit:
-                return text
-            half = limit // 2
-            return text[:half] + f"\n...[Output Truncated ({len(text) - limit} chars hidden)]...\n" + text[-half:]
+        """统一格式化命令执行结果"""
 
         result = [f"命令: {command}"]
         if cwd:
@@ -298,9 +292,9 @@ class ShellTool(Tool):
         result.append(f"退出码: {code}")
         
         if stdout:
-            result.append(f"\n标准输出:\n{truncate(stdout)}")
+            result.append(f"\n标准输出:\n{stdout}")
         if stderr:
-            result.append(f"\n标准错误:\n{truncate(stderr)}")
+            result.append(f"\n标准错误:\n{stderr}")
             
         if code != 0:
             result.append(f"\n⚠️  命令执行失败（退出码 {code}）")
