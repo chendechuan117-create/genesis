@@ -40,10 +40,9 @@ class FermentorDaemon:
 
     def __init__(self, use_free_pool_only: bool = True):
         self.config = ConfigManager().config
-        self.vault = NodeVault()
+        self.vault = NodeVault(skip_vector_engine=True)
         self.tools = NodeManagementTools(self.vault)
-        self.vector = VectorEngine()
-        self.vector.initialize()
+        self.vector = self.vault.vector_engine  # 空壳，不加载模型
         
         # Initialize Free Pool Provider Router
         self.provider = self._init_provider(use_free_pool_only)
@@ -66,15 +65,17 @@ class FermentorDaemon:
                     logger.error("没有任何可用的 LLM 提供商，发酵池退出。")
                     sys.exit(1)
             else:
-                # 随机挑一个免费模型，避免只薅一家羊毛
-                chosen = random.choice(available)
-                logger.info(f"发酵池选用免费/廉价提供商: {chosen}")
-                router._switch_provider(chosen)
+                random.shuffle(available)
+                router.failover_order = available
+                router._switch_provider(available[0])
+                router._preferred_provider_name = available[0]
+                logger.info(f"发酵池 failover chain: {' → '.join(available)}")
                 
         return router
 
     async def run_cycle(self):
         """运行一次发酵循环"""
+        self.vault.heartbeat("fermentor", "running", "发酵循环开始")
         logger.info("=========================================")
         logger.info("🌟 知识发酵池 (Fermentation Cycle) 启动")
         logger.info("=========================================")
@@ -100,6 +101,7 @@ class FermentorDaemon:
         logger.info("=========================================")
         logger.info(f"🏁 发酵完成. 连线: {stats['edges_created']}, 概念: {stats['meta_created']}, 假设: {stats['hypotheses_generated']}")
         logger.info("=========================================")
+        self.vault.heartbeat("fermentor", "idle", f"edges={stats['edges_created']}, meta={stats['meta_created']}, hypo={stats['hypotheses_generated']}")
 
     async def _generate_hypotheses(self) -> int:
         """
@@ -166,9 +168,13 @@ ID: {seed['node_id']}
                             logger.info(f"  -> {res}")
                             hypotheses_created += 1
                             
-                            # 建立关联
+                            # 盖上 FERMENTED 出生证 + 建立关联
                             import json as pyjson
                             if 'node_id' in args:
+                                self.vault._conn.execute(
+                                    "UPDATE knowledge_nodes SET trust_tier = 'FERMENTED', confidence_score = 0.45 WHERE node_id = ?",
+                                    (args['node_id'],)
+                                )
                                 self.vault._conn.execute(
                                     "INSERT OR IGNORE INTO node_edges (source_id, target_id, relation, weight) VALUES (?, ?, ?, ?)",
                                     (seed['node_id'], args['node_id'], "inspired_hypothesis", 0.7)
@@ -186,7 +192,7 @@ ID: {seed['node_id']}
         """
         logger.info("[任务 1/2] 边缘发现 (Edge Discovery)...")
         # 1. 获取种子节点
-        cursor = self.vault._conn.execute("SELECT node_id, title, type FROM knowledge_nodes ORDER BY RANDOM() LIMIT 3")
+        cursor = self.vault._conn.execute("SELECT node_id, title, type FROM knowledge_nodes WHERE confidence_score >= 0.5 ORDER BY RANDOM() LIMIT 3")
         seed_nodes = cursor.fetchall()
             
         if not seed_nodes:
@@ -259,6 +265,7 @@ ID: {node_id}
             FROM knowledge_nodes k
             JOIN node_contents c ON k.node_id = c.node_id
             WHERE k.type = 'LESSON' 
+            AND k.confidence_score >= 0.5
             AND k.node_id NOT IN (SELECT source_id FROM node_edges)
             ORDER BY k.created_at DESC LIMIT 3
         """)

@@ -14,6 +14,11 @@ from .base import LLMProvider as BaseLLMProvider, LLMResponse, ToolCall
 logger = logging.getLogger(__name__)
 
 
+class WallClockTimeoutError(Exception):
+    """LLM 调用总体超时（非 provider 故障，不应触发 failover）"""
+    pass
+
+
 class NativeHTTPProvider(BaseLLMProvider):
     """基于原生 HTTP (httpx) 的提供商 - 高性能异步实现"""
     
@@ -26,6 +31,7 @@ class NativeHTTPProvider(BaseLLMProvider):
         default_model: str = "deepseek-chat",
         connect_timeout: int = 30,
         request_timeout: int = 180,
+        wall_clock_timeout: int = 300,  # 整体超时(秒)：防止推理模型思考过久
         stop_sequences: Optional[List[str]] = None,
         provider_name: str = "default"
     ):
@@ -34,9 +40,18 @@ class NativeHTTPProvider(BaseLLMProvider):
         self.default_model = default_model
         self.connect_timeout = connect_timeout
         self.request_timeout = request_timeout
+        self.wall_clock_timeout = wall_clock_timeout
         self.stop_sequences = stop_sequences if stop_sequences is not None else self.DEFAULT_STOP_SEQUENCES
         self.provider_name = provider_name
+        self._http_client: Optional[httpx.AsyncClient] = None
     
+    def _get_http_client(self) -> httpx.AsyncClient:
+        """延迟初始化的持久 httpx 客户端（复用 TCP 连接池）"""
+        if self._http_client is None or self._http_client.is_closed:
+            timeout = httpx.Timeout(self.request_timeout, connect=self.connect_timeout)
+            self._http_client = httpx.AsyncClient(timeout=timeout, trust_env=False)
+        return self._http_client
+
     def get_default_model(self) -> str:
         """获取默认模型"""
         return self.default_model
@@ -83,15 +98,21 @@ class NativeHTTPProvider(BaseLLMProvider):
             "User-Agent": "NanoGenesis/1.0"
         }
         
-        timeout = httpx.Timeout(self.request_timeout, connect=self.connect_timeout)
-        
-        # httpx handles proxies automatically via env vars (HTTP_PROXY, HTTPS_PROXY)
-        # 强制 trust_env=False，不使用代理（DeepSeek等国内API直连更快，避免绕代理导致单次请求多花11秒）
-        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+        # 复用持久 httpx 客户端（trust_env=False 在 _get_http_client 中设置）
+        # ⚠️ 注意：trust_env=False 会绕过系统代理。如需翻墙访问 groq/cloudflare 等墙外免费池，
+        #    参见 genesis/core/config.py:ConfigManager._apply_proxies 中的代理注入逻辑。
+        client = self._get_http_client()
+        try:
             if stream:
-                return await self._stream_with_httpx(client, url, headers, request_params, stream_callback)
+                coro = self._stream_with_httpx(client, url, headers, request_params, stream_callback)
             else:
-                return await self._chat_with_httpx(client, url, headers, request_params)
+                coro = self._chat_with_httpx(client, url, headers, request_params)
+            return await asyncio.wait_for(coro, timeout=self.wall_clock_timeout)
+        except asyncio.TimeoutError:
+            raise WallClockTimeoutError(
+                f"LLM 调用总超时 ({self.wall_clock_timeout}s)。"
+                f"推理模型可能思考过久，请简化问题或缩短上下文。"
+            )
 
     async def _chat_with_httpx(self, client: httpx.AsyncClient, url: str, headers: Dict, params: Dict) -> LLMResponse:
         """非流式请求"""
@@ -104,14 +125,20 @@ class NativeHTTPProvider(BaseLLMProvider):
                 response.raise_for_status()
                 return self._parse_response(response.json())
             except httpx.HTTPStatusError as e:
-                # API returned error (4xx/5xx)
+                status = e.response.status_code
                 error_body = e.response.text
                 try:
                     err_json = e.response.json()
                     error_msg = err_json.get('error', {}).get('message', error_body)
                 except:
                     error_msg = error_body
-                raise Exception(f"API Error ({e.response.status_code}): {error_msg}")
+                # 5xx 瞬态错误可重试（502/503/504）
+                if status in (502, 503, 504) and attempt < retries - 1:
+                    logger.warning(f"HTTP {status} (attempt {attempt+1}/{retries}): {error_msg[:100]}")
+                    last_exception = e
+                    await asyncio.sleep(1 * (attempt + 1))
+                    continue
+                raise Exception(f"API Error ({status}): {error_msg}")
             except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
                 logger.warning(f"httpx connection error (attempt {attempt+1}/{retries}): {e}")
                 last_exception = e
@@ -142,10 +169,20 @@ class NativeHTTPProvider(BaseLLMProvider):
         tool_calls = []
         if 'tool_calls' in message and message['tool_calls']:
             for tc in message['tool_calls']:
+                raw_args = tc['function'].get('arguments', '{}')
+                try:
+                    args = json.loads(raw_args)
+                except json.JSONDecodeError:
+                    # 修复：与流式路径对齐的 3 层回退
+                    repaired = raw_args.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+                    try:
+                        args = json.loads(repaired)
+                    except json.JSONDecodeError:
+                        args = {"__json_decode_error__": raw_args}
                 tool_calls.append(ToolCall(
                     id=tc['id'],
                     name=tc['function']['name'],
-                    arguments=json.loads(tc['function']['arguments'])
+                    arguments=args
                 ))
         
         content = message.get('content') or ""
@@ -180,6 +217,15 @@ class NativeHTTPProvider(BaseLLMProvider):
         retries = 3
         
         for attempt in range(retries):
+            # 重试时重置累积器，防止部分流残留导致内容重复/工具调用损坏
+            full_content = []
+            reasoning_content = []
+            tool_call_chunks = {}
+            final_tool_calls = []
+            finish_reason = None
+            input_tokens = 0
+            output_tokens = 0
+            prompt_cache_hit_tokens = 0
             try:
                 async with client.stream("POST", url, headers=headers, json=params) as response:
                     if response.status_code != 200:
@@ -245,7 +291,13 @@ class NativeHTTPProvider(BaseLLMProvider):
                 break
                 
             except httpx.HTTPStatusError as e:
-                raise Exception(f"API Error ({e.response.status_code}): {e.response.text}")
+                status = e.response.status_code
+                # 5xx 瞬态错误可重试
+                if status in (502, 503, 504) and attempt < retries - 1:
+                    logger.warning(f"Stream HTTP {status} (attempt {attempt+1}/{retries}): {e.response.text[:100]}")
+                    await asyncio.sleep(1 * (attempt + 1))
+                    continue
+                raise Exception(f"API Error ({status}): {e.response.text}")
             except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
                 logger.warning(f"httpx stream error (attempt {attempt+1}/{retries}): {e}")
                 if attempt < retries - 1:

@@ -15,14 +15,15 @@ from genesis.core.base import Message, MessageRole, LLMProvider, PerformanceMetr
 from genesis.core.registry import ToolRegistry
 from genesis.core.tracer import Tracer
 from genesis.core.models import DispatchPayload, OpResult
-from genesis.v4.manager import FactoryManager, NodeVault, NodeManagementTools
+from genesis.v4.manager import FactoryManager, NodeVault, NodeManagementTools, TRUST_TIER_RANK, TOOL_EXEC_MIN_TIER
 
 logger = logging.getLogger(__name__)
 
-# C-Process 专属工具名（G/Op 禁止调用）
-C_EXCLUSIVE_TOOLS = frozenset([
+# Op 禁用工具名（G 和 C 可用，但 Op 不能调用）
+OP_BLOCKED_TOOLS = frozenset([
     "record_context_node", "record_lesson_node", "create_meta_node",
-    "delete_node", "search_knowledge_nodes", "create_graph_node", "create_node_edge"
+    "delete_node", "search_knowledge_nodes", "create_graph_node", "create_node_edge",
+    "record_tool_node"
 ])
 
 # ── dispatch_to_op 工具 Schema ──────────────────────────────────
@@ -66,15 +67,21 @@ class V4Loop:
     3. C_PHASE (反思): (Post-loop) 仅允许节点管理工具，沉淀知识。
     """
 
+    OP_MAX_ITERATIONS = 30  # Op 独立上限：30 轮足够完成单次派发，超出说明任务应拆分
+    C_PHASE_MAX_ITER = {"FULL": 30, "LIGHT": 5, "SKIP": 0}
+    TOOL_EXEC_TIMEOUT = 120  # 工具执行超时（秒），防止挂起的 HTTP/命令阻塞整个管线
+
     def __init__(
         self,
         tools: ToolRegistry,
         provider: LLMProvider,
         max_iterations: int = 20,
+        c_phase_blocking: bool = False,
     ):
         self.tools = tools
         self.provider = provider
         self.max_iterations = max_iterations
+        self.c_phase_blocking = c_phase_blocking
         
         # 单例管理器
         self.factory = FactoryManager()
@@ -100,7 +107,11 @@ class V4Loop:
         self.execution_messages = []
         self.execution_reports = []
         self.execution_active_nodes: List[str] = []  # Knowledge Arena: 追踪被使用的节点
-        self.inferred_signature = self.vault.infer_metadata_signature(user_input)
+        # 签名推断只用用户实际请求，排除频道历史等上下文噪音
+        _sig_input = user_input
+        if "[GENESIS_USER_REQUEST_START]" in user_input:
+            _sig_input = user_input.split("[GENESIS_USER_REQUEST_START]", 1)[1]
+        self.inferred_signature = self.vault.infer_metadata_signature(_sig_input)
         
         # === Tracing ===
         self.tracer = Tracer.get_instance()
@@ -137,12 +148,21 @@ class V4Loop:
         # 保存这轮完整对话作为短期记忆（同步，确保记忆不丢）
         self._save_memory(final_response)
         
-        # === Phase 3: C-Process (反思沉淀) — 后台异步，不阻塞用户 ===
-        if self._should_run_c_phase():
-            asyncio.create_task(self._run_c_phase_safe(step_callback))
-            logger.info("C-Process launched in background (non-blocking).")
+        # === Phase 3: C-Process (反思沉淀) ===
+        # 长生命周期（Discord bot）: 后台 create_task，不阻塞用户
+        # 短生命周期（API server）: await 等待完成，防止 event loop 关闭时截断
+        c_mode = self._determine_c_phase_mode()
+        if c_mode != "SKIP":
+            if self.c_phase_blocking:
+                await self._run_c_phase_safe(step_callback, c_mode)
+                logger.info(f"C-Process completed (blocking mode={c_mode}, G={self.metrics.g_tokens}t, Op={self.metrics.op_tokens}t).")
+            else:
+                asyncio.create_task(self._run_c_phase_safe(step_callback, c_mode))
+                logger.info(f"C-Process launched in background (mode={c_mode}, G={self.metrics.g_tokens}t, Op={self.metrics.op_tokens}t).")
         elif len(self.execution_messages) > 0:
-            logger.info("Skipping C-Process: no high-value reflection signal detected.")
+            logger.info(f"Skipping C-Process: mode=SKIP (G={self.metrics.g_tokens}t, Op={self.metrics.op_tokens}t).")
+        
+        self.vault.heartbeat("main_loop", "idle", f"done G={self.metrics.g_tokens}t Op={self.metrics.op_tokens}t")
         
         # === End Trace ===
         self.tracer.end_trace(
@@ -159,10 +179,10 @@ class V4Loop:
         
         return final_response, self.metrics
 
-    async def _run_c_phase_safe(self, step_callback: Any):
+    async def _run_c_phase_safe(self, step_callback: Any, mode: str = "FULL"):
         """后台安全包装器：捕获 C-Process 异常，防止后台任务静默崩溃"""
         try:
-            await self._run_c_phase(step_callback)
+            await self._run_c_phase(step_callback, mode)
         except Exception as e:
             logger.error(f"C-Process background task failed: {e}", exc_info=True)
 
@@ -173,11 +193,13 @@ class V4Loop:
         self._phase_count += 1
         self._g_span = self.tracer.start_span(self.trace_id, "G_PHASE", span_type="phase", phase="G")
         
+        self.vault.heartbeat("main_loop", "running", f"G-Phase start: {user_input[:60]}")
         g_prompt = self.factory.build_g_prompt(
             recent_memory=self.vault.get_recent_memory(),
             available_tools_info=self._build_op_tools_info(),
             knowledge_digest=self.vault.get_digest(),
-            inferred_signature=self.vault.render_metadata_signature(self.inferred_signature)
+            inferred_signature=self.vault.render_metadata_signature(self.inferred_signature),
+            daemon_status=self.vault.get_daemon_status_summary()
         )
         
         # Build User Content (Multimodal if images exist)
@@ -207,6 +229,11 @@ class V4Loop:
         schema = [t.to_schema() for t in search_tools] + [DISPATCH_TOOL_SCHEMA]
         
         for i in range(self.max_iterations):
+            # === 跨进程向量同步：拉取 Scavenger/Fermentor 新增的节点向量 ===
+            self.vault.sync_vector_matrix_incremental()
+            # === G 蒸发机制：压缩旧的搜索结果和 Op 返回 ===
+            self._evaporate_g_messages()
+            
             self._llm_call_count += 1
             response = await self.provider.chat(
                 messages=[m.to_dict() for m in self.g_messages],
@@ -252,7 +279,14 @@ class V4Loop:
                             recent = self.vault.get_recent_memory(limit=2)
                             if recent:
                                 search_args["conversation_context"] = recent[:300]
-                        res = await self.tools.execute(tc.name, search_args)
+                        try:
+                            res = await asyncio.wait_for(
+                                self.tools.execute(tc.name, search_args),
+                                timeout=self.TOOL_EXEC_TIMEOUT
+                            )
+                        except asyncio.TimeoutError:
+                            res = f"Error: 搜索超时（{self.TOOL_EXEC_TIMEOUT}秒），请缩小搜索范围后重试。"
+                            logger.warning(f"G tool timeout: {tc.name} exceeded {self.TOOL_EXEC_TIMEOUT}s")
                         await self._safe_callback(step_callback, "search_result", {"name": tc.name, "result": res})
                     else:
                         res = f"G-Process has no permission to run tool {tc.name}"
@@ -376,9 +410,8 @@ class V4Loop:
         if match:
             block = match.group(1).strip()
         else:
-            # 2. 启发式回退：如果没写代码块，但检测到了关键字段，尝试全文解析
-            # 必须同时包含 OP_INTENT: 和 INSTRUCTIONS: 才被视为有效
-            if "OP_INTENT:" in content and "INSTRUCTIONS:" in content:
+            # 2. 启发式回退：要求关键字在行首出现（防止 G 在解释性文本中误触发）
+            if re.search(r"^OP_INTENT:", content, re.MULTILINE) and re.search(r"^INSTRUCTIONS:", content, re.MULTILINE):
                 logger.warning("G-Process output dispatch keywords but missed code block. Applying heuristic parsing.")
                 block = content.strip()
             else:
@@ -456,25 +489,23 @@ class V4Loop:
         if tool_name not in signature_write_tools:
             return prepared
 
-        text_parts: List[str] = []
-        for key in ["title", "state_description", "trigger_verb", "trigger_noun", "trigger_context", "because_reason", "resolves", "content", "tags"]:
-            value = prepared.get(key)
-            if value:
-                text_parts.append(str(value))
-        action_steps = prepared.get("action_steps") or []
-        if isinstance(action_steps, list):
-            text_parts.extend([str(item) for item in action_steps if item])
+        # C 自己写的签名优先；没写则从节点内容推断；不再强制合并全局签名（防止污染）
+        c_signature = prepared.get("metadata_signature")
+        if not c_signature:
+            text_parts: List[str] = []
+            for key in ["title", "state_description", "trigger_verb", "trigger_noun", "trigger_context", "because_reason", "resolves", "content", "tags"]:
+                value = prepared.get(key)
+                if value:
+                    text_parts.append(str(value))
+            action_steps = prepared.get("action_steps") or []
+            if isinstance(action_steps, list):
+                text_parts.extend([str(item) for item in action_steps if item])
+            c_signature = self.vault.infer_metadata_signature("\n".join(text_parts))
 
-        inferred_from_payload = self.vault.infer_metadata_signature("\n".join(text_parts))
-        merged_signature = self.vault.merge_metadata_signatures(
-            self.inferred_signature,
-            inferred_from_payload,
-            prepared.get("metadata_signature")
-        )
-        if merged_signature:
-            prepared["metadata_signature"] = merged_signature
+        if c_signature:
+            prepared["metadata_signature"] = c_signature
 
-        if merged_signature and not prepared.get("verification_source"):
+        if c_signature and not prepared.get("verification_source"):
             prepared["verification_source"] = "reflection"
 
         return prepared
@@ -636,36 +667,41 @@ class V4Loop:
         return result.model_dump()
 
     def _load_tool_nodes_from_active_nodes(self, active_nodes: List[str]) -> List[str]:
-        """从 active_nodes 中加载 TOOL 节点并动态注册工具"""
+        """从 active_nodes 中加载 TOOL 节点并动态注册工具（带信任闸门）"""
         loaded_tools = []
-        for node_id in active_nodes:
-            if node_id.startswith("TOOL_"):
-                # 获取节点内容
-                source_code = self.vault.get_node_content(node_id)
-                if source_code:
-                    # 从源码中提取工具名称
-                    import re
-                    # 尝试从源码中提取工具名称
-                    tool_name_match = re.search(r'def name\(self\) -> str:\s*return "([^"]+)"', source_code)
-                    if not tool_name_match:
-                        tool_name_match = re.search(r"def name\(self\) -> str:\s*return '([^']+)'", source_code)
-                    if tool_name_match:
-                        tool_name = tool_name_match.group(1)
-                        # 动态注册工具
-                        if self.tools.register_from_source(tool_name, source_code):
-                            loaded_tools.append(tool_name)
-                            logger.info(f"动态注册工具: {tool_name} from {node_id}")
-                        else:
-                            logger.warning(f"动态注册工具失败: {node_id}")
+        min_rank = TRUST_TIER_RANK.get(TOOL_EXEC_MIN_TIER, 3)
+        # 批量获取 TOOL 节点的 trust_tier（通过公开 API，避免直接访问 _conn）
+        tool_node_ids = [nid for nid in active_nodes if nid.startswith("TOOL_")]
+        briefs = self.vault.get_node_briefs(tool_node_ids) if tool_node_ids else {}
+        for node_id in tool_node_ids:
+            brief = briefs.get(node_id, {})
+            tier = brief.get("trust_tier") or "REFLECTION"
+            tier_rank = TRUST_TIER_RANK.get(tier, 0)
+            if tier_rank < min_rank:
+                logger.warning(f"⛔ TOOL 节点 [{node_id}] 信任等级不足 (tier={tier}, 需要>={TOOL_EXEC_MIN_TIER})，跳过 exec")
+                continue
+            source_code = self.vault.get_node_content(node_id)
+            if source_code:
+                import re
+                tool_name_match = re.search(r'def name\(self\) -> str:\s*return "([^"]+)"', source_code)
+                if not tool_name_match:
+                    tool_name_match = re.search(r"def name\(self\) -> str:\s*return '([^']+)'", source_code)
+                if tool_name_match:
+                    tool_name = tool_name_match.group(1)
+                    if self.tools.register_from_source(tool_name, source_code, node_id=node_id, trust_tier=tier):
+                        loaded_tools.append(tool_name)
+                        logger.info(f"动态注册工具: {tool_name} from {node_id} (tier={tier})")
                     else:
-                        logger.warning(f"无法从 TOOL 节点提取工具名称: {node_id}")
+                        logger.warning(f"动态注册工具失败: {node_id}")
+                else:
+                    logger.warning(f"无法从 TOOL 节点提取工具名称: {node_id}")
         return loaded_tools
 
 
     def _get_op_tools(self) -> List[Any]:
         op_tools = []
         for name in self.tools.list_tools():
-            if name not in C_EXCLUSIVE_TOOLS:
+            if name not in OP_BLOCKED_TOOLS:
                 tool = self.tools.get(name)
                 if tool:
                     op_tools.append(tool)
@@ -677,23 +713,32 @@ class V4Loop:
             tool_lines.append(f"- {tool.name}: {tool.description}")
         return "\n".join(tool_lines)
 
-    def _should_run_c_phase(self) -> bool:
+    def _determine_c_phase_mode(self) -> str:
+        """信号质量 → C-Phase 模式: FULL / LIGHT / SKIP"""
         if not self.execution_reports:
-            return False
+            return "SKIP"
+
+        # 信号质量评估
+        high_value = False
         if len(self.execution_reports) > 1:
-            return True
-        if any(report.get("artifacts") for report in self.execution_reports):
-            return True
-        if any(report.get("open_questions") for report in self.execution_reports):
-            return True
-        if any((report.get("status", "UNKNOWN") or "UNKNOWN").upper() in ["FAILED", "PARTIAL", "UNKNOWN"] for report in self.execution_reports):
-            return True
-        if sum(len(report.get("changes_made", []) or []) for report in self.execution_reports) >= 3:
-            return True
+            high_value = True
+        elif any(report.get("artifacts") for report in self.execution_reports):
+            high_value = True
+        elif any(report.get("open_questions") for report in self.execution_reports):
+            high_value = True
+        elif any((report.get("status", "UNKNOWN") or "UNKNOWN").upper() in ["FAILED", "PARTIAL", "UNKNOWN"] for report in self.execution_reports):
+            high_value = True
+        elif sum(len(report.get("changes_made", []) or []) for report in self.execution_reports) >= 3:
+            high_value = True
+
         tool_steps = sum(1 for message in self.execution_messages if message.role == MessageRole.TOOL)
         if tool_steps >= 4:
-            return True
-        return False
+            high_value = True
+
+        if not high_value:
+            return "SKIP"
+
+        return "FULL"
 
     def _build_execution_report_summary(self) -> str:
         if not self.execution_reports:
@@ -742,6 +787,8 @@ class V4Loop:
         tool_nodes_loaded = self._load_tool_nodes_from_active_nodes(active_nodes)
         if tool_nodes_loaded:
             logger.info(f"动态加载了 {len(tool_nodes_loaded)} 个 TOOL 节点")
+        # 记录本次 session 动态加载的工具名，Op 结束后注销
+        session_dynamic_tools = list(tool_nodes_loaded)
         
         op_prompt = self.factory.build_op_prompt(task_payload)
         
@@ -753,7 +800,12 @@ class V4Loop:
 
         schema = [t.to_schema() for t in all_tools]
         
-        for i in range(self.max_iterations):
+        for i in range(self.OP_MAX_ITERATIONS):
+            # === 蒸发机制：在发送给 LLM 前，压缩旧的 TOOL 消息 ===
+            # 原理：LLM 的 ASSISTANT 回复已隐式总结了上一轮 TOOL 输出的关键信息
+            #       因此旧的 TOOL 原文可以安全地"蒸发"为存根，不丢失信息
+            self._evaporate_op_messages()
+            
             self._llm_call_count += 1
             response = await self.provider.chat(
                 messages=[m.to_dict() for m in self.op_messages],
@@ -763,7 +815,7 @@ class V4Loop:
                 _trace_id=self.trace_id, _trace_phase="Op", _trace_parent=op_span
             )
             
-            self._update_metrics(response)
+            self._update_metrics(response, phase="Op")
             
             self.op_messages.append(Message(
                 role=MessageRole.ASSISTANT,
@@ -777,10 +829,17 @@ class V4Loop:
                     self._tool_call_count += 1
                     t0 = time.time()
                     
-                    if tc.name in C_EXCLUSIVE_TOOLS:
+                    if tc.name in OP_BLOCKED_TOOLS:
                         res = f"Error: Op-Process 禁止使用工具 {tc.name}"
                     else:
-                        res = await self.tools.execute(tc.name, tc.arguments)
+                        try:
+                            res = await asyncio.wait_for(
+                                self.tools.execute(tc.name, tc.arguments),
+                                timeout=self.TOOL_EXEC_TIMEOUT
+                            )
+                        except asyncio.TimeoutError:
+                            res = f"Error: 工具 {tc.name} 执行超时（{self.TOOL_EXEC_TIMEOUT}秒），已强制终止。"
+                            logger.warning(f"Op tool timeout: {tc.name} exceeded {self.TOOL_EXEC_TIMEOUT}s")
                     
                     self.tracer.log_tool_call(
                         self.trace_id, parent=op_span, phase="Op",
@@ -818,6 +877,11 @@ class V4Loop:
             )
             self._merge_signature_from_artifacts(op_result.get("artifacts", []) or [])
             self.tracer.end_span(op_span, status=op_result.get("status", "UNKNOWN"))
+            # Session-scoped 注销：清理本次动态加载的工具
+            for t_name in session_dynamic_tools:
+                self.tools.unregister(t_name)
+            if session_dynamic_tools:
+                logger.info(f"Op结束: 注销 {len(session_dynamic_tools)} 个动态工具: {session_dynamic_tools}")
             return op_result
             
         logger.warning("Op-Process reached max iterations.")
@@ -840,15 +904,25 @@ class V4Loop:
         self.execution_reports.append(timeout_result)
         self._merge_signature_from_texts(timeout_result.get("summary", ""), "\n".join(timeout_result.get("open_questions", []) or []))
         self.tracer.end_span(op_span, status="timeout")
+        # Session-scoped 注销：清理本次动态加载的工具
+        for t_name in session_dynamic_tools:
+            self.tools.unregister(t_name)
+        if session_dynamic_tools:
+            logger.info(f"Op超时: 注销 {len(session_dynamic_tools)} 个动态工具: {session_dynamic_tools}")
         return timeout_result
 
-    async def _run_c_phase(self, step_callback: Any):
-        """运行 C-Process 反思循环，基于 Op 的执行轨迹"""
-        logger.info(">>> Entering Phase 3: C-Process (Reflector)")
+    async def _run_c_phase(self, step_callback: Any, mode: str = "FULL"):
+        """运行 C-Process 反思循环，基于 Op 的执行轨迹。mode: FULL/LIGHT"""
+        max_iter = self.C_PHASE_MAX_ITER.get(mode, 30)
+        logger.info(f">>> Entering Phase 3: C-Process (Reflector) mode={mode}, max_iter={max_iter}")
         
         report_summary = self._build_execution_report_summary()
         # Knowledge Arena 反馈闭环: 根据任务结果调整被使用节点的置信度
-        if self.execution_active_nodes:
+        # 去重：防止多次 dispatch 同一节点导致 N 倍 boost/decay
+        unique_active_nodes = list(dict.fromkeys(self.execution_active_nodes))
+        if unique_active_nodes:
+            # 激活 usage_count：为 GC 防护提供信号（usage_count > 0 的节点免于 purge）
+            self.vault.increment_usage(unique_active_nodes)
             has_success = any(
                 (r.get("status", "") or "").upper() in ["SUCCESS", "PARTIAL"]
                 for r in self.execution_reports
@@ -858,11 +932,11 @@ class V4Loop:
                 for r in self.execution_reports
             )
             if has_success and not has_failure:
-                self.vault.record_usage_outcome(self.execution_active_nodes, success=True)
-                logger.info(f"Knowledge Arena: +boost for {len(self.execution_active_nodes)} nodes (task SUCCESS)")
+                self.vault.record_usage_outcome(unique_active_nodes, success=True)
+                logger.info(f"Knowledge Arena: +boost for {len(unique_active_nodes)} nodes (task SUCCESS)")
             elif has_failure:
-                self.vault.record_usage_outcome(self.execution_active_nodes, success=False)
-                logger.info(f"Knowledge Arena: -decay for {len(self.execution_active_nodes)} nodes (task FAILED)")
+                self.vault.record_usage_outcome(unique_active_nodes, success=False)
+                logger.info(f"Knowledge Arena: -decay for {len(unique_active_nodes)} nodes (task FAILED)")
 
         # 3. 整理执行总结
         summary_lines = ["[Op 执行过程摘要]"]
@@ -882,87 +956,41 @@ class V4Loop:
         signature_text = self.vault.render_metadata_signature(self.inferred_signature)
         signature_block = f"[当前任务推测签名]\n{signature_text}\n\n" if signature_text else ""
         
-        reflection_system_prompt = f"""你是 Genesis 的后台反思进程 (C-Process)，你的代号是 "The Cartographer" (制图师)。
-你的任务是审查以下执行器 (Op) 的 [执行过程摘要]，将其转化为结构化的 **Genesis Experience Graph (经验图谱)**。
+        reflection_system_prompt = f"""你是 Genesis 反思进程 (C-Process)。审查 Op 的执行轨迹，提炼高价值元信息。
 
 {signature_block}
-
 {report_summary}
-
 {execution_summary}
 
-[核心使命]
-不要写日记！不要记流水账！你的职责是把执行轨迹转化为高价值元信息。
-你必须先判断最小但最有用的沉淀形式，而不是默认画图。
+[原则]
+不写日记，不记流水账。先判断这轮有没有长期价值——如果 Op 只是读了个文件或搜了一下，没有状态修改，直接回复 NO_ACTION。
 
-[沉淀优先级]
-1. **ASSET**: 如果这轮产出了可复用脚本、模板、配置、命令集合、验证器，优先创建 `ASSET`。
-2. **LESSON**: 如果这轮暴露了错误假设、稳定排错路线、可复用方法，优先创建 `LESSON`。
-3. **CONTEXT**: 如果这轮确认了稳定环境事实、约束、配置状态，创建 `CONTEXT`。
-4. **EPISODE**: 只有当阶段性轨迹本身对未来继续工作有帮助时，才创建 `EPISODE`。
-5. **GRAPH**: 只有在存在明确、高置信因果链时，才创建 `ENTITY / EVENT / ACTION` 节点及其边。
+[沉淀优先级] ASSET > LESSON > CONTEXT > EPISODE > GRAPH(ENTITY/EVENT/ACTION+边)
+选最小、最精准的表示。同一事实不要同时写多种类型。
 
-[LESSON 提炼原则]
-- 不要总结"这次用了几个工具"或"先做了什么后做了什么"。
-- 要优先问：**到底是哪一个错误假设，导致了这条轨迹？**
-- 一个高价值 LESSON 应该长成：
-  - 误判了什么
-  - 哪个证据推翻了它
-  - 以后再遇到什么信号时，应该先检查什么
-- 如果只是一次性过程，没有可泛化原则，就不要写成 LESSON。
+[LESSON 核心]
+不要总结步骤流水。问自己：哪个错误假设导致了这条轨迹？哪个证据推翻了它？下次遇到什么信号该先检查什么？
+不可泛化的一次性过程不写 LESSON。LESSON 必须填 resolves 字段（解决什么问题），尽量填 prerequisites。
 
-[Knowledge Arena — 必填字段]
-创建 LESSON 时，你**必须**尽量填写以下两个字段：
-- `resolves`: 此 LESSON 解决的具体问题是什么？(如 "docker网络不通", "pip安装ssl报错")
-- `prerequisites`: 此 LESSON 依赖哪些已有节点？(填 node_id，逗号分隔；不确定可留空)
-这两个字段是知识竞争和进化的基础——同一个 `resolves` 目标的多个 LESSON 会通过实际使用效果竞争，胜者置信度上升，败者被自然淘汰。
-
-[图谱节点类型]
-1. **ENTITY (实体)**: 静态对象/工具/服务/配置。
-2. **EVENT (事件)**: 发生的现象 (报错/结果/日志)。
-3. **ACTION (动作)**: 具体的执行动作/命令。
-
-[关系类型 (Edges)]
-- `TRIGGERS` (Action -> Event): 动作触发了现象 (e.g. pip install -> ssl error)
-- `RESOLVES` (Action -> Event): 动作解决了现象 (e.g. use mirror -> ssl error)
-- `REQUIRES` (Action -> Entity): 动作依赖某实体 (e.g. git clone -> proxy config)
-- `LOCATED_AT` (Entity -> Entity): 实体的物理位置 (e.g. proxy -> localhost:20170)
-- `RELATED_TO` (Any <-> Any): 弱相关性
-
-[工作流]
-1. 先判断这轮是否存在明确的长期价值；如果没有，直接回复 `NO_ACTION`。**特别注意：如果 Op 只是作为侦察兵去读取了一个文件、搜索了一下网络，并没有进行状态修改，这属于“无长期价值的阶段性动作”，直接回复 NO_ACTION。**
-2. 优先选择最小的高价值表示，避免重复写入。同一事实不要同时写成 LESSON、EPISODE 和图谱。
-3. 如果你能从日志中稳定识别环境/任务特征（如 `os_family`、`runtime`、`language`、`framework`、`task_kind`、`error_kind`），在创建节点时尽量同时填写 `metadata_signature`。
-4. 只有当命令输出、日志或明确证据已经确认某事实成立时，才把 `metadata_signature.validation_status` 标为 `validated`；否则优先用 `unverified` 或留空。
-5. 如果你填写了验证结论，尽量同时给出 `verification_source`；只有在你明确知道验证时间时才填写 `last_verified_at`。
-6. 对可复用产物使用 `create_meta_node` 创建 `ASSET`。
-7. 对稳定环境事实使用 `record_context_node` 创建 `CONTEXT`。
-8. 对错误假设修正、稳定方法、排错原则使用 `record_lesson_node` 创建 `LESSON`，其中 `because_reason` 要写“为什么原假设错了、正确判断依据是什么”。
-9. 只有当阶段性轨迹本身值得未来继续推进时，才使用 `create_meta_node` 创建 `EPISODE`。
-10. 只有当日志中存在清晰的因果关系时，才使用 `create_graph_node` 与 `create_node_edge` 构建图谱。
-
-[可用工具]
-- record_context_node: 创建 CONTEXT 环境事实节点
-- record_lesson_node: 创建 LESSON 经验原则节点
-- create_meta_node: 创建 ASSET / EPISODE 元信息节点
-- create_graph_node: 创建节点
-- create_node_edge: 创建边
-- search_knowledge_nodes: 查重
-- delete_node: 删错误节点
+[metadata_signature]
+为每个节点写精准的签名——只填该节点实际涉及的值，不要堆砌。
+核心字段：os_family, runtime, language, framework, task_kind, error_kind, target_kind, environment_scope。
+也可以发明自定义维度。validation_status 只有命令输出/日志明确证实时才填 validated，否则用 unverified。
 """
         c_messages = [Message(role=MessageRole.SYSTEM, content=reflection_system_prompt)]
         
-        c_tool_names = ["search_knowledge_nodes", "record_context_node", "record_lesson_node", "create_meta_node", "create_graph_node", "create_node_edge", "delete_node"]
+        c_tool_names = ["search_knowledge_nodes", "record_context_node", "record_lesson_node", "create_meta_node", "create_graph_node", "create_node_edge", "delete_node", "record_tool_node"]
         c_tools = [self.tools.get(n) for n in c_tool_names if self.tools.get(n)]
         c_schema = [t.to_schema() for t in c_tools]
         
-        for _ in range(30):
+        for _ in range(max_iter):
             try:
                 response = await self.provider.chat(
                     messages=[m.to_dict() for m in c_messages],
                     tools=c_schema,
                     stream=False
                 )
+                self._update_metrics(response, phase="C")
                 
                 content = response.content
                 tool_calls = response.tool_calls
@@ -990,8 +1018,112 @@ class V4Loop:
                     
                     c_messages.append(Message(role=MessageRole.TOOL, content=res, tool_call_id=tc.id, name=tc.name))
             except Exception as e:
-                logger.error(f"Reflection step failed: {e}")
-                break
+                logger.error(f"Reflection step failed (continuing): {e}")
+                _c_consecutive_errors = getattr(self, '_c_consecutive_errors', 0) + 1
+                if _c_consecutive_errors >= 3:
+                    logger.warning("C-Phase: 3 consecutive errors, stopping.")
+                    break
+                self._c_consecutive_errors = _c_consecutive_errors
+                continue
+        
+        logger.info(f"C-Process finished. c_tokens={self.metrics.c_tokens}, total={self.metrics.total_tokens}")
+        await self._safe_callback(step_callback, "c_phase_done", {"mode": mode, "c_tokens": self.metrics.c_tokens})
+
+    # ─── 蒸发机制 ─────────────────────────────────────────────────────
+    
+    def _evaporate_op_messages(self):
+        """
+        蒸发 Op-Process 中旧的 TOOL 消息。
+        
+        原理：
+        - LLM 的 ASSISTANT 回复已隐式总结了上一轮 TOOL 输出的关键信息
+        - 因此在 LLM 处理完 TOOL 结果后，原文可以安全地"蒸发"为存根
+        - 这不是截断：信息已被 LLM 消化，存根只是标记"发生过什么"
+        
+        策略：
+        - 保留最近 2 轮的完整 TOOL 消息（LLM 可能还在引用它们）
+        - 更早的 TOOL 消息压缩为单行存根
+        """
+        if len(self.op_messages) <= 5:
+            return  # 消息太少，无需蒸发
+        
+        # 找出所有 TOOL 消息的索引
+        tool_indices = [i for i, m in enumerate(self.op_messages) if m.role == MessageRole.TOOL]
+        
+        if len(tool_indices) <= 2:
+            return  # TOOL 消息太少，无需蒸发
+        
+        # 保留最后 2 条 TOOL 消息的完整内容
+        keep_indices = set(tool_indices[-2:])
+        
+        for idx in tool_indices:
+            if idx in keep_indices:
+                continue
+            
+            msg = self.op_messages[idx]
+            content_len = len(str(msg.content or ""))
+            
+            # 只有足够长的消息才值得蒸发
+            if content_len < 500:
+                continue
+            
+            # 创建存根：保留工具名和长度信息
+            stub_content = f"[{msg.name}: 已处理, {content_len}字符]"
+            
+            # 原地替换为存根
+            self.op_messages[idx] = Message(
+                role=MessageRole.TOOL,
+                content=stub_content,
+                tool_call_id=msg.tool_call_id,
+                name=msg.name
+            )
+        
+        # 记录蒸发效果
+        total_chars = sum(len(str(m.content or "")) for m in self.op_messages)
+        logger.debug(f"Op蒸发: {len(tool_indices) - 2} 条TOOL消息已压缩, 剩余上下文约 {total_chars} 字符")
+
+    def _evaporate_g_messages(self):
+        """
+        蒸发 G-Process 中旧的 TOOL 消息（搜索结果、Op 返回）。
+        
+        与 Op 蒸发对称：G 的 ASSISTANT 回复已隐式消化了旧 TOOL 输出，
+        因此旧的大体积 TOOL 消息可以安全压缩为存根。
+        """
+        if len(self.g_messages) <= 6:
+            return
+        
+        # 找出所有 TOOL 消息的索引（跳过 index 0=SYSTEM, 1=USER）
+        tool_indices = [i for i, m in enumerate(self.g_messages) if m.role == MessageRole.TOOL and i >= 2]
+        
+        if len(tool_indices) <= 2:
+            return
+        
+        # 保留最后 2 条 TOOL 消息的完整内容
+        keep_indices = set(tool_indices[-2:])
+        evaporated = 0
+        
+        for idx in tool_indices:
+            if idx in keep_indices:
+                continue
+            
+            msg = self.g_messages[idx]
+            content_len = len(str(msg.content or ""))
+            
+            if content_len < 500:
+                continue
+            
+            stub_content = f"[{msg.name or 'tool'}: 已处理, {content_len}字符]"
+            self.g_messages[idx] = Message(
+                role=MessageRole.TOOL,
+                content=stub_content,
+                tool_call_id=msg.tool_call_id,
+                name=msg.name
+            )
+            evaporated += 1
+        
+        if evaporated:
+            total_chars = sum(len(str(m.content or "")) for m in self.g_messages)
+            logger.debug(f"G蒸发: {evaporated} 条TOOL消息已压缩, 剩余上下文约 {total_chars} 字符")
 
     def _save_memory(self, agent_response: str):
         """保存本次对话到短期记忆"""
@@ -1003,11 +1135,18 @@ class V4Loop:
         except Exception as e:
             logger.error(f"Failed to save memory: {e}")
 
-    def _update_metrics(self, response: Any):
+    def _update_metrics(self, response: Any, phase: str = "G"):
+        tokens = response.input_tokens + response.output_tokens
         self.metrics.input_tokens += response.input_tokens
         self.metrics.output_tokens += response.output_tokens
         self.metrics.total_tokens += response.total_tokens
         self.metrics.iterations += 1
+        if phase == "G":
+            self.metrics.g_tokens += tokens
+        elif phase == "Op":
+            self.metrics.op_tokens += tokens
+        elif phase == "C":
+            self.metrics.c_tokens += tokens
 
     async def _safe_callback(self, callback, event, data):
         """安全调用回调"""

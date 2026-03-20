@@ -21,55 +21,32 @@ class KnowledgeVerifier:
     
     def __init__(self, use_free_pool_only: bool = True):
         self.config = ConfigManager()
-        self.vault = NodeVault()
+        self.vault = NodeVault(skip_vector_engine=True)
         self.provider = self._init_provider(use_free_pool_only)
         
     def _init_provider(self, use_free_pool_only: bool):
-        from genesis.providers.cloud_providers import _build_qianfan, _build_zhipu, _build_siliconflow, _build_deepseek, _build_groq, _build_cloudflare, _build_zen
-        import os
-        
-        qianfan_key = os.environ.get("QIANFAN_API_KEY")
-        zhipu_key = os.environ.get("ZHIPU_API_KEY")
-        sf_key = os.environ.get("SILICONFLOW_API_KEY")
-        ds_key = os.environ.get("DEEPSEEK_API_KEY")
-        groq_key = os.environ.get("GROQ_API_KEY")
-        cf_key = os.environ.get("CLOUDFLARE_API_KEY")
-        zen_key = os.environ.get("ZEN_API_KEY")
-        
-        if groq_key:
-            self.config._config.groq_api_key = groq_key
-            logger.info("验证池选用廉价提供商: groq")
-            return _build_groq(self.config)
-        elif zen_key:
-            self.config._config.zen_api_key = zen_key
-            logger.info("验证池选用廉价提供商: zen")
-            return _build_zen(self.config)
-        elif cf_key:
-            self.config._config.cloudflare_api_key = cf_key
-            logger.info("验证池选用廉价提供商: cloudflare")
-            return _build_cloudflare(self.config)
-        elif sf_key:
-            self.config._config.siliconflow_api_key = sf_key
-            logger.info("验证池选用廉价提供商: siliconflow")
-            return _build_siliconflow(self.config)
-        elif qianfan_key:
-            self.config._config.qianfan_api_key = qianfan_key
-            logger.info("验证池选用廉价提供商: qianfan")
-            return _build_qianfan(self.config)
-        elif zhipu_key:
-            self.config._config.zhipu_api_key = zhipu_key
-            logger.info("验证池选用廉价提供商: zhipu")
-            return _build_zhipu(self.config)
-        elif ds_key:
-            self.config._config.deepseek_api_key = ds_key
-            logger.info("验证池选用提供商: deepseek")
-            return _build_deepseek(self.config)
-            
-        logger.error("No valid API keys found for verifier")
-        return None
+        router = ProviderRouter(self.config)
+        if use_free_pool_only:
+            free_providers = ["groq", "dashscope", "qianfan", "zhipu", "siliconflow", "cloudflare", "zen"]
+            available = [p for p in free_providers if p in router.providers]
+            if not available:
+                if "deepseek" in router.providers:
+                    logger.warning("验证池无免费提供商，使用 deepseek 兜底。")
+                    router._switch_provider("deepseek")
+                else:
+                    logger.error("No valid providers found for verifier.")
+                    return None
+            else:
+                random.shuffle(available)
+                router.failover_order = available
+                router._switch_provider(available[0])
+                router._preferred_provider_name = available[0]
+                logger.info(f"验证池 failover chain: {' → '.join(available)}")
+        return router
 
     async def verify_cycle(self, limit: int = 3):
         """执行一次验证循环"""
+        self.vault.heartbeat("verifier", "running", "验证循环开始")
         logger.info("=========================================")
         logger.info("🛡️ 知识验证池 (Verification Cycle) 启动")
         logger.info("=========================================")
@@ -98,6 +75,7 @@ class KnowledgeVerifier:
             
         logger.info("=========================================")
         logger.info("🏁 验证循环完成。")
+        self.vault.heartbeat("verifier", "idle", f"verified {len(candidates)} nodes")
         logger.info("=========================================")
 
     async def _verify_single_node(self, node: Dict[str, Any]):

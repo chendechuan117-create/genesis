@@ -2,7 +2,7 @@ import logging
 import json
 from typing import Dict, Any, List
 from genesis.core.base import Tool
-from genesis.v4.manager import NodeVault, METADATA_SIGNATURE_FIELDS
+from genesis.v4.manager import NodeVault, METADATA_SIGNATURE_FIELDS, TRUST_TIERS
 
 logger = logging.getLogger(__name__)
 
@@ -10,8 +10,9 @@ logger = logging.getLogger(__name__)
 TRUST_SCHEMA_PROPERTIES = {
     "metadata_signature": {
         "type": "object",
-        "description": "可选的环境/任务签名，例如 os_family, language, framework, runtime, error_kind, task_kind。",
-        "properties": {field: {"type": "string", "description": f"{field} 签名"} for field in METADATA_SIGNATURE_FIELDS}
+        "description": "环境/任务签名。核心字段: os_family, language, framework, runtime, error_kind, task_kind, target_kind, environment_scope, validation_status。也接受任意自定义维度（如 polarity, maturity, user_preference 等），系统会自动保存和检索。",
+        "properties": {field: {"type": "string", "description": f"{field} 签名"} for field in METADATA_SIGNATURE_FIELDS},
+        "additionalProperties": {"type": "string"}
     },
     "confidence_score": {"type": "number", "description": "可选。0-1 之间的弱可信度评分。仅在你有明确把握时填写。"},
     "last_verified_at": {"type": "string", "description": "可选。最近验证时间，建议 ISO 或 'YYYY-MM-DD HH:MM:SS'。"},
@@ -53,8 +54,9 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 },
                 "signature": {
                     "type": "object",
-                    "description": "可选的环境/任务签名过滤条件。只填写你确定的字段，如 os_family, language, framework, runtime, error_kind, task_kind。",
-                    "properties": {field: {"type": "string", "description": f"{field} 过滤条件"} for field in METADATA_SIGNATURE_FIELDS}
+                    "description": "可选的签名过滤条件。核心字段: os_family, language, framework, runtime, error_kind, task_kind。也支持任意自定义维度过滤。",
+                    "properties": {field: {"type": "string", "description": f"{field} 过滤条件"} for field in METADATA_SIGNATURE_FIELDS},
+                    "additionalProperties": {"type": "string"}
                 },
                 "conversation_context": {
                     "type": "string",
@@ -85,6 +87,25 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
         if ntype in ["ACTION", "EVENT", "ENTITY"]:
             return "更适合作为因果背景或图谱补充"
         return "作为背景参考"
+
+    def _metric_score(self, node: Dict[str, Any]) -> float:
+        """UCB 战绩评分：未经测试的节点获得探索加成，随数据积累自然衰减。
+        
+        公式: exploitation + exploration_bonus
+        - exploitation = success_rate (0~1)
+        - exploration_bonus = sqrt(2 * ln(N+1) / (n+1))，N=全局总使用次数，n=该节点使用次数
+        - 未测试节点 ≈ 0.7，经过考验的好节点 > 0.8，失败多的节点 < 0.4
+        """
+        import math
+        success = node.get('usage_success_count', 0) or 0
+        fail = node.get('usage_fail_count', 0) or 0
+        n = success + fail
+        if n == 0:
+            return 0.7  # 探索奖励：给未测试节点显著高于旧版 0.5 的基线
+        exploitation = success / n
+        # 探索项：随 n 增大而衰减，让数据说话
+        exploration = math.sqrt(2.0 * math.log(n + 2) / (n + 1))
+        return min(1.0, exploitation + 0.15 * exploration)
 
     def _type_rank(self, node: Dict[str, Any]) -> int:
         ntype = (node.get("type") or "").upper()
@@ -121,8 +142,9 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
         if not query_signature:
             return 0
         score = 0
-        hard_keys = ["os_family", "runtime", "language", "framework", "environment_scope"]
-        soft_keys = ["task_kind", "target_kind", "error_kind", "validation_status"]
+        hard_keys = {"os_family", "runtime", "language", "framework", "environment_scope"}
+        soft_keys = {"task_kind", "target_kind", "error_kind", "validation_status"}
+        known_keys = hard_keys | soft_keys
         for key in hard_keys:
             query_values = set(self._signature_values(query_signature, key))
             if not query_values:
@@ -139,7 +161,33 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
             node_values = set(self._signature_values(node_signature, key))
             if node_values & query_values:
                 score += 2
+        for key in query_signature:
+            if key in known_keys:
+                continue
+            query_values = set(self._signature_values(query_signature, key))
+            if not query_values:
+                continue
+            node_values = set(self._signature_values(node_signature, key))
+            if node_values & query_values:
+                score += 1
         return score
+
+    # ── 分数融合 (Score Fusion) ──
+    # 加权融合代替元组排序，每个信号归一化后按权重叠加
+    FUSION_WEIGHTS = {"rerank": 0.35, "trust": 0.25, "metric": 0.20, "signature": 0.20}
+
+    def _fusion_score(self, row: Dict[str, Any], max_sig: float = 1.0) -> float:
+        w = self.FUSION_WEIGHTS
+        rerank = min(1.0, max(0.0, row.get('rerank_score', 0.0) or 0.0))
+        reliability = row.get('reliability') or {}
+        trust_raw = reliability.get('trust_score', 0.0)
+        trust = min(1.0, max(0.0, trust_raw / 10.0))  # trust_score 范围 ~0-10 归一化
+        metric = self._metric_score(row)
+        sig_raw = row.get('signature_match_score', 0)
+        sig = min(1.0, max(0.0, sig_raw / max(max_sig, 1.0))) if max_sig > 0 else 0.0
+        fused = w["rerank"] * rerank + w["trust"] * trust + w["metric"] * metric + w["signature"] * sig
+        row['fusion_score'] = round(fused, 4)
+        return fused
 
     async def execute(self, keywords: List[str], ntype: str = "ALL", signature: Dict[str, Any] = None, conversation_context: str = None) -> str:
         try:
@@ -165,7 +213,7 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
 
             conn = self.vault._conn
             with conn:
-                query = "SELECT node_id, type, title, tags, prerequisites, resolves, metadata_signature, usage_count, usage_success_count, usage_fail_count, confidence_score, last_verified_at, verification_source, updated_at FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%'"
+                query = "SELECT node_id, type, title, tags, prerequisites, resolves, metadata_signature, usage_count, usage_success_count, usage_fail_count, confidence_score, last_verified_at, verification_source, updated_at, trust_tier FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%'"
                 params = []
 
                 if ntype != "ALL":
@@ -194,7 +242,7 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     if conditions:
                         query += " AND (" + " OR ".join(conditions) + ")"
 
-                query += " ORDER BY usage_count DESC LIMIT ?"
+                query += " ORDER BY updated_at DESC LIMIT ?"
                 params.append(40 if normalized_signature else 15)
                 rows = conn.execute(query, tuple(params)).fetchall()
 
@@ -210,22 +258,38 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                         sig_text = self.vault.render_metadata_signature(normalized_signature)
                         return f"⚠️ [签名过滤后未命中] 未找到同时满足关键词 {keywords} 与签名 {sig_text} 的 {ntype} 节点。建议放宽部分硬环境约束后重试。"
                 row_dicts = self.vault.vector_engine.rerank(query_str, row_dicts)
+                # 批量预取所有 prerequisite 节点签名（1 次 SQL 代替 N 次）
+                all_prereq_node_ids = set()
+                for row in row_dicts:
+                    prereq_str = (row.get('prerequisites') or '').strip()
+                    if prereq_str:
+                        for pid in prereq_str.split(','):
+                            pid = pid.strip()
+                            if pid:
+                                all_prereq_node_ids.add(pid)
+                prereq_briefs = self.vault.get_node_briefs(list(all_prereq_node_ids)) if all_prereq_node_ids else {}
                 for row in row_dicts:
                     parsed_signature = self.vault.parse_metadata_signature(row.get('metadata_signature'))
                     row['signature_text'] = self.vault.render_metadata_signature(parsed_signature)
                     row['signature_match_score'] = self._signature_score(parsed_signature, normalized_signature)
-                    closure_signature = self.vault.expand_signature_from_node_ids([row['node_id']])
-                    row['signature_closure_text'] = self.vault.render_metadata_signature(closure_signature)
+                    # 构建 closure signature：自身签名 + prerequisite 签名（无额外 SQL）
+                    closure_sigs = [parsed_signature] if parsed_signature else []
+                    prereq_str = (row.get('prerequisites') or '').strip()
+                    if prereq_str:
+                        for pid in prereq_str.split(','):
+                            pid = pid.strip()
+                            pb = prereq_briefs.get(pid)
+                            if pb and pb.get('metadata_signature'):
+                                closure_sigs.append(self.vault.parse_metadata_signature(pb['metadata_signature']))
+                    row['signature_closure_text'] = self.vault.render_metadata_signature(
+                        self.vault.merge_metadata_signatures(*closure_sigs) if closure_sigs else {}
+                    )
                     row['reliability'] = self.vault.build_reliability_profile(row)
-                row_dicts.sort(
-                    key=lambda r: (
-                        r.get('signature_match_score', 0),
-                        (r.get('reliability') or {}).get('trust_score', 0.0),
-                        r.get('rerank_score', 0.0) or 0.0,
-                        r.get('usage_count', 0) or 0
-                    ),
-                    reverse=True
-                )
+                # 分数融合：加权排序代替元组排序
+                max_sig = max((r.get('signature_match_score', 0) for r in row_dicts), default=1) or 1
+                for r in row_dicts:
+                    self._fusion_score(r, max_sig=max_sig)
+                row_dicts.sort(key=lambda r: r.get('fusion_score', 0.0), reverse=True)
                 
                 # === Graph Walk (V4.3 Experience Graph) ===
                 # 顺藤摸瓜：基于图谱关系扩展上下文
@@ -282,17 +346,13 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     key=lambda r: (
                         0 if self._active_bucket(r) == "recommended" else 1,
                         self._type_rank(r),
-                        -((r.get('reliability') or {}).get('trust_score', 0.0)),
-                        -(r.get('rerank_score', 0.0) or 0.0),
-                        -(r.get('usage_count', 0) or 0)
+                        -(r.get('fusion_score', 0.0)),
                     )
                 )
                 support_rows.sort(
                     key=lambda r: (
                         self._type_rank(r),
-                        -((r.get('reliability') or {}).get('trust_score', 0.0)),
-                        -(r.get('rerank_score', 0.0) or 0.0),
-                        -(r.get('usage_count', 0) or 0)
+                        -(r.get('fusion_score', 0.0)),
                     )
                 )
 
@@ -347,13 +407,15 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     sig = f" | sig:{r.get('signature_text', '')}" if r.get('signature_text') else ""
                     sig_score = f" | sig_score:{r.get('signature_match_score', 0)}" if normalized_signature else ""
                     reliability = r.get('reliability') or {}
+                    tier_label = f" | tier:{reliability.get('trust_tier', r.get('trust_tier', ''))}" if reliability.get('trust_tier') or r.get('trust_tier') else ""
                     trust = f" | trust:{reliability.get('trust_score', 0):.1f}" if reliability else ""
                     conf = f" | conf:{reliability.get('confidence_score', 0):.2f}" if reliability else ""
                     fresh = f" | fresh:{reliability.get('freshness_label', 'unknown')}" if reliability else ""
                     verify = f" | verify:{reliability.get('validation_status')}" if reliability.get('validation_status') else ""
                     score_label = f" (相关度:{r['rerank_score']:.2f})" if 'rerank_score' in r else ""
+                    fusion = f" | fusion:{r.get('fusion_score', 0):.3f}" if 'fusion_score' in r else ""
                     
-                    lines.append(f"{source_label} <{r['type']}> [{nid}] {r['title']} | tags:{r.get('tags', '')}{reqs}{res}{sig}{sig_score}{trust}{conf}{fresh}{verify}{score_label}")
+                    lines.append(f"{source_label} <{r['type']}> [{nid}] {r['title']} | tags:{r.get('tags', '')}{reqs}{res}{sig}{sig_score}{tier_label}{trust}{conf}{fresh}{verify}{fusion}{score_label}")
                     
                     if nid in graph_context:
                         for rel_line in graph_context[nid]:
@@ -420,7 +482,8 @@ class RecordContextNodeTool(BaseNodeTool):
                 metadata_signature=metadata_signature,
                 confidence_score=confidence_score,
                 last_verified_at=last_verified_at,
-                verification_source=verification_source
+                verification_source=verification_source,
+                trust_tier="REFLECTION"
             )
             return f"✅ CONTEXT节点 [{node_id}] '{title}' 写入/覆盖成功。"
         except Exception as e:
@@ -468,7 +531,6 @@ class RecordLessonNodeTool(BaseNodeTool):
 
     async def execute(self, node_id: str, title: str, trigger_verb: str, trigger_noun: str, trigger_context: str, action_steps: List[str], because_reason: str, prerequisites: List[str] = None, resolves: str = None, metadata_signature: Dict[str, Any] = None, confidence_score: float = None, last_verified_at: str = None, verification_source: str = None) -> str:
         try:
-            # 在 Python 层优雅地组装为 JSON 存储给 Op 读取
             lesson_struct = {
                 "IF_trigger": {
                     "verb": trigger_verb,
@@ -479,9 +541,46 @@ class RecordLessonNodeTool(BaseNodeTool):
                 "BECAUSE_reason": because_reason
             }
             content = json.dumps(lesson_struct, ensure_ascii=False, indent=2)
-
             prereq_str = ",".join(prerequisites) if prerequisites else None
-            
+
+            # === 语义去重：写入前搜索相似 LESSON ===
+            dedup_action = None
+            merged_node_id = None
+            if self.vault.vector_engine.is_ready:
+                query_text = f"{title} {trigger_noun} {trigger_context} {resolves or ''}"
+                similar = self.vault.vector_engine.search(query_text, top_k=3, threshold=0.75)
+                for sim_id, sim_score in similar:
+                    if sim_id == node_id:
+                        continue
+                    # 只对比 LESSON 类型
+                    row = self.vault._conn.execute(
+                        "SELECT type, title FROM knowledge_nodes WHERE node_id = ?", (sim_id,)
+                    ).fetchone()
+                    if not row or row['type'] != 'LESSON':
+                        continue
+                    if sim_score >= 0.85:
+                        # 高度相似：合并到已有节点
+                        dedup_action = "merge"
+                        merged_node_id = sim_id
+                        # 版本链：在覆写前快照旧内容
+                        self.vault._snapshot_if_exists(sim_id)
+                        self.vault._conn.execute(
+                            "UPDATE node_contents SET full_content = ?, source = 'reflection_merged' WHERE node_id = ?",
+                            (content, sim_id)
+                        )
+                        self.vault.promote_node_confidence(sim_id, boost=0.1, max_score=0.95)
+                        self.vault._conn.commit()
+                        logger.info(f"LESSON dedup: merged [{node_id}] into [{sim_id}] (sim={sim_score:.2f})")
+                        break
+                    elif sim_score >= 0.65:
+                        # 中等相似：创建新节点但建立关联边
+                        dedup_action = "relate"
+                        merged_node_id = sim_id
+                        break
+
+            if dedup_action == "merge":
+                return f"♻️ LESSON [{node_id}] 与已有 [{merged_node_id}] 高度相似(>0.85)，已合并更新内容并提升置信度。"
+
             self.vault.create_node(
                 node_id=node_id,
                 ntype="LESSON",
@@ -495,9 +594,15 @@ class RecordLessonNodeTool(BaseNodeTool):
                 metadata_signature=metadata_signature,
                 confidence_score=confidence_score,
                 last_verified_at=last_verified_at,
-                verification_source=verification_source
+                verification_source=verification_source,
+                trust_tier="REFLECTION"
             )
-            return f"✅ LESSON节点 [{node_id}] '{title}' 写入/覆盖成功。带有了关联图谱。"
+
+            if dedup_action == "relate" and merged_node_id:
+                self.vault.add_edge(node_id, merged_node_id, "RELATED_TO", weight=0.7)
+                return f"✅ LESSON节点 [{node_id}] '{title}' 写入成功。检测到相似节点 [{merged_node_id}]，已建立 RELATED_TO 边。"
+
+            return f"✅ LESSON节点 [{node_id}] '{title}' 写入成功。"
         except Exception as e:
             logger.error(f"Lesson node creation failed: {e}")
             return f"Error: {e}"
@@ -543,7 +648,8 @@ class CreateMetaNodeTool(BaseNodeTool):
                 metadata_signature=metadata_signature,
                 confidence_score=confidence_score,
                 last_verified_at=last_verified_at,
-                verification_source=verification_source
+                verification_source=verification_source,
+                trust_tier="REFLECTION"
             )
             return f"✅ {ntype}节点 [{node_id}] 创建成功。"
         except Exception as e:
@@ -574,15 +680,11 @@ class DeleteNodeTool(BaseNodeTool):
 
     async def execute(self, node_id: str) -> str:
         try:
-            # 先删边 (Graph Edges)
-            self.vault._conn.execute("DELETE FROM node_edges WHERE source_id = ? OR target_id = ?", (node_id, node_id))
-            # 再删内容 (Content)
-            self.vault._conn.execute("DELETE FROM node_contents WHERE node_id = ?", (node_id,))
-            # 最后删节点 (Index)
-            self.vault._conn.execute("DELETE FROM knowledge_nodes WHERE node_id = ?", (node_id,))
-            self.vault._conn.commit()
-            logger.info(f"NodeVault: Deleted node [{node_id}] and its edges")
-            return f"✅ 节点 [{node_id}] 及其关联边已删除。"
+            success = self.vault.delete_node(node_id)
+            if success:
+                logger.info(f"NodeVault: Deleted node [{node_id}] and its edges")
+                return f"✅ 节点 [{node_id}] 及其关联边已删除。"
+            return f"Error: delete_node returned False for [{node_id}]"
         except Exception as e:
             logger.error(f"Node deletion failed: {e}")
             return f"Error: {e}"
@@ -627,7 +729,8 @@ class CreateGraphNodeTool(BaseNodeTool):
                 metadata_signature=metadata_signature,
                 confidence_score=confidence_score,
                 last_verified_at=last_verified_at,
-                verification_source=verification_source
+                verification_source=verification_source,
+                trust_tier="REFLECTION"
             )
             return f"✅ {ntype}节点 [{node_id}] 创建成功。"
         except Exception as e:
@@ -714,7 +817,8 @@ class RecordToolNodeTool(BaseNodeTool):
                 metadata_signature=metadata_signature,
                 confidence_score=confidence_score or 0.8,
                 last_verified_at=last_verified_at,
-                verification_source=verification_source
+                verification_source=verification_source,
+                trust_tier="REFLECTION"
             )
             
             logger.info(f"NodeVault: Recorded tool node [{node_id}] - {tool_name}")

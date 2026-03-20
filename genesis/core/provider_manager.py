@@ -5,14 +5,14 @@ import time
 from typing import Dict, Any, List, Optional
 from genesis.core.provider import NativeHTTPProvider, MockLLMProvider
 from genesis.core.registry import provider_registry
-from genesis.core.base import LLMProvider, LLMResponse
+from genesis.core.base import LLMProvider
+from genesis.core.provider import WallClockTimeoutError, LLMResponse
 from genesis.core.tracer import Tracer
 # Ensure providers are loaded
 import genesis.providers
 logger = logging.getLogger(__name__)
 
 # provider_name -> config attribute that must be truthy for it to be valid
-# "antigravity" (local proxy) is always valid, handled separately
 PROVIDER_KEY_MAP = {
     "deepseek": "deepseek_api_key",
     "gemini": "gemini_api_key",
@@ -23,7 +23,9 @@ PROVIDER_KEY_MAP = {
     "dashscope": "dashscope_api_key",
     "qianfan": "qianfan_api_key",
     "zhipu": "zhipu_api_key",
-    "antigravity": "antigravity_key", # Actually local
+    "groq": "groq_api_key",
+    "cloudflare": "cloudflare_api_key",
+    "zen": "zen_api_key"
 }
 
 class ProviderRouter(LLMProvider):
@@ -33,13 +35,20 @@ class ProviderRouter(LLMProvider):
     Implements LLMProvider interface so it can be passed directly to Genesis.
     """
     
+    # 回退探活：failover 后每隔此秒数尝试恢复首选 provider
+    RECOVERY_COOLDOWN_SECS = 60
+
     def __init__(self, config: Any, api_key: str = None, base_url: str = None, model: str = None):
         self.config = config
         self.providers: Dict[str, Any] = {}
         self.active_provider_name = 'antigravity'
+        self._preferred_provider_name: Optional[str] = None  # 首选 provider
+        self._failover_time: float = 0  # 上次 failover 时间戳
+        self._last_recovery_attempt: float = 0  # 上次探活时间戳
         
         self._initialize_providers(api_key, base_url, model)
         self.active_provider = self.providers.get(self.active_provider_name)
+        self._preferred_provider_name = self.active_provider_name
         
         # Fallback if preferred provider not available
         if not self.active_provider:
@@ -68,11 +77,10 @@ class ProviderRouter(LLMProvider):
                 if name == "deepseek" and api_key:
                     provider_instance.api_key = api_key
                 
-                # Validate: key-based providers need their config key; local proxy always valid
+                # Validate: each provider needs its OWN config key
                 required_attr = PROVIDER_KEY_MAP.get(name)
                 is_valid = (
-                    name == "antigravity"
-                    or api_key
+                    (name == "deepseek" and api_key)
                     or (required_attr and getattr(self.config, required_attr, None))
                 )
                 
@@ -84,9 +92,10 @@ class ProviderRouter(LLMProvider):
                 logger.warning(f"Failed to build provider plugin '{name}': {e}")
         
         # Determine Activation & Failover Order
-        self.failover_order = ['gemini', 'deepseek', 'openrouter', 'openai', 'antigravity']
+        # Core Providers: Genesis Body only uses DeepSeek and Gemini
+        self.failover_order = ['deepseek', 'gemini']
         
-        self.active_provider_name = 'antigravity'
+        self.active_provider_name = 'deepseek'
         for name in self.failover_order:
             if name in self.providers:
                 self.active_provider_name = name
@@ -119,6 +128,27 @@ class ProviderRouter(LLMProvider):
 
         t0 = time.time()
 
+        # 回退探活：如果当前不是首选 provider，定期用轻量 ping 尝试恢复
+        if (
+            self._preferred_provider_name
+            and self.active_provider_name != self._preferred_provider_name
+            and self._preferred_provider_name in self.providers
+            and (time.time() - self._last_recovery_attempt) > self.RECOVERY_COOLDOWN_SECS
+        ):
+            self._last_recovery_attempt = time.time()
+            try:
+                probe_provider = self.providers[self._preferred_provider_name]
+                _probe_msgs = [{"role": "user", "content": "ping"}]
+                _probe_kwargs = {k: v for k, v in kwargs.items() if k not in ("tools", "stream", "stream_callback")}
+                _probe_kwargs["max_tokens"] = 1
+                await probe_provider.chat(messages=_probe_msgs, **_probe_kwargs)
+                # 探活成功，恢复首选（不返回 probe 结果，继续走正常路径用真实消息）
+                self._switch_provider(self._preferred_provider_name)
+                self._failover_time = 0
+                logger.info(f"✅ Provider recovered: back to {self._preferred_provider_name}")
+            except Exception as probe_e:
+                logger.debug(f"Recovery probe to {self._preferred_provider_name} failed: {probe_e}")
+
         # Try active first
         try:
             result = await self.active_provider.chat(messages=messages, **kwargs)
@@ -134,8 +164,11 @@ class ProviderRouter(LLMProvider):
                     has_tool_calls=result.has_tool_calls
                 )
             return result
+        except WallClockTimeoutError:
+            raise  # 总超时不是 provider 故障，直接上抛，不触发 failover
         except Exception as e:
             logger.error(f"Provider {self.active_provider_name} Failed: {e}")
+            self._failover_time = time.time()
             
             # Dynamic Failover
             current_index = -1
@@ -190,11 +223,23 @@ class ProviderRouter(LLMProvider):
 
     def get_consumable_provider(self):
         """Returns the first available cheap/free provider from the consumables pool"""
-        consumable_order = ['sambanova', 'siliconflow', 'dashscope', 'zhipu', 'qianfan']
+        # Consumables Pool: For Scavenger / Fermentation / Background tasks
+        # Prioritize Groq as it is currently verified working
+        consumable_order = [
+            'groq',
+            'siliconflow', 
+            'dashscope', 
+            'zhipu', 
+            'qianfan', 
+            'cloudflare', 
+            'zen', 
+            'sambanova'
+        ]
+        
         for name in consumable_order:
             if name in self.providers:
-                logger.info(f"🧬 Selected Consumable Provider: {name}")
+                # logger.info(f"🧬 Selected Consumable Provider: {name}")
                 return self.providers[name]
                 
-        logger.warning("No Consumable Provider found! Falling back to active provider (May consume premium tokens!)")
-        return self.active_provider
+        logger.warning("No Consumable Provider found! Returning None (refusing to silently consume premium tokens).")
+        return None

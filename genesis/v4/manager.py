@@ -15,6 +15,13 @@ from genesis.v4.vector_engine import VectorEngine
 logger = logging.getLogger(__name__)
 
 DB_PATH = Path.home() / '.nanogenesis' / 'workshop_v4.sqlite'
+
+# ── Trust Tier 出生证系统 ──────────────────────────────────
+# 每个知识节点携带不可伪造的来源水印，决定其初始信任和执行权限。
+TRUST_TIERS = ("HUMAN", "REFLECTION", "FERMENTED", "SCAVENGED", "CONVERSATION")
+TRUST_TIER_RANK = {"HUMAN": 4, "REFLECTION": 3, "FERMENTED": 2, "SCAVENGED": 1, "CONVERSATION": 0}
+TOOL_EXEC_MIN_TIER = "REFLECTION"  # TOOL 节点 exec() 最低信任等级
+
 METADATA_SIGNATURE_FIELDS = [
     "os_family",
     "runtime",
@@ -32,13 +39,13 @@ class NodeVault:
     """万物皆节点库 — 双层架构（索引 + 内容）, 单例模式"""
     _instance = None
     
-    def __new__(cls, db_path: Path = DB_PATH):
+    def __new__(cls, *args, **kwargs):
         if cls._instance is None:
             cls._instance = super(NodeVault, cls).__new__(cls)
             cls._instance._initialized = False
         return cls._instance
     
-    def __init__(self, db_path: Path = DB_PATH):
+    def __init__(self, db_path: Path = DB_PATH, skip_vector_engine: bool = False):
         if self._initialized:
             return
         self.db_path = db_path
@@ -52,15 +59,59 @@ class NodeVault:
         self._ensure_schema()
         self._migrate_old_data()
         
-        # 启动并加载向量引擎
-        self.vector_engine = VectorEngine()
-        self.vector_engine.initialize()
-        self._load_embeddings_to_memory()
+        # 启动并加载向量引擎（守护进程可跳过以节省内存和启动时间）
+        if skip_vector_engine:
+            self.vector_engine = VectorEngine()  # 空壳，is_ready=False
+            self._last_matrix_sync = "2000-01-01 00:00:00"
+            logger.info("NodeVault: skip_vector_engine=True, 跳过嵌入模型加载")
+        else:
+            self.vector_engine = VectorEngine()
+            self.vector_engine.initialize()
+            self._load_embeddings_to_memory()
+            self._last_matrix_sync: str = self._get_db_now()
         self._initialized = True
+
+    def _get_db_now(self) -> str:
+        """SQLite CURRENT_TIMESTAMP 的 Python 等价"""
+        row = self._conn.execute("SELECT datetime('now')").fetchone()
+        return row[0] if row else "2000-01-01 00:00:00"
 
     def _load_embeddings_to_memory(self):
         rows = self._conn.execute("SELECT node_id, embedding FROM knowledge_nodes WHERE embedding IS NOT NULL AND node_id NOT LIKE 'MEM_CONV%'").fetchall()
         self.vector_engine.load_matrix([dict(r) for r in rows])
+
+    def sync_vector_matrix_incremental(self) -> int:
+        """
+        心跳驱动的增量同步：只加载上次同步以来新增/更新的向量。
+        解决跨进程不同步：Scavenger/Fermentor 写入的新节点向量
+        能被主循环进程及时看到，而不需要重启。
+        返回同步的节点数。
+        """
+        if not self.vector_engine or not self.vector_engine.is_ready:
+            return 0
+        rows = self._conn.execute(
+            "SELECT node_id, embedding FROM knowledge_nodes "
+            "WHERE embedding IS NOT NULL AND node_id NOT LIKE 'MEM_CONV%' "
+            "AND updated_at > ?",
+            (self._last_matrix_sync,)
+        ).fetchall()
+        if not rows:
+            return 0
+        import json as _json
+        items = []
+        for r in rows:
+            try:
+                vec = _json.loads(r['embedding'])
+                items.append((r['node_id'], vec))
+            except Exception:
+                pass
+        if items:
+            self.vector_engine.add_to_matrix_batch(items)
+        synced = len(items)
+        self._last_matrix_sync = self._get_db_now()
+        if synced:
+            logger.debug(f"VectorSync: 增量同步 {synced} 个向量 (since {self._last_matrix_sync})")
+        return synced
         
     def _ensure_schema(self):
         """建立双层表结构 + 图谱边表"""
@@ -97,18 +148,54 @@ class NodeVault:
             ('usage_fail_count', 'INTEGER DEFAULT 0'),
             ('confidence_score', 'REAL DEFAULT 0.55'),
             ('last_verified_at', 'TIMESTAMP'),
-            ('verification_source', 'TEXT')
+            ('verification_source', 'TEXT'),
+            ('trust_tier', 'TEXT DEFAULT \'REFLECTION\'')
         ]:
             try:
                 conn.execute(f"ALTER TABLE knowledge_nodes ADD COLUMN {col[0]} {col[1]}")
             except sqlite3.OperationalError:
                 pass
+        # 回填 trust_tier：根据 verification_source 推断历史节点的出生证
+        try:
+            conn.execute("UPDATE knowledge_nodes SET trust_tier = 'SCAVENGED' WHERE trust_tier IS NULL AND verification_source LIKE '%scavenger%'")
+            conn.execute("UPDATE knowledge_nodes SET trust_tier = 'FERMENTED' WHERE trust_tier IS NULL AND verification_source LIKE '%ferment%'")
+            conn.execute("UPDATE knowledge_nodes SET trust_tier = 'CONVERSATION' WHERE trust_tier IS NULL AND node_id LIKE 'MEM_CONV%'")
+            conn.execute("UPDATE knowledge_nodes SET trust_tier = 'REFLECTION' WHERE trust_tier IS NULL")
+            conn.commit()
+        except Exception:
+            pass
+        # 心跳水位线：进程间协调表
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS process_heartbeat (
+            process_name TEXT PRIMARY KEY,
+            status TEXT DEFAULT 'idle',
+            last_heartbeat TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_summary TEXT DEFAULT '',
+            pid INTEGER,
+            extra TEXT
+        )
+        ''')
         conn.execute('''
         CREATE TABLE IF NOT EXISTS node_contents (
             node_id TEXT PRIMARY KEY,
             full_content TEXT NOT NULL,
             source TEXT DEFAULT 'system',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (node_id) REFERENCES knowledge_nodes(node_id)
+        )
+        ''')
+        # 版本链：节点编辑历史
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS node_versions (
+            version_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id TEXT NOT NULL,
+            title TEXT,
+            full_content TEXT,
+            metadata_signature TEXT,
+            confidence_score REAL,
+            trust_tier TEXT,
+            source TEXT,
+            snapshot_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (node_id) REFERENCES knowledge_nodes(node_id)
         )
         ''')
@@ -187,26 +274,33 @@ class NodeVault:
 
     @functools.lru_cache(maxsize=256)
     def _normalize_metadata_signature_cached(self, dict_str: str) -> Dict[str, Any]:
-        """Internal cached worker for normalize_metadata_signature."""
+        """Internal cached worker for normalize_metadata_signature.
+        
+        Preserves ALL key-value pairs (known + arbitrary).
+        Known fields (METADATA_SIGNATURE_FIELDS) get standard normalization.
+        Arbitrary fields get basic string normalization.
+        """
         try:
             signature = json.loads(dict_str)
         except Exception:
             return {}
             
         normalized: Dict[str, Any] = {}
-        for key in METADATA_SIGNATURE_FIELDS:
-            value = signature.get(key)
-            if value:
-                if isinstance(value, list):
-                    normalized[key] = value if len(value) > 1 else value[0]
-                elif isinstance(value, str):
-                    item_str = value.strip()
-                    if "," in item_str:
-                        split_values = [part.strip() for part in item_str.split(",") if part.strip()]
-                        if split_values:
-                            normalized[key] = split_values if len(split_values) > 1 else split_values[0]
-                    else:
-                        normalized[key] = item_str
+        for key, value in signature.items():
+            if not value:
+                continue
+            if isinstance(value, list):
+                normalized[key] = value if len(value) > 1 else value[0]
+            elif isinstance(value, str):
+                item_str = value.strip()
+                if "," in item_str:
+                    split_values = [part.strip() for part in item_str.split(",") if part.strip()]
+                    if split_values:
+                        normalized[key] = split_values if len(split_values) > 1 else split_values[0]
+                else:
+                    normalized[key] = item_str
+            else:
+                normalized[key] = value
         return normalized
 
     def normalize_metadata_signature(self, signature: Any) -> Dict[str, Any]:
@@ -232,12 +326,22 @@ class NodeVault:
         if not normalized:
             return ""
         parts = []
+        rendered_keys = set()
         for key in METADATA_SIGNATURE_FIELDS:
             value = normalized.get(key)
             if not value:
                 continue
+            rendered_keys.add(key)
             if isinstance(value, list):
-                parts.append(f"{key}={','.join(value)}")
+                parts.append(f"{key}={','.join(str(v) for v in value)}")
+            else:
+                parts.append(f"{key}={value}")
+        for key in sorted(normalized.keys()):
+            if key in rendered_keys:
+                continue
+            value = normalized[key]
+            if isinstance(value, list):
+                parts.append(f"{key}={','.join(str(v) for v in value)}")
             else:
                 parts.append(f"{key}={value}")
         return " | ".join(parts)
@@ -248,8 +352,7 @@ class NodeVault:
             signature = self.normalize_metadata_signature(raw_signature)
             if not signature:
                 continue
-            for key in METADATA_SIGNATURE_FIELDS:
-                value = signature.get(key)
+            for key, value in signature.items():
                 if not value:
                     continue
                 values = value if isinstance(value, list) else [value]
@@ -471,18 +574,22 @@ class NodeVault:
             parsed = default
         return max(0.0, min(1.0, parsed))
 
-    def _default_confidence_score(self, signature: Dict[str, Any], source: str = "sedimenter") -> float:
+    def _default_confidence_score(self, signature: Dict[str, Any], source: str = "sedimenter", trust_tier: str = "REFLECTION") -> float:
         validation_status = self.normalize_metadata_signature(signature).get("validation_status")
         source_key = (source or "").strip().lower()
+        tier = trust_tier if trust_tier in TRUST_TIERS else "REFLECTION"
+        # trust_tier 基线
+        tier_base = {"HUMAN": 0.85, "REFLECTION": 0.6, "FERMENTED": 0.45, "SCAVENGED": 0.35, "CONVERSATION": 0.5}
+        base = tier_base.get(tier, 0.55)
+        # validation_status 覆盖
         if validation_status == "validated":
-            return 0.85
+            return max(base, 0.85)
         if validation_status == "unverified":
-            return 0.35
+            return min(base, 0.35)
+        # source 微调
         if source_key in ["reflection_meta", "reflection_graph"]:
-            return 0.65
-        if source_key == "reflection":
-            return 0.6
-        return 0.55
+            return max(base, 0.65)
+        return base
 
     def build_reliability_profile(self, row: Dict[str, Any]) -> Dict[str, Any]:
         row_dict = dict(row or {})
@@ -515,7 +622,9 @@ class NodeVault:
                 freshness_score = 0.0
                 freshness_label = "stale"
 
-        trust_score = confidence_score * 6.0 + freshness_score
+        trust_tier = row_dict.get("trust_tier") or "REFLECTION"
+        tier_bonus = {"HUMAN": 2.0, "REFLECTION": 0.5, "FERMENTED": -0.5, "SCAVENGED": -1.5, "CONVERSATION": 0.0}
+        trust_score = confidence_score * 6.0 + freshness_score + tier_bonus.get(trust_tier, 0.0)
         if validation_status == "validated":
             trust_score += 1.5
         elif validation_status == "unverified":
@@ -527,10 +636,79 @@ class NodeVault:
             "freshness_score": round(freshness_score, 3),
             "freshness_days": freshness_days,
             "freshness_label": freshness_label,
+            "trust_tier": trust_tier,
             "validation_status": validation_status,
             "last_verified_at": row_dict.get("last_verified_at") or "",
             "verification_source": row_dict.get("verification_source") or "",
         }
+
+    # ─── 版本链 (Version Chain) ───
+
+    VERSION_KEEP_LIMIT = 5  # 每个节点保留最近 N 个版本
+
+    def _snapshot_if_exists(self, node_id: str):
+        """如果节点已存在，保存当前版本到 node_versions，并 GC 超限旧版本"""
+        try:
+            row = self._conn.execute(
+                "SELECT k.title, c.full_content, k.metadata_signature, k.confidence_score, k.trust_tier, c.source "
+                "FROM knowledge_nodes k LEFT JOIN node_contents c ON k.node_id = c.node_id "
+                "WHERE k.node_id = ?", (node_id,)
+            ).fetchone()
+            if row:
+                self._conn.execute(
+                    "INSERT INTO node_versions (node_id, title, full_content, metadata_signature, confidence_score, trust_tier, source) VALUES (?,?,?,?,?,?,?)",
+                    (node_id, row["title"], row["full_content"], row["metadata_signature"], row["confidence_score"], row["trust_tier"], row["source"])
+                )
+                # Version GC：保留最近 N 个版本，删除更早的
+                self._conn.execute(
+                    "DELETE FROM node_versions WHERE node_id = ? AND version_id NOT IN "
+                    "(SELECT version_id FROM node_versions WHERE node_id = ? ORDER BY snapshot_at DESC LIMIT ?)",
+                    (node_id, node_id, self.VERSION_KEEP_LIMIT)
+                )
+        except Exception as e:
+            logger.debug(f"Version snapshot skipped for {node_id}: {e}")
+
+    def get_node_versions(self, node_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """获取节点的编辑历史（最新在前）"""
+        rows = self._conn.execute(
+            "SELECT version_id, node_id, title, confidence_score, trust_tier, source, snapshot_at FROM node_versions WHERE node_id = ? ORDER BY snapshot_at DESC LIMIT ?",
+            (node_id, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ─── 心跳水位线 (Process Heartbeat) ───
+
+    def heartbeat(self, process_name: str, status: str = "running", summary: str = "", extra: Dict[str, Any] = None):
+        """写入当前进程心跳"""
+        import os
+        extra_json = json.dumps(extra, ensure_ascii=False) if extra else None
+        self._conn.execute(
+            "INSERT OR REPLACE INTO process_heartbeat (process_name, status, last_heartbeat, last_summary, pid, extra) VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?, ?)",
+            (process_name, status, summary, os.getpid(), extra_json)
+        )
+        self._conn.commit()
+
+    def get_heartbeats(self) -> List[Dict[str, Any]]:
+        """读取所有进程心跳状态"""
+        rows = self._conn.execute(
+            "SELECT process_name, status, last_heartbeat, last_summary, pid FROM process_heartbeat ORDER BY last_heartbeat DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_daemon_status_summary(self) -> str:
+        """给 G 的守护进程状态摘要"""
+        beats = self.get_heartbeats()
+        if not beats:
+            return ""
+        lines = ["[守护进程状态]"]
+        for b in beats:
+            ts = b.get("last_heartbeat", "?")
+            name = b.get("process_name", "?")
+            status = b.get("status", "?")
+            summary = b.get("last_summary", "")
+            summary_preview = summary[:80] if summary else ""
+            lines.append(f"- {name}: {status} (last: {ts}) {summary_preview}")
+        return "\n".join(lines)
 
     # ─── Graph RAG 接口 ───
 
@@ -547,12 +725,23 @@ class NodeVault:
             logger.error(f"Failed to add edge: {e}")
 
     def delete_node(self, node_id: str) -> bool:
-        """物理删除一个节点及其内容和连线"""
+        """物理删除一个节点及其所有关联数据（统一删除入口）"""
         try:
             self._conn.execute("DELETE FROM node_edges WHERE source_id = ? OR target_id = ?", (node_id, node_id))
+            self._conn.execute("DELETE FROM node_versions WHERE node_id = ?", (node_id,))
             self._conn.execute("DELETE FROM node_contents WHERE node_id = ?", (node_id,))
             self._conn.execute("DELETE FROM knowledge_nodes WHERE node_id = ?", (node_id,))
             self._conn.commit()
+            # 清理向量引擎内存矩阵
+            if self.vector_engine and node_id in getattr(self.vector_engine, 'node_ids', []):
+                try:
+                    idx = self.vector_engine.node_ids.index(node_id)
+                    self.vector_engine.node_ids.pop(idx)
+                    if self.vector_engine.matrix is not None and len(self.vector_engine.matrix) > idx:
+                        import numpy as np
+                        self.vector_engine.matrix = np.delete(self.vector_engine.matrix, idx, axis=0)
+                except (ValueError, IndexError):
+                    pass
             return True
         except Exception as e:
             logger.error(f"Failed to delete node {node_id}: {e}")
@@ -612,23 +801,47 @@ class NodeVault:
         logger.info(f"NodeVault: Promoted node [{node_id}]. Confidence {current_score:.2f} -> {new_score:.2f}")
         return new_score
 
+    # Trust tier 地板保护：高信任节点的 confidence 不会被 Arena penalty 打到此线以下
+    TIER_MIN_CONFIDENCE = {
+        "CORE": 0.6,
+        "VERIFIED": 0.55,
+        "REFLECTION": 0.1,
+        "SCAVENGED": 0.1,
+        "CONVERSATION": 0.1,
+    }
+
     def decay_node_confidence(self, node_id: str, penalty: float = 0.15, min_score: float = 0.1) -> float:
         """
-        失败惩罚：
-        当一个节点在实际任务中被使用但任务失败，降低其置信度。
-        这是 Knowledge Arena 的核心机制之一——知识节点通过实际使用效果竞争。
+        贝叶斯衰减：
+        penalty 随节点的历史战绩自动减轻。久经考验的知识天然抗衰减（Long-Term Potentiation）。
+        高信任 tier 的节点享有地板保护，永远不会被连坐打到 GC 线以下。
         """
-        row = self._conn.execute("SELECT confidence_score FROM knowledge_nodes WHERE node_id = ?", (node_id,)).fetchone()
+        import math
+        row = self._conn.execute(
+            "SELECT confidence_score, usage_count, usage_success_count, usage_fail_count, trust_tier FROM knowledge_nodes WHERE node_id = ?",
+            (node_id,)
+        ).fetchone()
         if not row:
             return 0.0
         current_score = row[0] if row[0] is not None else 0.5
-        new_score = max(current_score - penalty, min_score)
+        usage_count = row[1] or 0
+        success_count = row[2] or 0
+        fail_count = row[3] or 0
+        trust_tier = row[4] or "REFLECTION"
+        # 贝叶斯衰减：成功率越高、使用次数越多，惩罚越轻
+        total = success_count + fail_count
+        success_ratio = success_count / total if total > 0 else 0.0
+        effective_penalty = penalty / (1.0 + success_ratio * math.log1p(usage_count))
+        # trust tier 地板保护
+        tier_floor = self.TIER_MIN_CONFIDENCE.get(trust_tier, min_score)
+        floor = max(min_score, tier_floor)
+        new_score = max(current_score - effective_penalty, floor)
         self._conn.execute(
             "UPDATE knowledge_nodes SET confidence_score = ?, updated_at = CURRENT_TIMESTAMP WHERE node_id = ?",
             (new_score, node_id)
         )
         self._conn.commit()
-        logger.info(f"NodeVault: Decayed node [{node_id}]. Confidence {current_score:.2f} -> {new_score:.2f}")
+        logger.info(f"NodeVault: Decayed [{node_id}] {current_score:.2f}->{new_score:.2f} (eff_penalty={effective_penalty:.4f}, tier={trust_tier}, usage={usage_count})")
         return new_score
 
     def record_usage_outcome(self, node_ids: List[str], success: bool):
@@ -691,116 +904,49 @@ class NodeVault:
     # ─── G 侧接口 ───
 
     def get_digest(self, top_k: int = 4) -> str:
+        """精简认知目录：类别计数 + 战绩节点 + 待探索节点，消除马太效应"""
         type_rows = self._conn.execute(
-            "SELECT type, COUNT(*) AS cnt FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%' GROUP BY type ORDER BY type ASC"
+            "SELECT type, COUNT(*) AS cnt FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%' GROUP BY type ORDER BY cnt DESC"
         ).fetchall()
         type_counts = {r['type']: r['cnt'] for r in type_rows}
+        total = sum(type_counts.values())
 
-        total_nodes = sum(type_counts.values())
-        total_edges = self._conn.execute("SELECT COUNT(*) FROM node_edges").fetchone()[0]
-        signature_rows = self._conn.execute(
-            "SELECT metadata_signature, confidence_score, last_verified_at, verification_source, updated_at FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%'"
+        # 按战绩排序的 Top 节点（成功率高 + 使用次数多）
+        top_rows = self._conn.execute(
+            """SELECT node_id, type, title, usage_success_count, usage_fail_count
+               FROM knowledge_nodes
+               WHERE node_id NOT LIKE 'MEM_CONV%' AND (usage_success_count > 0 OR usage_count > 2)
+               ORDER BY CAST(usage_success_count AS REAL) / (usage_success_count + usage_fail_count + 1) DESC,
+                        usage_count DESC
+               LIMIT ?""",
+            (top_k,)
         ).fetchall()
-        signature_counts: Dict[str, Dict[str, int]] = {}
-        high_confidence_count = 0
-        validated_count = 0
-        recent_verified_count = 0
-        for row in signature_rows:
-            signature = self.parse_metadata_signature(row['metadata_signature'])
-            reliability = self.build_reliability_profile(dict(row))
-            if reliability['confidence_score'] >= 0.75:
-                high_confidence_count += 1
-            if reliability['validation_status'] == 'validated':
-                validated_count += 1
-            if reliability['last_verified_at'] and (reliability['freshness_days'] is not None and reliability['freshness_days'] <= 30):
-                recent_verified_count += 1
-            for key in ["os_family", "language", "framework", "task_kind", "error_kind"]:
-                value = signature.get(key)
-                if not value:
-                    continue
-                values = value if isinstance(value, list) else [value]
-                if key not in signature_counts:
-                    signature_counts[key] = {}
-                for item in values:
-                    signature_counts[key][item] = signature_counts[key].get(item, 0) + 1
 
-        def highlights(ntype: str, limit: int = 2, order_by: str = "usage_count DESC, updated_at DESC"):
-            rows = self._conn.execute(
-                f"SELECT node_id, title, usage_count FROM knowledge_nodes WHERE type = ? AND node_id NOT LIKE 'MEM_CONV%' ORDER BY {order_by} LIMIT ?",
-                (ntype, limit)
-            ).fetchall()
-            return [dict(r) for r in rows]
+        # 待探索节点：从未使用过、最近创建的高潜力节点（打破马太效应的关键）
+        untested_rows = self._conn.execute(
+            """SELECT node_id, type, title, confidence_score, tags
+               FROM knowledge_nodes
+               WHERE node_id NOT LIKE 'MEM_CONV%'
+                 AND usage_count = 0
+                 AND type IN ('ASSET', 'LESSON', 'CONTEXT')
+               ORDER BY created_at DESC
+               LIMIT ?""",
+            (top_k,)
+        ).fetchall()
 
-        top_contexts = highlights("CONTEXT", limit=2)
-        top_lessons = highlights("LESSON", limit=2)
-        top_assets = highlights("ASSET", limit=2)
-        active_episodes = highlights("EPISODE", limit=2, order_by="updated_at DESC")
-
-        lines = ["[认知摘要 DIGEST]"]
-        lines.append(f"CATALOG: nodes={total_nodes} | edges={total_edges}")
-        lines.append(
-            "KNOWN_INFO: "
-            f"context={type_counts.get('CONTEXT', 0)} | "
-            f"lesson={type_counts.get('LESSON', 0)} | "
-            f"asset={type_counts.get('ASSET', 0)} | "
-            f"episode={type_counts.get('EPISODE', 0)}"
-        )
-        lines.append(
-            "GRAPH: "
-            f"entity={type_counts.get('ENTITY', 0)} | "
-            f"event={type_counts.get('EVENT', 0)} | "
-            f"action={type_counts.get('ACTION', 0)}"
-        )
-        signature_parts = []
-        for key in ["os_family", "language", "framework", "task_kind", "error_kind"]:
-            values = signature_counts.get(key, {})
-            if not values:
-                continue
-            best = sorted(values.items(), key=lambda item: (-item[1], item[0]))[:2]
-            joined = ", ".join([f"{name}({count})" for name, count in best])
-            signature_parts.append(f"{key}={joined}")
-        if signature_parts:
-            lines.append(f"SIGNATURE_HINTS: {' | '.join(signature_parts)}")
-        lines.append(
-            "TRUST: "
-            f"high_conf={high_confidence_count} | "
-            f"validated={validated_count} | "
-            f"recent_verified={recent_verified_count}"
-        )
-        # Knowledge Arena stats
-        arena_rows = self._conn.execute(
-            "SELECT COUNT(*) as total, SUM(usage_success_count) as wins, SUM(usage_fail_count) as losses "
-            "FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%' AND (usage_success_count > 0 OR usage_fail_count > 0)"
-        ).fetchone()
-        if arena_rows and arena_rows['total'] > 0:
-            lines.append(
-                f"ARENA: tested_nodes={arena_rows['total']} | wins={arena_rows['wins'] or 0} | losses={arena_rows['losses'] or 0}"
-            )
-
-        lines.append("TOP_CONTEXT:")
-        if top_contexts:
-            lines.extend([f"- [{r['node_id']}] {r['title']}" for r in top_contexts])
-        else:
-            lines.append("- NONE")
-
-        lines.append("TOP_LESSONS:")
-        if top_lessons:
-            lines.extend([f"- [{r['node_id']}] {r['title']}" for r in top_lessons])
-        else:
-            lines.append("- NONE")
-
-        lines.append("TOP_ASSETS:")
-        if top_assets:
-            lines.extend([f"- [{r['node_id']}] {r['title']}" for r in top_assets])
-        else:
-            lines.append("- NONE")
-
-        lines.append("ACTIVE_EPISODES:")
-        if active_episodes:
-            lines.extend([f"- [{r['node_id']}] {r['title']}" for r in active_episodes])
-        else:
-            lines.append("- NONE")
-
+        cats = " | ".join(f"{t}:{c}" for t, c in type_counts.items() if c > 0)
+        lines = [f"[认知目录] {total}节点 | {cats}"]
+        if top_rows:
+            lines.append("PROVEN:")
+            for r in top_rows:
+                w, l = r['usage_success_count'] or 0, r['usage_fail_count'] or 0
+                lines.append(f"- [{r['node_id']}] <{r['type']}> {r['title']} ({w}W/{l}L)")
+        if untested_rows:
+            lines.append("UNTESTED (从未使用，优先尝试挂载):")
+            for r in untested_rows:
+                conf = r['confidence_score'] or 0.55
+                lines.append(f"- [{r['node_id']}] <{r['type']}> {r['title']} (conf:{conf:.2f})")
+        lines.append("需要细节时请使用 search_knowledge_nodes 搜索。")
         return "\n".join(lines)
 
     def get_all_titles(self) -> str:
@@ -852,7 +998,7 @@ class NodeVault:
             return {}
         placeholders = ','.join('?' * len(node_ids))
         rows = self._conn.execute(
-            f"SELECT node_id, type, title, human_translation, tags, prerequisites, resolves, metadata_signature, usage_count, confidence_score, last_verified_at, verification_source, updated_at FROM knowledge_nodes WHERE node_id IN ({placeholders})",
+            f"SELECT node_id, type, title, human_translation, tags, prerequisites, resolves, metadata_signature, usage_count, confidence_score, last_verified_at, verification_source, updated_at, trust_tier FROM knowledge_nodes WHERE node_id IN ({placeholders})",
             tuple(node_ids)
         ).fetchall()
         return {r['node_id']: dict(r) for r in rows}
@@ -887,16 +1033,18 @@ class NodeVault:
                     metadata_signature: Optional[Dict[str, Any]] = None,
                     confidence_score: Optional[float] = None,
                     last_verified_at: Optional[str] = None,
-                    verification_source: Optional[str] = None):
+                    verification_source: Optional[str] = None,
+                    trust_tier: str = "REFLECTION"):
         """创建一个新的双层节点（索引 + 内容），支持注入因果属性和自动向量化"""
         # 如果是知识类节点，自动计算其向量
         embedding_json = None
         normalized_signature = self.normalize_metadata_signature(metadata_signature)
         signature_json = json.dumps(normalized_signature, ensure_ascii=False) if normalized_signature else None
         signature_text = self.render_metadata_signature(normalized_signature)
+        validated_tier = trust_tier if trust_tier in TRUST_TIERS else "REFLECTION"
         normalized_confidence = self._clamp_confidence_score(
             confidence_score,
-            default=self._default_confidence_score(normalized_signature, source)
+            default=self._default_confidence_score(normalized_signature, source, validated_tier)
         )
         normalized_last_verified = last_verified_at
         if not normalized_last_verified and normalized_signature.get("validation_status") == "validated":
@@ -911,12 +1059,35 @@ class NodeVault:
                 embedding_json = json.dumps(vec)
                 self.vector_engine.add_to_matrix(node_id, vec)
 
+        # 版本链：如果节点已存在，先快照旧版本
+        self._snapshot_if_exists(node_id)
+
         self._conn.execute(
-            "INSERT OR REPLACE INTO knowledge_nodes (node_id, type, title, human_translation, tags, prerequisites, resolves, parent_node_id, metadata_signature, embedding, confidence_score, last_verified_at, verification_source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (node_id, ntype, title, human_translation, tags, prerequisites, resolves, parent_node_id, signature_json, embedding_json, normalized_confidence, normalized_last_verified, normalized_verification_source)
+            """INSERT INTO knowledge_nodes
+               (node_id, type, title, human_translation, tags, prerequisites, resolves,
+                parent_node_id, metadata_signature, embedding, confidence_score,
+                last_verified_at, verification_source, trust_tier)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(node_id) DO UPDATE SET
+                 type=excluded.type, title=excluded.title,
+                 human_translation=excluded.human_translation, tags=excluded.tags,
+                 prerequisites=excluded.prerequisites, resolves=excluded.resolves,
+                 parent_node_id=excluded.parent_node_id,
+                 metadata_signature=excluded.metadata_signature,
+                 embedding=excluded.embedding,
+                 confidence_score=excluded.confidence_score,
+                 last_verified_at=excluded.last_verified_at,
+                 verification_source=excluded.verification_source,
+                 trust_tier=excluded.trust_tier,
+                 updated_at=CURRENT_TIMESTAMP
+            """,
+            (node_id, ntype, title, human_translation, tags, prerequisites, resolves, parent_node_id, signature_json, embedding_json, normalized_confidence, normalized_last_verified, normalized_verification_source, validated_tier)
         )
         self._conn.execute(
-            "INSERT OR REPLACE INTO node_contents (node_id, full_content, source) VALUES (?,?,?)",
+            """INSERT INTO node_contents (node_id, full_content, source) VALUES (?,?,?)
+               ON CONFLICT(node_id) DO UPDATE SET
+                 full_content=excluded.full_content, source=excluded.source
+            """,
             (node_id, full_content, source)
         )
         self._conn.commit()
@@ -988,7 +1159,7 @@ class FactoryManager:
     def __init__(self, vault: NodeVault = None):
         self.vault = vault or NodeVault()
         
-    def build_g_prompt(self, recent_memory: str = "", available_tools_info: str = "", knowledge_digest: str = "", inferred_signature: str = "") -> str:
+    def build_g_prompt(self, recent_memory: str = "", available_tools_info: str = "", knowledge_digest: str = "", inferred_signature: str = "", daemon_status: str = "") -> str:
         """为 G (Thinker) 构建系统提示词"""
         
         digest_block = ""
@@ -1020,55 +1191,28 @@ class FactoryManager:
 {available_tools_info}
 """
 
-        return f"""你是 Genesis 的认知装配师 / 大脑 (G-Process)。
-你的核心使命是通过**主动查阅**知识库，理解用户的真实意图，然后为执行器 (Op-Process) 准备一份包含充足上下文的任务派发书 (Task Payload)。
-当执行器 (Op-Process) 完成任务后，系统会将执行结果返回给你，你需要基于结果和上下文，给用户做出最终的回复。
+        daemon_block = ""
+        if daemon_status:
+            daemon_block = f"""{daemon_status}
+"""
 
-[用户配置]
-- 语言：始终使用简体中文回复
-- 身份：用户是 Genesis 的创造者，偏好直接简洁
+        return f"""你是 Genesis 大脑 (G-Process)。你是缸中之脑——只能思考、搜索知识库、派发任务给执行器 (Op)。
+用简体中文回复。用户是 Genesis 创造者，偏好直接简洁。
 
 {digest_block}
-
 {signature_block}
-
 {memory_block}
-
 {tools_block}
+{daemon_block}
+[工作流]
+Op 没有任何历史上下文。流程：你搜索思考 → dispatch_to_op → Op 执行 → 结果回传给你 → 你综合回复用户。
 
-[工作流指令 - 必读]
-你和 Op (执行器) 是隔离的。Op 没有任何历史上下文，是个纯粹的打工人。
-整个工作流是：你搜索思考 -> 你派发任务给 Op -> Op 在空白环境执行 -> Op 将结果返回给你 -> 你总结给用户。
+检索：先读 DIGEST 建立全局判断。PROVEN 是久经考验的节点；UNTESTED 是尚未使用的新知识——如果看到与任务相关的 UNTESTED 节点，优先尝试挂载（让它们有机会证明自己）。需要细节时用 search_knowledge_nodes 定向搜索。不要为了形式盲目搜索。
+派发：调用 dispatch_to_op(op_intent, active_nodes, instructions)。需要读文件、查日志等侦察任务也必须派发给 Op——你没有任何直接操作现实世界的能力。
+综合：收到 Op 结果后，结合用户原始诉求做最终回复（纯文本，不调工具）。Op 已经执行完了，禁止说"将会执行"。还需更多工作则再次 dispatch。
 
-**阶段一：推理式检索与思考 (G 的工作)**
-1. 先阅读系统提供的 DIGEST（特别是 CATEGORY 分类和 SIGNATURE_HINTS），快速判断当前库里有哪些领域的知识。
-2. **不要盲目进行全量搜索**。如果任务需要特定知识，请先**推断可能存在的类别或领域**，然后有针对性地使用 `search_knowledge_nodes`。
-3. **层级导航**：你可以先进行宽泛的搜索（比如 `ntype="ALL"`, keywords=["Docker"]），观察返回结果中的关联提示（如 `graph:+` 或是相关的子分类），然后再根据需要进一步搜索更具体的子节点。这就像人类翻书一样，先看目录，再看章节，最后读细节。
-4. 如果 DIGEST 已经足够支持判断，你可以直接回答用户，或定向派发 Op，不必为了形式而搜索。
-5. **绝对限制：你只是一个只能思考和搜索数据库的“缸中之脑”。你没有任何修改现实世界的能力（没有文件读写、没有Shell、没有网络）。**
-6. **Op 就是你的终极工具**。当你需要与现实世界交互时，你**必须**把 Op 当作你的“探针”或“机械臂”来使用。
-7. **侦察兵模式 (Reconnaissance Dispatch)**：如果你发现需要读取特定的本地文件才能继续思考，你**必须**派发一个侦察任务给 Op，让 Op 去读取文件，然后在 `[Op-Process 执行完毕]` 后把文件内容带回给你。
-8. 阅读搜索结果时，优先关注 `RECOMMENDED_ACTIVE_NODES`，同时注意它们的 **arena（胜负战绩）** 和 **trust** 评分，优先选择经过实战检验的高分节点。
-
-**阶段二：派发任务 (呼叫子程序 Op)**
-当你收集完信息准备让 Op 开始干活时，请**直接输出以下格式的任务派发书**。
-只要你输出这个格式，系统就会立刻挂起你的运行，并将里面的内容交给 Op 去执行。
-系统可能会对 `ACTIVE_NODES` 做一次轻量审查；如果你收到 `[Dispatch Review]`，优先修正派发书。如果你确认当前派发是有意为之，可以重新输出 `dispatch`，并让 `INSTRUCTIONS:` 第一行以 `[REVIEW_OVERRIDE]` 开头说明理由。
-
-```dispatch
-OP_INTENT: <对 Op 目标的简短明确指令>
-ACTIVE_NODES: <你需要挂载给 Op 参考的节点ID列表，用逗号分隔，如 CTX_XXX, LESSON_XXX, ASSET_XXX。如果没有则写 NONE>
-INSTRUCTIONS:
-<给 Op 的具体执行建议或上下文信息。写清楚你想让 Op 怎么做。
-注意：如果是“侦察任务”，请在这里明确告诉 Op：“读取 XXX 文件，并将文件内容通过总结直接返回给我”。>
-```
-
-**阶段三：综合与最终回复 (总结)**
-当 Op 执行完毕后，你会收到一条包含 `[Op-Process 执行完毕]` 的系统消息。
-此时，你需要结合用户的最初诉求、你的历史上下文以及 Op 的执行结果，决定下一步：
-1. 如果任务已经足够完成，直接向用户输出最终的自然语言回复。
-2. 如果还需要进一步执行，请重新输出新的 `dispatch` 任务书，再次调用 Op 子程序。
-3. 最终回复时，不要机械复读 Op 的原文，而要做真正的综合、解释与取舍。
+收到 [Dispatch Review] 时优先修正；确认无误则 instructions 首行写 [REVIEW_OVERRIDE] 并说明理由。
+最终回复要综合取舍，不要机械复读 Op 原文。
 """
 
     def build_op_prompt(self, task_payload: dict) -> str:
@@ -1087,46 +1231,39 @@ INSTRUCTIONS:
                 for nid, text in node_contents.items():
                     injection_text += f"--- NODE: {nid} ---\n{text}\n"
 
-        return f"""你是 Genesis 的执行器 (Op-Process)。
-你的核心使命是**只管干活**。你不需要知道复杂的历史背景，你只需要根据大脑 (G) 分配给你的目标和参考资料，利用你手头的工具完成任务。
+        return f"""你是 Genesis 执行器 (Op-Process)。只管干活，不需要历史背景。
+用简体中文回复。
 
-[用户配置]
-- 语言：始终使用简体中文回复
+[任务]
+目标: {op_intent}
 
-[G 派发的任务]
-**目标 (OP_INTENT):** {op_intent}
-
-**执行建议 (INSTRUCTIONS):**
+执行建议:
 {instructions}
 {injection_text}
 
-[工作流指令 - 必读]
-1. 立即开始使用你的工具（如 Shell、File、Web 等）执行上述目标。
-2. 遇到问题时，根据报错信息自行调整重试。
-3. **你的双重身份**：你有时候是被叫来“修改代码/执行命令”的，有时候是被叫来“当侦察兵去读取特定文件内容”的。仔细阅读 G 的指令。
-4. 你不是直接面向用户回复的人。你是 G 调用的子程序，最终只需要向 G 回传结构化报告。
-5. 如果 G 让你去“读取文件”或“调查某个环境”，你**必须**在 `SUMMARY` 或 `FINDINGS` 里把你读到的关键内容、代码片段或调查结果直接写出来，否则 G 依然什么都看不到！
-6. 当你认为任务已经彻底完成、阶段性完成、或穷尽方法依然失败时，必须输出如下格式的执行报告，不要输出面向用户的寒暄或总结：
+[规则]
+1. 立即用工具（Shell、File、Web 等）执行目标。遇到报错自行调整重试。
+2. 你可能是来执行命令的，也可能是来当侦察兵读取文件的——仔细看 G 的指令。
+3. 你是 G 调用的子程序，不直接面向用户。侦察任务必须在 FINDINGS 里写出读到的关键内容，否则 G 看不到。
+4. 任务完成、阶段性完成、或穷尽方法失败时，输出执行报告：
 
 ```op_result
 STATUS: SUCCESS | PARTIAL | FAILED
 SUMMARY:
-<一句话或一小段，说明这次执行达成了什么、没达成什么>
+<达成了什么、没达成什么>
 
 FINDINGS:
-<如果这是一次侦察任务（如读取文件、查看日志），在这里输出你找到的具体内容片段、配置值或日志全文。如果是纯执行任务，写 NONE>
+<侦察结果（文件内容/日志/配置），纯执行任务写 NONE>
 
 CHANGES_MADE:
-- <本轮实际做出的修改、执行过的关键动作；如果没有写 NONE>
+- <实际修改/关键动作，没有写 NONE>
 
 ARTIFACTS:
-- <生成或修改的文件、脚本、配置、产物路径；如果没有写 NONE>
+- <生成或修改的文件路径，没有写 NONE>
 
 OPEN_QUESTIONS:
-- <仍未解决的问题、风险、需要 G 决策的点；如果没有写 NONE>
+- <未解决问题/需要 G 决策的点，没有写 NONE>
 ```
-
-7. 如果某一项为空，明确写 `NONE`。
 """
 
     def render_op_result_for_g(self, op_result: dict) -> str:
@@ -1231,7 +1368,8 @@ class NodeManagementTools:
             human_translation=f"对话记忆 ({ts})",
             tags="memory,conversation,episode",
             full_content=memory_content,
-            source="conversation"
+            source="conversation",
+            trust_tier="CONVERSATION"
         )
         logger.info(f"NodeManagement: Stored conversation → [{node_id}]")
         self._cleanup_old_memories()
@@ -1257,9 +1395,8 @@ class NodeManagementTools:
             to_delete = [row[0] for row in del_cursor.fetchall()]
 
             if to_delete:
-                conn.execute(f"DELETE FROM knowledge_nodes WHERE node_id LIKE 'MEM_CONV_%' AND node_id NOT IN ({placeholders})", tuple(keep_ids))
-                conn.execute(f"DELETE FROM node_contents WHERE node_id LIKE 'MEM_CONV_%' AND node_id NOT IN ({placeholders})", tuple(keep_ids))
-                conn.commit()
+                for nid in to_delete:
+                    self.vault.delete_node(nid)
                 logger.info(f"NodeManagement: Memory sliding window purged {len(to_delete)} old conversations.")
         except Exception as e:
             logger.error(f"Failed to cleanup old memories: {e}")

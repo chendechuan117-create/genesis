@@ -43,7 +43,7 @@ logger = logging.getLogger("Scavenger")
 class ScavengerDaemon:
     def __init__(self, use_free_pool_only: bool = True, use_browser_tool: bool = True):
         self.config = ConfigManager().config
-        self.vault = NodeVault()
+        self.vault = NodeVault(skip_vector_engine=True)
         
         # Tools for foraging
         self.search_tool = WebSearchTool()
@@ -67,7 +67,7 @@ class ScavengerDaemon:
     def _init_provider(self, use_free_pool_only: bool) -> ProviderRouter:
         router = ProviderRouter(self.config)
         if use_free_pool_only:
-            free_providers = ["siliconflow", "dashscope", "qianfan", "zhipu", "groq", "cloudflare", "zen"]
+            free_providers = ["groq", "dashscope", "qianfan", "zhipu", "siliconflow", "cloudflare", "zen"]
             available = [p for p in free_providers if p in router.providers]
             
             if not available:
@@ -78,12 +78,15 @@ class ScavengerDaemon:
                     logger.error("No valid providers found for Scavenger.")
                     sys.exit(1)
             else:
-                chosen = random.choice(available)
-                logger.info(f"Using Free/Cheap Provider: {chosen}")
-                router._switch_provider(chosen)
+                random.shuffle(available)
+                router.failover_order = available
+                router._switch_provider(available[0])
+                router._preferred_provider_name = available[0]
+                logger.info(f"Free pool failover chain: {' → '.join(available)}")
         return router
 
     async def run_cycle(self):
+        self.vault.heartbeat("scavenger", "running", "远征开始")
         logger.info("=========================================")
         logger.info("🎒 拾荒者 (Scavenger) 开启新的远征")
         logger.info("=========================================")
@@ -120,11 +123,13 @@ class ScavengerDaemon:
         logger.info("=========================================")
         logger.info("🏕️ 远征结束，返回营地休整。")
         logger.info("=========================================")
+        self.vault.heartbeat("scavenger", "idle", "远征完成")
 
     def _pick_seed_node(self) -> Optional[Dict[str, Any]]:
         cursor = self.vault._conn.execute("""
-            SELECT k.node_id, k.title, k.content, k.ntype, k.confidence_score
+            SELECT k.node_id, k.title, nc.full_content AS content, k.type, k.confidence_score
             FROM knowledge_nodes k
+            LEFT JOIN node_contents nc ON k.node_id = nc.node_id
             WHERE k.confidence_score >= 0.7
             ORDER BY RANDOM()
             LIMIT 1
@@ -135,7 +140,7 @@ class ScavengerDaemon:
                 'node_id': row[0],
                 'title': row[1],
                 'content': row[2],
-                'ntype': row[3],
+                'type': row[3],
                 'confidence_score': row[4]
             }
         return None
@@ -340,9 +345,9 @@ class ScavengerDaemon:
                 existing_sig = self.vault.parse_metadata_signature(row[1]) if row[1] else {}
                 existing_sig['validation_status'] = 'unverified'
                 sig_json = json.dumps(existing_sig, ensure_ascii=False)
-                # 降低置信度 (0.4)，标记来源，标记为未验证
+                # 降低置信度 (0.4)，标记来源，标记为未验证，盖上 SCAVENGED 出生证
                 self.vault._conn.execute(
-                    "UPDATE knowledge_nodes SET confidence_score = 0.4, verification_source = ?, metadata_signature = ? WHERE node_id = ?",
+                    "UPDATE knowledge_nodes SET confidence_score = 0.4, verification_source = ?, metadata_signature = ?, trust_tier = 'SCAVENGED' WHERE node_id = ?",
                     (f"scavenger_bot ({url})", sig_json, new_id)
                 )
                 # 建立关联：此知识是从 seed 发散出来的
