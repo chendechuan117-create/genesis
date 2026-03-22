@@ -1,12 +1,11 @@
 import sys, os; sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import asyncio
 import logging
-import random
 import time
 from typing import Dict, Any, List
 
 from genesis.core.config import ConfigManager
-from genesis.core.provider_manager import ProviderRouter
+from genesis.core.provider_manager import ProviderRouter, FreePoolManager
 from genesis.core.base import Message, MessageRole
 from genesis.v4.manager import NodeVault
 
@@ -22,27 +21,26 @@ class KnowledgeVerifier:
     def __init__(self, use_free_pool_only: bool = True):
         self.config = ConfigManager()
         self.vault = NodeVault(skip_vector_engine=True)
-        self.provider = self._init_provider(use_free_pool_only)
-        
-    def _init_provider(self, use_free_pool_only: bool):
-        router = ProviderRouter(self.config)
-        if use_free_pool_only:
-            free_providers = ["groq", "dashscope", "qianfan", "zhipu", "siliconflow", "cloudflare", "zen"]
-            available = [p for p in free_providers if p in router.providers]
-            if not available:
-                if "deepseek" in router.providers:
-                    logger.warning("验证池无免费提供商，使用 deepseek 兜底。")
-                    router._switch_provider("deepseek")
-                else:
-                    logger.error("No valid providers found for verifier.")
-                    return None
-            else:
-                random.shuffle(available)
-                router.failover_order = available
-                router._switch_provider(available[0])
-                router._preferred_provider_name = available[0]
-                logger.info(f"验证池 failover chain: {' → '.join(available)}")
-        return router
+        self.router = ProviderRouter(self.config.config)
+        self.pool = FreePoolManager.get_instance(self.router)
+        self._probed = not use_free_pool_only
+
+    async def _chat(self, **kwargs):
+        """统一 LLM 调用入口：使用 FreePoolManager 自动选 provider + 健康反馈。"""
+        last_err = None
+        for attempt in range(3):
+            name, provider = self.pool.get_best_provider()
+            if not provider:
+                raise RuntimeError("FreePool: no provider available")
+            try:
+                resp = await asyncio.wait_for(provider.chat(**kwargs), timeout=60)
+                self.pool.report_success(name)
+                return resp
+            except Exception as e:
+                self.pool.report_failure(name)
+                last_err = e
+                logger.warning(f"FreePool: {name} failed (attempt {attempt+1}/3): {type(e).__name__}: {str(e)[:60]}")
+        raise last_err
 
     async def verify_cycle(self, limit: int = 3):
         """执行一次验证循环"""
@@ -112,7 +110,7 @@ ID: {node_id}
         messages = [Message(role=MessageRole.SYSTEM, content=prompt).to_dict()]
         
         try:
-            response = await self.provider.chat(messages, stream=False)
+            response = await self._chat(messages=messages, stream=False)
             result_text = response.content.strip()
             
             # 提取 JSON

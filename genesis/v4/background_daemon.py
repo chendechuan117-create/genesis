@@ -19,13 +19,14 @@ import time
 import asyncio
 import logging
 import random
+from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
 sys.path.insert(0, str(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))))
 
 from genesis.core.config import ConfigManager
 from genesis.core.base import Message, MessageRole
-from genesis.core.provider_manager import ProviderRouter
+from genesis.core.provider_manager import ProviderRouter, FreePoolManager
 from genesis.v4.manager import NodeVault
 from genesis.tools.node_tools import CreateMetaNodeTool, CreateNodeEdgeTool
 from genesis.tools.web_tool import WebSearchTool
@@ -48,7 +49,7 @@ class BackgroundDaemon:
 
     def __init__(self, use_free_pool_only: bool = True):
         self.config = ConfigManager().config
-        self.vault = NodeVault(skip_vector_engine=True)
+        self.vault = NodeVault(skip_vector_engine=False)
 
         # 工具实例（直接创建，不依赖 NodeManagementTools）
         self.search_tool = WebSearchTool()
@@ -56,34 +57,38 @@ class BackgroundDaemon:
         self.create_meta_tool = CreateMetaNodeTool()
         self.create_edge_tool = CreateNodeEdgeTool()
 
-        self.provider = self._init_provider(use_free_pool_only)
+        self.router = ProviderRouter(self.config)
+        self.pool = FreePoolManager.get_instance(self.router)
+        self._probed = not use_free_pool_only
         self.cycle_count = 0
 
-    def _init_provider(self, use_free_pool_only: bool) -> ProviderRouter:
-        router = ProviderRouter(self.config)
-        if use_free_pool_only:
-            free_providers = ["groq", "dashscope", "qianfan", "zhipu", "siliconflow", "cloudflare", "zen"]
-            available = [p for p in free_providers if p in router.providers]
-            if not available:
-                logger.warning("No free LLM configured. Daemon will consume main model tokens.")
-                if "deepseek" in router.providers:
-                    router._switch_provider("deepseek")
-                else:
-                    logger.error("No valid providers found.")
-                    sys.exit(1)
-            else:
-                random.shuffle(available)
-                router.failover_order = available
-                router._switch_provider(available[0])
-                router._preferred_provider_name = available[0]
-                logger.info(f"Free pool failover: {' → '.join(available)}")
-        return router
+    async def _chat(self, **kwargs):
+        """统一 LLM 调用入口：自动选最健康的 free provider + 健康反馈。
+        失败时自动尝试下一个，最多重试 3 次。"""
+        last_err = None
+        for attempt in range(3):
+            name, provider = self.pool.get_best_provider()
+            if not provider:
+                raise RuntimeError("FreePool: no provider available (all dead + deepseek limit reached)")
+            try:
+                # 通过 provider 直接调用，绕过 ProviderRouter 的 failover（FreePoolManager 自己管理）
+                resp = await asyncio.wait_for(provider.chat(**kwargs), timeout=60)
+                self.pool.report_success(name)
+                return resp
+            except Exception as e:
+                self.pool.report_failure(name)
+                last_err = e
+                logger.warning(f"FreePool: {name} failed (attempt {attempt+1}/3): {type(e).__name__}: {str(e)[:60]}")
+        raise last_err
 
     # ════════════════════════════════════════════
     #  主循环
     # ════════════════════════════════════════════
 
     async def run_cycle(self):
+        if not self._probed:
+            await self.pool.probe_all()
+            self._probed = True
         self.cycle_count += 1
         self.vault.heartbeat("daemon", "running", f"cycle #{self.cycle_count}")
         logger.info("=" * 50)
@@ -134,9 +139,11 @@ class BackgroundDaemon:
                      f"概念:{stats['concepts']} 假设:{stats['hypotheses']} "
                      f"验证:{stats['verified']} GC:{stats['gc']}")
         logger.info("=" * 50)
+        pool_status = self.pool.get_status()
         self.vault.heartbeat("daemon", "idle",
                               f"s:{stats['scavenged']} e:{stats['edges']} c:{stats['concepts']} "
-                              f"h:{stats['hypotheses']} v:{stats['verified']} gc:{stats['gc']}")
+                              f"h:{stats['hypotheses']} v:{stats['verified']} gc:{stats['gc']}",
+                              extra={"pool_status": pool_status})
 
     # ════════════════════════════════════════════
     #  Task 1: 拾荒 (Scavenge)
@@ -173,16 +180,21 @@ class BackgroundDaemon:
         return ingested
 
     def _pick_seed_node(self, min_confidence: float = 0.5) -> Optional[Dict[str, Any]]:
-        row = self.vault._conn.execute(
-            """SELECT k.node_id, k.title, nc.full_content AS content, k.type, k.confidence_score
-               FROM knowledge_nodes k
-               LEFT JOIN node_contents nc ON k.node_id = nc.node_id
-               WHERE k.confidence_score >= ? AND k.node_id NOT LIKE 'MEM_CONV%'
-               ORDER BY RANDOM() LIMIT 1""",
-            (min_confidence,)
-        ).fetchone()
-        if row:
-            return dict(row)
+        # 优先选择 VOID 标签节点（Multi-G 信息空洞），定向填补知识盲区
+        rows = self.vault.query_nodes("tags LIKE '%VOID%' ORDER BY created_at DESC", limit=1)
+        if rows:
+            seed = rows[0]
+            seed['content'] = self.vault.get_node_content(seed['node_id']) or ''
+            logger.info(f"  🎯 优先拾荒 VOID 节点: {seed['node_id']}")
+            return seed
+        # 回退：随机选择高可信度节点
+        rows = self.vault.query_nodes(
+            "confidence_score >= ? ORDER BY RANDOM()", params=(min_confidence,), limit=1
+        )
+        if rows:
+            seed = rows[0]
+            seed['content'] = self.vault.get_node_content(seed['node_id']) or ''
+            return seed
         return None
 
     async def _generate_curiosity_queries(self, seed: Dict[str, Any]) -> List[str]:
@@ -198,7 +210,7 @@ class BackgroundDaemon:
 如果没有发散价值，直接输出 "NO_CURIOSITY"。
 每行一个搜索词。"""
         try:
-            resp = await self.provider.chat(
+            resp = await self._chat(
                 messages=[{"role": "system", "content": prompt}], stream=False
             )
             text = resp.content.strip()
@@ -244,7 +256,7 @@ class BackgroundDaemon:
 3. 内容陈旧或没有实际价值 → 直接输出 "GARBAGE"。
 4. 否则使用 create_meta_node 工具创建节点。"""
         try:
-            resp = await self.provider.chat(
+            resp = await self._chat(
                 messages=[{"role": "system", "content": prompt}],
                 tools=[self.create_meta_tool.to_schema()],
                 stream=False
@@ -261,33 +273,34 @@ class BackgroundDaemon:
                         args["ntype"] = "ASSET"
                         args["title"] = f"[拾荒] {args.get('title', '未知发现')}"
                         await self.create_meta_tool.execute(**args)
-                        self._mark_as_scavenged(url, seed['node_id'])
-                        logger.info(f"    ✨ 入库成功")
+                        created_id = args.get('node_id', '')
+                        self._mark_as_scavenged(url, seed['node_id'], created_id)
+                        logger.info(f"    ✨ 入库成功: {created_id}")
                         return True
             return False
         except Exception as e:
             logger.error(f"  提纯入库异常: {e}")
             return False
 
-    def _mark_as_scavenged(self, url: str, seed_id: str):
+    def _mark_as_scavenged(self, url: str, seed_id: str, new_id: str = ""):
         try:
-            row = self.vault._conn.execute(
-                "SELECT node_id, metadata_signature FROM knowledge_nodes ORDER BY created_at DESC LIMIT 1"
-            ).fetchone()
-            if row:
-                new_id = row['node_id']
-                sig = self.vault.parse_metadata_signature(row['metadata_signature']) if row['metadata_signature'] else {}
+            if not new_id:
+                rows = self.vault.query_nodes("1=1 ORDER BY created_at DESC", limit=1)
+                new_id = rows[0]['node_id'] if rows else None
+            if new_id:
+                # 获取已有签名（如果有）
+                briefs = self.vault.get_node_briefs([new_id])
+                existing_sig_raw = briefs.get(new_id, {}).get('metadata_signature')
+                sig = self.vault.parse_metadata_signature(existing_sig_raw) if existing_sig_raw else {}
                 sig['validation_status'] = 'unverified'
-                self.vault._conn.execute(
-                    "UPDATE knowledge_nodes SET confidence_score = 0.4, verification_source = ?, "
-                    "metadata_signature = ?, trust_tier = 'SCAVENGED' WHERE node_id = ?",
-                    (f"scavenger ({url})", json.dumps(sig, ensure_ascii=False), new_id)
+                self.vault.patch_node_metadata(
+                    new_id,
+                    confidence_score=0.4,
+                    verification_source=f"scavenger ({url})",
+                    metadata_signature=sig,
+                    trust_tier='SCAVENGED'
                 )
-                self.vault._conn.execute(
-                    "INSERT OR IGNORE INTO node_edges (source_id, target_id, relation, weight) VALUES (?, ?, ?, ?)",
-                    (seed_id, new_id, "inspired_by", 0.5)
-                )
-                self.vault._conn.commit()
+                self.vault.create_node_edge(seed_id, new_id, "inspired_by", 0.5)
                 logger.info(f"    📌 标记 {new_id} 为 SCAVENGED, conf=0.4, seed={seed_id}")
         except Exception as e:
             logger.error(f"  标记拾荒状态失败: {e}")
@@ -298,35 +311,43 @@ class BackgroundDaemon:
 
     async def _task_discover_edges(self) -> int:
         logger.info("[2/4] 🔗 边缘发现 (Edge Discovery)...")
-        seeds = self.vault._conn.execute(
-            "SELECT node_id, title, type FROM knowledge_nodes "
-            "WHERE confidence_score >= 0.5 AND node_id NOT LIKE 'MEM_CONV%' "
-            "ORDER BY RANDOM() LIMIT 3"
-        ).fetchall()
+        seeds = self.vault.query_nodes(
+            "confidence_score >= 0.5 ORDER BY RANDOM()", limit=3
+        )
         if not seeds:
             logger.info("  知识库为空。")
             return 0
 
         edges_created = 0
         for seed in seeds:
-            node_id, title, node_type = seed['node_id'], seed['title'], seed['type']
+            node_id, title, node_type = seed['node_id'], seed.get('title', ''), seed.get('type', '')
             logger.info(f"  > 分析: [{node_id}] ({node_type})")
 
-            # 无向量引擎，用关键词匹配找候选邻居
-            keywords = [w for w in re.split(r'[\s_,/]+', title) if len(w) >= 2]
-            if not keywords:
-                continue
-            kw_conds = " OR ".join(["(title LIKE ? OR tags LIKE ?)"] * len(keywords))
-            kw_params = []
-            for kw in keywords:
-                kw_params.extend([f"%{kw}%", f"%{kw}%"])
-            cand_rows = self.vault._conn.execute(
-                f"SELECT node_id, type, title FROM knowledge_nodes "
-                f"WHERE node_id != ? AND node_id NOT LIKE 'MEM_CONV%' AND ({kw_conds}) "
-                f"ORDER BY RANDOM() LIMIT 3",
-                (node_id, *kw_params)
-            ).fetchall()
-            candidates = [dict(r) for r in cand_rows]
+            # 优先语义搜索找候选邻居，回退到关键词匹配
+            candidates = []
+            if self.vault.vector_engine and self.vault.vector_engine.is_ready:
+                vec_results = self.vault.vector_engine.search(title, top_k=5)
+                candidate_ids = [nid for nid, _score in vec_results if nid != node_id][:3]
+                if candidate_ids:
+                    candidates = self.vault.query_nodes(
+                        f"node_id IN ({','.join('?' * len(candidate_ids))})",
+                        params=tuple(candidate_ids),
+                        limit=3
+                    )
+            if not candidates:
+                # 回退：关键词匹配
+                keywords = [w for w in re.split(r'[\s_,/]+', title) if len(w) >= 2]
+                if not keywords:
+                    continue
+                kw_conds = " OR ".join(["(title LIKE ? OR tags LIKE ?)"] * len(keywords))
+                kw_params = []
+                for kw in keywords:
+                    kw_params.extend([f"%{kw}%", f"%{kw}%"])
+                candidates = self.vault.query_nodes(
+                    f"node_id != ? AND ({kw_conds}) ORDER BY RANDOM()",
+                    params=(node_id, *kw_params),
+                    limit=3
+                )
             if not candidates:
                 continue
 
@@ -347,7 +368,7 @@ ID: {node_id} | 类型: {node_type} | 标题: {title}
 没有明确关系 → 输出 "NO_ACTION"。"""
 
             try:
-                resp = await self.provider.chat(
+                resp = await self._chat(
                     messages=[{"role": "system", "content": prompt}],
                     tools=[self.create_edge_tool.to_schema()],
                     stream=False
@@ -376,27 +397,26 @@ ID: {node_id} | 类型: {node_type} | 标题: {title}
     async def _task_distill_concepts(self) -> int:
         logger.info("[2/4] ✨ 概念蒸馏 (Concept Distillation)...")
         # 找孤立的 LESSON（没有出边的）
-        lessons = self.vault._conn.execute(
-            """SELECT k.node_id, k.title, c.full_content
-               FROM knowledge_nodes k
-               JOIN node_contents c ON k.node_id = c.node_id
-               WHERE k.type = 'LESSON' AND k.confidence_score >= 0.5
-                 AND k.node_id NOT IN (SELECT source_id FROM node_edges)
-               ORDER BY k.created_at DESC LIMIT 3"""
-        ).fetchall()
+        lessons = self.vault.query_nodes(
+            "type = 'LESSON' AND confidence_score >= 0.5 "
+            "AND node_id NOT IN (SELECT source_id FROM node_edges) "
+            "ORDER BY created_at DESC",
+            limit=3
+        )
         if len(lessons) < 2:
             logger.info("  孤立 LESSON 不足 2 个，跳过。")
             return 0
 
         prompt = "你是 Genesis 的自动发酵进程 (The Alchemist)。\n阅读以下零散教训，尝试抽象出更高阶的底层规律或长期资产(ASSET)。\n\n"
         for idx, lesson in enumerate(lessons, 1):
-            prompt += f"--- LESSON {idx} ({lesson['node_id']}) ---\n标题: {lesson['title']}\n内容:\n{(lesson['full_content'] or '')[:500]}\n\n"
+            content = self.vault.get_node_content(lesson['node_id']) or ''
+            prompt += f"--- LESSON {idx} ({lesson['node_id']}) ---\n标题: {lesson['title']}\n内容:\n{content[:500]}\n\n"
         prompt += """如果存在共性规律，使用 create_meta_node 创建 ASSET 节点。
 同时用 create_node_edge 关联来源 LESSON（relation: RELATED_TO）。
 没有强烈共性 → 输出 "NO_ACTION"。"""
 
         try:
-            resp = await self.provider.chat(
+            resp = await self._chat(
                 messages=[{"role": "system", "content": prompt}],
                 tools=[self.create_meta_tool.to_schema(), self.create_edge_tool.to_schema()],
                 stream=False
@@ -428,20 +448,16 @@ ID: {node_id} | 类型: {node_type} | 标题: {title}
 
     async def _task_generate_hypotheses(self) -> int:
         logger.info("[2/4] 💡 假设引擎 (Hypothesis Engine)...")
-        seeds = self.vault._conn.execute(
-            """SELECT node_id, title, resolves, tags
-               FROM knowledge_nodes
-               WHERE type = 'LESSON' AND node_id NOT LIKE 'MEM_CONV%'
-               ORDER BY confidence_score DESC, RANDOM()
-               LIMIT 2"""
-        ).fetchall()
+        seeds = self.vault.query_nodes(
+            "type = 'LESSON' ORDER BY confidence_score DESC, RANDOM()",
+            limit=2
+        )
         if not seeds:
             logger.info("  无 LESSON 可作启发。")
             return 0
 
         created = 0
         for seed in seeds:
-            seed = dict(seed)
             content = self.vault.get_node_content(seed['node_id'])
             prompt = f"""你是 Genesis 的"假设引擎" (The Speculator)。
 阅读已有经验教训，提出一个【未经验证但极具价值的假设】。
@@ -458,7 +474,7 @@ ID: {seed['node_id']} | 标题: {seed['title']} | 解决: {seed.get('resolves', 
 4. 在内容中描述假设及验证步骤。标签包含 hypothesis,unverified。"""
 
             try:
-                resp = await self.provider.chat(
+                resp = await self._chat(
                     messages=[{"role": "system", "content": prompt}],
                     tools=[self.create_meta_tool.to_schema()],
                     stream=False
@@ -472,15 +488,15 @@ ID: {seed['node_id']} | 标题: {seed['title']} | 解决: {seed.get('resolves', 
                             await self.create_meta_tool.execute(**args)
                             # 盖上 FERMENTED 出生证
                             if 'node_id' in args:
-                                self.vault._conn.execute(
-                                    "UPDATE knowledge_nodes SET trust_tier = 'FERMENTED', confidence_score = 0.45 WHERE node_id = ?",
-                                    (args['node_id'],)
+                                self.vault.patch_node_metadata(
+                                    args['node_id'],
+                                    trust_tier='FERMENTED',
+                                    confidence_score=0.45
                                 )
-                                self.vault._conn.execute(
-                                    "INSERT OR IGNORE INTO node_edges (source_id, target_id, relation, weight) VALUES (?, ?, ?, ?)",
-                                    (seed['node_id'], args['node_id'], "inspired_hypothesis", 0.7)
+                                self.vault.create_node_edge(
+                                    seed['node_id'], args['node_id'],
+                                    "inspired_hypothesis", 0.7
                                 )
-                                self.vault._conn.commit()
                             created += 1
                             logger.info(f"    💡 假设: {args.get('title', '?')}")
             except Exception as e:
@@ -494,23 +510,25 @@ ID: {seed['node_id']} | 标题: {seed['title']} | 解决: {seed.get('resolves', 
 
     async def _task_verify(self, limit: int = 3) -> int:
         logger.info("[3/4] 🛡️ 验证 (Verify)...")
-        candidates = self.vault._conn.execute(
-            """SELECT node_id, type, title, resolves, tags
-               FROM knowledge_nodes
-               WHERE node_id NOT LIKE 'MEM_CONV%'
-                 AND type IN ('LESSON', 'CONTEXT')
-                 AND (last_verified_at IS NULL OR datetime(last_verified_at) < datetime('now', '-7 days'))
-               ORDER BY usage_fail_count DESC, confidence_score ASC
-               LIMIT ?""",
-            (limit,)
-        ).fetchall()
+        
+        # 算法层签名审计（零 LLM 成本，先跑一轮）
+        sig_stats = self.vault.audit_signatures(limit=50)
+        sig_fixed = sig_stats.get("fixed_normalize", 0) + sig_stats.get("fixed_blacklist", 0) + sig_stats.get("fixed_contradiction", 0)
+        if sig_fixed:
+            logger.info(f"  🔧 签名审计: {sig_stats['audited']} 扫描, {sig_fixed} 修复")
+        
+        candidates = self.vault.query_nodes(
+            "type IN ('LESSON', 'CONTEXT') "
+            "AND (last_verified_at IS NULL OR datetime(last_verified_at) < datetime('now', '-7 days')) "
+            "ORDER BY usage_fail_count DESC, confidence_score ASC",
+            limit=limit
+        )
         if not candidates:
             logger.info("  没有需要验证的节点。")
             return 0
 
         verified = 0
         for cand in candidates:
-            cand = dict(cand)
             node_id = cand['node_id']
             content = self.vault.get_node_content(node_id)
             logger.info(f"  > 审计: [{node_id}] {cand['title']}")
@@ -527,7 +545,7 @@ ID: {node_id} | 类型: {cand['type']} | 标题: {cand['title']}
 {{"status": "VALID" | "OBSOLETE" | "NEEDS_REVISION", "reason": "简短理由", "suggested_confidence_delta": 0.0, "validation_status": "validated" | "unverified" | "outdated"}}"""
 
             try:
-                resp = await self.provider.chat(
+                resp = await self._chat(
                     messages=[{"role": "system", "content": prompt}], stream=False
                 )
                 json_match = re.search(r'\{.*\}', resp.content.strip(), re.DOTALL)
@@ -542,17 +560,14 @@ ID: {node_id} | 类型: {cand['type']} | 标题: {cand['title']}
                     elif delta < 0:
                         self.vault.decay_node_confidence(node_id, penalty=abs(delta))
 
-                    sig_row = self.vault._conn.execute(
-                        "SELECT metadata_signature FROM knowledge_nodes WHERE node_id=?", (node_id,)
-                    ).fetchone()
-                    sig = self.vault.parse_metadata_signature(sig_row[0]) if sig_row and sig_row[0] else {}
+                    sig = self.vault.parse_metadata_signature(cand.get('metadata_signature')) if cand.get('metadata_signature') else {}
                     sig['validation_status'] = v_status
-                    self.vault._conn.execute(
-                        "UPDATE knowledge_nodes SET metadata_signature = ?, "
-                        "last_verified_at = CURRENT_TIMESTAMP, verification_source = 'auditor_daemon' WHERE node_id = ?",
-                        (json.dumps(sig, ensure_ascii=False), node_id)
+                    self.vault.patch_node_metadata(
+                        node_id,
+                        metadata_signature=sig,
+                        last_verified_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        verification_source='auditor_daemon'
                     )
-                    self.vault._conn.commit()
                     verified += 1
                 else:
                     logger.warning(f"    -> 解析失败: {resp.content[:100]}")

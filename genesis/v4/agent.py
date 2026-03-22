@@ -3,7 +3,7 @@ Genesis V4 (Glassbox) Agent 实例
 """
 
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from genesis.core.base import LLMProvider, PerformanceMetrics
 from genesis.core.registry import ToolRegistry
@@ -19,12 +19,14 @@ class GenesisV4:
         tools: ToolRegistry,
         provider: LLMProvider,
         max_iterations: int = 200,
-        enable_logging: bool = True
+        enable_logging: bool = True,
+        c_phase_blocking: bool = False,
     ):
         self.tools = tools
         self.provider = provider
         self.max_iterations = max_iterations
         self.enable_logging = enable_logging
+        self.c_phase_blocking = c_phase_blocking
 
     async def process(self, user_input: str, step_callback: Optional[Any] = None, image_paths: Optional[List[str]] = None) -> Dict[str, Any]:
         """
@@ -37,6 +39,7 @@ class GenesisV4:
             tools=self.tools,
             provider=self.provider,
             max_iterations=self.max_iterations,
+            c_phase_blocking=self.c_phase_blocking,
         )
 
         try:

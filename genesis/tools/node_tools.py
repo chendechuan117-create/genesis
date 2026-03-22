@@ -29,6 +29,57 @@ class BaseNodeTool(Tool):
 class SearchKnowledgeNodesTool(BaseNodeTool):
     """节点管理工具：全局搜索。前后台均有权限使用。"""
 
+    # ── 搜索命中率仪表盘（进程级统计） ──
+    _search_total: int = 0
+    _search_hits: int = 0
+    _search_misses: int = 0
+    _fusion_score_sum: float = 0.0
+    _fusion_score_count: int = 0
+    # ── 节点级信用归因缓存：最近一次搜索的 {node_id: fusion_score} ──
+    _last_fusion_scores: Dict[str, float] = {}
+
+    @classmethod
+    def _record_search_stats(cls, hit: bool, top_fusion_scores: list = None):
+        cls._search_total += 1
+        if hit:
+            cls._search_hits += 1
+        else:
+            cls._search_misses += 1
+        if top_fusion_scores:
+            cls._fusion_score_sum += sum(top_fusion_scores)
+            cls._fusion_score_count += len(top_fusion_scores)
+        # 每 5 次搜索输出一次摘要日志
+        if cls._search_total % 5 == 0:
+            hit_rate = cls._search_hits / cls._search_total if cls._search_total else 0
+            avg_fusion = cls._fusion_score_sum / cls._fusion_score_count if cls._fusion_score_count else 0
+            logger.info(
+                f"[搜索仪表盘] total={cls._search_total} hit_rate={hit_rate:.1%} "
+                f"avg_fusion={avg_fusion:.3f} misses={cls._search_misses}"
+            )
+
+    @classmethod
+    def get_fusion_scores(cls, node_ids: list = None) -> Dict[str, float]:
+        """获取指定节点的 fusion_score（供 Arena 信用归因），未指定则返回全部缓存"""
+        if node_ids is None:
+            return dict(cls._last_fusion_scores)
+        return {nid: cls._last_fusion_scores.get(nid, 0.0) for nid in node_ids}
+
+    @classmethod
+    def reset_fusion_cache(cls):
+        """每次请求开始时重置，防止上一次请求的分数污染当前归因"""
+        cls._last_fusion_scores = {}
+
+    @classmethod
+    def get_search_stats(cls) -> dict:
+        """供 heartbeat / 外部监控获取搜索健康指标"""
+        return {
+            "search_total": cls._search_total,
+            "search_hits": cls._search_hits,
+            "search_misses": cls._search_misses,
+            "hit_rate": round(cls._search_hits / cls._search_total, 4) if cls._search_total else None,
+            "avg_fusion_score": round(cls._fusion_score_sum / cls._fusion_score_count, 4) if cls._fusion_score_count else None,
+        }
+
     @property
     def name(self) -> str:
         return "search_knowledge_nodes"
@@ -169,23 +220,30 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 continue
             node_values = set(self._signature_values(node_signature, key))
             if node_values & query_values:
-                score += 1
+                score += 2  # 与 soft_keys 同权，让注册表维度有实际区分力
         return score
 
     # ── 分数融合 (Score Fusion) ──
     # 加权融合代替元组排序，每个信号归一化后按权重叠加
     FUSION_WEIGHTS = {"rerank": 0.35, "trust": 0.25, "metric": 0.20, "signature": 0.20}
+    # reranker 不可用时的降级权重（rerank 权重按比例分配到其余三个信号）
+    FUSION_WEIGHTS_NO_RERANK = {"trust": 0.385, "metric": 0.308, "signature": 0.308}
 
     def _fusion_score(self, row: Dict[str, Any], max_sig: float = 1.0) -> float:
-        w = self.FUSION_WEIGHTS
-        rerank = min(1.0, max(0.0, row.get('rerank_score', 0.0) or 0.0))
+        has_rerank = 'rerank_score' in row and row['rerank_score'] is not None
         reliability = row.get('reliability') or {}
         trust_raw = reliability.get('trust_score', 0.0)
         trust = min(1.0, max(0.0, trust_raw / 10.0))  # trust_score 范围 ~0-10 归一化
         metric = self._metric_score(row)
         sig_raw = row.get('signature_match_score', 0)
         sig = min(1.0, max(0.0, sig_raw / max(max_sig, 1.0))) if max_sig > 0 else 0.0
-        fused = w["rerank"] * rerank + w["trust"] * trust + w["metric"] * metric + w["signature"] * sig
+        if has_rerank:
+            w = self.FUSION_WEIGHTS
+            rerank = min(1.0, max(0.0, row.get('rerank_score', 0.0) or 0.0))
+            fused = w["rerank"] * rerank + w["trust"] * trust + w["metric"] * metric + w["signature"] * sig
+        else:
+            w = self.FUSION_WEIGHTS_NO_RERANK
+            fused = w["trust"] * trust + w["metric"] * metric + w["signature"] * sig
         row['fusion_score'] = round(fused, 4)
         return fused
 
@@ -247,6 +305,7 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 rows = conn.execute(query, tuple(params)).fetchall()
 
                 if not rows:
+                    self._record_search_stats(hit=False)
                     return f"⚠️ [未命中] 未找到与 {keywords} 相关的 {ntype} 节点（字面+语义均无匹配）。当前处于未知区域，请基于通用能力处理。"
 
                 # Reranker 精排：用 Cross-Encoder 按相关度重新排序
@@ -255,9 +314,12 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 if normalized_signature:
                     row_dicts = [r for r in row_dicts if self._signature_gate(self.vault.parse_metadata_signature(r.get('metadata_signature')), normalized_signature)]
                     if not row_dicts:
+                        self._record_search_stats(hit=False)
                         sig_text = self.vault.render_metadata_signature(normalized_signature)
                         return f"⚠️ [签名过滤后未命中] 未找到同时满足关键词 {keywords} 与签名 {sig_text} 的 {ntype} 节点。建议放宽部分硬环境约束后重试。"
                 row_dicts = self.vault.vector_engine.rerank(query_str, row_dicts)
+                if row_dicts and 'rerank_score' not in row_dicts[0]:
+                    logger.warning("搜索降级: reranker 不可用，fusion_score 已切换为三信号归一化权重模式")
                 # 批量预取所有 prerequisite 节点签名（1 次 SQL 代替 N 次）
                 all_prereq_node_ids = set()
                 for row in row_dicts:
@@ -290,6 +352,12 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 for r in row_dicts:
                     self._fusion_score(r, max_sig=max_sig)
                 row_dicts.sort(key=lambda r: r.get('fusion_score', 0.0), reverse=True)
+                # ── 信用归因缓存：累积每次搜索的 fusion_score（同节点取最高分） ──
+                for r in row_dicts:
+                    nid = r.get('node_id')
+                    score = r.get('fusion_score', 0.0)
+                    if nid and score > self.__class__._last_fusion_scores.get(nid, 0.0):
+                        self.__class__._last_fusion_scores[nid] = score
                 
                 # === Graph Walk (V4.3 Experience Graph) ===
                 # 顺藤摸瓜：基于图谱关系扩展上下文
@@ -439,6 +507,10 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 lines.append("- EPISODE 仅在你需要延续同一任务脉络时再挂。")
                 lines.append("- ENTITY / EVENT / ACTION 通常作为背景参考；只有在因果链本身重要时再挂。")
                 lines.append("- 如果某节点带有 reqs 或 graph:+ 提示，派发给 Op 时优先把相关依赖也一起考虑进 active_nodes。")
+                # ── 搜索仪表盘统计 ──
+                top_scores = [r.get('fusion_score', 0.0) for r in row_dicts[:5]]
+                self._record_search_stats(hit=True, top_fusion_scores=top_scores)
+
                 return "\n".join(lines)
         except Exception as e:
             logger.error(f"Search failed: {e}")
@@ -549,27 +621,21 @@ class RecordLessonNodeTool(BaseNodeTool):
             if self.vault.vector_engine.is_ready:
                 query_text = f"{title} {trigger_noun} {trigger_context} {resolves or ''}"
                 similar = self.vault.vector_engine.search(query_text, top_k=3, threshold=0.75)
+                # 批量获取候选节点的类型信息（公共 API，不直接访问 _conn）
+                candidate_ids = [sid for sid, _ in similar if sid != node_id]
+                candidate_briefs = self.vault.get_node_briefs(candidate_ids) if candidate_ids else {}
                 for sim_id, sim_score in similar:
                     if sim_id == node_id:
                         continue
-                    # 只对比 LESSON 类型
-                    row = self.vault._conn.execute(
-                        "SELECT type, title FROM knowledge_nodes WHERE node_id = ?", (sim_id,)
-                    ).fetchone()
-                    if not row or row['type'] != 'LESSON':
+                    brief = candidate_briefs.get(sim_id)
+                    if not brief or brief.get('type') != 'LESSON':
                         continue
                     if sim_score >= 0.85:
-                        # 高度相似：合并到已有节点
+                        # 高度相似：合并到已有节点（含版本快照 + 向量重嵌入）
                         dedup_action = "merge"
                         merged_node_id = sim_id
-                        # 版本链：在覆写前快照旧内容
-                        self.vault._snapshot_if_exists(sim_id)
-                        self.vault._conn.execute(
-                            "UPDATE node_contents SET full_content = ?, source = 'reflection_merged' WHERE node_id = ?",
-                            (content, sim_id)
-                        )
+                        self.vault.update_node_content(sim_id, content, source="reflection_merged")
                         self.vault.promote_node_confidence(sim_id, boost=0.1, max_score=0.95)
-                        self.vault._conn.commit()
                         logger.info(f"LESSON dedup: merged [{node_id}] into [{sim_id}] (sim={sim_score:.2f})")
                         break
                     elif sim_score >= 0.65:

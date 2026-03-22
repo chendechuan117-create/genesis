@@ -29,7 +29,9 @@ async def chat_endpoint(request: ChatRequest):
         from factory import create_agent
         
         # Temporary instantiation per request (stateless mode)
+        # c_phase_blocking=True: API 短生命周期，必须等 C-Phase 完成再返回
         agent = create_agent()
+        agent.c_phase_blocking = True
         
         result = await agent.process(request.user_input, image_paths=request.image_paths)
         

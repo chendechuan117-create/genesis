@@ -1,0 +1,156 @@
+{
+  "name": "Genesis博客自动化发布工作流",
+  "nodes": [
+    {
+      "name": "读取博客文件",
+      "type": "n8n-nodes-base.readFile",
+      "position": [250, 300],
+      "parameters": {
+        "filePath": "={{$json.filePath}}",
+        "options": {}
+      }
+    },
+    {
+      "name": "解析Markdown内容",
+      "type": "n8n-nodes-base.function",
+      "position": [450, 300],
+      "parameters": {
+        "jsCode": "// 解析Markdown内容并提取元数据\nconst content = items[0].json.fileContent;\nconst lines = content.split('\\n');\n\nlet title = '';\nlet description = '';\nlet tags = [];\nlet body = '';\nlet inBody = false;\n\nfor (const line of lines) {\n  // 提取标题\n  if (line.startsWith('# ')) {\n    title = line.replace('# ', '');\n    continue;\n  }\n  \n  // 提取描述\n  if (line.startsWith('> ')) {\n    description = line.replace('> ', '');\n    continue;\n  }\n  \n  // 提取标签\n  if (line.startsWith('tags: ')) {\n    tags = line.replace('tags: ', '').split(',').map(tag => tag.trim());\n    continue;\n  }\n  \n  // 提取正文\n  if (line === '---' || line === '') {\n    if (!inBody) {\n      inBody = true;\n      continue;\n    }\n  }\n  \n  if (inBody && line !== '---') {\n    body += line + '\\n';\n  }\n}\n\nreturn [{\n  json: {\n    title,\n    description,\n    tags,\n    body,\n    originalContent: content\n  }\n}];"
+      }
+    },
+    {
+      "name": "格式化知乎文章",
+      "type": "n8n-nodes-base.function",
+      "position": [650, 200],
+      "parameters": {
+        "jsCode": "// 格式化内容为知乎文章格式\nconst item = items[0].json;\nconst zhihuContent = `# ${item.title}\\n\\n${item.description}\\n\\n${item.body}\\n\\n**标签**: ${item.tags.join(', ')}`;\n\nreturn [{\n  json: {\n    ...item,\n    zhihuContent\n  }\n}];"
+      }
+    },
+    {
+      "name": "格式化掘金文章",
+      "type": "n8n-nodes-base.function",
+      "position": [650, 400],
+      "parameters": {
+        "jsCode": "// 格式化内容为掘金文章格式\nconst item = items[0].json;\nconst juejinContent = `# ${item.title}\\n\\n> ${item.description}\\n\\n${item.body}\\n\\n## 标签\\n${item.tags.map(tag => `- ${tag}`).join('\\n')}`;\n\nreturn [{\n  json: {\n    ...item,\n    juejinContent\n  }\n}];"
+      }
+    },
+    {
+      "name": "格式化V2EX帖子",
+      "type": "n8n-nodes-base.function",
+      "position": [650, 600],
+      "parameters": {
+        "jsCode": "// 格式化内容为V2EX帖子格式\nconst item = items[0].json;\nconst v2exContent = `## ${item.title}\\n\\n${item.description}\\n\\n${item.body}\\n\\n标签: ${item.tags.join(', ')}`;\n\nreturn [{\n  json: {\n    ...item,\n    v2exContent\n  }\n}];"
+      }
+    },
+    {
+      "name": "发布状态记录",
+      "type": "n8n-nodes-base.function",
+      "position": [850, 300],
+      "parameters": {
+        "jsCode": "// 记录发布状态\nconst item = items[0].json;\nconst timestamp = new Date().toISOString();\nconst logEntry = {\n  timestamp,\n  title: item.title,\n  platforms: ['知乎', '掘金', 'V2EX'],\n  status: 'pending',\n  filePath: $input.first().json.filePath\n};\n\n// 这里可以添加实际发布逻辑\n// 目前只是记录状态\nconsole.log('准备发布文章:', item.title);\nconsole.log('标签:', item.tags);\nconsole.log('内容长度:', item.body.length);\n\nreturn [{\n  json: {\n    ...item,\n    logEntry,\n    message: '文章已格式化完成，准备发布到各平台'\n  }\n}];"
+      }
+    },
+    {
+      "name": "Webhook响应",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [1050, 300],
+      "parameters": {
+        "responseMode": "responseNode",
+        "responseData": "={{$json.message}}",
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "读取博客文件": {
+      "main": [
+        [
+          {
+            "node": "解析Markdown内容",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "解析Markdown内容": {
+      "main": [
+        [
+          {
+            "node": "格式化知乎文章",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "格式化掘金文章",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "格式化V2EX帖子",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "格式化知乎文章": {
+      "main": [
+        [
+          {
+            "node": "发布状态记录",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "格式化掘金文章": {
+      "main": [
+        [
+          {
+            "node": "发布状态记录",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "格式化V2EX帖子": {
+      "main": [
+        [
+          {
+            "node": "发布状态记录",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "发布状态记录": {
+      "main": [
+        [
+          {
+            "node": "Webhook响应",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "trigger": {
+    "type": "n8n-nodes-base.webhook",
+    "name": "Webhook",
+    "position": [50, 300],
+    "parameters": {
+      "path": "blog-publish",
+      "responseMode": "responseNode",
+      "options": {}
+    }
+  }
+}

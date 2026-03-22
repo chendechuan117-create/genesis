@@ -285,7 +285,10 @@ class ShellTool(Tool):
     @staticmethod
     def _format_result(command: str, cwd, code: int, stdout: str, stderr: str) -> str:
         """统一格式化命令执行结果"""
-
+        
+        # 安全网：限制输出总长度，防止单次工具输出撑爆上下文
+        MAX_OUTPUT_CHARS = 30000  # ~7500 tokens，足以容纳绝大多数有意义输出
+        
         result = [f"命令: {command}"]
         if cwd:
             result.append(f"目录: {cwd}")
@@ -300,4 +303,12 @@ class ShellTool(Tool):
             result.append(f"\n⚠️  命令执行失败（退出码 {code}）")
         else:
             result.append("\n✓ 命令执行成功")
-        return "\n".join(result)
+        
+        output = "\n".join(result)
+        
+        # 截断处理：保留首尾，中间用省略标记
+        if len(output) > MAX_OUTPUT_CHARS:
+            half = MAX_OUTPUT_CHARS // 2
+            output = output[:half] + f"\n\n... [输出过长，已截断 {len(output) - MAX_OUTPUT_CHARS} 字符] ...\n\n" + output[-half:]
+        
+        return output

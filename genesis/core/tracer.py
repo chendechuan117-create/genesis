@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS spans (
     output_tokens   INTEGER,
     total_tokens    INTEGER,
     tool_name       TEXT,
+    cache_hit_tokens  INTEGER,
     tool_args_preview   TEXT,
     tool_result_preview TEXT,
     metadata_json   TEXT,
@@ -103,6 +104,11 @@ class Tracer:
             self._conn.executescript(_SCHEMA)
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
+            # 增量迁移：旧表可能缺少 cache_hit_tokens 列
+            try:
+                self._conn.execute("ALTER TABLE spans ADD COLUMN cache_hit_tokens INTEGER")
+            except sqlite3.OperationalError:
+                pass  # 列已存在
             logger.info(f"Tracer DB ready: {_DB_PATH}")
         except Exception as e:
             logger.warning(f"Tracer DB init failed (tracing disabled): {e}")
@@ -264,7 +270,8 @@ class Tracer:
     def log_llm_call(self, trace_id: str, *, parent: str = None,
                      phase: str = "", model: str = "",
                      input_tokens: int = 0, output_tokens: int = 0,
-                     total_tokens: int = 0, duration_ms: float = 0,
+                     total_tokens: int = 0, cache_hit_tokens: int = 0,
+                     duration_ms: float = 0,
                      has_tool_calls: bool = False, error: str = ""):
         """一步记录完整的 LLM 调用（不需要 start/end 配对）"""
         if not self._enabled:
@@ -273,17 +280,20 @@ class Tracer:
         now = time.time()
         name = f"llm:{model}" if model else "llm_call"
         meta = {"has_tool_calls": has_tool_calls}
+        if cache_hit_tokens:
+            meta["cache_hit_tokens"] = cache_hit_tokens
         try:
             self._conn.execute(
                 """INSERT INTO spans
                    (span_id, trace_id, parent_span_id, name, span_type, phase,
                     started_at, ended_at, duration_ms,
                     model, input_tokens, output_tokens, total_tokens,
-                    metadata_json, status, error)
-                   VALUES (?, ?, ?, ?, 'llm_call', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    cache_hit_tokens, metadata_json, status, error)
+                   VALUES (?, ?, ?, ?, 'llm_call', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (span_id, trace_id, parent, name, phase,
                  now - (duration_ms / 1000), now, duration_ms,
                  model, input_tokens, output_tokens, total_tokens,
+                 cache_hit_tokens or None,
                  json.dumps(meta, ensure_ascii=False),
                  "error" if error else "completed", error or None)
             )

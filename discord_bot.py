@@ -1,4 +1,5 @@
 import os
+import sys
 import asyncio
 import logging
 from pathlib import Path
@@ -15,6 +16,23 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger("DiscordBot")
+
+# 0. 单实例保护：防止多个 bot 进程同时运行
+PIDFILE = Path("runtime/discord_bot.pid")
+PIDFILE.parent.mkdir(parents=True, exist_ok=True)
+if PIDFILE.exists():
+    old_pid = PIDFILE.read_text().strip()
+    # 检查旧进程是否还活着
+    try:
+        os.kill(int(old_pid), 0)
+        logger.error(f"Another discord_bot instance is already running (PID {old_pid}). Exiting.")
+        sys.exit(1)
+    except (ProcessLookupError, ValueError):
+        pass  # 旧进程已死，继续启动
+PIDFILE.write_text(str(os.getpid()))
+
+import atexit
+atexit.register(lambda: PIDFILE.unlink(missing_ok=True))
 
 # 2. Env
 load_dotenv()
@@ -64,6 +82,29 @@ class DiscordCallback:
             elif evt.event_type == "tool_result":
                 result_peek = (evt.result or "")[:200]
                 await self.message.channel.send(f"✅ **[{evt.name or '?'}]**:\n```\n{result_peek}\n```")
+            elif evt.event_type == "lens_start":
+                personas = (data or {}).get("personas", []) if isinstance(data, dict) else []
+                probe_hits = (data or {}).get("probe_hits", 0) if isinstance(data, dict) else 0
+                task_brief = (data or {}).get("task_brief", "") if isinstance(data, dict) else ""
+                persona_str = " / ".join(f"`{p}`" for p in personas)
+                brief_preview = task_brief[:200] if task_brief else ""
+                msg = f"🔭 **Multi-G 透镜启动** | 知识密度探针: {probe_hits} 命中 → {len(personas)} 个视角\n{persona_str}"
+                if brief_preview:
+                    msg += f"\n📋 **G 布置的搜索作业：**\n```\n{brief_preview}\n```"
+                await self.message.channel.send(msg)
+            elif evt.event_type == "lens_search":
+                info = data if isinstance(data, dict) else {}
+                persona = info.get("persona", "?")
+                query = info.get("query", [])
+                query_str = ", ".join(query) if isinstance(query, list) else str(query)
+                await self.message.channel.send(f"🔭 `Lens-{persona}` 搜索: {query_str[:100]}")
+            elif evt.event_type == "lens_done":
+                info = data if isinstance(data, dict) else {}
+                entries = info.get("entries", 0)
+                voids = info.get("voids", 0)
+                await self.message.channel.send(
+                    f"🔭 **透镜阶段完成** | {entries} 条分析 / {voids} 个信息空洞"
+                )
         except Exception as e:
             logger.error(f"Callback error: {e}")
 
@@ -194,7 +235,7 @@ async def on_message(message: discord.Message):
                     files_str = "\n".join(f"  - {p}" for p in attachment_paths)
                     full_input += f"\n\n[Attached files:\n{files_str}]"
 
-                full_input = f"{channel_ctx}[当前请求]\n{full_input}"
+                full_input = f"{channel_ctx}[GENESIS_USER_REQUEST_START]\n{full_input}"
 
                 ui_callback = DiscordCallback(message)
                 result = await agent.process(full_input, step_callback=ui_callback, image_paths=image_paths)

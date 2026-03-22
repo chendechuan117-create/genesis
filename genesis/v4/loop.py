@@ -15,7 +15,8 @@ from genesis.core.base import Message, MessageRole, LLMProvider, PerformanceMetr
 from genesis.core.registry import ToolRegistry
 from genesis.core.tracer import Tracer
 from genesis.core.models import DispatchPayload, OpResult
-from genesis.v4.manager import FactoryManager, NodeVault, NodeManagementTools, TRUST_TIER_RANK, TOOL_EXEC_MIN_TIER
+from genesis.v4.manager import FactoryManager, NodeVault, NodeManagementTools, TRUST_TIER_RANK, TOOL_EXEC_MIN_TIER, PERSONA_ACTIVATION_MAP
+from genesis.v4.blackboard import Blackboard
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,7 @@ class V4Loop:
     3. C_PHASE (反思): (Post-loop) 仅允许节点管理工具，沉淀知识。
     """
 
-    OP_MAX_ITERATIONS = 30  # Op 独立上限：30 轮足够完成单次派发，超出说明任务应拆分
+    OP_MAX_ITERATIONS = 12  # Op 单次派发上限：短 Op + 多次 dispatch，G 保持控制权
     C_PHASE_MAX_ITER = {"FULL": 30, "LIGHT": 5, "SKIP": 0}
     TOOL_EXEC_TIMEOUT = 120  # 工具执行超时（秒），防止挂起的 HTTP/命令阻塞整个管线
 
@@ -96,6 +97,35 @@ class V4Loop:
         self.execution_messages: List[Message] = []
         self.execution_reports: List[Dict[str, Any]] = []
         self.inferred_signature: Dict[str, Any] = {}
+        self.blackboard: Optional[Blackboard] = None  # Multi-G 黑板
+        
+        # 启动时恢复 persona 学习数据（只在首次 V4Loop 实例化时加载一次）
+        Blackboard.load_from_db()
+
+    # ── Token 效率退化诊断：类级滑动窗口 ──
+    _token_history: List[int] = []  # 最近 N 次请求的总 token 数
+    _TOKEN_WINDOW = 10
+
+    @classmethod
+    def _record_token_usage(cls, total_tokens: int):
+        """记录本次请求的 token 消耗，维护最近 _TOKEN_WINDOW 次的滑动窗口"""
+        cls._token_history.append(total_tokens)
+        if len(cls._token_history) > cls._TOKEN_WINDOW:
+            cls._token_history = cls._token_history[-cls._TOKEN_WINDOW:]
+
+    @classmethod
+    def get_token_efficiency_stats(cls) -> Optional[Dict[str, Any]]:
+        """供 heartbeat 获取 token 效率诊断数据"""
+        if not cls._token_history:
+            return None
+        avg = sum(cls._token_history) / len(cls._token_history)
+        return {
+            "window_size": len(cls._token_history),
+            "avg_tokens_per_request": round(avg),
+            "last_tokens": cls._token_history[-1] if cls._token_history else 0,
+            "max_tokens": max(cls._token_history),
+            "min_tokens": min(cls._token_history),
+        }
 
     async def run(self, user_input: str, step_callback: Any = None, image_paths: Optional[List[str]] = None) -> Tuple[str, PerformanceMetrics]:
         """执行主管线 G -> Op -> G -> C (Subroutine Mode)"""
@@ -107,11 +137,25 @@ class V4Loop:
         self.execution_messages = []
         self.execution_reports = []
         self.execution_active_nodes: List[str] = []  # Knowledge Arena: 追踪被使用的节点
+        self._signature_drift_events: List[Dict[str, Any]] = []  # 签名偏差检测事件
+        # 每次请求重置 fusion_score 缓存，防止上次请求的分数污染当前归因
+        from genesis.tools.node_tools import SearchKnowledgeNodesTool
+        SearchKnowledgeNodesTool.reset_fusion_cache()
         # 签名推断只用用户实际请求，排除频道历史等上下文噪音
         _sig_input = user_input
         if "[GENESIS_USER_REQUEST_START]" in user_input:
             _sig_input = user_input.split("[GENESIS_USER_REQUEST_START]", 1)[1]
         self.inferred_signature = self.vault.infer_metadata_signature(_sig_input)
+        self.blackboard = None  # 每次请求重置
+        
+        # === Multi-G 透镜预激活 ===
+        if self._should_activate_multi_g(user_input):
+            try:
+                self.blackboard = await self._run_lens_phase(user_input, step_callback)
+                logger.info(f"Multi-G lens phase completed: {self.blackboard.entry_count} entries, {len(self.blackboard.search_voids)} voids")
+            except Exception as e:
+                logger.error(f"Multi-G lens phase failed (falling back to single-G): {e}", exc_info=True)
+                self.blackboard = None
         
         # === Tracing ===
         self.tracer = Tracer.get_instance()
@@ -152,6 +196,15 @@ class V4Loop:
         # 长生命周期（Discord bot）: 后台 create_task，不阻塞用户
         # 短生命周期（API server）: await 等待完成，防止 event loop 关闭时截断
         c_mode = self._determine_c_phase_mode()
+        # Token budget 守卫：G+Op 消耗过多时降级 C，防止上下文溢出或注意力退化
+        if c_mode == "FULL" and self.metrics.total_tokens > 0:
+            TOKEN_BUDGET_THRESHOLD = 80000  # ~60% of 128k context
+            if self.metrics.total_tokens > TOKEN_BUDGET_THRESHOLD:
+                logger.warning(
+                    f"Token budget guard: G+Op consumed {self.metrics.total_tokens} tokens "
+                    f"(>{TOKEN_BUDGET_THRESHOLD}), downgrading C-Phase FULL→LIGHT"
+                )
+                c_mode = "LIGHT"
         if c_mode != "SKIP":
             if self.c_phase_blocking:
                 await self._run_c_phase_safe(step_callback, c_mode)
@@ -162,7 +215,57 @@ class V4Loop:
         elif len(self.execution_messages) > 0:
             logger.info(f"Skipping C-Process: mode=SKIP (G={self.metrics.g_tokens}t, Op={self.metrics.op_tokens}t).")
         
-        self.vault.heartbeat("main_loop", "idle", f"done G={self.metrics.g_tokens}t Op={self.metrics.op_tokens}t")
+        # Multi-G 空洞自动入库（放在 C 之后，避免改变 digest 导致 G 缓存失效）
+        if self.blackboard:
+            self._auto_record_voids(self.blackboard)
+        
+        # 搜索仪表盘 + 签名偏差数据写入 heartbeat，供外部监控和自诊断
+        from genesis.tools.node_tools import SearchKnowledgeNodesTool
+        search_stats = SearchKnowledgeNodesTool.get_search_stats()
+        # 签名偏差摘要：统计盲区/误报/冲突的出现频次
+        sig_drift_summary = None
+        if self._signature_drift_events:
+            blind_all, fp_all, conflict_all = [], [], []
+            for ev in self._signature_drift_events:
+                blind_all.extend(ev.get("blind_spots", []))
+                fp_all.extend(ev.get("false_positives", []))
+                conflict_all.extend(ev.get("value_conflicts", []))
+            sig_drift_summary = {
+                "events": len(self._signature_drift_events),
+                "top_blind_spots": sorted(set(blind_all), key=blind_all.count, reverse=True)[:5],
+                "top_false_positives": sorted(set(fp_all), key=fp_all.count, reverse=True)[:5],
+                "top_value_conflicts": sorted(set(conflict_all), key=conflict_all.count, reverse=True)[:5],
+            }
+            logger.info(f"[签名偏差摘要] {sig_drift_summary}")
+        persona_stats = Blackboard.get_persona_stats() if Blackboard._persona_stats else None
+        # Provider 质量漂移
+        from genesis.core.provider import NativeHTTPProvider
+        provider_stats = NativeHTTPProvider.get_provider_stats()
+        # Token 效率退化：记录本次并获取滑动窗口
+        self._record_token_usage(self.metrics.total_tokens or 0)
+        token_efficiency = self.get_token_efficiency_stats()
+        # 知识库熵增：低 confidence 节点占比
+        kb_entropy = self.vault.get_kb_entropy()
+        # 缓存命中率
+        cache_stats = None
+        if self.metrics.input_tokens > 0:
+            cache_stats = {
+                "input_tokens": self.metrics.input_tokens,
+                "cache_hit_tokens": self.metrics.prompt_cache_hit_tokens,
+                "cache_hit_rate": round(self.metrics.prompt_cache_hit_tokens / self.metrics.input_tokens, 3),
+            }
+        self.vault.heartbeat("main_loop", "idle",
+            f"done G={self.metrics.g_tokens}t Op={self.metrics.op_tokens}t cache={cache_stats['cache_hit_rate']*100:.1f}%" if cache_stats else f"done G={self.metrics.g_tokens}t Op={self.metrics.op_tokens}t",
+            extra={
+                "search_stats": search_stats,
+                "signature_drift": sig_drift_summary,
+                "persona_stats": persona_stats,
+                "provider_stats": provider_stats,
+                "token_efficiency": token_efficiency,
+                "kb_entropy": kb_entropy,
+                "cache_stats": cache_stats,
+            }
+        )
         
         # === End Trace ===
         self.tracer.end_trace(
@@ -223,6 +326,31 @@ class V4Loop:
             Message(role=MessageRole.SYSTEM, content=g_prompt),
             Message(role=MessageRole.USER, content=user_content)
         ]
+        
+        # === Multi-G 黑板注入：如果透镜阶段已完成，将结果注入 G 的上下文 ===
+        if self.blackboard and self.blackboard.entry_count > 0:
+            collapse_results = self.blackboard.collapse(self.vault)
+            board_text = self.blackboard.render_for_g(collapse_results=collapse_results)
+            collapse_summary_lines = ["[坍缩排名]"]
+            for rank, item in enumerate(collapse_results[:5], 1):
+                e = item["entry"]
+                collapse_summary_lines.append(f"  {rank}. [{e.persona}] score={item['score']:.3f} — {e.framework}")
+            collapse_text = "\n".join(collapse_summary_lines)
+            
+            # 提取 top entry 的 verification_action，如果具体则建议 G 优先执行
+            verification_hint = ""
+            if collapse_results:
+                top_entry = collapse_results[0]["entry"]
+                if hasattr(top_entry, "verification_action") and top_entry.verification_action:
+                    va = top_entry.verification_action.strip()
+                    if len(va) > 10:  # 足够具体的验证动作
+                        verification_hint = f"\n\n[建议优先验证]\n透镜 {top_entry.persona} 建议的最小验证动作：{va}\n如果此动作可行，建议在你的第一次 dispatch 中优先执行它，以快速确认或否定假设。"
+            
+            self.g_messages.append(Message(
+                role=MessageRole.SYSTEM,
+                content=f"[Multi-G 透镜侦察完毕]\n你的透镜子程序已从不同认知视角检索了知识库，以下是汇总。你可以参考但不必盲从——你是主脑，保留最终判断权。\n\n{board_text}\n\n{collapse_text}{verification_hint}"
+            ))
+            logger.info(f"Multi-G blackboard injected into G context: {self.blackboard.entry_count} entries, top={collapse_results[0]['entry'].persona if collapse_results else 'N/A'}")
         
         search_tools = [self.tools.get("search_knowledge_nodes")]
         search_tools = [t for t in search_tools if t]
@@ -490,20 +618,59 @@ class V4Loop:
             return prepared
 
         # C 自己写的签名优先；没写则从节点内容推断；不再强制合并全局签名（防止污染）
-        c_signature = prepared.get("metadata_signature")
-        if not c_signature:
-            text_parts: List[str] = []
-            for key in ["title", "state_description", "trigger_verb", "trigger_noun", "trigger_context", "because_reason", "resolves", "content", "tags"]:
-                value = prepared.get(key)
-                if value:
-                    text_parts.append(str(value))
-            action_steps = prepared.get("action_steps") or []
-            if isinstance(action_steps, list):
-                text_parts.extend([str(item) for item in action_steps if item])
-            c_signature = self.vault.infer_metadata_signature("\n".join(text_parts))
+        c_explicit_signature = prepared.get("metadata_signature")
+        # 始终从节点内容推断一份签名（用于偏差对比）
+        text_parts: List[str] = []
+        for key in ["title", "state_description", "trigger_verb", "trigger_noun", "trigger_context", "because_reason", "resolves", "content", "tags"]:
+            value = prepared.get(key)
+            if value:
+                text_parts.append(str(value))
+        action_steps = prepared.get("action_steps") or []
+        if isinstance(action_steps, list):
+            text_parts.extend([str(item) for item in action_steps if item])
+        inferred_signature = self.vault.infer_metadata_signature("\n".join(text_parts))
+
+        c_signature = c_explicit_signature or inferred_signature
 
         if c_signature:
             prepared["metadata_signature"] = c_signature
+
+        # ── 签名推断偏差检测（反馈环 Ⅳ）──
+        # 当 C 显式写入签名时，对比 C 的签名与推断引擎的签名，记录维度偏差
+        if c_explicit_signature and inferred_signature:
+            c_dims = set(c_explicit_signature.keys())
+            inferred_dims = set(inferred_signature.keys())
+            # C 写了但推断引擎没推出来的维度 = 推断引擎的盲区
+            blind_spots = c_dims - inferred_dims
+            # 推断引擎推出来但 C 没写的维度 = C 认为不重要或推断误报
+            false_positives = inferred_dims - c_dims
+            # 同维度值不同 = 判断分歧
+            value_conflicts = {
+                k for k in c_dims & inferred_dims
+                if str(c_explicit_signature[k]).lower() != str(inferred_signature[k]).lower()
+            }
+            # ── 自动学习：将 C 的盲区维度作为新 marker 持久化 ──
+            content_text = "\n".join(text_parts).lower()
+            for dim_key in blind_spots:
+                c_val = c_explicit_signature.get(dim_key)
+                if not c_val:
+                    continue
+                vals = c_val if isinstance(c_val, list) else [c_val]
+                for v in vals:
+                    v_str = str(v).strip().lower()
+                    # 只学习在节点内容中确实出现的值（确认是合理的 marker）
+                    if v_str and v_str in content_text:
+                        self.vault.learn_signature_marker(dim_key, v_str, source="c_phase")
+            if blind_spots or false_positives or value_conflicts:
+                self._signature_drift_events.append({
+                    "tool": tool_name,
+                    "blind_spots": list(blind_spots),
+                    "false_positives": list(false_positives),
+                    "value_conflicts": list(value_conflicts),
+                })
+                logger.debug(
+                    f"[签名偏差] tool={tool_name} blind={blind_spots} fp={false_positives} conflict={value_conflicts}"
+                )
 
         if c_signature and not prepared.get("verification_source"):
             prepared["verification_source"] = "reflection"
@@ -735,10 +902,39 @@ class V4Loop:
         if tool_steps >= 4:
             high_value = True
 
+        # 上游信号补充（避免 C-Phase 信号盲区 FRAGILITY_acc4）
+        # Multi-G 搜索空洞多 = 知识库有明显缺口，值得 C 记录 LESSON/VOID
+        if self.blackboard and len(self.blackboard.search_voids) >= 2:
+            high_value = True
+        # 多节点 dispatch = 复杂任务，反思价值更高
+        if len(self.execution_active_nodes) >= 3:
+            high_value = True
+        # 签名维度多 = 专业领域，C 的精准签名写入更关键
+        if len(self.inferred_signature) >= 4:
+            high_value = True
+
         if not high_value:
             return "SKIP"
 
-        return "FULL"
+        # LIGHT vs FULL 梯度：信号量少的 high_value 任务用 LIGHT，避免白烧 30 轮
+        # FULL 条件：多报告 / 失败 / 大量变更 / 知识空洞 / 复杂签名
+        full_signals = 0
+        if len(self.execution_reports) > 1:
+            full_signals += 1
+        if any((r.get("status", "UNKNOWN") or "UNKNOWN").upper() in ["FAILED", "PARTIAL", "UNKNOWN"] for r in self.execution_reports):
+            full_signals += 1
+        if sum(len(r.get("changes_made", []) or []) for r in self.execution_reports) >= 3:
+            full_signals += 1
+        if self.blackboard and len(self.blackboard.search_voids) >= 2:
+            full_signals += 1
+        if len(self.execution_active_nodes) >= 3:
+            full_signals += 1
+        if any(r.get("open_questions") for r in self.execution_reports):
+            full_signals += 1
+
+        if full_signals >= 2:
+            return "FULL"
+        return "LIGHT"
 
     def _build_execution_report_summary(self) -> str:
         if not self.execution_reports:
@@ -801,10 +997,19 @@ class V4Loop:
         schema = [t.to_schema() for t in all_tools]
         
         for i in range(self.OP_MAX_ITERATIONS):
-            # === 蒸发机制：在发送给 LLM 前，压缩旧的 TOOL 消息 ===
-            # 原理：LLM 的 ASSISTANT 回复已隐式总结了上一轮 TOOL 输出的关键信息
-            #       因此旧的 TOOL 原文可以安全地"蒸发"为存根，不丢失信息
-            self._evaporate_op_messages()
+            # ⚠️ Op 内部不蒸发：Op 的 ReAct 循环需要完整记忆自己做过什么。
+            # 蒸发只发生在 G（跨 dispatch）和 Lens（跨搜索轮次）中。
+            
+            # ── 优雅终止：倒数第 2 轮提醒 Op 收尾 ──
+            if i == self.OP_MAX_ITERATIONS - 2:
+                self.op_messages.append(Message(
+                    role=MessageRole.SYSTEM,
+                    content=(
+                        f"[系统提醒] 你还剩 2 轮迭代就会被强制终止。"
+                        f"请立即停止新的工具调用，输出 op_result 执行报告总结你已完成的工作和未完成的部分。"
+                        f"G 会根据你的报告决定是否需要继续派发。"
+                    )
+                ))
             
             self._llm_call_count += 1
             response = await self.provider.chat(
@@ -892,14 +1097,21 @@ class V4Loop:
             if m.role == MessageRole.TOOL:
                 preview = str(m.content)[:150].replace("\n", " ")
                 partial_work.append(f"- [{m.name}]: {preview}")
-        partial_summary = "\n".join(partial_work[-6:]) if partial_work else "无已完成步骤"
+        partial_summary = "\n".join(partial_work[-8:]) if partial_work else "无已完成步骤"
+        # 提取 Op 最后一条 assistant 消息作为 findings（Op 可能已有阶段性结论）
+        last_assistant = ""
+        for m in reversed(self.op_messages):
+            if m.role == MessageRole.ASSISTANT and m.content and m.content.strip():
+                last_assistant = m.content.strip()[:800]
+                break
         timeout_result = {
             "status": "PARTIAL",
-            "summary": f"Op 达到迭代上限被截断，但已执行 {len(partial_work)} 步工具调用。\n已完成步骤：\n{partial_summary}",
+            "summary": f"Op 达到迭代上限（{self.OP_MAX_ITERATIONS}轮），已执行 {len(partial_work)} 步。",
+            "findings": last_assistant or "Op 未输出阶段性结论",
             "changes_made": [],
             "artifacts": [],
-            "open_questions": [],
-            "raw_output": f"达到最大迭代次数限制，强制终止。已执行 {len(partial_work)} 步。"
+            "open_questions": [f"Op 在 {len(partial_work)} 步后被截断，G 应根据已完成步骤判断是否需要继续派发。"],
+            "raw_output": f"已完成步骤：\n{partial_summary}"
         }
         self.execution_reports.append(timeout_result)
         self._merge_signature_from_texts(timeout_result.get("summary", ""), "\n".join(timeout_result.get("open_questions", []) or []))
@@ -916,6 +1128,10 @@ class V4Loop:
         max_iter = self.C_PHASE_MAX_ITER.get(mode, 30)
         logger.info(f">>> Entering Phase 3: C-Process (Reflector) mode={mode}, max_iter={max_iter}")
         
+        # 跨进程向量同步：拉取 Daemon/Scavenger 在 G/Op 期间新增的节点向量，
+        # 确保 C 的 search_knowledge_nodes 能看到最新节点（LESSON 去重依赖此）
+        self.vault.sync_vector_matrix_incremental()
+        
         report_summary = self._build_execution_report_summary()
         # Knowledge Arena 反馈闭环: 根据任务结果调整被使用节点的置信度
         # 去重：防止多次 dispatch 同一节点导致 N 倍 boost/decay
@@ -931,12 +1147,33 @@ class V4Loop:
                 (r.get("status", "") or "").upper() in ["FAILED"]
                 for r in self.execution_reports
             )
+            # 节点级信用归因：用 fusion_score 加权 boost/decay
+            from genesis.tools.node_tools import SearchKnowledgeNodesTool
+            fusion_weights = SearchKnowledgeNodesTool.get_fusion_scores(unique_active_nodes)
             if has_success and not has_failure:
-                self.vault.record_usage_outcome(unique_active_nodes, success=True)
-                logger.info(f"Knowledge Arena: +boost for {len(unique_active_nodes)} nodes (task SUCCESS)")
+                self.vault.record_usage_outcome(unique_active_nodes, success=True, weights=fusion_weights)
+                logger.info(f"Knowledge Arena: +boost for {len(unique_active_nodes)} nodes (task SUCCESS, weighted)")
             elif has_failure:
-                self.vault.record_usage_outcome(unique_active_nodes, success=False)
-                logger.info(f"Knowledge Arena: -decay for {len(unique_active_nodes)} nodes (task FAILED)")
+                self.vault.record_usage_outcome(unique_active_nodes, success=False, weights=fusion_weights)
+                logger.info(f"Knowledge Arena: -decay for {len(unique_active_nodes)} nodes (task FAILED, weighted)")
+
+        # Persona 在线学习：将任务结果反馈给 Blackboard 的 persona 表现统计
+        # 注意：独立于 unique_active_nodes，即使 Op 没引用知识节点也要记录 persona 表现
+        if self.blackboard and self.blackboard.entries:
+            has_success_p = any(
+                (r.get("status", "") or "").upper() in ["SUCCESS", "PARTIAL"]
+                for r in self.execution_reports
+            )
+            has_failure_p = any(
+                (r.get("status", "") or "").upper() in ["FAILED"]
+                for r in self.execution_reports
+            )
+            contributing_personas = list({e.persona for e in self.blackboard.entries})
+            task_success = has_success_p and not has_failure_p
+            raw_atk = self.inferred_signature.get("task_kind") or ""
+            arena_task_kind = (raw_atk[0] if isinstance(raw_atk, list) and raw_atk else str(raw_atk)).lower()
+            Blackboard.record_persona_outcome(contributing_personas, success=task_success, task_kind=arena_task_kind)
+            logger.info(f"Persona Arena: {'WIN' if task_success else 'LOSS'} for {contributing_personas} (task_kind={arena_task_kind})")
 
         # 3. 整理执行总结
         summary_lines = ["[Op 执行过程摘要]"]
@@ -956,11 +1193,15 @@ class V4Loop:
         signature_text = self.vault.render_metadata_signature(self.inferred_signature)
         signature_block = f"[当前任务推测签名]\n{signature_text}\n\n" if signature_text else ""
         
-        reflection_system_prompt = f"""你是 Genesis 反思进程 (C-Process)。审查 Op 的执行轨迹，提炼高价值元信息。
+        # Multi-G 信息空洞（仅供 C 参考，不需要 C 处理——已由基础设施自动入库）
+        void_block = ""
+        if self.blackboard:
+            void_count = len(self.blackboard.search_voids)
+            if void_count > 0:
+                void_block = f"\n[Multi-G 信息空洞] 本次透镜阶段有 {void_count} 个搜索未命中，已自动记录为 VOID 节点供后台拾荒。你无需处理它们。\n"
 
-{signature_block}
-{report_summary}
-{execution_summary}
+        # ⚠️ 前缀缓存优化：稳定指令放前面，每次请求不同的变量内容放后面
+        reflection_system_prompt = f"""你是 Genesis 反思进程 (C-Process)。审查 Op 的执行轨迹，提炼高价值元信息。
 
 [原则]
 不写日记，不记流水账。先判断这轮有没有长期价值——如果 Op 只是读了个文件或搜了一下，没有状态修改，直接回复 NO_ACTION。
@@ -973,9 +1214,17 @@ class V4Loop:
 不可泛化的一次性过程不写 LESSON。LESSON 必须填 resolves 字段（解决什么问题），尽量填 prerequisites。
 
 [metadata_signature]
-为每个节点写精准的签名——只填该节点实际涉及的值，不要堆砌。
+为每个节点写精准的签名——只填该节点实际涉及的值。
 核心字段：os_family, runtime, language, framework, task_kind, error_kind, target_kind, environment_scope。
-也可以发明自定义维度。validation_status 只有命令输出/日志明确证实时才填 validated，否则用 unverified。
+反堆砌规则：每个字段最多 2 个值。task_kind 只填最核心的 1 个（debug/configure/deploy 等），不要把所有沾边的都塞进去。
+自定义维度鼓励：知识分类型（如 severity, scope, maturity, pattern_type, failure_mode），这些能帮助未来搜索定位。
+自定义维度禁止：运营流水型（timestamp, port, version, daily_count, followup_needed 等），这些对搜索无价值。
+validation_status 只有命令输出/日志明确证实时才填 validated，否则用 unverified。
+
+{signature_block}
+{report_summary}
+{execution_summary}
+{void_block}
 """
         c_messages = [Message(role=MessageRole.SYSTEM, content=reflection_system_prompt)]
         
@@ -1029,58 +1278,501 @@ class V4Loop:
         logger.info(f"C-Process finished. c_tokens={self.metrics.c_tokens}, total={self.metrics.total_tokens}")
         await self._safe_callback(step_callback, "c_phase_done", {"mode": mode, "c_tokens": self.metrics.c_tokens})
 
-    # ─── 蒸发机制 ─────────────────────────────────────────────────────
-    
-    def _evaporate_op_messages(self):
+    # ─── Multi-G 透镜编排 ──────────────────────────────────────────────
+
+    def _auto_record_voids(self, blackboard: Blackboard):
         """
-        蒸发 Op-Process 中旧的 TOOL 消息。
+        基础设施层自动记录搜索空洞到 NodeVault。
         
-        原理：
-        - LLM 的 ASSISTANT 回复已隐式总结了上一轮 TOOL 输出的关键信息
-        - 因此在 LLM 处理完 TOOL 结果后，原文可以安全地"蒸发"为存根
-        - 这不是截断：信息已被 LLM 消化，存根只是标记"发生过什么"
+        不依赖 C-Process 判断——所有透镜搜索未命中 + 假设型条目的建议搜索方向
+        都直接写成轻量级 VOID 节点，供 Scavenger/Fermentor 定向拾荒。
         
-        策略：
-        - 保留最近 2 轮的完整 TOOL 消息（LLM 可能还在引用它们）
-        - 更早的 TOOL 消息压缩为单行存根
+        去重逻辑：对 query 做向量相似度检查，相似度 > 0.80 的 VOID 合并。
         """
-        if len(self.op_messages) <= 5:
-            return  # 消息太少，无需蒸发
+        all_voids = list(blackboard.search_voids)
+        for entry in blackboard.entries:
+            if hasattr(entry, 'suggested_search_directions'):
+                for d in (entry.suggested_search_directions or []):
+                    all_voids.append({
+                        "persona": entry.persona,
+                        "query": d,
+                        "source": "hypothesis_suggestion"
+                    })
         
-        # 找出所有 TOOL 消息的索引
-        tool_indices = [i for i, m in enumerate(self.op_messages) if m.role == MessageRole.TOOL]
+        if not all_voids:
+            return
         
-        if len(tool_indices) <= 2:
-            return  # TOOL 消息太少，无需蒸发
-        
-        # 保留最后 2 条 TOOL 消息的完整内容
-        keep_indices = set(tool_indices[-2:])
-        
-        for idx in tool_indices:
-            if idx in keep_indices:
+        # 去重：按 query 文本粗去重
+        seen_queries = set()
+        unique_voids = []
+        for v in all_voids:
+            q = v.get("query", "").strip()
+            if not q or len(q) < 5:
                 continue
+            q_key = q[:80].lower()
+            if q_key not in seen_queries:
+                seen_queries.add(q_key)
+                unique_voids.append(v)
+        
+        if not unique_voids:
+            return
+        
+        # 向量去重：检查是否已有相似的 VOID 节点
+        recorded = 0
+        for v in unique_voids[:10]:  # 每次最多记录 10 个，避免膨胀
+            query = v["query"]
+            persona = v.get("persona", "unknown")
             
-            msg = self.op_messages[idx]
-            content_len = len(str(msg.content or ""))
+            # 检查是否已有相似的 VOID
+            if self.vault.vector_engine.is_ready:
+                existing = self.vault.vector_engine.search(query, top_k=3, threshold=0.80)
+                # 检查命中的是否为 VOID 节点
+                if existing:
+                    existing_ids = [r[0] for r in existing]
+                    briefs = self.vault.get_node_briefs(existing_ids)
+                    has_similar_void = any(
+                        "VOID" in (b.get("tags") or "")
+                        for b in briefs.values()
+                    )
+                    if has_similar_void:
+                        continue  # 已有相似 VOID，跳过
             
-            # 只有足够长的消息才值得蒸发
-            if content_len < 500:
-                continue
+            # 生成简洁的 node_id
+            import hashlib
+            q_hash = hashlib.md5(query.encode()).hexdigest()[:8].upper()
+            node_id = f"VOID_{q_hash}"
             
-            # 创建存根：保留工具名和长度信息
-            stub_content = f"[{msg.name}: 已处理, {content_len}字符]"
-            
-            # 原地替换为存根
-            self.op_messages[idx] = Message(
-                role=MessageRole.TOOL,
-                content=stub_content,
-                tool_call_id=msg.tool_call_id,
-                name=msg.name
+            try:
+                self.vault.create_node(
+                    node_id=node_id,
+                    ntype="CONTEXT",
+                    title=f"[信息空洞] {query[:60]}",
+                    human_translation=query,
+                    tags="VOID",
+                    full_content=f"Multi-G 透镜 {persona} 搜索未命中。\n查询: {query}\n来源: {v.get('source', 'search_miss')}\n任务签名: {json.dumps(self.inferred_signature, ensure_ascii=False)}",
+                    source="multi_g_void",
+                    metadata_signature=self.inferred_signature,
+                    confidence_score=0.3,
+                    trust_tier="SCAVENGED"
+                )
+                recorded += 1
+            except Exception as e:
+                logger.debug(f"Auto-record void failed for '{query[:40]}': {e}")
+        
+        if recorded:
+            logger.info(f"Multi-G: auto-recorded {recorded}/{len(unique_voids)} voids to NodeVault")
+
+    # 需要 Multi-G 的复杂 task_kind 集合
+    MULTI_G_TASK_KINDS = frozenset(["debug", "refactor", "build", "optimize", "design", "test", "deploy", "configure"])
+    LENS_MAX_ITERATIONS = 2   # 每个透镜子程序最多 2 轮搜索（+ 1 次强制输出）
+    LENS_TIMEOUT_SECS = 60    # 单个透镜超时
+
+    def _should_activate_multi_g(self, user_input: str) -> bool:
+        """判断是否应启用 Multi-G 透镜阶段
+        
+        策略：默认开启，仅在以下情况跳过：
+        - 用户 /quick 强制跳过
+        - 输入太短（闲聊/打招呼，< 10 个有效字符）
+        """
+        # 提取实际用户请求（跳过频道历史噪音）—— 必须先做，否则 /deep /quick 被频道历史淹没
+        actual_input = user_input
+        if "[GENESIS_USER_REQUEST_START]" in user_input:
+            actual_input = user_input.split("[GENESIS_USER_REQUEST_START]", 1)[1]
+        actual_input = actual_input.strip()
+        
+        # 用户强制开关（在提取后的实际请求中检查）
+        if "/quick" in actual_input[:20]:
+            logger.info("Multi-G skipped by /quick prefix")
+            return False
+        if "/deep" in actual_input[:20]:
+            logger.info("Multi-G activated by /deep prefix (force 7 lenses)")
+            return True
+        
+        # 太短的输入不值得激活透镜
+        if len(actual_input) < 10:
+            logger.info(f"Multi-G skipped: input too short ({len(actual_input)} chars)")
+            return False
+        
+        logger.info(f"Multi-G activated (default-on, input={len(actual_input)} chars)")
+        return True
+
+    # 从 PERSONA_ACTIVATION_MAP 的 3 个基础人格扩展到 5/7 时的补充池
+    # 按认知维度互补排列，确保新增人格带来差异化视角
+    PERSONA_EXTENSION_POOL = ["ISTP", "ENTJ", "ISFJ", "ENFP", "ESTJ", "INFJ", "ISTJ", "INTP", "INTJ"]
+
+    # 全 16 型 MBTI 池（供动态淘汰/递补选择）
+    ALL_PERSONAS = [
+        "ISTJ", "ISFJ", "INFJ", "INTJ", "ISTP", "ISFP", "INFP", "INTP",
+        "ESTP", "ESFP", "ENFP", "ENTP", "ESTJ", "ESFJ", "ENFJ", "ENTJ",
+    ]
+
+    def _select_personas(self, target_count: int = 3) -> List[str]:
+        """根据签名映射选择激活的人格透镜，支持自适应数量 + 动态淘汰/递补"""
+        raw_tk = self.inferred_signature.get("task_kind") or ""
+        task_kind = (raw_tk[0] if isinstance(raw_tk, list) and raw_tk else str(raw_tk)).lower()
+        base = list(PERSONA_ACTIVATION_MAP.get(task_kind, PERSONA_ACTIVATION_MAP["_default"]))
+        # 动态淘汰/递补：基于 task_kind 历史胜率替换表现差的 persona
+        base = Blackboard.suggest_persona_swap(base, task_kind, self.ALL_PERSONAS)
+        if target_count <= len(base):
+            return base[:target_count]
+        # 从扩展池中补充，跳过已在 base 中的人格
+        for p in self.PERSONA_EXTENSION_POOL:
+            if len(base) >= target_count:
+                break
+            if p not in base:
+                base.append(p)
+        return base
+
+    async def _probe_knowledge_density(self, user_input: str) -> int:
+        """G 的'第一搜'：快速探测知识库对当前任务的覆盖密度，返回命中节点数"""
+        try:
+            # 清理前缀
+            text = user_input
+            for prefix in ["/deep ", "/quick "]:
+                if text.startswith(prefix):
+                    text = text[len(prefix):]
+            # 提取关键词（中文+英文 token，取前 5 个有意义的）
+            tokens = re.findall(r'[\w\u4e00-\u9fff]{2,}', text)
+            keywords = tokens[:5] if tokens else []
+            if not keywords:
+                return 0
+            query_str = " ".join(keywords)
+            # 向量搜索
+            hits = 0
+            if self.vault.vector_engine.is_ready:
+                results = self.vault.vector_engine.search(query_str, top_k=10, threshold=0.55)
+                hits = len(results)
+            logger.info(f"Multi-G probe: query='{query_str}' → {hits} vector hits")
+            return hits
+        except Exception as e:
+            logger.warning(f"Multi-G probe failed: {e}")
+            return 0
+
+    async def _build_lens_task_brief(self, clean_input: str, knowledge_digest: str) -> str:
+        """G 为透镜布置作业：解读用户意图，生成结构化搜索任务简报。
+        
+        避免透镜对用户原话做词级同义词发散（"不完整"→搜"不完整,未完成,部分完成..."）。
+        取而代之，先理解用户到底在问什么，再给出具体的搜索方向。
+        """
+        digest_hint = ""
+        if knowledge_digest:
+            digest_hint = f"\n知识库概况（前500字）：\n{knowledge_digest[:500]}\n"
+        
+        prompt = f"""你是任务解读器。用一句话总结用户的底层意图，然后给出 3-5 个具体搜索方向。
+搜索方向必须是【知识库中可能存在的主题/实体】，不是用户原话的同义词改写。
+
+用户原话：{clean_input}
+{digest_hint}
+严格按以下格式输出（不要多余文字）：
+意图：（用户真正想知道/想做什么）
+搜索方向：
+- （具体主题词或短语1）
+- （具体主题词或短语2）
+- （具体主题词或短语3）"""
+        
+        try:
+            resp = await asyncio.wait_for(
+                self.provider.chat(
+                    messages=[{"role": "user", "content": prompt}],
+                    stream=False
+                ),
+                timeout=15
             )
+            brief = (resp.content or "").strip()
+            if brief and "意图" in brief:
+                logger.info(f"Lens task brief: {brief[:120]}...")
+                return brief
+        except Exception as e:
+            logger.warning(f"Task brief generation failed: {e}")
         
-        # 记录蒸发效果
-        total_chars = sum(len(str(m.content or "")) for m in self.op_messages)
-        logger.debug(f"Op蒸发: {len(tool_indices) - 2} 条TOOL消息已压缩, 剩余上下文约 {total_chars} 字符")
+        # 兜底：直接返回原文
+        return f"意图：{clean_input}\n搜索方向：\n- （自行判断最相关的知识领域）"
+
+    async def _run_lens_phase(self, user_input: str, step_callback: Any) -> Blackboard:
+        """
+        运行 Multi-G 透镜阶段：
+        1. 探针搜索（G 的"第一搜"）→ 根据命中密度自适应选择透镜数量
+        2. 并行 spawn 多个透镜子程序，各自搜索 NodeVault
+        3. 将结果写入共享黑板
+        
+        返回填充完毕的 Blackboard。
+        """
+        blackboard = Blackboard()
+        
+        # ── 探针搜索：用 G 的视角做一次快速搜索，测量知识密度 ──
+        # 提取实际用户请求后再检查 /deep（Discord 会在前面加频道历史）
+        _actual = user_input
+        if "[GENESIS_USER_REQUEST_START]" in user_input:
+            _actual = user_input.split("[GENESIS_USER_REQUEST_START]", 1)[1]
+        force_deep = "/deep" in _actual.strip()[:20]
+        probe_hits = 0
+        if not force_deep:
+            probe_hits = await self._probe_knowledge_density(user_input)
+            if probe_hits <= 2:
+                target_count = 3   # 稀疏：保守
+            elif probe_hits <= 6:
+                target_count = 5   # 中等
+            else:
+                target_count = 7   # 密集：全力
+            logger.info(f"Multi-G probe: {probe_hits} hits → {target_count} lenses")
+        else:
+            target_count = 7  # /deep 强制满配
+            logger.info(f"Multi-G /deep: forcing {target_count} lenses")
+        
+        personas = self._select_personas(target_count)
+        
+        logger.info(f">>> Multi-G Lens Phase: spawning {len(personas)} lenses: {personas}")
+        
+        # 预获取共享的 digest 和签名（避免每个透镜重复计算）
+        knowledge_digest = self.vault.get_digest()
+        signature_text = self.vault.render_metadata_signature(self.inferred_signature)
+        
+        # 去掉频道历史和 /deep /quick 前缀后的干净任务文本
+        clean_input = _actual.strip()
+        for prefix in ["/deep ", "/quick "]:
+            if clean_input.startswith(prefix):
+                clean_input = clean_input[len(prefix):]
+        clean_input = clean_input.strip()
+        
+        # ── G 布置作业：解读用户意图，生成结构化搜索任务简报 ──
+        task_brief = await self._build_lens_task_brief(clean_input, knowledge_digest)
+        
+        await self._safe_callback(step_callback, "lens_start", {
+            "personas": personas, "probe_hits": probe_hits,
+            "task_brief": task_brief
+        })
+        
+        # 并行运行所有透镜
+        tasks = [
+            self._run_single_lens(
+                persona=p,
+                task_context=task_brief,
+                blackboard=blackboard,
+                knowledge_digest=knowledge_digest,
+                signature_text=signature_text,
+                step_callback=step_callback
+            )
+            for p in personas
+        ]
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for persona, result in zip(personas, results):
+            if isinstance(result, Exception):
+                logger.error(f"Lens-{persona} failed: {result}")
+        
+        await self._safe_callback(step_callback, "lens_done", {
+            "entries": blackboard.entry_count,
+            "voids": len(blackboard.search_voids)
+        })
+        
+        return blackboard
+
+    async def _run_single_lens(
+        self,
+        persona: str,
+        task_context: str,
+        blackboard: Blackboard,
+        knowledge_digest: str,
+        signature_text: str,
+        step_callback: Any
+    ):
+        """运行单个透镜子程序：搜索 + 输出三元组 + 写黑板"""
+        lens_prompt = self.factory.build_lens_prompt(
+            persona=persona,
+            task_context=task_context,
+            blackboard_state=blackboard.render_for_g() if blackboard.entry_count > 0 else "",
+            knowledge_digest=knowledge_digest,
+            inferred_signature=signature_text
+        )
+        
+        messages = [
+            Message(role=MessageRole.SYSTEM, content=lens_prompt),
+            Message(role=MessageRole.USER, content="请根据任务简报中的搜索方向开始搜索。")
+        ]
+        
+        search_tool = self.tools.get("search_knowledge_nodes")
+        schema = [search_tool.to_schema()] if search_tool else []
+        parsed = False
+        
+        for iteration in range(self.LENS_MAX_ITERATIONS):
+            # 透镜内蒸发：压缩非最近一轮的 TOOL 消息，防止 token 二次增长
+            tool_indices = [i for i, m in enumerate(messages) if m.role == MessageRole.TOOL and i >= 2]
+            if len(tool_indices) > 1:
+                for idx in tool_indices[:-1]:
+                    msg = messages[idx]
+                    if len(str(msg.content or "")) > 300:
+                        messages[idx] = Message(
+                            role=MessageRole.TOOL,
+                            content=f"[搜索结果已消化, {len(str(msg.content))}字符]",
+                            tool_call_id=msg.tool_call_id, name=msg.name
+                        )
+            try:
+                response = await asyncio.wait_for(
+                    self.provider.chat(
+                        messages=[m.to_dict() for m in messages],
+                        tools=schema,
+                        stream=False
+                    ),
+                    timeout=self.LENS_TIMEOUT_SECS
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"Lens-{persona} timeout at iteration {iteration}")
+                break
+            except Exception as e:
+                logger.error(f"Lens-{persona} LLM call failed: {e}")
+                break
+            
+            self._update_metrics(response, phase="G")  # 透镜 token 计入 G 阶段
+            
+            messages.append(Message(
+                role=MessageRole.ASSISTANT,
+                content=response.content,
+                tool_calls=[tc.__dict__ for tc in response.tool_calls] if response.tool_calls else None
+            ))
+            
+            if response.tool_calls:
+                # 执行搜索工具调用
+                for tc in response.tool_calls:
+                    if tc.name != "search_knowledge_nodes":
+                        messages.append(Message(
+                            role=MessageRole.TOOL,
+                            content=f"Lens 只允许使用 search_knowledge_nodes",
+                            tool_call_id=tc.id, name=tc.name
+                        ))
+                        continue
+                    
+                    search_args = dict(tc.arguments or {})
+                    if self.inferred_signature:
+                        search_args["signature"] = self.vault.merge_metadata_signatures(
+                            self.inferred_signature,
+                            search_args.get("signature")
+                        )
+                    
+                    try:
+                        res = await asyncio.wait_for(
+                            self.tools.execute(tc.name, search_args),
+                            timeout=self.TOOL_EXEC_TIMEOUT
+                        )
+                    except asyncio.TimeoutError:
+                        res = f"搜索超时（{self.TOOL_EXEC_TIMEOUT}秒）"
+                    
+                    # 检测搜索空洞
+                    if res and ("未找到" in str(res) or "0 个匹配" in str(res) or "没有找到" in str(res)):
+                        blackboard.record_search_void(
+                            persona=persona,
+                            query=str(search_args.get("keywords", "")),
+                            signature=search_args.get("signature")
+                        )
+                    
+                    messages.append(Message(
+                        role=MessageRole.TOOL, content=res,
+                        tool_call_id=tc.id, name=tc.name
+                    ))
+                    
+                    await self._safe_callback(step_callback, "lens_search", {
+                        "persona": persona, "tool": tc.name,
+                        "query": search_args.get("keywords", [])
+                    })
+                
+                continue  # 搜索完继续循环让 LLM 输出最终 JSON
+            
+            # 无 tool_calls → LLM 输出了最终文本，解析 JSON 三元组
+            if response.content:
+                self._parse_lens_output(persona, response.content, blackboard)
+                parsed = True
+            break
+        
+        # 兜底：如果搜索用完了迭代但从未输出 JSON，做一次无工具的强制输出
+        if not parsed:
+            logger.info(f"Lens-{persona}: forcing final JSON output (no-tools call)")
+            messages.append(Message(
+                role=MessageRole.USER,
+                content="搜索阶段已结束。禁止调用任何工具。禁止输出 function_calls/DSML 标记。\n请直接输出一个纯 JSON 对象，格式二选一：\n{\"type\": \"evidence\", \"framework\": \"你的诊断框架\", \"evidence_node_ids\": [\"搜索到的节点ID\"], \"verification_action\": \"建议的验证命令\"}\n{\"type\": \"hypothesis\", \"framework\": \"你的假设\", \"reasoning_chain\": \"推理过程\", \"suggested_search_directions\": [\"建议搜索方向\"]}"
+            ))
+            try:
+                response = await asyncio.wait_for(
+                    self.provider.chat(
+                        messages=[m.to_dict() for m in messages],
+                        tools=[],  # 不提供任何工具，强制文本输出
+                        stream=False
+                    ),
+                    timeout=self.LENS_TIMEOUT_SECS
+                )
+                self._update_metrics(response, phase="G")
+                if response.content:
+                    self._parse_lens_output(persona, response.content, blackboard)
+                    parsed = True
+            except Exception as e:
+                logger.error(f"Lens-{persona} forced output failed: {e}")
+        
+        logger.info(f"Lens-{persona} finished (parsed={parsed})")
+
+    def _parse_lens_output(self, persona: str, content: str, blackboard: Blackboard):
+        """解析透镜 LLM 输出的 JSON 三元组，写入黑板"""
+        # 尝试从文本中提取 JSON
+        text = content.strip()
+        
+        # 剥离可能的 markdown 代码块包裹
+        if text.startswith("```"):
+            lines = text.split("\n")
+            lines = [l for l in lines if not l.strip().startswith("```")]
+            text = "\n".join(lines).strip()
+        
+        # 防御性清洗：provider 层已做一级 DSML 剥离，此处为二级兜底
+        if "DSML" in text or "tool_call" in text.lower():
+            text = re.sub(r'<[｜|](?:DSML|tool_call|function_call)[｜|][^>]*>', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'</[｜|](?:DSML|tool_call|function_call)[｜|][^>]*>', '', text, flags=re.IGNORECASE)
+            text = re.sub(r'[｜|](?:DSML|tool_call|function_call)[｜|]', '', text, flags=re.IGNORECASE)
+            text = text.strip()
+            if not text:
+                logger.warning(f"Lens-{persona}: control markers stripped, no content remaining")
+                text = ""
+        
+        # 多层 JSON 解析容错
+        parsed = None
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            # 尝试找到第一个 { 和最后一个 }
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end > start:
+                try:
+                    parsed = json.loads(text[start:end + 1])
+                except json.JSONDecodeError:
+                    pass
+        
+        if not parsed or not isinstance(parsed, dict):
+            logger.warning(f"Lens-{persona} output not valid JSON, treating as hypothesis: {text[:100]}")
+            # 回退：把整个输出当做一个假设
+            blackboard.add_hypothesis(
+                persona=persona,
+                framework=text[:200] if text else "无法解析的输出",
+                reasoning_chain=text,
+                suggested_search_directions=[]
+            )
+            return
+        
+        entry_type = parsed.get("type", "hypothesis")
+        
+        if entry_type == "evidence":
+            blackboard.add_evidence(
+                persona=persona,
+                framework=parsed.get("framework", "未指定框架"),
+                evidence_node_ids=parsed.get("evidence_node_ids", []),
+                verification_action=parsed.get("verification_action", "")
+            )
+        else:
+            blackboard.add_hypothesis(
+                persona=persona,
+                framework=parsed.get("framework", "未指定框架"),
+                reasoning_chain=parsed.get("reasoning_chain", ""),
+                suggested_search_directions=parsed.get("suggested_search_directions", [])
+            )
+
+    # ─── 蒸发机制 ─────────────────────────────────────────────────────
+    # 注意：Op 不蒸发（ReAct 循环需要完整记忆），仅 G 蒸发旧 TOOL 消息。
 
     def _evaporate_g_messages(self):
         """
@@ -1140,6 +1832,7 @@ class V4Loop:
         self.metrics.input_tokens += response.input_tokens
         self.metrics.output_tokens += response.output_tokens
         self.metrics.total_tokens += response.total_tokens
+        self.metrics.prompt_cache_hit_tokens += getattr(response, 'prompt_cache_hit_tokens', 0)
         self.metrics.iterations += 1
         if phase == "G":
             self.metrics.g_tokens += tokens

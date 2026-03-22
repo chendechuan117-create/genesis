@@ -18,12 +18,59 @@ class WallClockTimeoutError(Exception):
     """LLM 调用总体超时（非 provider 故障，不应触发 failover）"""
     pass
 
+# DeepSeek DSML 及其他模型特定控制标记的统一清洗正则
+_CONTROL_MARKER_RE = re.compile(
+    r'<[\uff5c|](?:DSML|tool_call|function_call)[\uff5c|][^>]*>'
+    r'|</[\uff5c|](?:DSML|tool_call|function_call)[\uff5c|][^>]*>'
+    r'|[\uff5c|](?:DSML|tool_call|function_call)[\uff5c|]',
+    re.IGNORECASE
+)
+
 
 class NativeHTTPProvider(BaseLLMProvider):
     """基于原生 HTTP (httpx) 的提供商 - 高性能异步实现"""
     
     DEFAULT_STOP_SEQUENCES = ["User:", "Observation:", "用户:", "Model:", "Assistant:"]
-    
+
+    # ── Provider 质量漂移诊断：滑动窗口统计 ──
+    _STATS_WINDOW = 100  # 滑动窗口大小
+    _stats_total_calls: int = 0
+    _stats_retries: int = 0
+    _stats_timeouts: int = 0
+    _stats_errors: int = 0
+    _stats_wall_clock_timeouts: int = 0
+    # 滑动窗口：每个元素是 ("ok" | "retry" | "timeout" | "error" | "wall_timeout")
+    _stats_window: List[str] = []
+
+    @classmethod
+    def _record_stat(cls, event: str):
+        """记录一次调用事件到滑动窗口"""
+        cls._stats_window.append(event)
+        if len(cls._stats_window) > cls._STATS_WINDOW:
+            cls._stats_window = cls._stats_window[-cls._STATS_WINDOW:]
+
+    @classmethod
+    def get_provider_stats(cls) -> Dict[str, Any]:
+        """供 heartbeat 获取 provider 质量指标（含全局累计 + 最近窗口）"""
+        total = cls._stats_total_calls
+        # 最近窗口统计
+        w = cls._stats_window
+        w_total = len(w)
+        w_errors = sum(1 for e in w if e in ("error", "timeout", "wall_timeout"))
+        w_retries = sum(1 for e in w if e == "retry")
+        return {
+            "total_calls": total,
+            "retries": cls._stats_retries,
+            "timeouts": cls._stats_timeouts,
+            "errors": cls._stats_errors,
+            "wall_clock_timeouts": cls._stats_wall_clock_timeouts,
+            "retry_rate": round(cls._stats_retries / total, 3) if total > 0 else 0,
+            "error_rate": round(cls._stats_errors / total, 3) if total > 0 else 0,
+            "recent_window": w_total,
+            "recent_error_rate": round(w_errors / w_total, 3) if w_total > 0 else 0,
+            "recent_retry_rate": round(w_retries / w_total, 3) if w_total > 0 else 0,
+        }
+
     def __init__(
         self,
         api_key: Optional[str] = None,
@@ -33,7 +80,8 @@ class NativeHTTPProvider(BaseLLMProvider):
         request_timeout: int = 180,
         wall_clock_timeout: int = 300,  # 整体超时(秒)：防止推理模型思考过久
         stop_sequences: Optional[List[str]] = None,
-        provider_name: str = "default"
+        provider_name: str = "default",
+        use_proxy: bool = False
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip('/') if base_url else "https://api.deepseek.com/v1"
@@ -43,13 +91,14 @@ class NativeHTTPProvider(BaseLLMProvider):
         self.wall_clock_timeout = wall_clock_timeout
         self.stop_sequences = stop_sequences if stop_sequences is not None else self.DEFAULT_STOP_SEQUENCES
         self.provider_name = provider_name
+        self.use_proxy = use_proxy
         self._http_client: Optional[httpx.AsyncClient] = None
     
     def _get_http_client(self) -> httpx.AsyncClient:
         """延迟初始化的持久 httpx 客户端（复用 TCP 连接池）"""
         if self._http_client is None or self._http_client.is_closed:
             timeout = httpx.Timeout(self.request_timeout, connect=self.connect_timeout)
-            self._http_client = httpx.AsyncClient(timeout=timeout, trust_env=False)
+            self._http_client = httpx.AsyncClient(timeout=timeout, trust_env=self.use_proxy)
         return self._http_client
 
     def get_default_model(self) -> str:
@@ -102,13 +151,18 @@ class NativeHTTPProvider(BaseLLMProvider):
         # ⚠️ 注意：trust_env=False 会绕过系统代理。如需翻墙访问 groq/cloudflare 等墙外免费池，
         #    参见 genesis/core/config.py:ConfigManager._apply_proxies 中的代理注入逻辑。
         client = self._get_http_client()
+        NativeHTTPProvider._stats_total_calls += 1
         try:
             if stream:
                 coro = self._stream_with_httpx(client, url, headers, request_params, stream_callback)
             else:
                 coro = self._chat_with_httpx(client, url, headers, request_params)
-            return await asyncio.wait_for(coro, timeout=self.wall_clock_timeout)
+            result = await asyncio.wait_for(coro, timeout=self.wall_clock_timeout)
+            NativeHTTPProvider._record_stat("ok")
+            return result
         except asyncio.TimeoutError:
+            NativeHTTPProvider._stats_wall_clock_timeouts += 1
+            NativeHTTPProvider._record_stat("wall_timeout")
             raise WallClockTimeoutError(
                 f"LLM 调用总超时 ({self.wall_clock_timeout}s)。"
                 f"推理模型可能思考过久，请简化问题或缩短上下文。"
@@ -134,19 +188,29 @@ class NativeHTTPProvider(BaseLLMProvider):
                     error_msg = error_body
                 # 5xx 瞬态错误可重试（502/503/504）
                 if status in (502, 503, 504) and attempt < retries - 1:
+                    NativeHTTPProvider._stats_retries += 1
+                    NativeHTTPProvider._record_stat("retry")
                     logger.warning(f"HTTP {status} (attempt {attempt+1}/{retries}): {error_msg[:100]}")
                     last_exception = e
                     await asyncio.sleep(1 * (attempt + 1))
                     continue
+                NativeHTTPProvider._stats_errors += 1
+                NativeHTTPProvider._record_stat("error")
                 raise Exception(f"API Error ({status}): {error_msg}")
             except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
                 logger.warning(f"httpx connection error (attempt {attempt+1}/{retries}): {e}")
                 last_exception = e
                 if attempt < retries - 1:
+                    NativeHTTPProvider._stats_retries += 1
+                    NativeHTTPProvider._record_stat("retry")
                     await asyncio.sleep(1)
                     continue
+                NativeHTTPProvider._stats_timeouts += 1
+                NativeHTTPProvider._record_stat("timeout")
                 raise Exception(f"Network Error after {retries} retries: {e}")
             except Exception as e:
+                 NativeHTTPProvider._stats_errors += 1
+                 NativeHTTPProvider._record_stat("error")
                  logger.error(f"httpx unexpected error: {e}")
                  raise
 
@@ -190,6 +254,10 @@ class NativeHTTPProvider(BaseLLMProvider):
         if "<reflection>" in content:
             content = re.sub(r"<reflection>.*?</reflection>", "", content, flags=re.DOTALL)
             content = content.strip()
+        
+        # 清洗模型特定控制标记（DeepSeek DSML 等）
+        if _CONTROL_MARKER_RE.search(content):
+            content = _CONTROL_MARKER_RE.sub('', content).strip()
 
         usage = resp_data.get('usage', {})
         
@@ -294,17 +362,27 @@ class NativeHTTPProvider(BaseLLMProvider):
                 status = e.response.status_code
                 # 5xx 瞬态错误可重试
                 if status in (502, 503, 504) and attempt < retries - 1:
+                    NativeHTTPProvider._stats_retries += 1
+                    NativeHTTPProvider._record_stat("retry")
                     logger.warning(f"Stream HTTP {status} (attempt {attempt+1}/{retries}): {e.response.text[:100]}")
                     await asyncio.sleep(1 * (attempt + 1))
                     continue
+                NativeHTTPProvider._stats_errors += 1
+                NativeHTTPProvider._record_stat("error")
                 raise Exception(f"API Error ({status}): {e.response.text}")
             except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
                 logger.warning(f"httpx stream error (attempt {attempt+1}/{retries}): {e}")
                 if attempt < retries - 1:
+                    NativeHTTPProvider._stats_retries += 1
+                    NativeHTTPProvider._record_stat("retry")
                     await asyncio.sleep(1)
                     continue
+                NativeHTTPProvider._stats_timeouts += 1
+                NativeHTTPProvider._record_stat("timeout")
                 raise Exception(f"Stream Network Error after {retries} retries: {e}")
             except Exception as e:
+                NativeHTTPProvider._stats_errors += 1
+                NativeHTTPProvider._record_stat("error")
                 raise
                 
         # Post-processing
@@ -335,6 +413,10 @@ class NativeHTTPProvider(BaseLLMProvider):
                     ))
 
         final_content = "".join(full_content)
+        
+        # 清洗模型特定控制标记（DeepSeek DSML 等）
+        if _CONTROL_MARKER_RE.search(final_content):
+            final_content = _CONTROL_MARKER_RE.sub('', final_content).strip()
         
         if not final_content and not final_tool_calls:
             rc_text = "".join(reasoning_content)

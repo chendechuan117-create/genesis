@@ -2,7 +2,8 @@
 工具注册表 - 统一管理所有工具
 """
 
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Set
+import ast
 import logging
 import importlib.util
 import inspect
@@ -10,7 +11,7 @@ import sys
 import subprocess
 from pathlib import Path
 
-from .base import Tool
+from .base import Tool, MetaTool
 
 logger = logging.getLogger(__name__)
 
@@ -64,12 +65,11 @@ class ToolRegistry:
             logger.error(error_msg)
             return f"Error: {error_msg}"
             
-        # 拦截底层的 JSON 解析错误，直接用自然语言反馈给大模型，避免引发底层的 TypeError
+        # 拦截底层的 JSON 解析错误
         if "__json_decode_error__" in arguments:
-            raw_bad_json = arguments["__json_decode_error__"]
-            error_msg = f"你生成的工具参数 JSON 格式有误（通常是未转义的换行符或引号导致）。请检查并修复你的 JSON 格式后再试。你刚才输出的错误内容片段：\n{raw_bad_json[:200]}..."
-            logger.warning(f"Intercepted JSON decode error for tool {tool_name}")
-            return f"Error: {error_msg}"
+            raw_bad = str(arguments["__json_decode_error__"])[:200]
+            logger.warning(f"Intercepted JSON decode error for tool {tool_name}: {raw_bad[:80]}")
+            return f"Error: JSON参数解析失败。错误片段: {raw_bad}\n请换一种方式：将多行内容拆分为多步小命令，或改用 write_file 工具写入文件。"
         
         try:
             logger.debug(f"执行工具: {tool_name} with {arguments}")
@@ -102,7 +102,13 @@ class ToolRegistry:
             spec = importlib.util.spec_from_file_location(path.stem, path)
             module = importlib.util.module_from_spec(spec)
             
-            # Auto-Dependency Installation Logic
+            # Auto-Dependency Installation Logic (白名单制，防供应链攻击)
+            _PIP_WHITELIST = frozenset([
+                "requests", "httpx", "beautifulsoup4", "bs4", "lxml",
+                "pyyaml", "toml", "pillow", "numpy", "pandas",
+                "aiohttp", "aiofiles", "chardet", "python-dateutil",
+                "jinja2", "markdownify", "feedparser",
+            ])
             max_retries = 3
             for attempt in range(max_retries):
                 try:
@@ -112,30 +118,21 @@ class ToolRegistry:
                     if attempt == max_retries - 1:
                         raise # Give up after retries
                     
-                    # Extract package name (simple heuristic)
                     missing_package = e.name.split('.')[0]
-                    logger.warning(f"缺少依赖 '{missing_package}'，正在尝试自动安装...")
-                    
+                    if missing_package not in _PIP_WHITELIST:
+                        logger.error(f"⛔ 自动安装被拒绝: '{missing_package}' 不在白名单中。手动安装后重试。")
+                        raise
+                    logger.warning(f"缺少依赖 '{missing_package}'（白名单内），正在自动安装...")
                     try:
-                        # Use sys.executable to ensure we install in the current environment (venv)
                         subprocess.check_call(
                             [sys.executable, "-m", "pip", "install", missing_package],
-                            stdout=subprocess.DEVNULL, # Keep it clean
+                            stdout=subprocess.DEVNULL,
                             stderr=subprocess.PIPE
                         )
                         logger.info(f"✓ 依赖 '{missing_package}' 安装成功")
-                    except subprocess.CalledProcessError:
-                        logger.warning(f"标准安装失败，尝试使用 --break-system-packages 强制安装 '{missing_package}'...")
-                        try:
-                            subprocess.check_call(
-                                [sys.executable, "-m", "pip", "install", missing_package, "--break-system-packages"],
-                                stdout=subprocess.DEVNULL,
-                                stderr=subprocess.PIPE
-                            )
-                            logger.info(f"✓ 依赖 '{missing_package}' (强制) 安装成功")
-                        except subprocess.CalledProcessError as e2:
-                             logger.error(f"无法安装依赖 '{missing_package}': {e2}")
-                             raise e # Re-raise original error if install fails
+                    except subprocess.CalledProcessError as e2:
+                        logger.error(f"无法安装依赖 '{missing_package}': {e2}")
+                        raise e
             
             # 查找 Tool 子类
             loaded = False
@@ -158,17 +155,76 @@ class ToolRegistry:
             logger.error(f"加载工具文件失败 {path}: {e}")
             return False
 
-    def register_from_source(self, name: str, source_code: str) -> bool:
+    # AST 安全审计：禁止动态工具源码中出现的危险模块和调用
+    _BLOCKED_IMPORTS: Set[str] = frozenset({
+        "os", "subprocess", "shutil", "ctypes", "socket", "pickle",
+        "shelve", "tempfile", "signal", "multiprocessing", "threading",
+        "importlib", "code", "codeop", "compileall", "py_compile",
+    })
+    _BLOCKED_BUILTINS: Set[str] = frozenset({
+        "exec", "eval", "compile", "__import__", "globals", "locals",
+        "breakpoint", "exit", "quit",
+    })
+    _BLOCKED_ATTRS: Set[str] = frozenset({
+        "__subclasses__", "__globals__", "__builtins__", "__code__",
+        "__bases__", "__mro__",
+    })
+
+    def _audit_source_safety(self, source_code: str, name: str) -> Optional[str]:
+        """AST 安全审计：在 exec 前扫描源码中的危险模式。
+        
+        Returns:
+            None 表示通过审计，否则返回拒绝原因字符串。
+        """
+        try:
+            tree = ast.parse(source_code)
+        except SyntaxError as e:
+            return f"语法错误: {e}"
+
+        for node in ast.walk(tree):
+            # 检查 import 语句
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    top_module = alias.name.split('.')[0]
+                    if top_module in self._BLOCKED_IMPORTS:
+                        return f"禁止导入模块 '{alias.name}'（安全策略）"
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    top_module = node.module.split('.')[0]
+                    if top_module in self._BLOCKED_IMPORTS:
+                        return f"禁止导入模块 '{node.module}'（安全策略）"
+            # 检查危险函数调用
+            elif isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Name) and func.id in self._BLOCKED_BUILTINS:
+                    return f"禁止调用内置函数 '{func.id}'（安全策略）"
+                if isinstance(func, ast.Attribute) and func.attr in self._BLOCKED_BUILTINS:
+                    return f"禁止调用 '{func.attr}'（安全策略）"
+            # 检查危险属性访问
+            elif isinstance(node, ast.Attribute):
+                if node.attr in self._BLOCKED_ATTRS:
+                    return f"禁止访问属性 '{node.attr}'（安全策略）"
+        return None
+
+    def register_from_source(self, name: str, source_code: str, node_id: str = "", trust_tier: str = "REFLECTION") -> bool:
         """从源码字符串动态注册工具
         
         Args:
             name: 工具名称
-            source_code: Python 源码字符串，必须包含一个继承自 Tool 的类定义
+            source_code: Python 源码字符串，必须包含一个继承自 Tool/MetaTool 的类定义
+            node_id: 来源 TOOL 节点 ID（元工具协议）
+            trust_tier: 信任等级（元工具协议）
             
         Returns:
             bool: 是否成功注册
         """
         try:
+            # AST 安全审计：在编译/执行前拦截危险代码
+            reject_reason = self._audit_source_safety(source_code, name)
+            if reject_reason:
+                logger.warning(f"🛡️ 动态工具 {name} (node={node_id}) 被安全审计拦截: {reject_reason}")
+                return False
+
             # 创建一个唯一的模块名
             module_name = f"dynamic_tool_{name}"
             
@@ -176,36 +232,13 @@ class ToolRegistry:
             compiled = compile(source_code, f"<dynamic_tool_{name}>", 'exec')
             
             # 创建新的模块
+            module = type(sys)(module_name, doc="Dynamically created tool module")
 
-            
-            module = type(sys)(
-
-            
-                module_name,
-
-            
-                doc="Dynamically created tool module"
-
-            
-            )
-
-            
-            
-
-            
-            # 注入必要的属性和导入
-
-            
+            # 注入必要的属性和导入（包括 MetaTool）
             module.__file__ = f"<dynamic_tool_{name}>"
-
-            
             module.__name__ = module_name
-
             
-            exec("from genesis.core.base import Tool", module.__dict__)
-            
-            # 注入必要的导入
-            exec("from genesis.core.base import Tool", module.__dict__)
+            exec("from genesis.core.base import Tool, MetaTool", module.__dict__)
             
             # 执行编译后的代码
             exec(compiled, module.__dict__)
@@ -215,7 +248,8 @@ class ToolRegistry:
             for obj_name, obj in inspect.getmembers(module):
                 if (inspect.isclass(obj) and 
                     issubclass(obj, Tool) and 
-                    obj is not Tool):
+                    obj is not Tool and
+                    obj is not MetaTool):
                     
                     try:
                         tool_instance = obj()
@@ -223,8 +257,18 @@ class ToolRegistry:
                         if tool_instance.name != name:
                             logger.warning(f"工具类中的名称 '{tool_instance.name}' 与请求的名称 '{name}' 不匹配，使用类中的名称")
                         
+                        # 元工具协议：盖上信任水印
+                        if isinstance(tool_instance, MetaTool):
+                            tool_instance._node_id = node_id
+                            tool_instance._trust_tier = trust_tier
+                            tool_instance._source = "nodevault"
+                        elif node_id:
+                            # 非 MetaTool 子类也尽力附加元数据
+                            tool_instance._node_id = node_id
+                            tool_instance._trust_tier = trust_tier
+                        
                         self.register(tool_instance)
-                        logger.info(f"✓ 从源码动态注册工具: {tool_instance.name}")
+                        logger.info(f"✓ 从源码动态注册工具: {tool_instance.name} (node={node_id}, tier={trust_tier})")
                         loaded = True
                         break
                     except Exception as e:

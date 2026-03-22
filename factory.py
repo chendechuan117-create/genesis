@@ -28,31 +28,46 @@ def create_agent(
     logger.info(">>> V4 Factory: Register Tools")
     tools = ToolRegistry()
 
+    # 逐组注册，单组失败不影响其余工具
     try:
         from genesis.tools.file_tools import ReadFileTool, WriteFileTool, AppendFileTool, ListDirectoryTool
+        for t in [ReadFileTool(), WriteFileTool(), AppendFileTool(), ListDirectoryTool()]:
+            tools.register(t)
+    except Exception as e:
+        logger.error(f"V4 tool group [file_tools] failed: {e}")
+
+    try:
         from genesis.tools.shell_tool import ShellTool
+        tools.register(ShellTool(use_sandbox=False))
+    except Exception as e:
+        logger.error(f"V4 tool group [shell_tool] failed: {e}")
+
+    try:
         from genesis.tools.web_tool import WebSearchTool
         from genesis.tools.url_tool import ReadUrlTool
-        from genesis.tools.skill_creator_tool import SkillCreatorTool
-        from genesis.tools.node_tools import SearchKnowledgeNodesTool, RecordContextNodeTool, RecordLessonNodeTool, CreateMetaNodeTool, DeleteNodeTool, CreateGraphNodeTool, CreateNodeEdgeTool
-
-        tools.register(ReadFileTool())
-        tools.register(WriteFileTool())
-        tools.register(AppendFileTool())
-        tools.register(ListDirectoryTool())
-        tools.register(ShellTool(use_sandbox=False))
         tools.register(WebSearchTool())
         tools.register(ReadUrlTool())
-        tools.register(SkillCreatorTool(tools))
-        tools.register(SearchKnowledgeNodesTool())
-        tools.register(RecordContextNodeTool())
-        tools.register(RecordLessonNodeTool())
-        tools.register(CreateMetaNodeTool())
-        tools.register(DeleteNodeTool())
-        tools.register(CreateGraphNodeTool())
-        tools.register(CreateNodeEdgeTool())
     except Exception as e:
-        logger.error(f"V4 tool registration failed: {e}")
+        logger.error(f"V4 tool group [web_tools] failed: {e}")
+
+    try:
+        from genesis.tools.skill_creator_tool import SkillCreatorTool
+        tools.register(SkillCreatorTool(tools))
+    except Exception as e:
+        logger.error(f"V4 tool group [skill_creator] failed: {e}")
+
+    try:
+        from genesis.tools.node_tools import (
+            SearchKnowledgeNodesTool, RecordContextNodeTool, RecordLessonNodeTool,
+            CreateMetaNodeTool, DeleteNodeTool, CreateGraphNodeTool, CreateNodeEdgeTool,
+            RecordToolNodeTool
+        )
+        for t in [SearchKnowledgeNodesTool(), RecordContextNodeTool(), RecordLessonNodeTool(),
+                   CreateMetaNodeTool(), DeleteNodeTool(), CreateGraphNodeTool(), CreateNodeEdgeTool(),
+                   RecordToolNodeTool()]:
+            tools.register(t)
+    except Exception as e:
+        logger.error(f"V4 tool group [node_tools] failed: {e}")
 
     # 核心改动：把带有 Failover 能力的 Router 直接传给 Agent
     agent = GenesisV4(tools=tools, provider=provider_router)

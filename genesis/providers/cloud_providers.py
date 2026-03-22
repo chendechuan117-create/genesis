@@ -17,7 +17,8 @@ def _build_openai(config) -> NativeHTTPProvider:
     return NativeHTTPProvider(
         api_key=api_key,
         base_url="https://api.openai.com/v1",
-        default_model="gpt-4o"
+        default_model="gpt-4o",
+        use_proxy=True
     )
 
 def _build_gemini(config) -> NativeHTTPProvider:
@@ -26,7 +27,9 @@ def _build_gemini(config) -> NativeHTTPProvider:
     return NativeHTTPProvider(
         api_key=api_key,
         base_url="https://generativelanguage.googleapis.com/v1beta/openai",
-        default_model="gemini-2.5-flash"
+        default_model="gemini-2.5-pro",
+        provider_name="gemini",
+        use_proxy=True
     )
 
 def _build_openrouter(config) -> NativeHTTPProvider:
@@ -34,16 +37,8 @@ def _build_openrouter(config) -> NativeHTTPProvider:
     return NativeHTTPProvider(
         api_key=api_key,
         base_url="https://openrouter.ai/api/v1",
-        default_model="meta-llama/llama-3.2-3b-instruct:free"
-    )
-
-def _build_antigravity(config) -> NativeHTTPProvider:
-    api_key = getattr(config, 'antigravity_key', "default-local-key") 
-    url = getattr(config, 'antigravity_url', "http://127.0.0.1:8045/v1")
-    return NativeHTTPProvider(
-        api_key=api_key,
-        base_url=url,
-        default_model="gemini-2.5-flash"
+        default_model="meta-llama/llama-3.2-3b-instruct:free",
+        use_proxy=True
     )
 
 def _build_siliconflow(config) -> NativeHTTPProvider:
@@ -83,23 +78,29 @@ def _build_groq(config) -> NativeHTTPProvider:
     return NativeHTTPProvider(
         api_key=api_key,
         base_url="https://api.groq.com/openai/v1",
-        default_model="llama-3.3-70b-versatile"
+        default_model="llama-3.3-70b-versatile",
+        provider_name="groq",
+        use_proxy=True
     )
 
 def _build_cloudflare(config) -> NativeHTTPProvider:
     api_key = getattr(config, 'cloudflare_api_key', None)
+    if not api_key: return None
     return NativeHTTPProvider(
         api_key=api_key,
         base_url="https://api.cloudflare.com/client/v4/accounts/2c85cf36f8686813d3d0a5cf5483b1e4/ai/v1",
-        default_model="@cf/meta/llama-3.1-8b-instruct"
+        default_model="@cf/meta/llama-3.1-8b-instruct",
+        use_proxy=True
     )
 
 def _build_zen(config) -> NativeHTTPProvider:
     api_key = getattr(config, 'zen_api_key', None)
+    if not api_key: return None
     return NativeHTTPProvider(
         api_key=api_key,
-        base_url="https://api.opencode.ai/v1",  # Zen API is commonly opencode.ai or zenmux
-        default_model="gpt-4o-mini"
+        base_url="https://api.zenmux.com/v1",  
+        default_model="gpt-4o-mini",
+        use_proxy=True
     )
 
 # Register all standard cloud providers
@@ -107,7 +108,6 @@ provider_registry.register("deepseek", _build_deepseek)
 provider_registry.register("gemini", _build_gemini)
 provider_registry.register("openai", _build_openai)
 provider_registry.register("openrouter", _build_openrouter)
-provider_registry.register("antigravity", _build_antigravity)
 
 # Register Consumables Pool
 provider_registry.register("siliconflow", _build_siliconflow)

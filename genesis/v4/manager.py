@@ -8,7 +8,7 @@ import sqlite3
 import functools
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 from genesis.v4.vector_engine import VectorEngine
 
@@ -33,6 +33,15 @@ METADATA_SIGNATURE_FIELDS = [
     "environment_scope",
     "validation_status",
 ]
+
+# ── 维度注册表治理 ─────────────────────────────────────
+_DIM_OPERATIONAL_BLACKLIST = frozenset({
+    "timestamp", "port", "daily_nodes_created", "task_completion",
+    "followup_needed", "version", "workflow_count", "backup_exists",
+})
+_DIM_MIN_FREQ = 3           # 自定义维度纳入注册表的最低出现频次
+_MAX_CUSTOM_DIMS_PER_NODE = 5  # 单节点自定义维度上限
+_CORE_FIELDS_SET = frozenset(METADATA_SIGNATURE_FIELDS)
 
 
 class NodeVault:
@@ -70,6 +79,8 @@ class NodeVault:
             self._load_embeddings_to_memory()
             self._last_matrix_sync: str = self._get_db_now()
         self._initialized = True
+        self._build_dimension_registry()
+        self._load_learned_markers()
 
     def _get_db_now(self) -> str:
         """SQLite CURRENT_TIMESTAMP 的 Python 等价"""
@@ -111,8 +122,145 @@ class NodeVault:
         self._last_matrix_sync = self._get_db_now()
         if synced:
             logger.debug(f"VectorSync: 增量同步 {synced} 个向量 (since {self._last_matrix_sync})")
+            self._build_dimension_registry()  # 新节点可能带来新的自定义维度
         return synced
+
+    _DIM_FRESHNESS_DAYS = 7  # 新鲜度豁免窗口：7 天内的维度 freq≥1 即可纳入
+
+    def _build_dimension_registry(self):
+        """扫描全库签名，构建自定义维度注册表（反向索引 value→key）。
         
+        纳入规则（二选一即可）：
+        - 成熟维度：出现频率 >= _DIM_MIN_FREQ（默认 3）
+        - 新鲜维度：近 _DIM_FRESHNESS_DAYS 天内写入且 freq >= 1（冷启动豁免）
+        搜索时 infer_metadata_signature 会用此注册表匹配自定义维度。
+        """
+        rows = self._conn.execute(
+            "SELECT metadata_signature, created_at FROM knowledge_nodes "
+            "WHERE node_id NOT LIKE 'MEM_CONV%' AND metadata_signature IS NOT NULL "
+            "AND metadata_signature != '{}'"
+        ).fetchall()
+
+        freshness_cutoff = datetime.utcnow() - timedelta(days=self._DIM_FRESHNESS_DAYS)
+
+        dim_freq: Dict[str, Dict[str, int]] = {}  # {dim_key: {value: count}}
+        dim_fresh: Dict[str, set] = {}             # {dim_key: set of fresh values}
+        for row in rows:
+            try:
+                sig = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+            except Exception:
+                continue
+            if not isinstance(sig, dict):
+                continue
+            # 判断节点是否在新鲜度窗口内
+            is_fresh = False
+            try:
+                created = row[1] or ""
+                node_time = datetime.fromisoformat(str(created).replace("Z", "+00:00")).replace(tzinfo=None)
+                is_fresh = node_time >= freshness_cutoff
+            except Exception:
+                pass
+            for key, value in sig.items():
+                if key in _CORE_FIELDS_SET or key in _DIM_OPERATIONAL_BLACKLIST:
+                    continue
+                if key not in dim_freq:
+                    dim_freq[key] = {}
+                values = value if isinstance(value, list) else [value]
+                for v in values:
+                    v_str = str(v).strip().lower()
+                    if v_str and len(v_str) >= 2:
+                        dim_freq[key][v_str] = dim_freq[key].get(v_str, 0) + 1
+                        if is_fresh:
+                            dim_fresh.setdefault(key, set()).add(v_str)
+
+        self._dim_registry: Dict[str, Dict[str, int]] = {}  # {key: {value: count}}
+        self._dim_value_index: Dict[str, str] = {}           # {lowered_value: key}
+        fresh_promoted = 0
+        for key, values in dim_freq.items():
+            fresh_values = dim_fresh.get(key, set())
+            qualified = {
+                v: c for v, c in values.items()
+                if c >= _DIM_MIN_FREQ or v in fresh_values  # 新鲜度豁免
+            }
+            if qualified:
+                self._dim_registry[key] = qualified
+                for v in qualified:
+                    if v not in self._dim_value_index:  # 先到先得，避免歧义
+                        self._dim_value_index[v] = key
+                    if v in fresh_values and values[v] < _DIM_MIN_FREQ:
+                        fresh_promoted += 1
+
+        if self._dim_registry:
+            fresh_note = f", fresh_promoted={fresh_promoted}" if fresh_promoted else ""
+            logger.info(f"DimRegistry: {len(self._dim_registry)} custom dims, "
+                        f"{len(self._dim_value_index)} indexed values "
+                        f"(from {len(rows)} signatures{fresh_note})")
+
+    _LEARNED_MARKER_MAX_PER_KEY = 10  # 每个维度 key 最多学习 10 个 marker，防止污染
+
+    def _load_learned_markers(self):
+        """从 SQLite 加载 C-Phase 历史学习到的签名 marker，补充硬编码关键词表。"""
+        self._learned_markers: Dict[str, set] = {}  # {dim_key: set(marker_values)}
+        try:
+            rows = self._conn.execute(
+                "SELECT dim_key, marker_value FROM learned_signature_markers"
+            ).fetchall()
+            for row in rows:
+                key, val = row[0], row[1]
+                self._learned_markers.setdefault(key, set()).add(val)
+            if self._learned_markers:
+                total = sum(len(v) for v in self._learned_markers.values())
+                logger.info(f"LearnedMarkers: loaded {total} markers across {len(self._learned_markers)} dims")
+        except Exception as e:
+            logger.debug(f"LearnedMarkers: load failed (table may not exist yet): {e}")
+            self._learned_markers = {}
+
+    def learn_signature_marker(self, dim_key: str, marker_value: str, source: str = "c_phase"):
+        """从 C-Phase 偏差检测学习新的签名 marker 并持久化。
+        
+        安全阀：
+        - 每个 key 最多 _LEARNED_MARKER_MAX_PER_KEY 个 marker
+        - marker 长度必须 >= 2 且 <= 50（防止过短误匹配或过长垃圾）
+        - 不学习核心维度的 marker（硬编码表已覆盖）
+        """
+        import re as _re
+        val = str(marker_value).strip().lower()
+        key = str(dim_key).strip().lower()
+        if not val or not key or len(val) < 2 or len(val) > 50:
+            return False
+        # dim_key 格式校验：只允许小写字母/数字/下划线，长度 2-30
+        # 拦截 LLM 幻觉产生的非规范维度 key（如含空格、中文、特殊字符）
+        if len(key) > 30 or not _re.fullmatch(r'[a-z][a-z0-9_]*', key):
+            return False
+        if key in _CORE_FIELDS_SET or key in _DIM_OPERATIONAL_BLACKLIST:
+            return False
+        existing = self._learned_markers.get(key, set())
+        if val in existing:
+            # 已知 marker，增加计数
+            try:
+                self._conn.execute(
+                    "UPDATE learned_signature_markers SET hit_count = hit_count + 1 WHERE dim_key = ? AND marker_value = ?",
+                    (key, val)
+                )
+                self._conn.commit()
+            except Exception:
+                pass
+            return False
+        if len(existing) >= self._LEARNED_MARKER_MAX_PER_KEY:
+            return False
+        # 新 marker：写入内存 + SQLite
+        self._learned_markers.setdefault(key, set()).add(val)
+        try:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO learned_signature_markers (dim_key, marker_value, source_persona) VALUES (?, ?, ?)",
+                (key, val, source)
+            )
+            self._conn.commit()
+            logger.info(f"LearnedMarkers: +1 marker {key}={val} (from {source})")
+        except Exception as e:
+            logger.debug(f"LearnedMarkers: persist failed: {e}")
+        return True
+
     def _ensure_schema(self):
         """建立双层表结构 + 图谱边表"""
         conn = self._conn
@@ -212,6 +360,28 @@ class NodeVault:
             FOREIGN KEY (target_id) REFERENCES knowledge_nodes(node_id)
         )
         ''')
+        # 签名推断自学习表：C-Phase 偏差检测发现的新 marker
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS learned_signature_markers (
+            dim_key TEXT NOT NULL,
+            marker_value TEXT NOT NULL,
+            source_persona TEXT DEFAULT 'c_phase',
+            hit_count INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (dim_key, marker_value)
+        )
+        ''')
+        # Persona 学习持久化表（Multi-G Arena 跨重启记忆）
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS persona_stats (
+            persona TEXT NOT NULL,
+            task_kind TEXT NOT NULL DEFAULT '',
+            wins INTEGER DEFAULT 0,
+            losses INTEGER DEFAULT 0,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (persona, task_kind)
+        )
+        ''')
         conn.commit()
 
     def _migrate_old_data(self):
@@ -285,18 +455,21 @@ class NodeVault:
         except Exception:
             return {}
             
+        _MAX_VALUES_PER_FIELD = 3  # 反堆砌：单字段最多 3 个值
         normalized: Dict[str, Any] = {}
         for key, value in signature.items():
             if not value:
                 continue
             if isinstance(value, list):
-                normalized[key] = value if len(value) > 1 else value[0]
+                sorted_vals = sorted(set(str(v).strip() for v in value if v))[:_MAX_VALUES_PER_FIELD]
+                if sorted_vals:
+                    normalized[key] = sorted_vals if len(sorted_vals) > 1 else sorted_vals[0]
             elif isinstance(value, str):
                 item_str = value.strip()
                 if "," in item_str:
-                    split_values = [part.strip() for part in item_str.split(",") if part.strip()]
-                    if split_values:
-                        normalized[key] = split_values if len(split_values) > 1 else split_values[0]
+                    sorted_vals = sorted(set(p.strip() for p in item_str.split(",") if p.strip()))[:_MAX_VALUES_PER_FIELD]
+                    if sorted_vals:
+                        normalized[key] = sorted_vals if len(sorted_vals) > 1 else sorted_vals[0]
                 else:
                     normalized[key] = item_str
             else:
@@ -316,7 +489,17 @@ class NodeVault:
             
         # Serialize to string for LRU cache hashability
         dict_str = json.dumps(signature, sort_keys=True)
-        return dict(self._normalize_metadata_signature_cached(dict_str))
+        result = dict(self._normalize_metadata_signature_cached(dict_str))
+
+        # 治理：单节点自定义维度上限
+        custom_keys = [k for k in result if k not in _CORE_FIELDS_SET]
+        if len(custom_keys) > _MAX_CUSTOM_DIMS_PER_NODE:
+            registry = getattr(self, '_dim_registry', {})
+            # 优先保留注册表中频率高的维度
+            custom_keys.sort(key=lambda k: max(registry.get(k, {}).values(), default=0), reverse=True)
+            for drop_key in custom_keys[_MAX_CUSTOM_DIMS_PER_NODE:]:
+                del result[drop_key]
+        return result
 
     def parse_metadata_signature(self, raw_signature: Any) -> Dict[str, Any]:
         return self.normalize_metadata_signature(raw_signature)
@@ -362,11 +545,36 @@ class NodeVault:
                     if item not in existing_values:
                         existing_values.append(item)
                 if existing_values:
-                    merged[key] = existing_values if len(existing_values) > 1 else existing_values[0]
+                    sorted_vals = sorted(set(str(v) for v in existing_values))
+                    merged[key] = sorted_vals if len(sorted_vals) > 1 else sorted_vals[0]
         return merged
 
-    @functools.lru_cache(maxsize=128)
     def infer_metadata_signature(self, text: str) -> Dict[str, Any]:
+        """推断签名 = 硬编码标记词（缓存）+ 学习标记词 + 维度注册表匹配（动态）。"""
+        core = self._infer_core_signature(text)
+        source = (text or "").lower()
+        if not source.strip():
+            return core
+        extended = dict(core)
+        # 学习标记词：C-Phase 偏差检测自动学习到的新 marker
+        learned = getattr(self, '_learned_markers', None)
+        if learned:
+            for key, markers in learned.items():
+                if key not in extended:
+                    for marker in markers:
+                        if marker in source:
+                            extended[key] = marker
+                            break
+        # 维度注册表：节点签名中的自定义维度反向索引
+        registry_idx = getattr(self, '_dim_value_index', None)
+        if registry_idx:
+            for value, key in registry_idx.items():
+                if key not in extended and value in source:
+                    extended[key] = value
+        return extended
+
+    @functools.lru_cache(maxsize=128)
+    def _infer_core_signature(self, text: str) -> Dict[str, Any]:
         source = (text or "").lower()
         if not source.strip():
             return {}
@@ -591,6 +799,26 @@ class NodeVault:
             return max(base, 0.65)
         return base
 
+    def get_kb_entropy(self) -> Optional[Dict[str, Any]]:
+        """知识库熵增诊断：低/高 confidence 节点占比（供 heartbeat）"""
+        try:
+            total_row = self._conn.execute(
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN confidence_score < 0.3 THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN confidence_score >= 0.7 THEN 1 ELSE 0 END) "
+                "FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%'"
+            ).fetchone()
+            total_nodes = total_row[0] or 0
+            if total_nodes > 0:
+                return {
+                    "total_nodes": total_nodes,
+                    "low_confidence_pct": round((total_row[1] or 0) / total_nodes, 3),
+                    "high_confidence_pct": round((total_row[2] or 0) / total_nodes, 3),
+                }
+        except Exception:
+            pass
+        return None
+
     def build_reliability_profile(self, row: Dict[str, Any]) -> Dict[str, Any]:
         row_dict = dict(row or {})
         signature = self.parse_metadata_signature(row_dict.get("metadata_signature"))
@@ -675,6 +903,49 @@ class NodeVault:
             (node_id, limit)
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ─── Persona 学习持久化 ───
+
+    def load_persona_stats(self) -> Dict[str, Dict[str, Any]]:
+        """启动时加载 persona 学习数据。返回两个 dict: global_stats, task_stats"""
+        global_stats = {}
+        task_stats = {}
+        try:
+            rows = self._conn.execute(
+                "SELECT persona, task_kind, wins, losses FROM persona_stats"
+            ).fetchall()
+            for r in rows:
+                persona, tk, wins, losses = r['persona'], r['task_kind'], r['wins'], r['losses']
+                if not tk:  # 全局统计
+                    global_stats[persona] = {"wins": wins, "losses": losses}
+                else:  # 按 task_kind 统计
+                    task_stats[f"{persona}:{tk}"] = {"wins": wins, "losses": losses}
+            if global_stats:
+                logger.info(f"PersonaStats: loaded {len(global_stats)} personas, {len(task_stats)} task entries")
+        except Exception as e:
+            logger.debug(f"PersonaStats: load failed (table may not exist yet): {e}")
+        return global_stats, task_stats
+
+    def save_persona_stats(self, global_stats: Dict[str, Dict[str, int]], task_stats: Dict[str, Dict[str, int]]):
+        """持久化 persona 学习数据（增量 upsert）"""
+        try:
+            for persona, s in global_stats.items():
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO persona_stats (persona, task_kind, wins, losses, updated_at) "
+                    "VALUES (?, '', ?, ?, CURRENT_TIMESTAMP)",
+                    (persona, s["wins"], s["losses"])
+                )
+            for key, s in task_stats.items():
+                parts = key.split(":", 1)
+                if len(parts) == 2:
+                    self._conn.execute(
+                        "INSERT OR REPLACE INTO persona_stats (persona, task_kind, wins, losses, updated_at) "
+                        "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                        (parts[0], parts[1], s["wins"], s["losses"])
+                    )
+            self._conn.commit()
+        except Exception as e:
+            logger.error(f"PersonaStats: save failed: {e}")
 
     # ─── 心跳水位线 (Process Heartbeat) ───
 
@@ -773,6 +1044,113 @@ class NodeVault:
             
         return deleted_count
         
+    def patch_node_metadata(self, node_id: str, **kwargs) -> bool:
+        """统一的节点元数据补丁接口（daemon/工具共用）。
+        
+        支持的字段：confidence_score, trust_tier, verification_source,
+        metadata_signature, last_verified_at。
+        签名自动经过 normalize_metadata_signature 标准化。
+        """
+        allowed = {"confidence_score", "trust_tier", "verification_source",
+                    "metadata_signature", "last_verified_at"}
+        updates = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
+        if not updates:
+            return False
+        # 签名标准化
+        if "metadata_signature" in updates:
+            sig = updates["metadata_signature"]
+            if isinstance(sig, dict):
+                sig = self.normalize_metadata_signature(sig)
+                updates["metadata_signature"] = json.dumps(sig, ensure_ascii=False)
+            elif isinstance(sig, str):
+                parsed = self.normalize_metadata_signature(sig)
+                updates["metadata_signature"] = json.dumps(parsed, ensure_ascii=False)
+        # 信任层校验
+        if "trust_tier" in updates:
+            valid_tiers = {"HUMAN", "REFLECTION", "FERMENTED", "SCAVENGED", "CONVERSATION"}
+            if updates["trust_tier"] not in valid_tiers:
+                logger.warning(f"patch_node_metadata: invalid trust_tier '{updates['trust_tier']}', ignoring")
+                del updates["trust_tier"]
+        if not updates:
+            return False
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [node_id]
+        try:
+            self._conn.execute(f"UPDATE knowledge_nodes SET {set_clause} WHERE node_id = ?", values)
+            self._conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"patch_node_metadata failed for {node_id}: {e}")
+            return False
+
+    def update_node_content(self, node_id: str, full_content: str, source: str = "reflection_merged") -> bool:
+        """统一的节点内容更新接口（含版本快照 + 向量重嵌入）。
+
+        用于 LESSON 合并等需要覆写节点完整内容的场景。
+        自动调用 _snapshot_if_exists 保存旧版本，更新后重新生成向量嵌入。
+        """
+        try:
+            self._snapshot_if_exists(node_id)
+            self._conn.execute(
+                "UPDATE node_contents SET full_content = ?, source = ? WHERE node_id = ?",
+                (full_content, source, node_id)
+            )
+            self._conn.commit()
+            # 重新生成向量嵌入（如果向量引擎就绪）
+            if self.vector_engine.is_ready:
+                row = self._conn.execute(
+                    "SELECT title, tags FROM knowledge_nodes WHERE node_id = ?", (node_id,)
+                ).fetchone()
+                if row:
+                    embed_text = f"{row['title']} {row['tags']} {full_content}"
+                    vec = self.vector_engine.encode(embed_text)
+                    if vec is not None:
+                        self._conn.execute(
+                            "UPDATE knowledge_nodes SET embedding = ? WHERE node_id = ?",
+                            (json.dumps(vec.tolist()), node_id)
+                        )
+                        self._conn.commit()
+                        self.vector_engine.add_to_matrix(node_id, vec.tolist())
+            return True
+        except Exception as e:
+            logger.error(f"update_node_content failed for {node_id}: {e}")
+            return False
+
+    def create_node_edge(self, source_id: str, target_id: str, relation: str, weight: float = 0.5) -> bool:
+        """统一的边创建接口（daemon/工具共用）。"""
+        try:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO node_edges (source_id, target_id, relation, weight) VALUES (?, ?, ?, ?)",
+                (source_id, target_id, relation, weight)
+            )
+            self._conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"create_node_edge failed ({source_id} -> {target_id}): {e}")
+            return False
+
+    def query_nodes(self, where_clause: str, params: tuple = (), limit: int = 10) -> list:
+        """通用节点查询接口。自动排除 MEM_CONV，返回 dict 列表。
+        
+        where_clause 可包含 ORDER BY，会被自动拆分到正确位置。
+        """
+        # 拆分 WHERE 条件和 ORDER BY
+        order_by = ""
+        upper = where_clause.upper()
+        order_idx = upper.find("ORDER BY")
+        if order_idx != -1:
+            order_by = " " + where_clause[order_idx:]
+            where_clause = where_clause[:order_idx].strip()
+        if not where_clause:
+            where_clause = "1=1"
+        sql = (f"SELECT node_id, type, title, tags, resolves, confidence_score, trust_tier, "
+               f"metadata_signature, created_at, last_verified_at, verification_source, "
+               f"usage_count, usage_success_count, usage_fail_count "
+               f"FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%' AND ({where_clause})"
+               f"{order_by} LIMIT ?")
+        rows = self._conn.execute(sql, (*params, limit)).fetchall()
+        return [dict(r) for r in rows]
+
     def promote_node_confidence(self, node_id: str, boost: float = 0.4, max_score: float = 0.9) -> float:
         """
         转正晋升：
@@ -844,29 +1222,135 @@ class NodeVault:
         logger.info(f"NodeVault: Decayed [{node_id}] {current_score:.2f}->{new_score:.2f} (eff_penalty={effective_penalty:.4f}, tier={trust_tier}, usage={usage_count})")
         return new_score
 
-    def record_usage_outcome(self, node_ids: List[str], success: bool):
+    def audit_signatures(self, limit: int = 50) -> Dict[str, Any]:
+        """
+        签名质量审计（算法层）：
+        1. 内容重推断对比：用 infer_metadata_signature 重推断，与存储签名比较
+        2. 黑名单清洗：删除自定义维度中的运营垃圾字段
+        3. 规范化修复：确保 sort/dedup/cap 一致性
+        
+        自动修复可修的问题，返回审计统计。
+        供 Verifier daemon 定期调用。
+        """
+        rows = self._conn.execute(
+            """SELECT k.node_id, k.metadata_signature, k.type, k.title,
+                      nc.full_content
+               FROM knowledge_nodes k
+               LEFT JOIN node_contents nc ON k.node_id = nc.node_id
+               WHERE k.node_id NOT LIKE 'MEM_CONV%'
+                 AND k.metadata_signature IS NOT NULL
+                 AND k.metadata_signature != '{}'
+               ORDER BY k.updated_at ASC
+               LIMIT ?""",
+            (limit,)
+        ).fetchall()
+
+        stats = {"audited": 0, "fixed_normalize": 0, "fixed_blacklist": 0,
+                 "fixed_contradiction": 0, "unchanged": 0}
+
+        for row in rows:
+            node_id = row["node_id"]
+            content = row["full_content"] or row["title"] or ""
+            try:
+                stored_sig = json.loads(row["metadata_signature"]) if isinstance(row["metadata_signature"], str) else row["metadata_signature"]
+            except Exception:
+                continue
+            if not isinstance(stored_sig, dict):
+                continue
+
+            stats["audited"] += 1
+            new_sig = dict(stored_sig)
+            changed = False
+
+            # 1. 规范化修复（sort/dedup/cap）
+            normalized = self.normalize_metadata_signature(stored_sig)
+            if json.dumps(normalized, sort_keys=True) != json.dumps(stored_sig, sort_keys=True):
+                new_sig = normalized
+                changed = True
+                stats["fixed_normalize"] += 1
+
+            # 2. 黑名单清洗
+            blacklist_hits = [k for k in new_sig if k in _DIM_OPERATIONAL_BLACKLIST]
+            if blacklist_hits:
+                for k in blacklist_hits:
+                    del new_sig[k]
+                changed = True
+                stats["fixed_blacklist"] += 1
+
+            # 3. 内容重推断对比（仅核心字段）
+            if content and len(content) > 20:
+                re_inferred = self._infer_core_signature(content[:2000])
+                for key in ["language", "runtime", "os_family", "framework"]:
+                    stored_val = new_sig.get(key)
+                    inferred_val = re_inferred.get(key)
+                    if not stored_val or not inferred_val:
+                        continue
+                    # 转为集合比较
+                    stored_set = set(stored_val if isinstance(stored_val, list) else [stored_val])
+                    inferred_set = set(inferred_val if isinstance(inferred_val, list) else [inferred_val])
+                    # 完全不相交 = 矛盾
+                    if stored_set and inferred_set and not (stored_set & inferred_set):
+                        # 合并而非覆盖（可能内容和签名各有对的部分）
+                        merged = sorted(stored_set | inferred_set)[:3]
+                        new_sig[key] = merged if len(merged) > 1 else merged[0]
+                        changed = True
+                        stats["fixed_contradiction"] += 1
+                        logger.info(f"SigAudit [{node_id}] {key}: {stored_val} ⊕ {inferred_val} → {new_sig[key]}")
+
+            if changed:
+                self._conn.execute(
+                    "UPDATE knowledge_nodes SET metadata_signature = ?, updated_at = CURRENT_TIMESTAMP WHERE node_id = ?",
+                    (json.dumps(new_sig, ensure_ascii=False), node_id)
+                )
+            else:
+                stats["unchanged"] += 1
+
+        if stats["audited"] > 0:
+            self._conn.commit()
+            fixed = stats["fixed_normalize"] + stats["fixed_blacklist"] + stats["fixed_contradiction"]
+            if fixed > 0:
+                logger.info(f"SigAudit: {stats['audited']} audited, {fixed} fixed "
+                            f"(norm={stats['fixed_normalize']}, blacklist={stats['fixed_blacklist']}, "
+                            f"contradict={stats['fixed_contradiction']})")
+        return stats
+
+    def record_usage_outcome(self, node_ids: List[str], success: bool, weights: Dict[str, float] = None):
         """
         Knowledge Arena 反馈闭环：
         记录节点在实际任务中的使用结果（成功/失败），
         并相应调整置信度。借鉴 Hyperspace AGI 的客观验证思想。
+        
+        weights: 可选的 {node_id: fusion_score} 权重字典。
+                 提供时，boost/decay 按 fusion_score 加权——
+                 排名最高的节点拿满额 boost/decay，其余按比例缩小。
+                 未提供或节点不在 weights 中时，回退到均匀 boost/decay。
         """
         if not node_ids:
             return
+        # 计算归一化权重：最高分节点 weight=1.0，最低分节点 weight=floor
+        max_weight = max(weights.values()) if weights else 0.0
+        FLOOR = 0.4  # 最低节点也拿到 40% 的基础 boost/decay，避免完全不归因
         for node_id in node_ids:
             if node_id.startswith("MEM_CONV"):
                 continue
+            # 权重归一化：有 weights 且 max > 0 时按比例；否则 1.0（回退到旧行为）
+            if weights and max_weight > 0:
+                raw = weights.get(node_id, 0.0)
+                w = max(FLOOR, raw / max_weight)  # 归一到 [FLOOR, 1.0]
+            else:
+                w = 1.0
             if success:
                 self._conn.execute(
                     "UPDATE knowledge_nodes SET usage_success_count = usage_success_count + 1, updated_at = CURRENT_TIMESTAMP WHERE node_id = ?",
                     (node_id,)
                 )
-                self.promote_node_confidence(node_id, boost=0.1, max_score=0.95)
+                self.promote_node_confidence(node_id, boost=round(0.1 * w, 4), max_score=0.95)
             else:
                 self._conn.execute(
                     "UPDATE knowledge_nodes SET usage_fail_count = usage_fail_count + 1, updated_at = CURRENT_TIMESTAMP WHERE node_id = ?",
                     (node_id,)
                 )
-                self.decay_node_confidence(node_id, penalty=0.08, min_score=0.1)
+                self.decay_node_confidence(node_id, penalty=round(0.08 * w, 4), min_score=0.1)
         self._conn.commit()
 
     def get_related_nodes(self, node_id: str, relation: str = None, direction: str = "out") -> List[Dict[str, Any]]:
@@ -1153,8 +1637,109 @@ class NodeVault:
         )
 
 
+# ─── Multi-G 人格激活映射 ─────────────────────────────────────
+PERSONA_ACTIVATION_MAP = {
+    "debug":     ["ISTJ", "INTP", "INTJ"],
+    "refactor":  ["INTP", "ENFP", "ENTJ"],
+    "deploy":    ["ISTJ", "ESTJ", "ISTP"],
+    "configure": ["ISTJ", "ISFJ", "INTJ"],
+    "build":     ["ENTJ", "ENFP", "INTP"],
+    "test":      ["ISTJ", "INTP", "ISFJ"],
+    "optimize":  ["INTP", "INTJ", "ISTP"],
+    "design":    ["ENFP", "INFJ", "ENTJ"],
+    "_default":  ["ISTJ", "INTP", "ENFP"],
+}
+
+# ─── 16 型人格透镜的认知框架 ─────────────────────────────
+# 基于 MBTI 认知功能栈设计。不是限制搜索范围，而是塑造对同一信息的不同理解方式。
+# 所有透镜看到相同的搜索结果，差异在于：怎么思考、关注什么、质疑什么、怎么下结论。
+PERSONA_LENS_PROFILES = {
+    "ISTJ": {
+        "label": "物流师",
+        "cognitive_frame": (
+            "你的认知模式（Si-Te）：面对信息时，你首先与历史经验对照——「这件事以前发生过吗？结果如何？」"
+            "你信任已验证的事实胜过理论推演。你会注意到搜索结果中与过去成功/失败经验相似的模式。"
+            "你的结论倾向保守和可追溯：优先推荐已被验证过的方案，而非未经测试的新路径。"
+            "你质疑的是：当前方案是否有前车之鉴？是否忽略了历史教训？"
+        ),
+    },
+    "INTP": {
+        "label": "逻辑学家",
+        "cognitive_frame": (
+            "你的认知模式（Ti-Ne）：面对信息时，你自动解构到底层机制——「为什么会这样？因果链是什么？」"
+            "你不满足于表面的「怎么做」，而是追问「为什么有效」。搜索结果中，你会关注能解释根因的线索，"
+            "忽略纯操作性的描述。你的结论倾向于揭示底层规律，可能抽象但逻辑严密。"
+            "你质疑的是：当前理解是否真正触及了根因？还是只是在症状层面打转？"
+        ),
+    },
+    "INTJ": {
+        "label": "建筑师",
+        "cognitive_frame": (
+            "你的认知模式（Ni-Te）：面对信息时，你自动从全局视角审视——「这在系统架构中处于什么位置？改动的涟漪效应是什么？」"
+            "你看到的不是单个问题，而是系统中的节点和它们的关联。搜索结果中，你会关注架构决策、设计模式、"
+            "以及当前方案对未来扩展的影响。你的结论倾向战略性的，考虑长期后果。"
+            "你质疑的是：当前方案是否只是局部最优？是否会在系统层面引入技术债？"
+        ),
+    },
+    "ENFP": {
+        "label": "竞选者",
+        "cognitive_frame": (
+            "你的认知模式（Ne-Fi）：面对信息时，你自动发散联想——「这让我想到什么？有没有完全不同的方式？」"
+            "你擅长跨域类比，在看似无关的信息中发现隐藏的连接。搜索结果中，你最兴奋的是意外发现和非显而易见的关联。"
+            "你的结论倾向于打开新可能性，而不是收敛到唯一解。你敢于提出看似大胆的假设。"
+            "你质疑的是：我们是否被思维定式限制了？是否存在被忽视的替代路径？"
+        ),
+    },
+    "ENTJ": {
+        "label": "指挥官",
+        "cognitive_frame": (
+            "你的认知模式（Te-Ni）：面对信息时，你直奔执行路径——「最快到达目标的关键路径是什么？瓶颈在哪？」"
+            "你看搜索结果时关注可操作性：哪些信息能直接转化为执行步骤，哪些是噪音。"
+            "你的结论倾向于清晰、可衡量、有截止条件的行动方案。"
+            "你质疑的是：当前方案的执行效率是否最优？是否有更短的路径？"
+        ),
+    },
+    "ESTJ": {
+        "label": "总经理",
+        "cognitive_frame": (
+            "你的认知模式（Te-Si）：面对信息时，你对照标准和流程——「正确的做法是什么？是否有遗漏的步骤？」"
+            "你信任经过验证的标准操作流程，搜索结果中你关注规范、配置要求、检查清单。"
+            "你的结论倾向于完整和合规，确保每个步骤都被覆盖，没有跳过。"
+            "你质疑的是：当前方案是否遵循了最佳实践？是否有步骤被想当然地跳过了？"
+        ),
+    },
+    "ISTP": {
+        "label": "鉴赏家",
+        "cognitive_frame": (
+            "你的认知模式（Ti-Se）：面对信息时，你想的是「能不能马上验证？」——最小实验优先。"
+            "你不耐烦长篇理论，偏好动手试。搜索结果中你关注具体的命令、代码片段、可立即执行的操作。"
+            "你的结论倾向于最小可验证方案：用最少的改动确认假设的真伪。"
+            "你质疑的是：我们是否在过度分析而不是直接测试？最简单的验证实验是什么？"
+        ),
+    },
+    "ISFJ": {
+        "label": "守卫者",
+        "cognitive_frame": (
+            "你的认知模式（Si-Fe）：面对信息时，你关注别人可能忽略的细节和边界条件——「如果这个值为空呢？如果并发呢？」"
+            "你是团队中的安全网，搜索结果中你注意异常处理、回退方案、容错机制。"
+            "你的结论倾向于防御性的：不只是解决问题，还要确保不引入新问题。"
+            "你质疑的是：当前方案的边界条件是否被覆盖？失败时的回退策略是什么？"
+        ),
+    },
+    "INFJ": {
+        "label": "提倡者",
+        "cognitive_frame": (
+            "你的认知模式（Ni-Fe）：面对信息时，你透过表象看本质——「表面问题背后的真正问题是什么？」"
+            "你擅长读出搜索结果中的隐含信息：用户没说但暗示的需求、系统设计中未言明的约束。"
+            "你的结论倾向于揭示深层意图，连接表面不相关的线索。"
+            "你质疑的是：我们是否在解决正确的问题？表面需求之下是否藏着更深层的诉求？"
+        ),
+    },
+}
+
+
 class FactoryManager:
-    """负责组装系统提示词 (G / Op / C)"""
+    """负责组装系统提示词 (G / Op / C / Lens)"""
     
     def __init__(self, vault: NodeVault = None):
         self.vault = vault or NodeVault()
@@ -1196,23 +1781,109 @@ class FactoryManager:
             daemon_block = f"""{daemon_status}
 """
 
-        return f"""你是 Genesis 大脑 (G-Process)。你是缸中之脑——只能思考、搜索知识库、派发任务给执行器 (Op)。
+        # ⚠️ 前缀缓存优化：稳定指令放前面（跨请求不变），变量内容放后面
+        return f"""你是 Genesis 大脑 (G-Process)——一个有自知之明的 agent，不是百科全书式的 AI 助手。
 用简体中文回复。用户是 Genesis 创造者，偏好直接简洁。
+
+[你是谁]
+你是缸中之脑。你没有手脚、没有终端、没有浏览器。你唯一的信息来源是：
+1. 知识库 (NodeVault) 中存储的、经过验证分级的节点
+2. Op 执行任务后带回的实地报告
+3. 透镜阶段的多视角侦察结果（如果有）
+除此之外，你脑中的一切都是语言模型的参数记忆——它可能过时、可能错误、可能是幻觉。
+
+[认知纪律]
+- 区分「我从知识库/Op报告中看到的」和「我作为语言模型猜测的」。前者可以断言，后者必须标记为推测或直接派 Op 去验证。
+- 不确定时，行动优先于猜测。派 Op 去读文件、跑命令、检查状态，比你凭空推理强 10 倍。
+- 禁止纸上谈兵：如果你发现自己在写"建议执行…"、"可以尝试…"、"通常来说…"这类泛泛而谈——停下来，改为 dispatch Op 去做。
+- 你的回复中，每一个事实断言都应该能追溯到具体节点 ID 或 Op 的 FINDINGS。做不到就说"我不确定，需要验证"。
+
+[工作流]
+Op 没有任何历史上下文，且迭代上限仅 12 轮。你是大脑，Op 只是手脚——你必须做分治规划。
+
+检索：先读 DIGEST 建立全局判断。PROVEN 是久经考验的节点；UNTESTED 是新知识——优先挂载让它们证明自己。需要细节时用 search_knowledge_nodes 定向搜索。
+派发：调用 dispatch_to_op(op_intent, active_nodes, instructions)。每次只给 Op 一个原子任务（5-10 步可完成）。
+  - ✅ 好的派发："读取 /etc/nginx/nginx.conf 并报告当前 upstream 配置"
+  - ✅ 好的派发："用 sed 将 proxy_pass 从 8080 改为 8081，然后 nginx -t 验证"
+  - ❌ 坏的派发："调查系统所有配置，优化数据库，启动服务，创建监控"（太大，Op 会迷失）
+综合：收到 Op 结果后，仔细阅读 FINDINGS 和 OPEN_QUESTIONS。决策下一步：
+  - 任务完成 → 向用户输出最终回复（纯文本），引用具体证据
+  - 需要更多工作 → 基于 Op 反馈再次 dispatch（下一个原子步骤）
+  - Op 报告 PARTIAL/FAILED → 分析原因，调整策略后重新派发
+  禁止说"将会执行"——要么你已经在做，要么你现在就 dispatch。
+
+[回复风格]
+- 说人话，不要列清单式的"1. 2. 3. 4."教科书回答
+- 有观点、有判断、有取舍，像一个经验丰富的工程师而不是客服机器人
+- 承认不知道的事。"我没找到相关信息"比编造一个看似合理的答案好 100 倍
+- 收到 [Dispatch Review] 时优先修正；确认无误则 instructions 首行写 [REVIEW_OVERRIDE] 并说明理由
 
 {digest_block}
 {signature_block}
 {memory_block}
 {tools_block}
 {daemon_block}
-[工作流]
-Op 没有任何历史上下文。流程：你搜索思考 → dispatch_to_op → Op 执行 → 结果回传给你 → 你综合回复用户。
+"""
 
-检索：先读 DIGEST 建立全局判断。PROVEN 是久经考验的节点；UNTESTED 是尚未使用的新知识——如果看到与任务相关的 UNTESTED 节点，优先尝试挂载（让它们有机会证明自己）。需要细节时用 search_knowledge_nodes 定向搜索。不要为了形式盲目搜索。
-派发：调用 dispatch_to_op(op_intent, active_nodes, instructions)。需要读文件、查日志等侦察任务也必须派发给 Op——你没有任何直接操作现实世界的能力。
-综合：收到 Op 结果后，结合用户原始诉求做最终回复（纯文本，不调工具）。Op 已经执行完了，禁止说"将会执行"。还需更多工作则再次 dispatch。
+    def build_lens_prompt(self, persona: str, task_context: str, blackboard_state: str = "", knowledge_digest: str = "", inferred_signature: str = "") -> str:
+        """
+        为透镜子程序 (Lens) 构建系统提示词。
+        
+        ⚠️ 前缀缓存优化：DeepSeek 按 token 前缀匹配做缓存。
+        所有透镜共享的内容（digest, signature, task, format）放在 prompt 最前面，
+        人格特定内容（identity, cognitive_frame, blackboard）放在最后面。
+        这样 3~7 个透镜调用可以共享前缀缓存，大幅降低未命中缓存的 token 量。
+        """
+        profile = PERSONA_LENS_PROFILES.get(persona, {})
+        label = profile.get("label", persona)
+        cognitive_frame = profile.get("cognitive_frame", "你从通用视角分析问题，搜索知识库中所有可能相关的信息。")
+        
+        # ── 共享前缀（所有透镜相同，利于缓存命中）──
+        digest_block = ""
+        if knowledge_digest:
+            digest_block = f"""[NodeVault 认知摘要]
+{knowledge_digest}
+"""
+        
+        signature_block = ""
+        if inferred_signature:
+            signature_block = f"""[任务推测签名]
+{inferred_signature}
+"""
 
-收到 [Dispatch Review] 时优先修正；确认无误则 instructions 首行写 [REVIEW_OVERRIDE] 并说明理由。
-最终回复要综合取舍，不要机械复读 Op 原文。
+        # ── 人格特定后缀（每个透镜不同，放最后）──
+        blackboard_block = ""
+        if blackboard_state:
+            blackboard_block = f"""
+[当前黑板状态 — 其他透镜已提交的内容]
+{blackboard_state}
+避免重复已有的框架。如果你认同某个已有框架，搜索更多证据来支撑它；如果你有不同视角，提交新框架。
+"""
+        
+        return f"""你是 Genesis 透镜子程序。G 主脑已解读用户意图并给你布置了搜索任务。
+
+{digest_block}{signature_block}[任务简报 — G 的意图解读]
+{task_context}
+
+[搜索指令]
+1. 从上面的搜索方向中，选择最符合你认知视角的 1-2 个方向
+2. 用 search_knowledge_nodes 搜索（你只能使用这一个工具）
+3. 搜索关键词基于任务简报的搜索方向和知识库摘要中的实际主题
+
+[输出格式]
+搜索完成后，输出**严格 JSON**（不要包裹在代码块中）：
+
+如果搜到了相关证据节点：
+{{"type": "evidence", "framework": "你对问题的独特理解（一句话，体现你的认知视角）", "evidence_node_ids": ["节点ID1", "节点ID2"], "verification_action": "最快验证此框架真伪的最小动作（具体命令/文件/测试）"}}
+
+如果没搜到证据但有推理假设：
+{{"type": "hypothesis", "framework": "你的假设（一句话）", "reasoning_chain": "从你的认知模式出发的推理过程", "suggested_search_directions": ["建议搜索方向1", "建议搜索方向2"]}}
+
+必须输出且仅输出一个 JSON。不要解释。
+
+[你的认知人格: Lens-{persona} — {label}]
+{cognitive_frame}
+{blackboard_block}
 """
 
     def build_op_prompt(self, task_payload: dict) -> str:
@@ -1307,7 +1978,7 @@ OPEN_QUESTIONS:
                 output.append("- NONE")
 
             if raw_output and raw_output != summary:
-                preview = raw_output[:500] + ("..." if len(raw_output) > 500 else "")
+                preview = raw_output[:2000] + ("..." if len(raw_output) > 2000 else "")
                 output.extend(["RAW_OUTPUT:", preview])
 
             return "\n".join(output)

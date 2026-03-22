@@ -1,93 +1,174 @@
-<h1 align="center">Genesis V4</h1>
+# Genesis V4 — 自我进化的 AI Agent 内核
 
 <p align="center">
-  <strong>A Self-Aware Agent Kernel with Active Metabolism and Glassbox Architecture</strong>
+  <strong>A Self-Evolving Agent Kernel with Active Knowledge Metabolism and Glassbox Architecture</strong>
+</p>
+
+<p align="center">
+  <a href="#理念">理念</a> •
+  <a href="#核心特性">特性</a> •
+  <a href="#架构">架构</a> •
+  <a href="#快速开始">快速开始</a> •
+  <a href="#许可证">许可证</a>
 </p>
 
 ---
 
-## 什么是 Genesis V4？
+## 理念
 
-在 2025-2026 年的 AI 领域，开源 Agent 架构已经发展出五大阵营：以 OpenAI Agents SDK 为代表的编排流，以 Letta (MemGPT) / Mem0 为代表的记忆流，以 Manus / Claude Code 为代表的上下文工程流（Context Engineering）。
+Genesis 不是又一个 AI Agent 框架。它是一个**具备活性知识代谢能力的 Agent 内核**。
 
-但在这些框架中，**Genesis V4 是一个独一无二的存在**。它不是一个供你调用 SDK 的构建库，也不是一个单纯的记忆中间件。
+大多数 Agent 系统是"无状态的"——每次对话从零开始，工具调用结果用完即弃。Genesis 的设计哲学不同：**云 API 是意识，本地机器是身体，元信息系统是神经**。系统在执行任务的同时，持续地学习、验证、遗忘，让知识库保持"此时此地的最佳状态"。
 
-**Genesis V4 是一个 "有自我意识的 Agent 内核"。**
+## 核心特性
 
-如果把云端大模型 API 比作**意识**，把本地宿主机环境比作**身体**，那么 Genesis 提供的就是**神经系统**。
-它不仅首创了**基于纯净上下文隔离的三体认知管线 (Glassbox Architecture)**，更构建了当前行业内唯一的**具备活性代谢能力的自主知识系统 (Background Daemon)**。当你在睡觉时，它会在后台利用免费大模型算力，自主从互联网拾荒、发酵假设、验证知识并淘汰过期记忆。
+### 🧠 三体认知管线 — Context Firewall
 
----
+```
+用户请求 → Multi-G 透镜（3~7 个 MBTI 人格并行分析）
+         → G-Process（思考者：规划 + 知识检索 + 蓝图分派）
+         → Op-Process（执行者：纯净上下文，原子任务，工具调用）
+         → C-Process（反思者：提炼经验、记录教训、更新知识图谱）
+```
 
-## 🌟 核心破局点：Genesis vs. 2025 行业最佳实践
+- **G** 只看得到知识库和用户请求，负责"想"
+- **Op** 只看得到 G 给的蓝图，负责"做"——**上下文防火墙**隔绝噪音
+- **C** 只关注 Op 的物理执行结果，负责"学"——不记录脑内幻想
 
-### 1. 活性知识代谢 vs. 被动记忆 (Background Daemon vs. Letta/Mem0)
-当前主流记忆系统（如 Mem0, Letta）都是被动的——只在交互时读写。
-Genesis 是**唯一拥有 "自主知识新陈代谢系统" 的架构**。内置的 `genesis-daemon` 24/7 静默运行：
-- **拾荒 (Scavenge)**：从种子节点发散，自主搜索互联网，提纯干货入库。
-- **发酵 (Ferment)**：建立知识边缘，主动提出未经证实的底层规律假设。
-- **验证与遗忘 (Verify & GC)**：审计旧知识，降级过时信息，无情删除低置信度死数据。
+### � Multi-G 多维感知
 
-### 2. 激进的上下文防火墙 vs. 子智能体 (Context Firewall vs. Sub-agents)
-应对长文本 "上下文腐烂 (Context Rot)"，行业做法通常是 Sub-agent 或共享上下文的 Handoff。
-Genesis 采用**最激进的 A-b-C 子程序隔离**：G-Process (大脑) 负责思考，向 Op-Process (手脚) 派发一份只有目标和指令的**纯净执行蓝图 (Blueprint)**。Op 在完全空白的上下文中启动，物理层隔绝历史噪音，执行完毕结构化回传后即刻销毁。
+每次请求自动激活 3~7 个基于 MBTI 16 型人格的"透镜"并行分析任务，共享 NodeVault 但各自用不同的认知框架解读信息。BlackBoard 竞争机制选出最佳视角，Persona Arena 在线学习淘汰弱者。
 
-### 3. 信息论安全的蒸发机制 vs. 文本压缩 (Context Evaporation vs. Compaction)
-Manus 和 Claude Code 依靠调用 LLM 重新总结对话历史。
-Genesis 采用**蒸发机制**：基于 "LLM 的回复已隐式消化上一轮输出" 的前提，直接将旧工具输出替换为轻量存根（如 `[shell: 已处理, 3200字符]`）。不丢失任何信息，且零延迟、零额外 token 成本。
+### 🧬 活性知识代谢
 
-### 4. 元认知反思与信任闸门 (C-Process & Trust Tiers)
-这是行业框架中**完全缺失**的元认知闭环：
-- **C-Process (反思进程)**：任务结束后不记流水账，专门提问："哪个错误假设导致了失败？哪个证据推翻了它？"
-- **Knowledge Arena (知识竞技场)**：实战成功的知识会 boost，导致错误的会 decay。
-- **Trust Tiers (信任等级)**：知识被分为 5 个信任层级。机器自主拾荒来的代码，绝不允许越权直接给系统执行。
+后台 Daemon 24/7 运转：
 
----
+| 进程 | 功能 |
+|------|------|
+| **Scavenger（拾荒者）** | 自动从互联网搜集信息填补知识空洞 |
+| **Fermentor（发酵池）** | 发现节点间语义关联，生成假设 |
+| **Verifier（验证器）** | 审计知识新鲜度，衰减/提升置信度 |
+| **GC** | 清理被遗忘的过时知识 |
 
-## 🚀 快速启动
+知识不是静态存储——它在被创建、验证、关联、淘汰。
 
-### 1. 环境依赖
-Genesis 为极致轻量化设计，只依赖原生 Python 与最基础的网络库，抛弃了臃肿的 LangChain/LlamaIndex。
+### 📊 元信息签名系统
+
+每个知识节点携带 metadata_signature（OS、语言、框架、任务类型等维度），搜索时自动硬过滤+软评分。C-Process 写入时若发现新维度，自动学习并持久化。维度空间无限扩展，节点类型固定不变。
+
+### 🏟️ 双竞技场在线学习
+
+- **Knowledge Arena**：任务成功/失败后，被引用的知识节点 confidence 动态升降
+- **Persona Arena**：参与任务的 Multi-G 人格被记录胜负，按 task_kind 细分，弱者被淘汰替换
+
+### ⚡ 信息论安全蒸发
+
+G 和 Lens 的历史工具输出被压缩为轻量存根（零 LLM 调用、零信息损失），最大化 DeepSeek prefix caching 命中率。Op 保留完整 ReAct 记忆，不蒸发。
+
+## 架构
+
+```
+用户 → Discord Bot → V4Loop
+  ├── Multi-G 透镜预激活（3~7 MBTI 人格并行，共享 prefix cache）
+  ├── Phase 1: G-Process（search_knowledge_nodes + dispatch_to_op）
+  ├── Phase 2: Op-Process（16 个工具，纯净上下文，≤12 轮）
+  ├── Phase 3: POST（对话记忆 → MEM_CONV 滑动窗口）
+  ├── Phase 4: C-Process（FULL/LIGHT/SKIP 三级，8 个节点工具）
+  └── Post-C: 信息空洞自动入库（VOID 节点 → Scavenger 填补）
+
+后台守护进程（BackgroundDaemon）：
+  ├── Scavenger  — 优先填补 VOID 节点，web_search + read_url + 提纯入库
+  ├── Fermentor  — 语义向量搜索发现边缘关联 + 假设生成
+  ├── Verifier   — LLM 审计节点新鲜度 + confidence 衰减/提升
+  └── GC         — 清理被遗忘的节点
+
+外部服务：
+  ├── SearXNG（自建元搜索，聚合 Google/Bing/DuckDuckGo）
+  └── Playwright Chromium（headless 浏览器）
+
+知识库：NodeVault（SQLite + 向量引擎 BGE-small-zh）
+Provider：DeepSeek（主力）→ Gemini（failover）| FreePoolManager（Daemon 用免费池）
+```
+
+### 工具权限矩阵
+
+| 阶段 | 可用工具 | 控制机制 |
+|------|---------|----------|
+| **Lens** | `search_knowledge_nodes` | schema 只传 1 个工具 |
+| **G** | `search_knowledge_nodes` + `dispatch_to_op` | schema 只传 2 个 |
+| **Op** | 16 个工具减去 8 个节点工具 | 代码级过滤 |
+| **C** | 8 个节点工具 | 白名单 |
+
+## 快速开始
+
+### 环境要求
+
+- Python 3.11+
+- CUDA GPU（可选，加速向量引擎）
+- DeepSeek API Key（必需）
+
+### 安装
+
 ```bash
 git clone https://github.com/chendechuan117-create/genesis.git
 cd genesis
+
 python -m venv venv
 source venv/bin/activate
+
 pip install -r requirements.txt
 ```
 
-### 2. 注入灵魂 (API Keys)
-复制环境变量模板并在 `.env` 中填入你的大模型密钥：
+### 配置
+
 ```bash
 cp .env.example .env
-# 配置首选高智商模型（G/Op 进程使用，如 DeepSeek V3）
-DEEPSEEK_API_KEY=your_key_here
-# 配置一系列免费池（供后台 Daemon 白嫖使用，如 Groq/SiliconFlow）
-GROQ_API_KEY=...
-SILICONFLOW_API_KEY=...
 ```
 
-### 3. 启动数字生命
-Genesis 作为一个系统级服务存在，交互接口解耦。
+编辑 `.env`：
+
 ```bash
-# 安装并启动核心代理与后台守护进程 (Linux)
-cp genesis/v4/*.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now genesis-v4 genesis-daemon
+# 核心 LLM（必需）
+DEEPSEEK_API_KEY=your_key_here
 
-# 启动任意前端交互界面
-python discord_bot.py   # 在 Discord 频道协作
-# 或
-./start_api.sh          # 启动 RESTful FastAPI 用于程序间通信
+# 免费池（Daemon 后台用，可选）
+GROQ_API_KEY=your_key_here
+
+# Discord Bot（可选）
+DISCORD_TOKEN=your_token_here
+
+# 代理（墙内环境需要）
+HTTPS_PROXY=socks5://127.0.0.1:20170
 ```
+
+### 启动
+
+```bash
+# Discord 机器人（主接口）
+python discord_bot.py
+
+# 后台守护进程（知识代谢）
+python -m genesis.v4.background_daemon
+
+# 或用 systemd 管理
+systemctl --user start genesis-v4.service
+```
+
+## 项目结构
+
+```
+genesis/
+├── core/           # 基础设施：provider, registry, config
+├── v4/             # V4 引擎：loop, manager, blackboard, daemon
+├── tools/          # 工具集：node_tools, file_tools, web_tool, url_tool
+├── providers/      # LLM provider 注册
+└── mcp_server.py   # MCP 服务端
+```
+
+## 许可证
+
+MIT License. Copyright (c) 2025-2026.
 
 ---
 
-## 🔮 演化路径 (Evolution Path)
-
-经过对 2025-2026 行业架构的全景分析，Genesis 的下一步演化将聚焦于与生态的握手，同时保持其独特的内核：
-1. **MCP 协议融合**：打破单体孤岛，让神经系统能作为标准 MCP Server 直接为 Claude Code / Windsurf 等 IDE 服务。
-2. **KV-Cache 认知优化**：调整提示词与记忆挂载结构，极致压榨前沿模型长窗口下的缓存命中红利。
-3. **原生推理 (Native Reasoning) 释放**：重构工具管线，接驳 GPT-5 / Claude 4.5 Sonnet 的原生思维链路。
-
-本项目基于 MIT License 开放。欢迎所有追求 AGI 本质的开发者加入这场演化。
+**Genesis 不是工具，是身体。云 API 来了又走，但身体会记住每一次经历。**

@@ -1,0 +1,147 @@
+[
+  {
+    "config": "1-lens",
+    "personas": [
+      "ISTJ"
+    ],
+    "status": "OK",
+    "elapsed_sec": 14.45,
+    "g_tokens": 22128,
+    "total_entries": 1,
+    "evidence_entries": 1,
+    "hypothesis_entries": 0,
+    "search_voids": 0,
+    "suggested_directions": 0,
+    "top_score": 3.5,
+    "bottom_score": 3.5,
+    "score_spread": 0.0,
+    "collapse_ranking": [
+      "ISTJ(E)=3.500"
+    ],
+    "board_preview": "[透镜侦察黑板] 共 1 条条目：\n1. [ISTJ] (证据型) 框架: Discord Bot 消息延迟是网络代理配置冲突或 SSL/TLS 握手超时导致的异步事件循环阻塞。\n   证据节点: LESSON_PYTHON_PROXY_CONFIG_FIX, LESSON_SSL_HANDSHAKE_TIMEOUT_DIAGNOSIS, CTX_GENESIS_DISCORD_CALLBACK_ERROR\n   验证动作: 检查 discord_bot.py 中所有网络请求（如 ProviderRouter 调用）的代理环境变量和超时设置，并运行 `python -c \"impor..."
+  },
+  {
+    "config": "3-lens",
+    "personas": [
+      "ISTJ",
+      "INTP",
+      "ENFP"
+    ],
+    "status": "OK",
+    "elapsed_sec": 22.5,
+    "g_tokens": 101220,
+    "total_entries": 3,
+    "evidence_entries": 3,
+    "hypothesis_entries": 0,
+    "search_voids": 0,
+    "suggested_directions": 0,
+    "top_score": 4.4,
+    "bottom_score": 3.68,
+    "score_spread": 0.72,
+    "collapse_ranking": [
+      "INTP(E)=4.400",
+      "ENFP(E)=3.680",
+      "ISTJ(E)=3.680"
+    ],
+    "board_preview": "[透镜侦察黑板] 共 3 条条目：\n1. [ENFP] (证据型) 框架: Discord bot 延迟可能源于系统服务状态异常（如休眠唤醒）或网络波动，而非单纯代码bug。\n   证据节点: CTX_GENESIS_DISCORD_CALLBACK_ERROR, EP_SCAVENGER_STATUS_CHECK_20260319, ASSET_NETWORK_TEST_DETAILED_SCRIPT\n   验证动作: 运行 `systemctl status` 检查 bot 相关服务状态，同时执行 `python network_test_script.py` 测试网络延迟和...\n2. [ISTJ] (证据型) 框架: Discord Bot 消息延迟可能是由网络延迟、异步事件循环阻塞或外部依赖（如 ProviderRouter）调用超时导致的综合问题。\n   证据节点: CTX_NETWORK_LATENCY_TEST_RESULTS_2026_03_19, CTX_GENESIS_DISCORD_CALLBACK_ERROR, LESSON_SCAVENGER_SLEEP_T"
+  },
+  {
+    "config": "5-lens",
+    "personas": [
+      "ISTJ",
+      "INTP",
+      "ENFP",
+      "INTJ",
+      "ISTP"
+    ],
+    "status": "OK",
+    "elapsed_sec": 27.6,
+    "g_tokens": 285116,
+    "total_entries": 5,
+    "evidence_entries": 5,
+    "hypothesis_entries": 0,
+    "search_voids": 0,
+    "suggested_directions": 0,
+    "top_score": 4.58,
+    "bottom_score": 3.62,
+    "score_spread": 0.96,
+    "collapse_ranking": [
+      "INTP(E)=4.580",
+      "ISTP(E)=4.360",
+      "INTJ(E)=4.240",
+      "ENFP(E)=4.000",
+      "ISTJ(E)=3.620"
+    ],
+    "board_preview": "[透镜侦察黑板] 共 5 条条目：\n1. [ISTP] (证据型) 框架: Discord bot 消息延迟是网络代理配置冲突或 DNS 解析超时导致的异步阻塞，而非 event loop 内部问题。\n   证据节点: LESSON_PYTHON_PROXY_CONFIG_FIX, LESSON_SOCKS5_HTTPS_TIMEOUT_DIAGNOSIS, LESSON_REVERSE_DNS_TIMEOUT_DIAGNOSIS, CTX_GENESIS_DISCORD_CALLBACK_ERROR\n   验证动作: 在 discord_bot.py 中临时添加代理环境变量清除代码（os.environ.pop('HTTP_PROXY', None); os.environ....\n2. [ENFP] (证据型) 框架: Discord Bot 消息延迟是网络代理配置冲突与异步事件循环阻塞的复合问题，特别是 SOCKS5 代理下的 DNS 解析或 SSL 握手超时导致 provider failover 时阻塞主循环。\n   证据节点: LESSON_PYTHON_PROXY_CON"
+  },
+  {
+    "config": "7-lens",
+    "personas": [
+      "ISTJ",
+      "INTP",
+      "ENFP",
+      "INTJ",
+      "ISTP",
+      "ENTJ",
+      "ISFJ"
+    ],
+    "status": "OK",
+    "elapsed_sec": 24.52,
+    "g_tokens": 375388,
+    "total_entries": 7,
+    "evidence_entries": 6,
+    "hypothesis_entries": 1,
+    "search_voids": 0,
+    "suggested_directions": 3,
+    "top_score": 5.78,
+    "bottom_score": 0.4,
+    "score_spread": 5.38,
+    "collapse_ranking": [
+      "ISTP(E)=5.780",
+      "INTJ(E)=5.780",
+      "ENTJ(E)=5.260",
+      "INTP(E)=4.820",
+      "ISTJ(E)=3.500",
+      "ISFJ(E)=3.220",
+      "ENFP(H)=0.400"
+    ],
+    "board_preview": "[透镜侦察黑板] 共 7 条条目：\n1. [ISFJ] (证据型) 框架: Discord Bot 延迟问题源于网络代理配置冲突或外部API调用超时，导致 event loop 阻塞。\n   证据节点: LESSON_PYTHON_PROXY_CONFIG_FIX, CTX_GENESIS_DISCORD_CALLBACK_ERROR, LESSON_SOCKS5_HTTPS_TIMEOUT_DIAGNOSIS\n   验证动作: 检查 discord_bot.py 中所有外部 API 调用（如 ProviderRouter）的 timeout 设置，并运行 ASSET_NETWORK_T...\n2. [ISTJ] (证据型) 框架: Discord Bot 延迟问题源于网络代理配置冲突或SSL握手延迟，而非单纯的event loop阻塞。\n   证据节点: LESSON_PYTHON_PROXY_CONFIG_FIX, LESSON_SSL_HANDSHAKE_TIMEOUT_DIAGNOSIS, CTX_GENESIS_DISCORD_CALLBACK_ERROR\n   验证动作: "
+  },
+  {
+    "config": "9-lens",
+    "personas": [
+      "ISTJ",
+      "INTP",
+      "ENFP",
+      "INTJ",
+      "ISTP",
+      "ENTJ",
+      "ISFJ",
+      "ESTJ",
+      "INFJ"
+    ],
+    "status": "OK",
+    "elapsed_sec": 25.66,
+    "g_tokens": 486467,
+    "total_entries": 9,
+    "evidence_entries": 8,
+    "hypothesis_entries": 1,
+    "search_voids": 0,
+    "suggested_directions": 3,
+    "top_score": 5.588,
+    "bottom_score": 0.4,
+    "score_spread": 5.188,
+    "collapse_ranking": [
+      "INTP(E)=5.588",
+      "INFJ(E)=5.360",
+      "ENTJ(E)=5.140",
+      "ISTP(E)=4.640",
+      "ESTJ(E)=3.740",
+      "ISTJ(E)=3.500",
+      "ISFJ(E)=3.020",
+      "INTJ(E)=2.140",
+      "ENFP(H)=0.400"
+    ],
+    "board_preview": "[透镜侦察黑板] 共 9 条条目：\n1. [INTJ] (证据型) 框架: Discord bot 延迟源于异步事件循环被同步阻塞操作或网络依赖故障所阻塞，而非单纯 provider failover。\n   证据节点: CTX_GENESIS_DISCORD_CALLBACK_ERROR, ASSET_NETWORK_TEST_DETAILED_SCRIPT\n   验证动作: 在 discord_bot.py 中添加 asyncio 事件循环监控：`import asyncio; print(asyncio.all_tasks())`...\n2. [ENTJ] (证据型) 框架: Discord Bot 消息延迟是网络代理配置冲突或 DNS/SSL 握手超时导致的异步事件循环阻塞\n   证据节点: LESSON_SOCKS5_HTTPS_TIMEOUT_DIAGNOSIS, LESSON_REVERSE_DNS_TIMEOUT_DIAGNOSIS, LESSON_PYTHON_PROXY_CONFIG_FIX, CTX_GENESIS_DISCORD_CALLBACK_ERROR, "
+  }
+]

@@ -168,13 +168,35 @@ class VectorEngine:
         vec_np = vec_np / (norm if norm > 0 else 1e-10)
         
         if node_id in self.node_ids:
-            # Update existing
             idx = self.node_ids.index(node_id)
             self.matrix[idx] = vec_np
         else:
-            # Add new
             self.node_ids.append(node_id)
             if self.matrix is None:
                 self.matrix = vec_np.reshape(1, -1)
             else:
                 self.matrix = np.vstack([self.matrix, vec_np])
+
+    def add_to_matrix_batch(self, items: List[Tuple[str, List[float]]]):
+        """批量添加向量，一次 vstack 代替逐条 O(N²) 拷贝。"""
+        if not self.is_ready or not items:
+            return
+        new_ids = []
+        new_vecs = []
+        for node_id, vec in items:
+            vec_np = np.array(vec, dtype=np.float32)
+            norm = np.linalg.norm(vec_np)
+            vec_np = vec_np / (norm if norm > 0 else 1e-10)
+            if node_id in self.node_ids:
+                idx = self.node_ids.index(node_id)
+                self.matrix[idx] = vec_np
+            else:
+                new_ids.append(node_id)
+                new_vecs.append(vec_np)
+        if new_vecs:
+            new_matrix = np.array(new_vecs, dtype=np.float32)
+            self.node_ids.extend(new_ids)
+            if self.matrix is None:
+                self.matrix = new_matrix
+            else:
+                self.matrix = np.vstack([self.matrix, new_matrix])

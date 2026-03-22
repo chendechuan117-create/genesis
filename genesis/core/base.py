@@ -143,6 +143,45 @@ class Tool(ABC):
         }
 
 
+class MetaTool(Tool):
+    """元工具基类 — 从 NodeVault TOOL 节点动态加载的工具继承此类。
+    携带信任水印、来源节点 ID、生命周期钩子。
+    """
+
+    _node_id: str = ""
+    _trust_tier: str = "REFLECTION"
+    _source: str = "dynamic"
+
+    @property
+    def node_id(self) -> str:
+        return self._node_id
+
+    @property
+    def trust_tier(self) -> str:
+        return self._trust_tier
+
+    @property
+    def meta_info(self) -> Dict[str, Any]:
+        return {"node_id": self._node_id, "trust_tier": self._trust_tier, "source": self._source}
+
+    def pre_execute(self, **kwargs) -> Dict[str, Any]:
+        """执行前钩子：可用于参数校验、日志、或拒绝执行。返回修改后的 kwargs。"""
+        return kwargs
+
+    def post_execute(self, result: str) -> str:
+        """执行后钩子：可用于结果审计、截断、或记录指标。"""
+        return result
+
+    async def execute(self, **kwargs) -> str:
+        kwargs = self.pre_execute(**kwargs)
+        result = await self._execute_impl(**kwargs)
+        return self.post_execute(result)
+
+    async def _execute_impl(self, **kwargs) -> str:
+        """子类实现实际逻辑"""
+        raise NotImplementedError("MetaTool subclass must implement _execute_impl")
+
+
 class LLMProvider(ABC):
     """LLM 提供商基类"""
     
@@ -172,6 +211,10 @@ class PerformanceMetrics:
     output_tokens: int = 0
     total_tokens: int = 0
     prompt_cache_hit_tokens: int = 0
+    # 令牌计量表：分阶段 token 追踪
+    g_tokens: int = 0
+    op_tokens: int = 0
+    c_tokens: int = 0
     tools_used: List[str] = field(default_factory=list)
     success: bool = True
     cache_hit: bool = False

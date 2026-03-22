@@ -67,3 +67,5 @@ ehthumbs.db
 Thumbs.db
 
 .gitnexus
+.cascade/
+python_3.14_features_memo.md

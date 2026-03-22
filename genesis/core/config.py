@@ -78,46 +78,14 @@ class ConfigManager:
         
     def _load_all(self):
         """加载所有配置源"""
-        # 1. 尝试加载 OpenClaw 宿主配置 (最底层)
-        self._load_openclaw_config()
-        
-        # 2. 加载 .env (中间层)
+        # 1. 加载 .env (中间层)
         self._load_dotenv()
         
-        # 3. 加载环境变量 (最高优)
+        # 2. 加载环境变量 (最高优)
         self._load_env_vars()
         
-        # 4. 验证核心凭证
+        # 3. 验证核心凭证
         self._validate()
-
-    def _load_openclaw_config(self):
-        """寄生模式：读取 OpenClaw 配置文件"""
-        try:
-            # 标准路径
-            openclaw_path = Path.home() / ".local/share/openclaw/openclaw.json"
-            if not openclaw_path.exists():
-                return
-                
-            logger.info(f"🧬 检测到 OpenClaw 宿主配置: {openclaw_path}")
-            with open(openclaw_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                
-            # 提取 Proxy
-            if 'env' in data and 'vars' in data['env']:
-                env_vars = data['env']['vars']
-                self._config.http_proxy = env_vars.get('HTTP_PROXY') or env_vars.get('http_proxy')
-                self._config.https_proxy = env_vars.get('HTTPS_PROXY') or env_vars.get('https_proxy')
-                
-            # 提取 API Key (DeepSeek)
-            if 'models' in data and 'providers' in data['models']:
-                providers = data['models']['providers']
-                if 'deepseek' in providers:
-                    self._config.deepseek_api_key = providers['deepseek'].get('apiKey')
-            
-            logger.info("✓ 已从 OpenClaw 继承配置 (API Key, Proxy)")
-            
-        except Exception as e:
-            logger.warning(f"读取 OpenClaw 配置失败: {e}")
 
     def _load_dotenv(self):
         """加载 .env 文件"""
@@ -208,7 +176,11 @@ class ConfigManager:
             self._config.debug = (val.lower() == "true")
 
     def _apply_proxies(self):
-        """将代理配置应用到当前进程环境"""
+        """将代理配置应用到当前进程环境
+        ⚠️ 注意：provider.py 的 httpx 客户端使用 trust_env=False 绕过此处注入的代理，
+        以避免国内 API（DeepSeek）绕道代理 +11s 延迟。墙外免费池（groq/cloudflare）
+        因此无法通过代理访问。参见 provider.py:_get_http_client()。
+        """
         if self._config.http_proxy:
             os.environ['http_proxy'] = self._config.http_proxy
             os.environ['HTTP_PROXY'] = self._config.http_proxy
