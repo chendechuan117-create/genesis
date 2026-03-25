@@ -183,117 +183,58 @@ async def on_ready():
 
 # ── /auto 自主模式 ──────────────────────────────────────
 
-AUTO_MAX_ROUNDS = 50
-AUTO_DRY_LIMIT = 5  # 连续全局无产出轮数上限
-AUTO_CAT_FATIGUE = 2  # 单类别连续无产出 N 次后跳过
+AUTO_MAX_ROUNDS = 30
+AUTO_DRY_LIMIT = 4  # 连续无实质改进轮数上限
 
-# ── 任务类别定义 ──
-# 每个类别：(id, 名称, emoji, prompt 模板)
-# prompt 模板中的 {target} 和 {history} 会被动态替换
-AUTO_CATEGORIES = [
-    {
-        "id": "void_verify",
-        "name": "VOID 验证",
-        "emoji": "🔬",
-        "prompt": (
-            "任务类型：VOID 验证\n\n"
-            "执行步骤：\n"
-            "1. 用 search_knowledge_nodes(ntype=\"CONTEXT\", keywords=[\"VOID\"]) 找到待验证的 VOID 节点\n"
-            "2. 选择一个你尚未验证过的 VOID（优先选 confidence 最低的）\n"
-            "3. 设计最小实验来验证或推翻它（shell 命令、读代码、跑测试）\n"
-            "4. 根据实验结果：如果验证了→写 LESSON 并删除 VOID；如果推翻了→直接删除 VOID\n\n"
-            "{history}\n"
-            "限制：不要修改 genesis/ 下的 .py 文件。每轮只处理 1 个 VOID，做深不做广。"
-        ),
-    },
-    {
-        "id": "knowledge_audit",
-        "name": "知识审计",
-        "emoji": "🔍",
-        "prompt": (
-            "任务类型：知识审计\n\n"
-            "执行步骤：\n"
-            "1. 用 search_knowledge_nodes 搜索低质量节点（关键词搜索不同领域）\n"
-            "2. 找出以下问题节点：\n"
-            "   - 内容空洞或过于笼统的 LESSON\n"
-            "   - 相互矛盾的节点\n"
-            "   - 内容重复但表述不同的节点\n"
-            "   - validation_status=unverified 且 confidence < 0.5 的节点\n"
-            "3. 对问题节点：用实验验证→修正或删除\n\n"
-            "{history}\n"
-            "限制：不要修改 genesis/ 下的 .py 文件。每轮最多处理 3 个节点，做精不做多。"
-        ),
-    },
-    {
-        "id": "code_review",
-        "name": "代码审查",
-        "emoji": "📋",
-        "prompt": (
-            "任务类型：代码审查\n\n"
-            "目标模块：{target}\n\n"
-            "执行步骤：\n"
-            "1. 阅读目标模块的代码\n"
-            "2. 识别以下问题（按优先级排序）：\n"
-            "   - 安全漏洞（路径穿越、注入、未授权访问）\n"
-            "   - 错误处理缺陷（未捕获异常、静默失败）\n"
-            "   - 逻辑 bug（边界条件、状态不一致）\n"
-            "   - 性能问题（不必要的重复计算、内存泄漏）\n"
-            "3. 对每个发现：记录为 LESSON（包含文件名、行号、具体问题和建议修复方案）\n\n"
-            "{history}\n"
-            "限制：不要修改代码文件，只记录发现。每个发现必须包含具体代码引用。"
-        ),
-    },
-    {
-        "id": "health_check",
-        "name": "系统健康",
-        "emoji": "🏥",
-        "prompt": (
-            "任务类型：系统健康检查\n\n"
-            "执行步骤：\n"
-            "1. 检查系统状态：\n"
-            "   - 磁盘空间（df -h）\n"
-            "   - Genesis 进程状态（ps aux | grep genesis）\n"
-            "   - 最近的错误日志（tail runtime/genesis.log | grep -i error）\n"
-            "   - Docker 容器状态（docker ps）\n"
-            "   - 知识库大小和增长趋势\n"
-            "2. 对发现的异常：诊断根因并记录为 LESSON\n"
-            "3. 对系统正常运行的关键指标：记录为 ASSET（便于未来对比）\n\n"
-            "{history}\n"
-            "限制：不要修改配置文件或重启服务。只诊断和记录。"
-        ),
-    },
-    {
-        "id": "consolidate",
-        "name": "知识整合",
-        "emoji": "🧩",
-        "prompt": (
-            "任务类型：知识整合\n\n"
-            "执行步骤：\n"
-            "1. 用 search_knowledge_nodes 搜索某个主题领域的所有节点\n"
-            "2. 找出：\n"
-            "   - 可以合并的重复节点（内容相似但 ID 不同）\n"
-            "   - 可以从多个 CONTEXT 提炼出的更高层 LESSON\n"
-            "   - 缺少 prerequisites 或 resolves 的 LESSON（补全关系）\n"
-            "3. 执行整合：合并重复→提炼上位→补全关系\n\n"
-            "{history}\n"
-            "限制：每轮聚焦 1 个主题领域。删除节点前先确认内容已被保留在合并后的节点中。"
-        ),
-    },
-]
+# ── 反思驱动 prompt ──
+# 第一轮：回顾自己的历史行为，找出不足
+AUTO_PROMPT_REFLECT = """回顾你最近的行为记录和知识库。你的目标不是"做新事"，而是"找到自己哪里做得不够好"。
 
-# 代码审查的目标模块列表（轮转使用）
-_CODE_REVIEW_TARGETS = [
-    "genesis/v4/loop.py（核心循环：G/Op/C 阶段流转）",
-    "genesis/v4/manager.py（管理器：知识检索、Multi-G、prompt 构建）",
-    "genesis/core/provider.py（LLM 调用：httpx、流式解析、重试）",
-    "genesis/core/provider_manager.py（Provider 路由：failover、探活）",
-    "genesis/tools/node_tools.py（知识节点工具：CRUD、搜索、去重）",
-    "genesis/v4/agent.py（Agent 主体：初始化、process 入口）",
-    "genesis/v4/background_daemon.py（后台守护：拾荒者/发酵池/验证器/GC）",
-    "discord_bot.py（Discord 前端：消息处理、auto 模式）",
-    "genesis/v4/blackboard.py（黑板：Multi-G 透镜共享状态）",
-    "genesis/core/registry.py（注册表：工具和 Provider 的全局注册）",
-]
+执行步骤：
+1. 用 search_knowledge_nodes 回顾最近创建的节点（按时间倒序），审视最近 20 个节点
+2. 对每个节点诚实地问自己：
+   - 这个节点有实际价值吗？还是只是自说自话？
+   - 它的 IF→THEN→BECAUSE 结构是否基于真实实验？还是我在编造？
+   - 有没有用户之前纠正过我的类似错误，但我没学到？
+3. 找出你做得最差的 1-2 件事，具体说明问题在哪
+4. 如果发现垃圾节点（空洞、自证、重复），直接删除它们
+
+不要辩解，不要给自己找台阶。诚实是进化的前提。
+输出格式：先列问题，再列行动，最后总结"下一轮我应该聚焦什么"。"""
+
+# 后续轮：基于上轮反思结果，做具体改进
+AUTO_PROMPT_IMPROVE = """上轮反思发现了以下问题：
+{last_findings}
+
+现在请针对这些问题采取行动。你的终极目标是：让用户不需要介入就能得到正确结果。
+
+思考方向：
+- 用户过去在哪些场景下必须手动纠正你？能不能提前预防？
+- 你的哪些工具调用模式是低效的？有没有更好的方式？
+- 你记录的哪些"经验"其实从未在后续行动中被调用过？（死知识）
+- 你的哪些行为模式让用户感到重复、无聊、没价值？
+
+执行要求：
+- 每轮只解决 1 个具体问题，做到位
+- 如果问题需要修改代码，把改进方案写成 LESSON 并说明具体修改建议
+- 如果问题是知识质量，直接修正或删除有问题的节点
+- 如果问题是行为模式，写一条明确的 LESSON 告诫未来的自己
+
+{history}
+禁止：不要修改 genesis/ 下的 .py 文件。"""
+
+# 兜底 prompt：上轮没有明确发现时使用
+AUTO_PROMPT_EXPLORE = """上轮反思没有找到明确问题，说明你可能在回避真正的弱点。
+
+换个角度审视自己：
+1. 读取最近的 runtime/genesis.log 错误日志，看看你在实际运行中犯了什么错
+2. 回顾你知识库中 confidence 最低的 5 个节点，它们为什么低？
+3. 想一个用户可能会问你但你大概率答不好的问题，然后提前准备
+
+关键：不要做你已经擅长的事来刷成就感。专注于你的盲区。
+
+{history}
+禁止：不要修改 genesis/ 下的 .py 文件。"""
 
 def _get_node_count() -> int:
     """获取当前知识库节点数量"""
@@ -321,7 +262,7 @@ def _reset_provider():
         pass
 
 async def _run_auto(channel: discord.TextChannel):
-    """自主模式主循环：结构化任务队列 + 强制轮转"""
+    """自主模式主循环：反思驱动，审视过去 → 找不足 → 减少用户依赖"""
     import time as _time
     
     state = auto_state.get(channel.id)
@@ -330,32 +271,15 @@ async def _run_auto(channel: discord.TextChannel):
     
     round_num = 0
     total_nodes_created = 0
-    consecutive_dry = 0  # 全局连续零产出
+    nodes_deleted = 0
+    consecutive_dry = 0
     stop_reason = "manual"
+    round_log = []       # 每轮的行动摘要
+    last_findings = ""   # 上轮反思发现的问题，传递给下轮
     
-    # 每个类别的追踪状态
-    cat_stats = {}
-    for cat in AUTO_CATEGORIES:
-        cat_stats[cat["id"]] = {
-            "rounds": 0,           # 该类别已执行轮数
-            "nodes": 0,            # 该类别产出节点数
-            "consecutive_dry": 0,  # 该类别连续无产出
-            "fatigued": False,     # 是否疲劳（跳过）
-            "history": [],         # 该类别的执行历史
-        }
-    
-    # 代码审查模块索引
-    code_review_idx = 0
-    
-    # 构建轮转队列
-    cat_queue = [cat["id"] for cat in AUTO_CATEGORIES]
-    cat_pos = 0  # 当前队列位置
-    
-    # 启动消息
-    cat_names = " → ".join(f'{c["emoji"]}{c["name"]}' for c in AUTO_CATEGORIES)
     await channel.send(
-        f"🧠 **自主模式启动** (上限 {AUTO_MAX_ROUNDS} 轮, 连续 {AUTO_DRY_LIMIT} 轮无产出停止)\n"
-        f"📋 **任务轮转**: {cat_names}\n"
+        f"� **自主反思模式启动** (上限 {AUTO_MAX_ROUNDS} 轮)\n"
+        f"Genesis 将回顾自身行为，寻找不足并改进。\n"
         f"发送 `/auto stop` 停止。"
     )
     
@@ -366,47 +290,30 @@ async def _run_auto(channel: discord.TextChannel):
             stop_reason = f"reached {AUTO_MAX_ROUNDS} round cap"
             break
         
-        # ── 选择下一个非疲劳类别 ──
-        attempts = 0
-        while attempts < len(cat_queue):
-            cat_id = cat_queue[cat_pos % len(cat_queue)]
-            cat_pos += 1
-            if not cat_stats[cat_id]["fatigued"]:
-                break
-            attempts += 1
-        else:
-            # 所有类别都疲劳了
-            stop_reason = "all categories fatigued"
-            await channel.send("⏸️ 所有任务类别均已疲劳（连续无产出），自动停止。")
-            break
-        
-        # 找到当前类别定义
-        current_cat = next(c for c in AUTO_CATEGORIES if c["id"] == cat_id)
-        
         _reset_provider()
         nodes_before = _get_node_count()
         
-        # ── 构建 prompt ──
-        # 该类别的历史
-        cat_history = cat_stats[cat_id]["history"]
-        if cat_history:
-            history_text = "[本类别历史]\n" + "\n".join(cat_history[-5:]) + "\n以上内容你已经做过了，不要重复。\n"
+        # ── 选择 prompt ──
+        if round_num == 1:
+            prompt = AUTO_PROMPT_REFLECT
+            phase = "反思"
+        elif last_findings and last_findings.strip() != "(无输出)":
+            history = ""
+            if round_log:
+                history = "[已完成的改进]\n" + "\n".join(round_log[-5:]) + "\n不要重复以上内容。\n"
+            prompt = AUTO_PROMPT_IMPROVE.format(
+                last_findings=last_findings,
+                history=history,
+            )
+            phase = "改进"
         else:
-            history_text = ""
+            history = ""
+            if round_log:
+                history = "[已完成的行动]\n" + "\n".join(round_log[-5:]) + "\n不要重复以上内容。\n"
+            prompt = AUTO_PROMPT_EXPLORE.format(history=history)
+            phase = "深挖"
         
-        # 代码审查需要具体目标
-        target = ""
-        if cat_id == "code_review":
-            target = _CODE_REVIEW_TARGETS[code_review_idx % len(_CODE_REVIEW_TARGETS)]
-            code_review_idx += 1
-        
-        prompt = current_cat["prompt"].format(target=target, history=history_text)
-        
-        await channel.send(
-            f"{'─'*40}\n"
-            f"{current_cat['emoji']} **第 {round_num} 轮 | {current_cat['name']}**"
-            + (f"\n📁 目标: `{target}`" if target else "")
-        )
+        await channel.send(f"{'─'*40}\n🪞 **第 {round_num} 轮 | {phase}**")
         
         try:
             t0 = _time.time()
@@ -431,39 +338,35 @@ async def _run_auto(channel: discord.TextChannel):
             response = result.response if hasattr(result, 'response') else result.get("response", "") if isinstance(result, dict) else ""
             total_tokens = result.total_tokens if hasattr(result, 'total_tokens') else 0
             
-            # 价值追踪
+            # 节点变化追踪（允许负值 = 删除了垃圾节点）
             nodes_after = _get_node_count()
-            nodes_delta = max(0, nodes_after - nodes_before) if nodes_before >= 0 and nodes_after >= 0 else 0
-            total_nodes_created += nodes_delta
+            if nodes_before >= 0 and nodes_after >= 0:
+                nodes_delta = nodes_after - nodes_before
+                if nodes_delta > 0:
+                    total_nodes_created += nodes_delta
+                elif nodes_delta < 0:
+                    nodes_deleted += abs(nodes_delta)
+            else:
+                nodes_delta = 0
             
-            # 全局生产力
-            if nodes_delta > 0:
+            # 生产力判定：有产出（新建或删除都算有价值）
+            did_something = nodes_delta != 0
+            if did_something:
                 consecutive_dry = 0
             else:
                 consecutive_dry += 1
             
-            # 类别级追踪
-            cs = cat_stats[cat_id]
-            cs["rounds"] += 1
-            cs["nodes"] += nodes_delta
-            if nodes_delta > 0:
-                cs["consecutive_dry"] = 0
-            else:
-                cs["consecutive_dry"] += 1
-                if cs["consecutive_dry"] >= AUTO_CAT_FATIGUE:
-                    cs["fatigued"] = True
-                    logger.info(f"Auto: category {cat_id} fatigued after {cs['consecutive_dry']} dry rounds")
+            # 保存本轮输出作为下轮的"上轮发现"
+            last_findings = response[:500] if response else "(无输出)"
             
-            # 记录类别历史（摘要更丰富：前 200 字）
-            summary = response[:200].replace("\n", " ") if response else "(无输出)"
-            cs["history"].append(
-                f"R{round_num}: {'+'+ str(nodes_delta) + '节点' if nodes_delta else '无产出'} | {summary}"
-            )
+            # 记录摘要
+            summary = response[:150].replace("\n", " ") if response else "(无输出)"
+            delta_str = f"+{nodes_delta}" if nodes_delta > 0 else str(nodes_delta) if nodes_delta < 0 else "±0"
+            round_log.append(f"R{round_num}[{phase}]: {delta_str}节点 | {summary}")
             
-            tag = f"📝+{nodes_delta}" if nodes_delta > 0 else "⚪"
-            fatigue_warn = " ⚠️疲劳" if cs["fatigued"] else ""
+            tag = f"📝{delta_str}" if nodes_delta != 0 else "⚪"
             await channel.send(
-                f"**第{round_num}轮 [{current_cat['name']}]** | {duration:.0f}s | {total_tokens}t | {tag} | dry={consecutive_dry}{fatigue_warn}"
+                f"**第{round_num}轮 [{phase}]** | {duration:.0f}s | {total_tokens}t | {tag} | dry={consecutive_dry}"
             )
             
             if response:
@@ -474,35 +377,27 @@ async def _run_auto(channel: discord.TextChannel):
                     await channel.send(preview[i:i+1990])
                     
         except Exception as e:
-            logger.error(f"Auto round {round_num} [{cat_id}] error: {e}", exc_info=True)
-            await channel.send(f"⚠️ 第{round_num}轮 [{current_cat['name']}] 异常: {str(e)[:200]}")
+            logger.error(f"Auto round {round_num} [{phase}] error: {e}", exc_info=True)
+            await channel.send(f"⚠️ 第{round_num}轮 [{phase}] 异常: {str(e)[:200]}")
             consecutive_dry += 1
-            cat_stats[cat_id]["consecutive_dry"] += 1
+            last_findings = ""
         
-        # ── 全局生产力熔断 ──
+        # ── 熔断 ──
         if consecutive_dry >= AUTO_DRY_LIMIT:
             stop_reason = f"{AUTO_DRY_LIMIT} consecutive dry rounds"
-            await channel.send(f"⏸️ 连续 {AUTO_DRY_LIMIT} 轮全局无新节点，自动停止。")
+            await channel.send(f"⏸️ 连续 {AUTO_DRY_LIMIT} 轮无实质改进，自动停止。")
             break
         
         # 轮间休息
         if state.get("active", False):
-            sleep_time = 5 if consecutive_dry == 0 else 10 + consecutive_dry * 5
+            sleep_time = 8 if consecutive_dry == 0 else 15 + consecutive_dry * 5
             await asyncio.sleep(sleep_time)
     
-    # ── 汇总报告 ──
+    # ── 汇总 ──
     state["active"] = False
-    report_lines = []
-    for cat in AUTO_CATEGORIES:
-        cs = cat_stats[cat["id"]]
-        if cs["rounds"] > 0:
-            status = "✅" if cs["nodes"] > 0 else ("💤疲劳" if cs["fatigued"] else "⚪")
-            report_lines.append(f"  {cat['emoji']} {cat['name']}: {cs['rounds']}轮 +{cs['nodes']}节点 {status}")
-    
     await channel.send(
         f"{'═'*40}\n"
-        f"🏁 **自主模式结束** | {round_num} 轮 | 📝 +{total_nodes_created} 新节点 | 停止: {stop_reason}\n"
-        + "\n".join(report_lines) + "\n"
+        f"🏁 **自主反思结束** | {round_num} 轮 | 📝+{total_nodes_created} 🗑️-{nodes_deleted} | 停止: {stop_reason}\n"
         f"{'═'*40}"
     )
     auto_state.pop(channel.id, None)
