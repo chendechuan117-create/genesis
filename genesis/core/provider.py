@@ -267,7 +267,7 @@ class NativeHTTPProvider(BaseLLMProvider):
                 NativeHTTPProvider._stats_errors += 1
                 NativeHTTPProvider._record_stat("error")
                 raise Exception(f"API Error ({status}): {self._clean_error_text(error_msg)}")
-            except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
+            except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as e:
                 logger.warning(f"httpx connection error (attempt {attempt+1}/{retries}): {e}")
                 last_exception = e
                 if attempt < retries - 1:
@@ -468,7 +468,14 @@ class NativeHTTPProvider(BaseLLMProvider):
                         except json.JSONDecodeError:
                             continue
                             
-                # If we get here, stream completed successfully
+                # If we get here, stream completed — but check for empty response
+                if not full_content and not tool_call_chunks and not reasoning_content:
+                    if attempt < retries - 1:
+                        NativeHTTPProvider._stats_retries += 1
+                        NativeHTTPProvider._record_stat("retry")
+                        logger.warning(f"Empty stream response (attempt {attempt+1}/{retries}), retrying...")
+                        await asyncio.sleep(1 * (attempt + 1))
+                        continue
                 break
                 
             except httpx.HTTPStatusError as e:
@@ -502,7 +509,7 @@ class NativeHTTPProvider(BaseLLMProvider):
                 NativeHTTPProvider._stats_errors += 1
                 NativeHTTPProvider._record_stat("error")
                 raise Exception(f"API Error ({status}): {self._clean_error_text(e.response.text)}")
-            except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
+            except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as e:
                 logger.warning(f"httpx stream error (attempt {attempt+1}/{retries}): {e}")
                 if attempt < retries - 1:
                     NativeHTTPProvider._stats_retries += 1
