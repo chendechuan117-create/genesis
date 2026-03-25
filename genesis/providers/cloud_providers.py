@@ -1,5 +1,17 @@
 from genesis.core.provider import NativeHTTPProvider
 from genesis.core.registry import provider_registry
+from .aixj_responses_provider import AIXJResponsesProvider
+
+def _build_aixj(config) -> NativeHTTPProvider:
+    api_key = getattr(config, 'aixj_api_key', None)
+    if not api_key: return None
+    return NativeHTTPProvider(
+        api_key=api_key,
+        base_url="https://aixj.vip/v1",
+        default_model="gpt-5.4",
+        provider_name="aixj",
+        skip_content_type=True
+    )
 
 def _build_deepseek(config) -> NativeHTTPProvider:
     api_key = getattr(config, 'deepseek_api_key', None)
@@ -104,6 +116,7 @@ def _build_zen(config) -> NativeHTTPProvider:
     )
 
 # Register all standard cloud providers
+provider_registry.register("aixj", _build_aixj)
 provider_registry.register("deepseek", _build_deepseek)
 provider_registry.register("gemini", _build_gemini)
 provider_registry.register("openai", _build_openai)
@@ -117,3 +130,18 @@ provider_registry.register("zhipu", _build_zhipu)
 provider_registry.register("groq", _build_groq)
 provider_registry.register("cloudflare", _build_cloudflare)
 provider_registry.register("zen", _build_zen)
+
+
+def _build_aixj_responses(config) -> AIXJResponsesProvider:
+    api_key = getattr(config, 'aixj_api_key', None)
+    if not api_key: return None
+    return AIXJResponsesProvider(
+        api_key=api_key,
+        base_url="https://api.aixj.cn/v1",
+        default_model="gpt-5.4",
+        provider_name="aixj_responses",
+        skip_content_type=True
+    )
+
+# Register AIXJ Responses API provider
+provider_registry.register("aixj_responses", _build_aixj_responses)

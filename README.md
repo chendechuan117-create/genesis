@@ -135,7 +135,7 @@ DEEPSEEK_API_KEY=your_key_here
 GROQ_API_KEY=your_key_here
 
 # Discord Bot（可选）
-DISCORD_TOKEN=your_token_here
+DISCORD_BOT_TOKEN=your_token_here
 
 # 代理（墙内环境需要）
 HTTPS_PROXY=socks5://127.0.0.1:20170

@@ -67,8 +67,8 @@ class ToolRegistry:
             
         # 拦截底层的 JSON 解析错误
         if "__json_decode_error__" in arguments:
-            raw_bad = str(arguments["__json_decode_error__"])[:200]
-            logger.warning(f"Intercepted JSON decode error for tool {tool_name}: {raw_bad[:80]}")
+            raw_bad = str(arguments["__json_decode_error__"])[:500]
+            logger.warning(f"Intercepted JSON decode error for tool {tool_name}: {raw_bad[:300]}")
             return f"Error: JSON参数解析失败。错误片段: {raw_bad}\n请换一种方式：将多行内容拆分为多步小命令，或改用 write_file 工具写入文件。"
         
         try:

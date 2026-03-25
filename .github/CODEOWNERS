@@ -1,0 +1,33 @@
+# CODEOWNERS - 基于审计清单的治理加固初稿
+# 参考: ASSET_API_PROJECT_EVALUATION_QUESTIONS 中的安全合规性问题
+
+# 核心架构文件
+/genesis/ @core-maintainers
+/docs/ @core-maintainers @documentation-team
+
+# 安全相关文件
+*.py @security-team @core-maintainers
+*.sh @security-team @core-maintainers
+*.json @security-team @core-maintainers
+
+# 配置和环境文件
+.env @security-team
+*.yaml @core-maintainers
+*.yml @core-maintainers
+
+# 测试文件
+/tests/ @test-team @core-maintainers
+
+# 文档
+README.md @documentation-team @core-maintainers
+CONTRIBUTING.md @documentation-team @core-maintainers
+SECURITY.md @security-team @core-maintainers
+
+# 默认所有者（如果没有其他匹配）
+* @core-maintainers
+
+# 团队定义（需要在实际项目中配置）
+# @core-maintainers - 核心维护者团队
+# @security-team - 安全团队
+# @documentation-team - 文档团队
+# @test-team - 测试团队

@@ -247,7 +247,7 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
         row['fusion_score'] = round(fused, 4)
         return fused
 
-    async def execute(self, keywords: List[str], ntype: str = "ALL", signature: Dict[str, Any] = None, conversation_context: str = None) -> str:
+    async def execute(self, keywords: List[str] = None, ntype: str = "ALL", signature: Dict[str, Any] = None, conversation_context: str = None) -> str:
         try:
             normalized_signature = self.vault.normalize_metadata_signature(signature)
             # Query Expansion: 用对话上下文扩展搜索关键词

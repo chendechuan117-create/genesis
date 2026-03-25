@@ -7,7 +7,9 @@ from typing import Dict, Any, Optional, List
 
 from genesis.core.base import LLMProvider, PerformanceMetrics
 from genesis.core.registry import ToolRegistry
+from genesis.core.tracer import Tracer
 from genesis.v4.loop import V4Loop
+from genesis.v4.unified_response import UnifiedResponse
 
 logger = logging.getLogger(__name__)
 
@@ -28,12 +30,16 @@ class GenesisV4:
         self.enable_logging = enable_logging
         self.c_phase_blocking = c_phase_blocking
 
-    async def process(self, user_input: str, step_callback: Optional[Any] = None, image_paths: Optional[List[str]] = None) -> Dict[str, Any]:
+    async def process(self, user_input: str, step_callback: Optional[Any] = None, image_paths: Optional[List[str]] = None) -> UnifiedResponse:
         """
         处理单轮会话，V4 的管线：
         1. 交由 V4Loop 运行（强制 JSON Blueprint -> 工具调用序列）
+        2. 将内部结果转换为统一响应信封
         """
         logger.info("============== GENESIS V4 PROCESS START ==============")
+        
+        tracer = Tracer.get_instance()
+        trace_id = tracer.start_trace(user_input)
         
         loop = V4Loop(
             tools=self.tools,
@@ -48,14 +54,39 @@ class GenesisV4:
                 step_callback=step_callback,
                 image_paths=image_paths,
             )
+            
+            # 结束追踪
+            tracer.end_trace(trace_id, final_response=final_response)
+            
+            logger.info(f"V4 Process Complete. Success: {metrics.success}, Iters: {metrics.iterations}")
+            
+            # 检测部分成功场景
+            partial_reason = None
+            status = "SUCCESS"
+            if metrics.iterations >= self.max_iterations:
+                partial_reason = f"达到最大迭代上限 ({self.max_iterations})"
+                status = "PARTIAL"
+            elif not metrics.success:
+                status = "FAILED"
+            
+            return UnifiedResponse.from_op_result(
+                response_text=final_response,
+                metrics=metrics,
+                trace_id=trace_id,
+                partial_reason=partial_reason,
+                degraded=False  # 后续可根据具体降级路径检测
+            )
+            
         except Exception as e:
             logger.error(f"V4 execution failed: {e}", exc_info=True)
-            final_response = f"V4 Execution Error: {e}"
+            tracer.end_trace(trace_id, error=str(e))
+            
+            # 创建失败的 metrics
             metrics = PerformanceMetrics(success=False, total_time=0)
-
-        logger.info(f"V4 Process Complete. Success: {metrics.success}, Iters: {metrics.iterations}")
-        
-        return {
-            "response": final_response,
-            "metrics": metrics,
-        }
+            
+            return UnifiedResponse.from_op_result(
+                response_text=f"V4 Execution Error: {e}",
+                metrics=metrics,
+                trace_id=trace_id,
+                error_info={"type": "execution_error", "detail": str(e)}
+            )

@@ -7,6 +7,7 @@ import logging
 import json
 import re
 import asyncio
+import time
 import httpx
 
 from .base import LLMProvider as BaseLLMProvider, LLMResponse, ToolCall
@@ -81,7 +82,8 @@ class NativeHTTPProvider(BaseLLMProvider):
         wall_clock_timeout: int = 300,  # 整体超时(秒)：防止推理模型思考过久
         stop_sequences: Optional[List[str]] = None,
         provider_name: str = "default",
-        use_proxy: bool = False
+        use_proxy: bool = False,
+        skip_content_type: bool = False
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip('/') if base_url else "https://api.deepseek.com/v1"
@@ -92,8 +94,21 @@ class NativeHTTPProvider(BaseLLMProvider):
         self.stop_sequences = stop_sequences if stop_sequences is not None else self.DEFAULT_STOP_SEQUENCES
         self.provider_name = provider_name
         self.use_proxy = use_proxy
+        self.skip_content_type = skip_content_type
         self._http_client: Optional[httpx.AsyncClient] = None
     
+    @staticmethod
+    def _clean_error_text(text: str, max_len: int = 200) -> str:
+        """清洗 API 错误文本：去除 HTML（如 Cloudflare 502 页面），截断过长内容"""
+        if not text:
+            return "(empty)"
+        if "<html" in text.lower() or "<!doctype" in text.lower():
+            import re
+            # 尝试提取 <title> 内容作为摘要
+            m = re.search(r'<title>(.*?)</title>', text, re.IGNORECASE | re.DOTALL)
+            return m.group(1).strip() if m else "(HTML error page)"
+        return text[:max_len] + ("..." if len(text) > max_len else "")
+
     def _get_http_client(self) -> httpx.AsyncClient:
         """延迟初始化的持久 httpx 客户端（复用 TCP 连接池）"""
         if self._http_client is None or self._http_client.is_closed:
@@ -105,6 +120,48 @@ class NativeHTTPProvider(BaseLLMProvider):
         """获取默认模型"""
         return self.default_model
 
+    @staticmethod
+    def _sanitize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """清洗消息列表，修复会导致 API 400 的格式问题：
+        - content 为 None/空 → 填充占位符
+        - name 为空字符串 → 删除该字段
+        - tool_calls 中 name 为空 → 填充 'unknown'
+        """
+        cleaned = []
+        for msg in messages:
+            m = dict(msg)  # shallow copy
+            role = m.get("role", "")
+            
+            # 修复空 content（aixj API 要求所有消息 content 非空非 null）
+            if m.get("content") is None or m.get("content") == "":
+                if role == "tool":
+                    m["content"] = "(empty)"
+                else:
+                    m["content"] = " "
+            
+            # 修复空 name（API 拒绝空字符串）
+            if "name" in m and (m["name"] is None or m["name"] == ""):
+                if role == "tool":
+                    m["name"] = "tool"
+                else:
+                    del m["name"]
+            
+            # 修复 tool_calls 中的空 name
+            if "tool_calls" in m and m["tool_calls"]:
+                fixed_tcs = []
+                for tc in m["tool_calls"]:
+                    tc = dict(tc)
+                    if "function" in tc:
+                        fn = dict(tc["function"])
+                        if not fn.get("name"):
+                            fn["name"] = "unknown"
+                        tc["function"] = fn
+                    fixed_tcs.append(tc)
+                m["tool_calls"] = fixed_tcs
+            
+            cleaned.append(m)
+        return cleaned
+
     async def chat(
         self,
         messages: List[Dict[str, Any]],
@@ -115,6 +172,7 @@ class NativeHTTPProvider(BaseLLMProvider):
         **kwargs
     ) -> LLMResponse:
         """发送聊天请求 (httpx)"""
+        messages = self._sanitize_messages(messages)
         model = model or self.default_model
         if model.startswith("deepseek/"):
             model = model.replace("deepseek/", "")
@@ -142,10 +200,11 @@ class NativeHTTPProvider(BaseLLMProvider):
             request_params["tool_choice"] = "auto"
             
         headers = {
-            "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
             "User-Agent": "NanoGenesis/1.0"
         }
+        if not self.skip_content_type:
+            headers["Content-Type"] = "application/json"
         
         # 复用持久 httpx 客户端（trust_env=False 在 _get_http_client 中设置）
         # ⚠️ 注意：trust_env=False 会绕过系统代理。如需翻墙访问 groq/cloudflare 等墙外免费池，
@@ -175,7 +234,10 @@ class NativeHTTPProvider(BaseLLMProvider):
         
         for attempt in range(retries):
             try:
-                response = await client.post(url, headers=headers, json=params)
+                if self.skip_content_type:
+                    response = await client.post(url, headers=headers, content=json.dumps(params).encode())
+                else:
+                    response = await client.post(url, headers=headers, json=params)
                 response.raise_for_status()
                 return self._parse_response(response.json())
             except httpx.HTTPStatusError as e:
@@ -186,6 +248,14 @@ class NativeHTTPProvider(BaseLLMProvider):
                     error_msg = err_json.get('error', {}).get('message', error_body)
                 except:
                     error_msg = error_body
+                # skip_content_type 偶发 400：服务器代理层解析失败，重试通常能恢复
+                if status == 400 and self.skip_content_type and attempt < retries - 1:
+                    NativeHTTPProvider._stats_retries += 1
+                    NativeHTTPProvider._record_stat("retry")
+                    logger.warning(f"400 retry {attempt+1}/{retries}: {error_msg[:80]}")
+                    last_exception = e
+                    await asyncio.sleep(1)
+                    continue
                 # 5xx 瞬态错误可重试（502/503/504）
                 if status in (502, 503, 504) and attempt < retries - 1:
                     NativeHTTPProvider._stats_retries += 1
@@ -196,7 +266,7 @@ class NativeHTTPProvider(BaseLLMProvider):
                     continue
                 NativeHTTPProvider._stats_errors += 1
                 NativeHTTPProvider._record_stat("error")
-                raise Exception(f"API Error ({status}): {error_msg}")
+                raise Exception(f"API Error ({status}): {self._clean_error_text(error_msg)}")
             except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
                 logger.warning(f"httpx connection error (attempt {attempt+1}/{retries}): {e}")
                 last_exception = e
@@ -230,24 +300,49 @@ class NativeHTTPProvider(BaseLLMProvider):
         finish_reason = choice.get('finish_reason')
         
         # 提取工具调用
+        # 修复 aixj.vip split-chunk：非流式响应也会把一个 tool call 拆成两个条目
+        # 第一个有 name/id 但 arguments 为空，第二个有 arguments 但 name/id 为空
         tool_calls = []
         if 'tool_calls' in message and message['tool_calls']:
-            for tc in message['tool_calls']:
+            raw_tcs = message['tool_calls']
+            # 预处理：合并拆分的 tool call 条目
+            merged_tcs = []
+            for tc in raw_tcs:
+                fn = tc.get('function', {})
+                has_name = bool(fn.get('name', '').strip())
+                has_args = bool(fn.get('arguments', '').strip())
+                has_id = bool(tc.get('id', '').strip())
+                if has_name and has_id and not has_args and merged_tcs is not None:
+                    # 有 name/id 但没 args：暂存，等下一个补充
+                    merged_tcs.append(tc)
+                elif not has_name and not has_id and has_args and merged_tcs:
+                    # 没 name/id 但有 args：合并到前一个
+                    prev = merged_tcs[-1]
+                    prev['function']['arguments'] = fn['arguments']
+                    logger.info(f"[split-chunk fix] Merged args into tool call: {prev['function'].get('name')}")
+                else:
+                    merged_tcs.append(tc)
+
+            for tc in merged_tcs:
                 raw_args = tc['function'].get('arguments', '{}')
+                if not raw_args or not raw_args.strip():
+                    raw_args = '{}'
                 try:
                     args = json.loads(raw_args)
                 except json.JSONDecodeError:
-                    # 修复：与流式路径对齐的 3 层回退
                     repaired = raw_args.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
                     try:
                         args = json.loads(repaired)
                     except json.JSONDecodeError:
                         args = {"__json_decode_error__": raw_args}
-                tool_calls.append(ToolCall(
-                    id=tc['id'],
-                    name=tc['function']['name'],
-                    arguments=args
-                ))
+                tc_id = tc.get('id') or f"call_{len(tool_calls)}"
+                tc_name = tc['function'].get('name') or ''
+                if tc_name:
+                    tool_calls.append(ToolCall(
+                        id=tc_id,
+                        name=tc_name,
+                        arguments=args
+                    ))
         
         content = message.get('content') or ""
         
@@ -295,7 +390,11 @@ class NativeHTTPProvider(BaseLLMProvider):
             output_tokens = 0
             prompt_cache_hit_tokens = 0
             try:
-                async with client.stream("POST", url, headers=headers, json=params) as response:
+                if self.skip_content_type:
+                    stream_ctx = client.stream("POST", url, headers=headers, content=json.dumps(params).encode())
+                else:
+                    stream_ctx = client.stream("POST", url, headers=headers, json=params)
+                async with stream_ctx as response:
                     if response.status_code != 200:
                         await response.aread()
                     response.raise_for_status()
@@ -340,9 +439,23 @@ class NativeHTTPProvider(BaseLLMProvider):
                             if 'tool_calls' in delta:
                                 for tc in delta['tool_calls']:
                                     idx = tc['index']
+                                    has_id = 'id' in tc and tc['id']
+                                    has_name = 'function' in tc and 'name' in tc['function'] and tc['function']['name']
+                                    
+                                    # aixj.vip 特殊格式：名字在 index N，参数在 index N+1（无 name/id）
+                                    # 检测：新 index 且无 name/id，只有 args → 合并到上一个有名字的 call
+                                    if idx not in tool_call_chunks and not has_id and not has_name:
+                                        # 找最近一个有 name 的 index
+                                        named = [k for k in tool_call_chunks if tool_call_chunks[k]["name"]]
+                                        if named:
+                                            merge_idx = max(named)
+                                            if 'function' in tc and 'arguments' in tc['function']:
+                                                tool_call_chunks[merge_idx]["args"] += tc['function']['arguments']
+                                            continue
+                                    
                                     if idx not in tool_call_chunks:
                                         tool_call_chunks[idx] = {"id": "", "name": "", "args": ""}
-                                    if 'id' in tc and tc['id']: tool_call_chunks[idx]["id"] = tc['id']
+                                    if has_id: tool_call_chunks[idx]["id"] = tc['id']
                                     if 'function' in tc:
                                         if 'name' in tc['function']: tool_call_chunks[idx]["name"] += tc['function']['name']
                                         if 'arguments' in tc['function']: tool_call_chunks[idx]["args"] += tc['function']['arguments']
@@ -360,6 +473,25 @@ class NativeHTTPProvider(BaseLLMProvider):
                 
             except httpx.HTTPStatusError as e:
                 status = e.response.status_code
+                # skip_content_type 偶发 400：可能是连接状态污染，用全新 client 重试
+                if status == 400 and self.skip_content_type and attempt < retries - 1:
+                    NativeHTTPProvider._stats_retries += 1
+                    NativeHTTPProvider._record_stat("retry")
+                    body_bytes = json.dumps(params, ensure_ascii=False).encode('utf-8')
+                    if attempt == 0:
+                        try:
+                            with open(f"/tmp/genesis_400_{int(time.time())}.json", 'wb') as f:
+                                f.write(body_bytes)
+                        except: pass
+                    logger.warning(f"400 retry {attempt+1}/{retries} ({len(body_bytes)}B), fresh client")
+                    # 销毁旧 client，下次循环 _get_http_client() 会创新的
+                    if self._http_client:
+                        try: await self._http_client.aclose()
+                        except: pass
+                        self._http_client = None
+                    client = self._get_http_client()
+                    await asyncio.sleep(1)
+                    continue
                 # 5xx 瞬态错误可重试
                 if status in (502, 503, 504) and attempt < retries - 1:
                     NativeHTTPProvider._stats_retries += 1
@@ -369,7 +501,7 @@ class NativeHTTPProvider(BaseLLMProvider):
                     continue
                 NativeHTTPProvider._stats_errors += 1
                 NativeHTTPProvider._record_stat("error")
-                raise Exception(f"API Error ({status}): {e.response.text}")
+                raise Exception(f"API Error ({status}): {self._clean_error_text(e.response.text)}")
             except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as e:
                 logger.warning(f"httpx stream error (attempt {attempt+1}/{retries}): {e}")
                 if attempt < retries - 1:

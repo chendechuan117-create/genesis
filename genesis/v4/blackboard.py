@@ -110,6 +110,8 @@ class Blackboard:
     _persona_stats: Dict[str, Dict[str, int]] = {}
     # 按 task_kind 细分：{(persona, task_kind): {"wins": int, "losses": int}}
     _persona_task_stats: Dict[str, Dict[str, int]] = {}
+    # 采纳率追踪：{persona: {"adopted": int, "ignored": int}}
+    _persona_adoption: Dict[str, Dict[str, int]] = {}
     _db_loaded: bool = False
     
     @classmethod
@@ -160,6 +162,31 @@ class Blackboard:
                     cls._persona_task_stats[tk_key]["losses"] += 1
         cls._persist_to_db()
     
+    @classmethod
+    def record_persona_adoption(cls, persona: str, adopted: bool):
+        """记录单个 persona 的建议是否被 G 采纳"""
+        if persona not in cls._persona_adoption:
+            cls._persona_adoption[persona] = {"adopted": 0, "ignored": 0}
+        if adopted:
+            cls._persona_adoption[persona]["adopted"] += 1
+        else:
+            cls._persona_adoption[persona]["ignored"] += 1
+    
+    @classmethod
+    def get_adoption_stats(cls) -> Dict[str, Any]:
+        """获取所有 persona 的采纳率统计"""
+        result = {}
+        for p, stats in cls._persona_adoption.items():
+            total = stats["adopted"] + stats["ignored"]
+            rate = stats["adopted"] / total if total > 0 else 0.0
+            result[p] = {
+                "adopted": stats["adopted"],
+                "ignored": stats["ignored"],
+                "adoption_rate": round(rate, 3),
+                "samples": total
+            }
+        return result
+
     @classmethod
     def get_persona_multiplier(cls, persona: str) -> float:
         """基于历史胜率计算 persona 的评分乘数。

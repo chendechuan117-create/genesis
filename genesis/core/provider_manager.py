@@ -14,6 +14,8 @@ logger = logging.getLogger(__name__)
 
 # provider_name -> config attribute that must be truthy for it to be valid
 PROVIDER_KEY_MAP = {
+    "aixj": "aixj_api_key",
+    "aixj_responses": "aixj_api_key",
     "deepseek": "deepseek_api_key",
     "gemini": "gemini_api_key",
     "openai": "openai_api_key",
@@ -41,7 +43,7 @@ class ProviderRouter(LLMProvider):
     def __init__(self, config: Any, api_key: str = None, base_url: str = None, model: str = None):
         self.config = config
         self.providers: Dict[str, Any] = {}
-        self.active_provider_name = 'deepseek'
+        self.active_provider_name = 'aixj'
         self._preferred_provider_name: Optional[str] = None  # 首选 provider
         self._failover_time: float = 0  # 上次 failover 时间戳
         self._last_recovery_attempt: float = 0  # 上次探活时间戳
@@ -93,9 +95,9 @@ class ProviderRouter(LLMProvider):
         
         # Determine Activation & Failover Order
         # Core Providers: Genesis Body only uses DeepSeek and Gemini
-        self.failover_order = ['deepseek', 'gemini']
+        self.failover_order = ['aixj', 'deepseek', 'gemini']
         
-        self.active_provider_name = 'deepseek'
+        self.active_provider_name = 'aixj'
         for name in self.failover_order:
             if name in self.providers:
                 self.active_provider_name = name
@@ -168,10 +170,16 @@ class ProviderRouter(LLMProvider):
         except WallClockTimeoutError:
             raise  # 总超时不是 provider 故障，直接上抛，不触发 failover
         except Exception as e:
+            err_str = str(e)
             logger.error(f"Provider {self.active_provider_name} Failed: {e}")
+            
+            # 400 = 客户端格式错误，换 provider 也修不了，直接上抛
+            if "400" in err_str or "invalid_request_error" in err_str:
+                raise
+            
             self._failover_time = time.time()
             
-            # Dynamic Failover
+            # Dynamic Failover (仅对 5xx / 网络 / 超时等服务端故障)
             current_index = -1
             try:
                 current_index = self.failover_order.index(self.active_provider_name)
@@ -381,8 +389,9 @@ class FreePoolManager:
                 if provider:
                     return (name, provider)
         
-        # 所有免费 provider 都 dead → deepseek 兜底（限频）
-        return self._deepseek_fallback()
+        # 所有免费 provider 都 dead → 不兜底，不烧付费额度
+        logger.warning("FreePool: all free providers dead. No fallback (deepseek disabled).")
+        return (None, None)
     
     def _deepseek_fallback(self) -> tuple:
         """deepseek 限频兜底"""

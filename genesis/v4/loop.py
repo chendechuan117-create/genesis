@@ -207,10 +207,10 @@ class V4Loop:
                 c_mode = "LIGHT"
         if c_mode != "SKIP":
             if self.c_phase_blocking:
-                await self._run_c_phase_safe(step_callback, c_mode)
+                await self._run_c_phase_safe(step_callback, c_mode, g_final_response=final_response)
                 logger.info(f"C-Process completed (blocking mode={c_mode}, G={self.metrics.g_tokens}t, Op={self.metrics.op_tokens}t).")
             else:
-                asyncio.create_task(self._run_c_phase_safe(step_callback, c_mode))
+                asyncio.create_task(self._run_c_phase_safe(step_callback, c_mode, g_final_response=final_response))
                 logger.info(f"C-Process launched in background (mode={c_mode}, G={self.metrics.g_tokens}t, Op={self.metrics.op_tokens}t).")
         elif len(self.execution_messages) > 0:
             logger.info(f"Skipping C-Process: mode=SKIP (G={self.metrics.g_tokens}t, Op={self.metrics.op_tokens}t).")
@@ -282,10 +282,10 @@ class V4Loop:
         
         return final_response, self.metrics
 
-    async def _run_c_phase_safe(self, step_callback: Any, mode: str = "FULL"):
+    async def _run_c_phase_safe(self, step_callback: Any, mode: str = "FULL", g_final_response: str = ""):
         """后台安全包装器：捕获 C-Process 异常，防止后台任务静默崩溃"""
         try:
-            await self._run_c_phase(step_callback, mode)
+            await self._run_c_phase(step_callback, mode, g_final_response=g_final_response)
         except Exception as e:
             logger.error(f"C-Process background task failed: {e}", exc_info=True)
 
@@ -308,9 +308,19 @@ class V4Loop:
         # Build User Content (Multimodal if images exist)
         if hasattr(self, 'image_paths') and self.image_paths:
             import base64
+            from pathlib import Path as _Path
+            _ALLOWED_IMG_DIRS = ("/tmp", str(_Path.home() / "Genesis" / "Genesis" / "runtime"))
+            _ALLOWED_IMG_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".svg", ".tiff"}
             user_content = [{"type": "text", "text": user_input}]
             for path in self.image_paths:
                 try:
+                    resolved = str(_Path(path).resolve())
+                    if not any(resolved.startswith(d) for d in _ALLOWED_IMG_DIRS):
+                        logger.warning(f"image_paths blocked (dir): {path}")
+                        continue
+                    if _Path(path).suffix.lower() not in _ALLOWED_IMG_EXTS:
+                        logger.warning(f"image_paths blocked (ext): {path}")
+                        continue
                     with open(path, "rb") as f:
                         b64_data = base64.b64encode(f.read()).decode('utf-8')
                         user_content.append({
@@ -453,6 +463,15 @@ class V4Loop:
                     dispatched_nodes = [n for n in payload.get("active_nodes", []) if n and not n.startswith("MEM_CONV")]
                     self.execution_active_nodes.extend(dispatched_nodes)
                     
+                    # Multi-G 采纳率检测（dispatch 时机）
+                    if self.blackboard and self.blackboard.entry_count > 0:
+                        adoption = self._check_lens_adoption(
+                            g_text=payload.get("op_intent", "") + " " + payload.get("instructions", ""),
+                            g_active_nodes=dispatched_nodes,
+                            event="dispatch"
+                        )
+                        await self._safe_callback(step_callback, "lens_adoption", adoption)
+                    
                     rendered = self.factory.render_dispatch_for_human(payload)
                     await self._safe_callback(step_callback, "blueprint", rendered)
                     
@@ -512,6 +531,13 @@ class V4Loop:
                 # G 输出了普通文本且没有 dispatch 意图 → 最终回复
                 if response.content and response.content.strip():
                     logger.info(f"G-Process provided final response. length={len(response.content)}, preview={response.content[:80]!r}")
+                    # Multi-G 采纳率检测（final response 时机）
+                    if self.blackboard and self.blackboard.entry_count > 0:
+                        self._check_lens_adoption(
+                            g_text=response.content,
+                            g_active_nodes=list(self.execution_active_nodes),
+                            event="final_response"
+                        )
                     self.tracer.end_span(self._g_span)
                     return response.content
                 else:
@@ -988,8 +1014,11 @@ class V4Loop:
         
         op_prompt = self.factory.build_op_prompt(task_payload)
         
-        # Op 只有 system prompt，没有 user prompt (意图在 system 里了)
-        self.op_messages = [Message(role=MessageRole.SYSTEM, content=op_prompt)]
+        # Op system prompt 包含完整意图；追加最小 user 消息以兼容要求 user 角色的 API
+        self.op_messages = [
+            Message(role=MessageRole.SYSTEM, content=op_prompt),
+            Message(role=MessageRole.USER, content="Execute.")
+        ]
         
         # 获取所有执行工具 (除了反思专属的)
         all_tools = self._get_op_tools()
@@ -1123,7 +1152,7 @@ class V4Loop:
             logger.info(f"Op超时: 注销 {len(session_dynamic_tools)} 个动态工具: {session_dynamic_tools}")
         return timeout_result
 
-    async def _run_c_phase(self, step_callback: Any, mode: str = "FULL"):
+    async def _run_c_phase(self, step_callback: Any, mode: str = "FULL", g_final_response: str = ""):
         """运行 C-Process 反思循环，基于 Op 的执行轨迹。mode: FULL/LIGHT"""
         max_iter = self.C_PHASE_MAX_ITER.get(mode, 30)
         logger.info(f">>> Entering Phase 3: C-Process (Reflector) mode={mode}, max_iter={max_iter}")
@@ -1193,19 +1222,36 @@ class V4Loop:
         signature_text = self.vault.render_metadata_signature(self.inferred_signature)
         signature_block = f"[当前任务推测签名]\n{signature_text}\n\n" if signature_text else ""
         
-        # Multi-G 信息空洞（仅供 C 参考，不需要 C 处理——已由基础设施自动入库）
+        # G 综合判断：让 C 看到 G 的分析结论，而不仅仅是 Op 的工具日志
+        g_analysis_block = ""
+        if g_final_response and str(g_final_response).strip():
+            g_analysis_block = f"\n[G 综合判断]\n{g_final_response}\n"
+
+        # Multi-G 信息空洞：C 可以在 Op 执行结果中发现填补 VOID 的证据时升格它
         void_block = ""
         if self.blackboard:
             void_count = len(self.blackboard.search_voids)
             if void_count > 0:
-                void_block = f"\n[Multi-G 信息空洞] 本次透镜阶段有 {void_count} 个搜索未命中，已自动记录为 VOID 节点供后台拾荒。你无需处理它们。\n"
+                void_summaries = [v.get('query', '')[:60] for v in list(self.blackboard.search_voids)[:5]]
+                void_list = '\n'.join(f'  - {q}' for q in void_summaries if q)
+                void_block = f"\n[Multi-G 信息空洞] 本轮有 {void_count} 个搜索未命中（已自动入库为 VOID 节点）：\n{void_list}\n如果本轮 Op 的执行结果恰好能回答其中某个 VOID，你应该将结论写成 LESSON，然后用 delete_node 删除对应的 VOID 节点。\n"
 
         # ⚠️ 前缀缓存优化：稳定指令放前面，每次请求不同的变量内容放后面
         reflection_system_prompt = f"""你是 Genesis 反思进程 (C-Process)。审查 Op 的执行轨迹，提炼高价值元信息。
 
 [原则]
-不写日记，不记流水账。先判断这轮有没有长期价值——如果 Op 只是读了个文件或搜了一下，没有状态修改，直接回复 NO_ACTION。
+不写日记，不记流水账。先判断这轮有没有长期价值。
+如果 Op 只是读了几个文件且 G 没有新的结构性发现，可以 NO_ACTION。
+但如果 G 的综合判断中包含可复用的认知（如架构缺陷、设计模式、因果关系），即使 Op 是只读的，也应该提炼沉淀。
 
+[VOID 升格 — 最高优先级动作]
+每轮必须检查：本轮 Op 执行结果是否恰好回答了某个已有 VOID 节点？
+VOID 是系统已识别但未验证的知识缺口。当 Op 输出中包含填补 VOID 的实证（命令输出、日志、代码行为）：
+1. 用 search_knowledge_nodes(keywords=..., ntype="CONTEXT") 搜索相关 VOID 节点（VOID 存储为 tags="VOID" 的 CONTEXT 节点）
+2. 将验证结论写成 LESSON（IF→THEN→BECAUSE 结构，附带实证来源）
+3. 用 delete_node 删除已被填补的 VOID
+这是从「观察」升格为「规律」的关键闭环。只在有实证时才升格，不要凭空推测。
+{void_block}
 [沉淀优先级] ASSET > LESSON > CONTEXT > EPISODE > GRAPH(ENTITY/EVENT/ACTION+边)
 选最小、最精准的表示。同一事实不要同时写多种类型。
 
@@ -1224,9 +1270,12 @@ validation_status 只有命令输出/日志明确证实时才填 validated，否
 {signature_block}
 {report_summary}
 {execution_summary}
-{void_block}
+{g_analysis_block}
 """
-        c_messages = [Message(role=MessageRole.SYSTEM, content=reflection_system_prompt)]
+        c_messages = [
+            Message(role=MessageRole.SYSTEM, content=reflection_system_prompt),
+            Message(role=MessageRole.USER, content="Reflect.")
+        ]
         
         c_tool_names = ["search_knowledge_nodes", "record_context_node", "record_lesson_node", "create_meta_node", "create_graph_node", "create_node_edge", "delete_node", "record_tool_node"]
         c_tools = [self.tools.get(n) for n in c_tool_names if self.tools.get(n)]
@@ -1277,6 +1326,86 @@ validation_status 只有命令输出/日志明确证实时才填 validated，否
         
         logger.info(f"C-Process finished. c_tokens={self.metrics.c_tokens}, total={self.metrics.total_tokens}")
         await self._safe_callback(step_callback, "c_phase_done", {"mode": mode, "c_tokens": self.metrics.c_tokens})
+
+    # ─── Multi-G 采纳率追踪 ─────────────────────────────────────────────
+
+    def _check_lens_adoption(
+        self,
+        g_text: str,
+        g_active_nodes: List[str] = None,
+        event: str = "dispatch"
+    ) -> Dict[str, Any]:
+        """检测 G 是否采纳了 Multi-G 透镜的建议。零额外 LLM 调用。
+        
+        两层检测：
+        1. 节点采纳：G 的 active_nodes ∩ 透镜 evidence_node_ids
+        2. 语义采纳：向量引擎算 G 输出文本 vs 透镜 framework 的余弦相似度
+        
+        返回 {"adopted": [...], "ignored": [...], "adoption_rate": float}
+        """
+        if not self.blackboard or not self.blackboard.entries:
+            return {"adopted": [], "ignored": [], "adoption_rate": 0.0, "event": event}
+        
+        g_nodes = set(g_active_nodes or [])
+        adopted = []
+        ignored = []
+        
+        for entry in self.blackboard.entries:
+            persona = entry.persona
+            framework = entry.framework or ""
+            signals = []
+            
+            # 层1：节点重合
+            if hasattr(entry, "evidence_node_ids") and entry.evidence_node_ids:
+                overlap = g_nodes & set(entry.evidence_node_ids)
+                if overlap:
+                    signals.append(f"node_overlap={list(overlap)}")
+            
+            # 层2：语义相似度（用已有的向量引擎，不额外调 LLM）
+            if g_text and framework and len(framework) > 10:
+                try:
+                    from genesis.v4.vector_engine import VectorEngine
+                    ve = VectorEngine.get_instance()
+                    if ve.is_ready:
+                        g_vec = ve.encode(g_text[:300])
+                        f_vec = ve.encode(framework[:300])
+                        import numpy as np
+                        sim = float(np.dot(g_vec, f_vec) / (np.linalg.norm(g_vec) * np.linalg.norm(f_vec) + 1e-9))
+                        if sim > 0.65:
+                            signals.append(f"semantic_sim={sim:.3f}")
+                except Exception:
+                    pass  # 向量引擎不可用时跳过
+            
+            if signals:
+                adopted.append({"persona": persona, "signals": signals, "framework": framework[:80]})
+            else:
+                ignored.append({"persona": persona, "framework": framework[:80]})
+        
+        total = len(self.blackboard.entries)
+        rate = len(adopted) / total if total > 0 else 0.0
+        
+        report = {
+            "event": event,
+            "adopted": adopted,
+            "ignored": ignored,
+            "adoption_rate": rate,
+            "adopted_count": len(adopted),
+            "total_lenses": total,
+        }
+        
+        logger.info(
+            f"[Multi-G 采纳率] event={event} | {len(adopted)}/{total} adopted ({rate:.0%}) | "
+            f"adopted={[a['persona'] for a in adopted]} | "
+            f"ignored={[i['persona'] for i in ignored]}"
+        )
+        
+        # 记录到 persona 采纳统计
+        for a in adopted:
+            Blackboard.record_persona_adoption(a["persona"], adopted=True)
+        for i in ignored:
+            Blackboard.record_persona_adoption(i["persona"], adopted=False)
+        
+        return report
 
     # ─── Multi-G 透镜编排 ──────────────────────────────────────────────
 
@@ -1448,59 +1577,57 @@ validation_status 只有命令输出/日志明确证实时才填 validated，否
             logger.warning(f"Multi-G probe failed: {e}")
             return 0
 
-    async def _build_lens_task_brief(self, clean_input: str, knowledge_digest: str) -> str:
-        """G 为透镜布置作业：解读用户意图，生成结构化搜索任务简报。
+
+    async def _build_g_interpretation(self, clean_input: str, knowledge_digest: str, shared_knowledge: str) -> str:
+        """G 先对用户问题产出自己的理解，发布到黑板供透镜补充。
         
-        避免透镜对用户原话做词级同义词发散（"不完整"→搜"不完整,未完成,部分完成..."）。
-        取而代之，先理解用户到底在问什么，再给出具体的搜索方向。
+        不是旧版的搜索方向预嚼——是 G 作为主脑说出自己对问题的理解，
+        透镜再从各自的认知角度补充、挑战、扩展。
         """
-        digest_hint = ""
-        if knowledge_digest:
-            digest_hint = f"\n知识库概况（前500字）：\n{knowledge_digest[:500]}\n"
+        digest_hint = f"\n知识库概况：\n{knowledge_digest[:400]}\n" if knowledge_digest else ""
+        knowledge_hint = f"\n预搜到的相关信息：\n{shared_knowledge[:800]}\n" if shared_knowledge else ""
         
-        prompt = f"""你是任务解读器。用一句话总结用户的底层意图，然后给出 3-5 个具体搜索方向。
-搜索方向必须是【知识库中可能存在的主题/实体】，不是用户原话的同义词改写。
+        prompt = f"""你是 Genesis 主脑（G-Process）。在透镜团队分析之前，先简明说出你对用户问题的理解。
 
 用户原话：{clean_input}
-{digest_hint}
-严格按以下格式输出（不要多余文字）：
-意图：（用户真正想知道/想做什么）
-搜索方向：
-- （具体主题词或短语1）
-- （具体主题词或短语2）
-- （具体主题词或短语3）"""
+{digest_hint}{knowledge_hint}
+用 3-5 句话回答：
+1. 用户真正想知道/想做什么？（底层意图）
+2. 你目前的初步判断是什么？
+3. 你觉得哪些方面需要更多视角？
+
+直接输出，不要格式化。"""
         
         try:
             resp = await asyncio.wait_for(
                 self.provider.chat(
                     messages=[{"role": "user", "content": prompt}],
-                    stream=False
+                    timeout=15
                 ),
                 timeout=15
             )
-            brief = (resp.content or "").strip()
-            if brief and "意图" in brief:
-                logger.info(f"Lens task brief: {brief[:120]}...")
-                return brief
+            interpretation = (resp.content or "").strip()
+            if interpretation:
+                logger.info(f"G interpretation: {interpretation[:120]}...")
+                return interpretation
         except Exception as e:
-            logger.warning(f"Task brief generation failed: {e}")
+            logger.warning(f"G interpretation generation failed: {e}")
         
-        # 兜底：直接返回原文
-        return f"意图：{clean_input}\n搜索方向：\n- （自行判断最相关的知识领域）"
+        return ""
 
     async def _run_lens_phase(self, user_input: str, step_callback: Any) -> Blackboard:
         """
-        运行 Multi-G 透镜阶段：
-        1. 探针搜索（G 的"第一搜"）→ 根据命中密度自适应选择透镜数量
-        2. 并行 spawn 多个透镜子程序，各自搜索 NodeVault
-        3. 将结果写入共享黑板
+        运行 Multi-G 透镜阶段（v2 架构：G 先说理解 → 透镜补充建议）：
+        1. 探针搜索 → 根据命中密度自适应选择透镜数量
+        2. 预搜一次 → 拉取相关节点内容 → 构建共享知识包
+        3. G 先产出自己的理解（发布到黑板）
+        4. 并行 spawn 透镜，基于 G 的理解 + 共享知识，输出补充建议
         
-        返回填充完毕的 Blackboard。
+        核心：G 说理解，透镜说补充。
         """
         blackboard = Blackboard()
         
-        # ── 探针搜索：用 G 的视角做一次快速搜索，测量知识密度 ──
-        # 提取实际用户请求后再检查 /deep（Discord 会在前面加频道历史）
+        # ── 提取干净的用户请求 ──
         _actual = user_input
         if "[GENESIS_USER_REQUEST_START]" in user_input:
             _actual = user_input.split("[GENESIS_USER_REQUEST_START]", 1)[1]
@@ -1509,51 +1636,56 @@ validation_status 只有命令输出/日志明确证实时才填 validated，否
         if not force_deep:
             probe_hits = await self._probe_knowledge_density(user_input)
             if probe_hits <= 2:
-                target_count = 3   # 稀疏：保守
+                target_count = 3
             elif probe_hits <= 6:
-                target_count = 5   # 中等
+                target_count = 5
             else:
-                target_count = 7   # 密集：全力
+                target_count = 7
             logger.info(f"Multi-G probe: {probe_hits} hits → {target_count} lenses")
         else:
-            target_count = 7  # /deep 强制满配
+            target_count = 7
             logger.info(f"Multi-G /deep: forcing {target_count} lenses")
         
         personas = self._select_personas(target_count)
         
         logger.info(f">>> Multi-G Lens Phase: spawning {len(personas)} lenses: {personas}")
         
-        # 预获取共享的 digest 和签名（避免每个透镜重复计算）
-        knowledge_digest = self.vault.get_digest()
-        signature_text = self.vault.render_metadata_signature(self.inferred_signature)
-        
-        # 去掉频道历史和 /deep /quick 前缀后的干净任务文本
         clean_input = _actual.strip()
         for prefix in ["/deep ", "/quick "]:
             if clean_input.startswith(prefix):
                 clean_input = clean_input[len(prefix):]
         clean_input = clean_input.strip()
         
-        # ── G 布置作业：解读用户意图，生成结构化搜索任务简报 ──
-        task_brief = await self._build_lens_task_brief(clean_input, knowledge_digest)
+        # ── 预搜共享知识：一次搜索，所有透镜共享 ──
+        shared_knowledge = await self._prefetch_shared_knowledge(clean_input)
+        knowledge_digest = self.vault.get_digest()
+        conversation_digest = self.vault.get_conversation_digest(limit=10)
+        signature_text = self.vault.render_metadata_signature(self.inferred_signature)
+        
+        # ── G 先说自己的理解 ──
+        g_interpretation = await self._build_g_interpretation(clean_input, knowledge_digest, shared_knowledge)
         
         await self._safe_callback(step_callback, "lens_start", {
             "personas": personas, "probe_hits": probe_hits,
-            "task_brief": task_brief
+            "g_interpretation": g_interpretation[:200] if g_interpretation else "",
         })
         
-        # 并行运行所有透镜
-        tasks = [
-            self._run_single_lens(
-                persona=p,
-                task_context=task_brief,
-                blackboard=blackboard,
-                knowledge_digest=knowledge_digest,
-                signature_text=signature_text,
-                step_callback=step_callback
-            )
-            for p in personas
-        ]
+        # ── 并行运行所有透镜（限流：最多 2 并发，防止打爆 API 并发限制）──
+        sem = asyncio.Semaphore(2)
+        async def _throttled_lens(p):
+            async with sem:
+                return await self._run_single_lens(
+                    persona=p,
+                    user_question=clean_input,
+                    blackboard=blackboard,
+                    shared_knowledge=shared_knowledge,
+                    g_interpretation=g_interpretation,
+                    knowledge_digest=knowledge_digest,
+                    conversation_digest=conversation_digest,
+                    signature_text=signature_text,
+                    step_callback=step_callback
+                )
+        tasks = [_throttled_lens(p) for p in personas]
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
@@ -1568,145 +1700,109 @@ validation_status 只有命令输出/日志明确证实时才填 validated，否
         
         return blackboard
 
+    async def _prefetch_shared_knowledge(self, clean_input: str) -> str:
+        """预搜一次 NodeVault，拉取相关节点的元数据和内容，构建共享知识包。"""
+        # 搜索元数据
+        search_args = {"keywords": [clean_input[:80]]}
+        if self.inferred_signature:
+            search_args["signature"] = self.inferred_signature
+        
+        try:
+            search_result = await asyncio.wait_for(
+                self.tools.execute("search_knowledge_nodes", search_args),
+                timeout=self.TOOL_EXEC_TIMEOUT
+            )
+        except Exception as e:
+            logger.warning(f"Multi-G prefetch search failed: {e}")
+            return ""
+        
+        if not search_result or "未找到" in str(search_result) or "未命中" in str(search_result):
+            return ""
+        
+        # 从搜索结果中提取节点 ID（匹配 [NODE_ID] 模式）
+        import re
+        node_ids = re.findall(r'\[([A-Z_]+_[^\]]+)\]', str(search_result))
+        # 去重，保留顺序，取前 5 个
+        seen = set()
+        unique_ids = []
+        for nid in node_ids:
+            if nid not in seen and not nid.startswith("MEM_CONV"):
+                seen.add(nid)
+                unique_ids.append(nid)
+                if len(unique_ids) >= 5:
+                    break
+        
+        # 拉取节点完整内容
+        contents = self.vault.get_multiple_contents(unique_ids) if unique_ids else {}
+        
+        # 组装共享知识包
+        lines = [str(search_result)[:2000]]  # 搜索结果摘要（截断）
+        if contents:
+            lines.append("\n--- 相关节点详细内容 ---")
+            for nid in unique_ids:
+                content = contents.get(nid, "")
+                if content:
+                    lines.append(f"\n[{nid}] 内容：\n{content[:500]}")
+        
+        knowledge = "\n".join(lines)
+        logger.info(f"Multi-G prefetch: {len(unique_ids)} nodes, {len(knowledge)} chars shared knowledge")
+        return knowledge
+
     async def _run_single_lens(
         self,
         persona: str,
-        task_context: str,
+        user_question: str,
         blackboard: Blackboard,
+        shared_knowledge: str,
+        g_interpretation: str,
         knowledge_digest: str,
+        conversation_digest: str,
         signature_text: str,
         step_callback: Any
     ):
-        """运行单个透镜子程序：搜索 + 输出三元组 + 写黑板"""
+        """运行单个透镜：基于 G 的理解 + 共享知识，输出补充建议。"""
         lens_prompt = self.factory.build_lens_prompt(
             persona=persona,
-            task_context=task_context,
+            user_question=user_question,
+            shared_knowledge=shared_knowledge,
+            g_interpretation=g_interpretation,
             blackboard_state=blackboard.render_for_g() if blackboard.entry_count > 0 else "",
             knowledge_digest=knowledge_digest,
-            inferred_signature=signature_text
+            inferred_signature=signature_text,
+            conversation_digest=conversation_digest
         )
         
         messages = [
             Message(role=MessageRole.SYSTEM, content=lens_prompt),
-            Message(role=MessageRole.USER, content="请根据任务简报中的搜索方向开始搜索。")
+            Message(role=MessageRole.USER, content="从你的认知视角分析这个问题。直接输出 JSON。")
         ]
         
-        search_tool = self.tools.get("search_knowledge_nodes")
-        schema = [search_tool.to_schema()] if search_tool else []
-        parsed = False
+        try:
+            response = await asyncio.wait_for(
+                self.provider.chat(
+                    messages=[m.to_dict() for m in messages],
+                    tools=[],  # 不提供任何工具：透镜只思考
+                    stream=False
+                ),
+                timeout=self.LENS_TIMEOUT_SECS
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"Lens-{persona} timeout")
+            return
+        except Exception as e:
+            logger.error(f"Lens-{persona} LLM call failed: {e}")
+            return
         
-        for iteration in range(self.LENS_MAX_ITERATIONS):
-            # 透镜内蒸发：压缩非最近一轮的 TOOL 消息，防止 token 二次增长
-            tool_indices = [i for i, m in enumerate(messages) if m.role == MessageRole.TOOL and i >= 2]
-            if len(tool_indices) > 1:
-                for idx in tool_indices[:-1]:
-                    msg = messages[idx]
-                    if len(str(msg.content or "")) > 300:
-                        messages[idx] = Message(
-                            role=MessageRole.TOOL,
-                            content=f"[搜索结果已消化, {len(str(msg.content))}字符]",
-                            tool_call_id=msg.tool_call_id, name=msg.name
-                        )
-            try:
-                response = await asyncio.wait_for(
-                    self.provider.chat(
-                        messages=[m.to_dict() for m in messages],
-                        tools=schema,
-                        stream=False
-                    ),
-                    timeout=self.LENS_TIMEOUT_SECS
-                )
-            except asyncio.TimeoutError:
-                logger.warning(f"Lens-{persona} timeout at iteration {iteration}")
-                break
-            except Exception as e:
-                logger.error(f"Lens-{persona} LLM call failed: {e}")
-                break
-            
-            self._update_metrics(response, phase="G")  # 透镜 token 计入 G 阶段
-            
-            messages.append(Message(
-                role=MessageRole.ASSISTANT,
-                content=response.content,
-                tool_calls=[tc.__dict__ for tc in response.tool_calls] if response.tool_calls else None
-            ))
-            
-            if response.tool_calls:
-                # 执行搜索工具调用
-                for tc in response.tool_calls:
-                    if tc.name != "search_knowledge_nodes":
-                        messages.append(Message(
-                            role=MessageRole.TOOL,
-                            content=f"Lens 只允许使用 search_knowledge_nodes",
-                            tool_call_id=tc.id, name=tc.name
-                        ))
-                        continue
-                    
-                    search_args = dict(tc.arguments or {})
-                    if self.inferred_signature:
-                        search_args["signature"] = self.vault.merge_metadata_signatures(
-                            self.inferred_signature,
-                            search_args.get("signature")
-                        )
-                    
-                    try:
-                        res = await asyncio.wait_for(
-                            self.tools.execute(tc.name, search_args),
-                            timeout=self.TOOL_EXEC_TIMEOUT
-                        )
-                    except asyncio.TimeoutError:
-                        res = f"搜索超时（{self.TOOL_EXEC_TIMEOUT}秒）"
-                    
-                    # 检测搜索空洞
-                    if res and ("未找到" in str(res) or "0 个匹配" in str(res) or "没有找到" in str(res)):
-                        blackboard.record_search_void(
-                            persona=persona,
-                            query=str(search_args.get("keywords", "")),
-                            signature=search_args.get("signature")
-                        )
-                    
-                    messages.append(Message(
-                        role=MessageRole.TOOL, content=res,
-                        tool_call_id=tc.id, name=tc.name
-                    ))
-                    
-                    await self._safe_callback(step_callback, "lens_search", {
-                        "persona": persona, "tool": tc.name,
-                        "query": search_args.get("keywords", [])
-                    })
-                
-                continue  # 搜索完继续循环让 LLM 输出最终 JSON
-            
-            # 无 tool_calls → LLM 输出了最终文本，解析 JSON 三元组
-            if response.content:
-                self._parse_lens_output(persona, response.content, blackboard)
-                parsed = True
-            break
+        self._update_metrics(response, phase="G")
         
-        # 兜底：如果搜索用完了迭代但从未输出 JSON，做一次无工具的强制输出
-        if not parsed:
-            logger.info(f"Lens-{persona}: forcing final JSON output (no-tools call)")
-            messages.append(Message(
-                role=MessageRole.USER,
-                content="搜索阶段已结束。禁止调用任何工具。禁止输出 function_calls/DSML 标记。\n请直接输出一个纯 JSON 对象，格式二选一：\n{\"type\": \"evidence\", \"framework\": \"你的诊断框架\", \"evidence_node_ids\": [\"搜索到的节点ID\"], \"verification_action\": \"建议的验证命令\"}\n{\"type\": \"hypothesis\", \"framework\": \"你的假设\", \"reasoning_chain\": \"推理过程\", \"suggested_search_directions\": [\"建议搜索方向\"]}"
-            ))
-            try:
-                response = await asyncio.wait_for(
-                    self.provider.chat(
-                        messages=[m.to_dict() for m in messages],
-                        tools=[],  # 不提供任何工具，强制文本输出
-                        stream=False
-                    ),
-                    timeout=self.LENS_TIMEOUT_SECS
-                )
-                self._update_metrics(response, phase="G")
-                if response.content:
-                    self._parse_lens_output(persona, response.content, blackboard)
-                    parsed = True
-            except Exception as e:
-                logger.error(f"Lens-{persona} forced output failed: {e}")
+        if response.content:
+            self._parse_lens_output(persona, response.content, blackboard)
+            await self._safe_callback(step_callback, "lens_analysis", {
+                "persona": persona,
+                "content_preview": response.content[:150]
+            })
         
-        logger.info(f"Lens-{persona} finished (parsed={parsed})")
+        logger.info(f"Lens-{persona} finished")
 
     def _parse_lens_output(self, persona: str, content: str, blackboard: Blackboard):
         """解析透镜 LLM 输出的 JSON 三元组，写入黑板"""
@@ -1756,7 +1852,39 @@ validation_status 只有命令输出/日志明确证实时才填 validated，否
         
         entry_type = parsed.get("type", "hypothesis")
         
-        if entry_type == "evidence":
+        if entry_type == "analysis":
+            # v2 透镜输出：丰富的分析型条目，映射到 evidence/hypothesis
+            interpretation = parsed.get("interpretation", "")
+            key_insight = parsed.get("key_insight", "")
+            solution = parsed.get("solution_approach", "")
+            risk = parsed.get("risk_or_blind_spot", "")
+            node_ids = parsed.get("evidence_node_ids", [])
+            
+            # framework 承载解读 + 洞察
+            rich_framework = interpretation
+            if key_insight:
+                rich_framework += f" | 洞察: {key_insight}"
+            
+            if node_ids:
+                # 有证据支撑 → evidence 条目
+                rich_action = solution
+                if risk:
+                    rich_action += f" [风险: {risk}]"
+                blackboard.add_evidence(
+                    persona=persona,
+                    framework=rich_framework,
+                    evidence_node_ids=node_ids,
+                    verification_action=rich_action
+                )
+            else:
+                # 纯推理 → hypothesis 条目
+                blackboard.add_hypothesis(
+                    persona=persona,
+                    framework=rich_framework,
+                    reasoning_chain=solution,
+                    suggested_search_directions=[risk] if risk else []
+                )
+        elif entry_type == "evidence":
             blackboard.add_evidence(
                 persona=persona,
                 framework=parsed.get("framework", "未指定框架"),
