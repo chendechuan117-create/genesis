@@ -37,7 +37,7 @@ services:
       - /home/chendechusn/Genesis/Genesis:/src/genesis:ro
       
       # Python venv（只读）
-      - /home/chendechusn/Genesis/nanogenesis/venv:/opt/venv:ro
+      - /home/chendechusn/Genesis/Genesis/venv:/opt/venv:ro
       
       # Doctor 脚本
       - ./entrypoint.sh:/doctor/entrypoint.sh:ro
