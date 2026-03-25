@@ -356,11 +356,11 @@ async def _run_auto(channel: discord.TextChannel):
             else:
                 consecutive_dry += 1
             
-            # 保存本轮输出作为下轮的"上轮发现"
-            last_findings = response[:500] if response else "(无输出)"
+            # 保存本轮输出作为下轮的"上轮发现"（API 按天计费，不省 token）
+            last_findings = response[:2000] if response else "(无输出)"
             
             # 记录摘要
-            summary = response[:150].replace("\n", " ") if response else "(无输出)"
+            summary = response[:300].replace("\n", " ") if response else "(无输出)"
             delta_str = f"+{nodes_delta}" if nodes_delta > 0 else str(nodes_delta) if nodes_delta < 0 else "±0"
             round_log.append(f"R{round_num}[{phase}]: {delta_str}节点 | {summary}")
             
@@ -370,8 +370,8 @@ async def _run_auto(channel: discord.TextChannel):
             )
             
             if response:
-                preview = response[:1800]
-                if len(response) > 1800:
+                preview = response[:3600]
+                if len(response) > 3600:
                     preview += f"\n... (共{len(response)}字)"
                 for i in range(0, len(preview), 1990):
                     await channel.send(preview[i:i+1990])
