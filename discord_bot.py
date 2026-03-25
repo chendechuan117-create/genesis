@@ -295,10 +295,9 @@ async def _run_auto(channel: discord.TextChannel):
             )
             
             duration = _time.time() - t0
-            response = result.get("response", "")
-            metrics = result.get("metrics")
-            iterations = metrics.iterations if metrics else 0
-            total_tokens = metrics.total_tokens if metrics else 0
+            response = result.response if hasattr(result, 'response') else result.get("response", "") if isinstance(result, dict) else ""
+            iterations = result.iterations if hasattr(result, 'iterations') else 0
+            total_tokens = result.total_tokens if hasattr(result, 'total_tokens') else 0
             
             # 价值追踪
             nodes_after = _get_node_count()
@@ -455,7 +454,7 @@ async def on_message(message: discord.Message):
 
                 ui_callback = DiscordCallback(message)
                 result = await agent.process(full_input, step_callback=ui_callback, image_paths=image_paths)
-                response = result.get("response", "...")
+                response = result.response if hasattr(result, 'response') else result.get("response", "...") if isinstance(result, dict) else "..."
                 
                 # Discord 不允许发送空消息，增加保底机制
                 if not response or not str(response).strip():
