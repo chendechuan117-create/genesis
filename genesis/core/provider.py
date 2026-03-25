@@ -229,7 +229,7 @@ class NativeHTTPProvider(BaseLLMProvider):
 
     async def _chat_with_httpx(self, client: httpx.AsyncClient, url: str, headers: Dict, params: Dict) -> LLMResponse:
         """非流式请求"""
-        retries = 3
+        retries = 5
         last_exception = None
         
         for attempt in range(retries):
@@ -377,7 +377,7 @@ class NativeHTTPProvider(BaseLLMProvider):
         output_tokens = 0
         prompt_cache_hit_tokens = 0
         
-        retries = 3
+        retries = 5
         
         for attempt in range(retries):
             # 重试时重置累积器，防止部分流残留导致内容重复/工具调用损坏

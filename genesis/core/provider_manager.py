@@ -39,6 +39,8 @@ class ProviderRouter(LLMProvider):
     
     # 回退探活：failover 后每隔此秒数尝试恢复首选 provider
     RECOVERY_COOLDOWN_SECS = 60
+    # 每小时刷新 provider 连接，防止长连接腐化
+    REFRESH_INTERVAL_SECS = 3600
 
     def __init__(self, config: Any, api_key: str = None, base_url: str = None, model: str = None):
         self.config = config
@@ -47,6 +49,7 @@ class ProviderRouter(LLMProvider):
         self._preferred_provider_name: Optional[str] = None  # 首选 provider
         self._failover_time: float = 0  # 上次 failover 时间戳
         self._last_recovery_attempt: float = 0  # 上次探活时间戳
+        self._last_refresh_time: float = time.time()  # 上次刷新时间
         
         self._initialize_providers(api_key, base_url, model)
         self.active_provider = self.providers.get(self.active_provider_name)
@@ -132,6 +135,18 @@ class ProviderRouter(LLMProvider):
         model = kwargs.get("model") or self.get_default_model()
 
         t0 = time.time()
+
+        # 每小时刷新连接：关闭旧 httpx client，下次请求自动重建
+        if (time.time() - self._last_refresh_time) > self.REFRESH_INTERVAL_SECS:
+            self._last_refresh_time = time.time()
+            for name, prov in self.providers.items():
+                if hasattr(prov, '_http_client') and prov._http_client:
+                    try:
+                        await prov._http_client.aclose()
+                    except Exception:
+                        pass
+                    prov._http_client = None
+            logger.info("🔄 Provider connections refreshed (hourly)")
 
         # 回退探活：如果当前不是首选 provider，定期用轻量 ping 尝试恢复
         if (
