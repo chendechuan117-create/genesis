@@ -54,9 +54,7 @@ class ProviderRouter(LLMProvider):
         
         # Fallback if preferred provider not available
         if not self.active_provider:
-            if 'deepseek' in self.providers:
-                self._switch_provider('deepseek')
-            elif 'gemini' in self.providers:
+            if 'gemini' in self.providers:
                 self._switch_provider('gemini')
             else:
                  # Last resort mock
@@ -94,8 +92,13 @@ class ProviderRouter(LLMProvider):
                 logger.warning(f"Failed to build provider plugin '{name}': {e}")
         
         # Determine Activation & Failover Order
-        # Core Providers: Genesis Body only uses DeepSeek and Gemini
-        self.failover_order = ['aixj', 'deepseek', 'gemini']
+        # deepseek 默认不参与自动 failover（烧付费额度）
+        # 设置 GENESIS_DEEPSEEK_FAILOVER=1 可手动启用
+        import os
+        if os.environ.get('GENESIS_DEEPSEEK_FAILOVER') == '1':
+            self.failover_order = ['aixj', 'deepseek', 'gemini']
+        else:
+            self.failover_order = ['aixj', 'gemini']
         
         self.active_provider_name = 'aixj'
         for name in self.failover_order:
