@@ -43,6 +43,10 @@ logger = logging.getLogger("BackgroundDaemon")
 CYCLE_INTERVAL_SECS = 1800   # 每 30 分钟跑一轮
 GC_EVERY_N_CYCLES = 6        # 每 6 轮（约 3 小时）跑一次 GC
 
+# ── 任务开关 ──
+ENABLE_SCAVENGER = False      # 拾荒：已由 Autopilot 上位替代，暂停
+ENABLE_HYPOTHESIS = False     # 假设引擎：产出零使用率，暂停
+
 
 class BackgroundDaemon:
     """统一后台智能体：拾荒 + 发酵 + 验证 + GC"""
@@ -97,11 +101,12 @@ class BackgroundDaemon:
 
         stats = {"scavenged": 0, "edges": 0, "concepts": 0, "hypotheses": 0, "verified": 0, "gc": 0}
 
-        # 1. 拾荒
-        try:
-            stats["scavenged"] = await self._task_scavenge()
-        except Exception as e:
-            logger.error(f"拾荒异常: {e}", exc_info=True)
+        # 1. 拾荒（已暂停，由 Autopilot 替代）
+        if ENABLE_SCAVENGER:
+            try:
+                stats["scavenged"] = await self._task_scavenge()
+            except Exception as e:
+                logger.error(f"拾荒异常: {e}", exc_info=True)
 
         # 2. 发酵（边缘发现 + 概念蒸馏 + 假设引擎）
         try:
@@ -114,10 +119,11 @@ class BackgroundDaemon:
         except Exception as e:
             logger.error(f"概念蒸馏异常: {e}", exc_info=True)
 
-        try:
-            stats["hypotheses"] = await self._task_generate_hypotheses()
-        except Exception as e:
-            logger.error(f"假设引擎异常: {e}", exc_info=True)
+        if ENABLE_HYPOTHESIS:
+            try:
+                stats["hypotheses"] = await self._task_generate_hypotheses()
+            except Exception as e:
+                logger.error(f"假设引擎异常: {e}", exc_info=True)
 
         # 3. 验证
         try:

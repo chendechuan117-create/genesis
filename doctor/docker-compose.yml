@@ -39,6 +39,9 @@ services:
       # Python venv（只读）
       - /home/chendechusn/Genesis/Genesis/venv:/opt/venv:ro
       
+      # 数据库（只读，entrypoint 会复制快照到 /workspace/runtime/）
+      - /home/chendechusn/.nanogenesis/workshop_v4.sqlite:/src/db/workshop_v4.sqlite:ro
+      
       # Doctor 脚本
       - ./entrypoint.sh:/doctor/entrypoint.sh:ro
       

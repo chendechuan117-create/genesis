@@ -298,19 +298,36 @@ class Autopilot:
         except Exception:
             return (True, "unknown")
 
-    def _get_node_count(self) -> int:
-        """获取知识库节点数"""
+    def _get_node_count(self) -> dict:
+        """获取 knowledge_nodes 节点计数观测状态（中性 telemetry）。"""
+        db = Path.home() / ".nanogenesis" / "workshop_v4.sqlite"
         try:
             import sqlite3
-            db = Path.home() / ".nanogenesis" / "workshop_v4.sqlite"
             if not db.exists():
-                return 0
+                return {
+                    "status": "unavailable",
+                    "db_path": str(db),
+                    "count": None,
+                    "error": "database file not found",
+                }
             conn = sqlite3.connect(str(db))
-            count = conn.execute("SELECT COUNT(*) FROM knowledge_nodes").fetchone()[0]
-            conn.close()
-            return count
-        except Exception:
-            return -1
+            try:
+                count = conn.execute("SELECT COUNT(*) FROM knowledge_nodes").fetchone()[0]
+            finally:
+                conn.close()
+            return {
+                "status": "ok",
+                "db_path": str(db),
+                "count": count,
+                "error": None,
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "db_path": str(db),
+                "count": None,
+                "error": str(e),
+            }
 
     async def run_task(self, task: dict) -> bool:
         """执行单个任务"""
@@ -325,7 +342,7 @@ class Autopilot:
             self._stop = True
             return False
 
-        nodes_before = self._get_node_count()
+        node_count_before = self._get_node_count()
 
         logger.info(f"{'='*60}")
         logger.info(f"📋 Task: {label}")
@@ -345,17 +362,37 @@ class Autopilot:
             success = metrics.success if metrics else False
             iterations = metrics.iterations if metrics else 0
 
-            # ── 价值追踪 ──
-            nodes_after = self._get_node_count()
-            nodes_delta = max(0, nodes_after - nodes_before) if nodes_before >= 0 and nodes_after >= 0 else 0
+            # ── 中性 telemetry：节点计数观测，不进入价值语义 ──
+            node_count_after = self._get_node_count()
             value_tags = []
-            if nodes_delta > 0: value_tags.append(f"+{nodes_delta}节点")
             if response and len(response) > 200: value_tags.append(f"{len(response)}字")
             if iterations > 3: value_tags.append(f"{iterations}轮")
-            value_str = " | ".join(value_tags) if value_tags else "轻量"
+            value_str = " | ".join(value_tags) if value_tags else "已完成"
+
+            if node_count_before["status"] == "ok" and node_count_after["status"] == "ok":
+                count_before = node_count_before["count"]
+                count_after = node_count_after["count"]
+                nodes_delta = count_after - count_before
+                node_telemetry = f"节点计数观测: {count_before} -> {count_after} (Δ {nodes_delta:+d})"
+            elif node_count_after["status"] == "unavailable":
+                node_telemetry = (
+                    f"节点计数观测: 不可用 | db={node_count_after['db_path']} | "
+                    f"reason={node_count_after['error']}"
+                )
+            elif node_count_after["status"] == "error":
+                node_telemetry = (
+                    f"节点计数观测: 异常 | db={node_count_after['db_path']} | "
+                    f"error={node_count_after['error']}"
+                )
+            else:
+                node_telemetry = (
+                    f"节点计数观测: 前置状态={node_count_before['status']} | "
+                    f"后置状态={node_count_after['status']}"
+                )
 
             preview = response[:200] if response else "(empty)"
-            logger.info(f"✅ {label} 完成 | {iterations} iters | {duration:.1f}s | 价值: {value_str}")
+            logger.info(f"✅ {label} 完成 | {iterations} iters | {duration:.1f}s | 摘要: {value_str}")
+            logger.info(f"   {node_telemetry}")
             logger.info(f"   Response: {preview}")
 
             self.metrics.record(label, success, iterations, duration, preview)

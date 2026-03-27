@@ -43,7 +43,8 @@ class ReadFileTool(Tool):
     async def execute(self, file_path: str, encoding: str = "utf-8") -> str:
         """执行文件读取"""
         try:
-            path = Path(file_path).expanduser().resolve()
+            import os
+            path = Path(os.path.expandvars(file_path)).expanduser().resolve()
             
             if not path.exists():
                 return f"Error: 文件不存在: {file_path}"
@@ -124,7 +125,8 @@ class WriteFileTool(Tool):
     ) -> str:
         """执行文件写入"""
         try:
-            path = Path(file_path).expanduser().resolve()
+            import os
+            path = Path(os.path.expandvars(file_path)).expanduser().resolve()
             
             # 创建父目录
             if create_dirs and not path.parent.exists():
@@ -183,7 +185,8 @@ class AppendFileTool(Tool):
     ) -> str:
         """执行文件追加"""
         try:
-            path = Path(file_path).expanduser().resolve()
+            import os
+            path = Path(os.path.expandvars(file_path)).expanduser().resolve()
             
             # 追加内容
             with path.open('a', encoding=encoding) as f:
@@ -230,7 +233,8 @@ class ListDirectoryTool(Tool):
     async def execute(self, directory: str, pattern: str = "*") -> str:
         """执行目录列出"""
         try:
-            path = Path(directory).expanduser().resolve()
+            import os
+            path = Path(os.path.expandvars(directory)).expanduser().resolve()
             
             if not path.exists():
                 return f"Error: 目录不存在: {directory}"

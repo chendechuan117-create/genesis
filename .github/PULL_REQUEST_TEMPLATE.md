@@ -17,6 +17,20 @@
 ## 关联问题
 - 关联 Issue: #
 
+## 高风险宣告 / 升级前置检查（最小闭环）
+当你准备宣告 **PASS / FAIL / REVISED / SAFE-TO-WRITE**，或准备升级为**多工具 / 多文件 / 多阶段 dispatch** 时，先完成以下检查：
+- [ ] 已先显式检索相关 LESSON（写明检索了什么关键词/主题）
+- [ ] 若命中：已将相关节点加入 `active_nodes`，并说明命中了哪些节点
+- [ ] 若未命中或工具异常：已明确写出未命中 / 失败原因，并保持保守，未直接进入高风险结论或升级
+- [ ] 已做一个最低成本、可直接打假的单点验证（如单文件读取、单条 grep、单次编译/健康检查、单条 sqlite/日志确认）
+- [ ] 在输出或 PR 描述中留下痕迹：`LESSON search:` / `hits:` / `active_nodes:` / `miss_or_error:` / `minimal_check:`
+
+## KIL 登记前置检查（知识裁决 / 线索处置）
+如本次 PR 描述、审查记录或关联说明中会对知识对象直接作出 `approved` / `rejected` / `returned` 裁决，或对待验证线索作出升级 / 退回 / 拒绝结论，或留下任何可复用判断、状态裁决、规则例外说明：
+- [ ] 已先在 `docs/knowledge_intake_log.md` 登记或补回对应 KIL 锚点
+- [ ] 已在相关说明中引用对应锚点（示例：`docs/knowledge_intake_log.md#kil-YYYYMMDD-序号`）
+- [ ] 未登记 KIL 前，未将上述动作宣告为已完成
+
 ## 检查清单
 请确认以下事项：
 - [ ] 已阅读 `CONTRIBUTING.md`

@@ -382,6 +382,20 @@ class NodeVault:
             PRIMARY KEY (persona, task_kind)
         )
         ''')
+        # VOID 任务队列（从 knowledge_nodes 分离，不污染知识搜索空间）
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS void_tasks (
+            void_id TEXT PRIMARY KEY,
+            query TEXT NOT NULL,
+            source TEXT DEFAULT 'search_miss',
+            persona TEXT,
+            task_signature TEXT,
+            status TEXT DEFAULT 'open',
+            resolution_node_id TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            resolved_at TIMESTAMP
+        )
+        ''')
         conn.commit()
 
     def _migrate_old_data(self):
@@ -693,6 +707,26 @@ class NodeVault:
         if any(marker in source for marker in ["待验证", "未验证", "unknown", "不确定"]):
             add("validation_status", "unverified")
 
+        # 认知策略维度 — 从用户反馈或 C 提炼中推断
+        cognitive_markers = {
+            "aggressive": ["激进", "直接", "别把人当", "别啰嗦", "大胆", "aggressive"],
+            "conservative": ["保守", "谨慎", "先确认", "稳一点", "别急", "conservative"],
+            "deep_analysis": ["深入", "深度分析", "不够深", "这谁不知道", "深挖", "deep_analysis"],
+        }
+        for value, markers in cognitive_markers.items():
+            if any(marker in source for marker in markers):
+                add("cognitive_approach", value)
+
+        domain_markers = {
+            "consumer_service": ["外卖", "美团", "饿了么", "淘宝", "拼多多", "京东", "消费", "购物", "省钱", "优惠", "coupon"],
+            "system_config": ["系统配置", "system config", "systemd", "网络配置", "防火墙"],
+            "code_review": ["代码审查", "code review", "重构", "架构"],
+            "research": ["调研", "research", "分析", "评估", "对比"],
+        }
+        for value, markers in domain_markers.items():
+            if any(marker in source for marker in markers):
+                add("domain", value)
+
         return inferred
 
     def infer_metadata_signature_from_artifacts(self, artifacts: List[str]) -> Dict[str, Any]:
@@ -946,6 +980,71 @@ class NodeVault:
             self._conn.commit()
         except Exception as e:
             logger.error(f"PersonaStats: save failed: {e}")
+
+    # ─── VOID 任务队列 ───
+
+    def add_void_task(self, void_id: str, query: str, source: str = "search_miss",
+                      persona: str = None, task_signature: Dict[str, Any] = None) -> bool:
+        """写入一个 VOID 任务（知识缺口）。返回 True 表示新增，False 表示已存在。"""
+        sig_json = json.dumps(task_signature, ensure_ascii=False) if task_signature else None
+        try:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO void_tasks (void_id, query, source, persona, task_signature) VALUES (?,?,?,?,?)",
+                (void_id, query, source, persona, sig_json)
+            )
+            self._conn.commit()
+            return self._conn.total_changes > 0
+        except Exception as e:
+            logger.debug(f"add_void_task failed for {void_id}: {e}")
+            return False
+
+    def get_open_voids(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """获取待处理的 VOID 任务（open 状态，最旧优先）"""
+        rows = self._conn.execute(
+            "SELECT void_id, query, source, persona, task_signature, created_at "
+            "FROM void_tasks WHERE status = 'open' ORDER BY created_at ASC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_recent_voids(self, limit: int = 5) -> List[Dict[str, Any]]:
+        """获取最近的 VOID 任务（供 digest 展示，最新优先）"""
+        rows = self._conn.execute(
+            "SELECT void_id, query, status, created_at "
+            "FROM void_tasks WHERE status = 'open' ORDER BY created_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def resolve_void(self, void_id: str, resolution_node_id: str = None):
+        """标记 VOID 已解决（被升格为 LESSON 或已过时）"""
+        self._conn.execute(
+            "UPDATE void_tasks SET status = 'resolved', resolution_node_id = ?, resolved_at = CURRENT_TIMESTAMP WHERE void_id = ?",
+            (resolution_node_id, void_id)
+        )
+        self._conn.commit()
+
+    def stale_void(self, void_id: str):
+        """标记 VOID 已过时（不再需要追踪）"""
+        self._conn.execute(
+            "UPDATE void_tasks SET status = 'stale' WHERE void_id = ?",
+            (void_id,)
+        )
+        self._conn.commit()
+
+    def void_exists(self, void_id: str) -> bool:
+        """检查 VOID 是否已存在（任何状态）"""
+        row = self._conn.execute(
+            "SELECT 1 FROM void_tasks WHERE void_id = ?", (void_id,)
+        ).fetchone()
+        return row is not None
+
+    def get_void_stats(self) -> Dict[str, int]:
+        """VOID 统计（供 digest/heartbeat）"""
+        rows = self._conn.execute(
+            "SELECT status, COUNT(*) as cnt FROM void_tasks GROUP BY status"
+        ).fetchall()
+        return {r['status']: r['cnt'] for r in rows}
 
     # ─── 心跳水位线 (Process Heartbeat) ───
 
@@ -1329,7 +1428,7 @@ class NodeVault:
             return
         # 计算归一化权重：最高分节点 weight=1.0，最低分节点 weight=floor
         max_weight = max(weights.values()) if weights else 0.0
-        FLOOR = 0.4  # 最低节点也拿到 40% 的基础 boost/decay，避免完全不归因
+        FLOOR = 0.15  # 最低节点拿 15% 基础 boost/decay，高区分度归因
         for node_id in node_ids:
             if node_id.startswith("MEM_CONV"):
                 continue
@@ -1418,16 +1517,8 @@ class NodeVault:
             (top_k,)
         ).fetchall()
 
-        # 知识缺口：尚未被验证填补的 VOID 节点（G 的缺口地图）
-        void_rows = self._conn.execute(
-            """SELECT node_id, title
-               FROM knowledge_nodes
-               WHERE node_id LIKE 'VOID_%'
-                 AND usage_count = 0
-               ORDER BY created_at DESC
-               LIMIT ?""",
-            (3,)
-        ).fetchall()
+        # 知识缺口：从 void_tasks 队列读取（不再污染 knowledge_nodes）
+        void_rows = self.get_recent_voids(limit=3)
 
         cats = " | ".join(f"{t}:{c}" for t, c in type_counts.items() if c > 0)
         lines = [f"[认知目录] {total}节点 | {cats}"]
@@ -1444,7 +1535,7 @@ class NodeVault:
         if void_rows:
             lines.append("VOID (已识别的知识缺口，可通过实验验证后升格为 LESSON):")
             for r in void_rows:
-                lines.append(f"- [{r['node_id']}] {r['title']}")
+                lines.append(f"- [{r['void_id']}] {r['query']}")
         lines.append("需要细节时请使用 search_knowledge_nodes 搜索。")
         return "\n".join(lines)
 
@@ -1882,41 +1973,12 @@ class FactoryManager:
 """
 
         # ⚠️ 前缀缓存优化：稳定指令放前面（跨请求不变），变量内容放后面
-        return f"""你是 Genesis 大脑 (G-Process)——一个有自知之明的 agent，不是百科全书式的 AI 助手。
-用简体中文回复。用户是 Genesis 创造者，偏好直接简洁。
-
-[你是谁]
-你是缸中之脑。你没有手脚、没有终端、没有浏览器。你唯一的信息来源是：
-1. 知识库 (NodeVault) 中存储的、经过验证分级的节点
-2. Op 执行任务后带回的实地报告
-3. 透镜阶段的多视角侦察结果（如果有）
-除此之外，你脑中的一切都是语言模型的参数记忆——它可能过时、可能错误、可能是幻觉。
-
-[认知纪律]
-- 区分「我从知识库/Op报告中看到的」和「我作为语言模型猜测的」。前者可以断言，后者必须标记为推测或直接派 Op 去验证。
-- 不确定时，行动优先于猜测。派 Op 去读文件、跑命令、检查状态，比你凭空推理强 10 倍。
-- 禁止纸上谈兵：如果你发现自己在写"建议执行…"、"可以尝试…"、"通常来说…"这类泛泛而谈——停下来，改为 dispatch Op 去做。
-- 你的回复中，每一个事实断言都应该能追溯到具体节点 ID 或 Op 的 FINDINGS。做不到就说"我不确定，需要验证"。
-
-[工作流]
-Op 没有任何历史上下文，且迭代上限仅 12 轮。你是大脑，Op 只是手脚——你必须做分治规划。
-
-检索：先读 DIGEST 建立全局判断。PROVEN 是久经考验的节点；UNTESTED 是新知识——优先挂载让它们证明自己。需要细节时用 search_knowledge_nodes 定向搜索。
-派发：调用 dispatch_to_op(op_intent, active_nodes, instructions)。每次只给 Op 一个原子任务（5-10 步可完成）。
-  - ✅ 好的派发："读取 /etc/nginx/nginx.conf 并报告当前 upstream 配置"
-  - ✅ 好的派发："用 sed 将 proxy_pass 从 8080 改为 8081，然后 nginx -t 验证"
-  - ❌ 坏的派发："调查系统所有配置，优化数据库，启动服务，创建监控"（太大，Op 会迷失）
-综合：收到 Op 结果后，仔细阅读 FINDINGS 和 OPEN_QUESTIONS。决策下一步：
-  - 任务完成 → 向用户输出最终回复（纯文本），引用具体证据
-  - 需要更多工作 → 基于 Op 反馈再次 dispatch（下一个原子步骤）
-  - Op 报告 PARTIAL/FAILED → 分析原因，调整策略后重新派发
-  禁止说"将会执行"——要么你已经在做，要么你现在就 dispatch。
-
-[回复风格]
-- 说人话，不要列清单式的"1. 2. 3. 4."教科书回答
-- 有观点、有判断、有取舍，像一个经验丰富的工程师而不是客服机器人
-- 承认不知道的事。"我没找到相关信息"比编造一个看似合理的答案好 100 倍
-- 收到 [Dispatch Review] 时优先修正；确认无误则 instructions 首行写 [REVIEW_OVERRIDE] 并说明理由
+        return f"""你是 Genesis，用户的个人 AI 助手。用简体中文回复。
+你不是普通聊天 AI。你有执行器 Op，能在用户的环境里跑命令、读写文件、搜索网络。你有知识库，记着用户环境的经验和教训。用户选择你而不是普通 AI，就是因为你能动手、有记忆。
+Op 是独立上下文，没有你看到的对话，instructions 写自包含。自主完成完整请求，按需多次 dispatch。
+检索时注意 [知识密度] 行：高凝实→直接用积木组装方案；低凝实→先让 Op 探索再执行；[知识空洞] 是已知的未知，优先调查。
+PROVEN 节点久经考验，UNTESTED 节点优先挂载让它们证明自己。
+带 cognitive_approach 签名的知识节点是认知策略，按它调整态度和深度。
 
 {digest_block}
 {signature_block}

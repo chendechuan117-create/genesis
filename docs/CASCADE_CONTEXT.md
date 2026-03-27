@@ -44,7 +44,7 @@ Genesis/                          # 仓库根
 
 ```
 用户 → Discord Bot → V4Loop
-  ├── Multi-G 透镜预激活（3~7 MBTI 人格并行分析，共享 prefix）
+  ├── Multi-G 透镜（v2: 预搜共享知识 → 3~7 MBTI 人格并行解读，纯思考不搜索）
   ├── Phase 1: G-Process（组装，search + dispatch_to_op 虚拟工具）
   ├── Phase 2: Op-Process（执行，全部工具减去 8 个节点工具）
   ├── Phase 3: POST（对话记忆 MEM_CONV_*）
@@ -154,6 +154,16 @@ Genesis/                          # 仓库根
 - **重试**：流式/非流式均 3 次，5xx 可重试；`WallClockTimeoutError` 不触发 failover
 
 ## 四、近期重大改动（倒序）
+
+### 2026-03-22: Multi-G 认知解放 — 砍掉 task_brief 瓶颈
+- **病因**：`_build_lens_task_brief` 调用单独 LLM 把用户问题收窄为 3-5 个固定搜索方向，lens prompt 说"从搜索方向中选择"→ 所有透镜在同一菜单里排列组合，cognitive_frame 形同虚设（截图实锤：7 透镜搜索关键词几乎一致）
+- **修复**：
+  - 删除 `_build_lens_task_brief` 方法（省 1 次 LLM 调用 ~15s + tokens）
+  - `build_lens_prompt` 参数 `task_context` → `user_question`，直接注入原始用户问题
+  - Lens prompt 重写：从"从搜索方向中选择"改为"先用你的认知模式理解问题，再自己决定搜什么"
+  - `_run_single_lens` 的 user message 从"请根据任务简报搜索"改为"用你的认知视角理解这个问题"
+  - Discord callback 移除 task_brief 展示
+- **文件**：`manager.py`, `loop.py`, `discord_bot.py`
 
 ### 2026-03-22: 因果审计结构性修复（7 项）
 - **C-Phase 梯度恢复**：`_determine_c_phase_mode()` 从二极管（FULL/SKIP）改为三级（FULL/LIGHT/SKIP）。LIGHT 条件：high_value=True 但 full_signals<2（单报告+有 artifacts 但无失败/大量变更/空洞等复杂信号）。LIGHT=5 轮，FULL=30 轮。

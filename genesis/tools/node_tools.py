@@ -100,7 +100,7 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 },
                 "ntype": {
                     "type": "string", 
-                    "enum": ["ALL", "CONTEXT", "LESSON", "ASSET", "EPISODE", "TOOL", "ENTITY", "EVENT", "ACTION"],
+                    "enum": ["ALL", "LESSON", "ASSET", "CONTEXT", "EPISODE"],
                     "description": "要筛选的节点类型，默认为 'ALL'"
                 },
                 "signature": {
@@ -225,9 +225,10 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
 
     # ── 分数融合 (Score Fusion) ──
     # 加权融合代替元组排序，每个信号归一化后按权重叠加
-    FUSION_WEIGHTS = {"rerank": 0.35, "trust": 0.25, "metric": 0.20, "signature": 0.20}
-    # reranker 不可用时的降级权重（rerank 权重按比例分配到其余三个信号）
-    FUSION_WEIGHTS_NO_RERANK = {"trust": 0.385, "metric": 0.308, "signature": 0.308}
+    # 效用驱动检索（MemRL 启发）：metric(战绩) 是主信号，rerank(相关度) 是门槛
+    FUSION_WEIGHTS = {"rerank": 0.30, "trust": 0.15, "metric": 0.35, "signature": 0.20}
+    # reranker 不可用时，效用信号权重更高——缺乏相关度精排时，靠实战记录说话
+    FUSION_WEIGHTS_NO_RERANK = {"trust": 0.20, "metric": 0.50, "signature": 0.30}
 
     def _fusion_score(self, row: Dict[str, Any], max_sig: float = 1.0) -> float:
         has_rerank = 'rerank_score' in row and row['rerank_score'] is not None
@@ -266,7 +267,7 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
             semantic_ids = []
             if self.vault.vector_engine.is_ready and expanded_keywords:
                 query_str = " ".join(expanded_keywords)
-                results = self.vault.vector_engine.search(query_str, top_k=5, threshold=0.55)
+                results = self.vault.vector_engine.search(query_str, top_k=15, threshold=0.55)
                 semantic_ids = [r[0] for r in results]
 
             conn = self.vault._conn
@@ -282,11 +283,27 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     conditions = []
                     
                     # 传统的字面量匹配 (LIKE)
+                    # 将短语拆分为独立词：LLM 常传 'v2ray socks5 routing' 这样的短语，
+                    # LIKE '%v2ray socks5 routing%' 要求整串连续匹配，几乎永远命不中。
+                    # 拆成 ['v2ray', 'socks5', 'routing'] 后每个词独立 LIKE，召回率大幅提升。
                     if keywords:
-                        keyword_conditions = []
+                        import re as _re
+                        split_tokens = []
                         for kw in keywords:
+                            tokens = _re.findall(r'[\w\u4e00-\u9fff]+', kw)
+                            split_tokens.extend(tokens)
+                        # 去重保序
+                        seen = set()
+                        unique_tokens = []
+                        for t in split_tokens:
+                            t_lower = t.lower()
+                            if t_lower not in seen and len(t) >= 2:
+                                seen.add(t_lower)
+                                unique_tokens.append(t)
+                        keyword_conditions = []
+                        for token in unique_tokens:
                             keyword_conditions.append("(title LIKE ? OR tags LIKE ? OR node_id LIKE ? OR resolves LIKE ?)")
-                            kw_like = f"%{kw}%"
+                            kw_like = f"%{token}%"
                             params.extend([kw_like, kw_like, kw_like, kw_like])
                         if keyword_conditions:
                             conditions.append("(" + " OR ".join(keyword_conditions) + ")")
@@ -359,35 +376,62 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     if nid and score > self.__class__._last_fusion_scores.get(nid, 0.0):
                         self.__class__._last_fusion_scores[nid] = score
                 
-                # === Graph Walk (V4.3 Experience Graph) ===
-                # 顺藤摸瓜：基于图谱关系扩展上下文
+                # === Graph Walk (圆锥模型：连根拔起) ===
+                # 强边(REQUIRES/TRIGGERS)做 2 跳拉出深度，弱边(RELATED_TO)保持 1 跳拉出宽度
+                DEEP_EDGES = {"REQUIRES", "TRIGGERS", "RESOLVES"}
                 graph_context = {}
                 graph_related_ids = {}
+                cone_edge_count = 0
+                cone_all_neighbor_ids = set()
                 
                 for r in row_dicts:
                     nid = r['node_id']
+                    if nid not in graph_context: graph_context[nid] = []
+                    if nid not in graph_related_ids: graph_related_ids[nid] = []
                     
-                    outgoing = self.vault.get_related_nodes(nid, direction="out")
-                    for neighbor in outgoing:
-                        rel = neighbor['relation']
-                        target_str = f"--> [{rel}] --> <{neighbor['type']}> {neighbor['title']} ({neighbor['node_id']})"
-                        if nid not in graph_context: graph_context[nid] = []
-                        graph_context[nid].append(target_str)
-                        if nid not in graph_related_ids:
-                            graph_related_ids[nid] = []
-                        if neighbor['node_id'] not in graph_related_ids[nid]:
-                            graph_related_ids[nid].append(neighbor['node_id'])
-                        
-                    incoming = self.vault.get_related_nodes(nid, direction="in")
-                    for neighbor in incoming:
-                        rel = neighbor['relation']
-                        source_str = f"<-- [{rel}] -- <{neighbor['type']}> {neighbor['title']} ({neighbor['node_id']})"
-                        if nid not in graph_context: graph_context[nid] = []
-                        graph_context[nid].append(source_str)
-                        if nid not in graph_related_ids:
-                            graph_related_ids[nid] = []
-                        if neighbor['node_id'] not in graph_related_ids[nid]:
-                            graph_related_ids[nid].append(neighbor['node_id'])
+                    # 1-hop: 所有边
+                    hop1_deep_ids = []
+                    for direction, arrow_fmt in [("out", "--> [{rel}] --> <{type}> {title} ({nid2})"),
+                                                  ("in",  "<-- [{rel}] -- <{type}> {title} ({nid2})")]:
+                        neighbors = self.vault.get_related_nodes(nid, direction=direction)
+                        for neighbor in neighbors:
+                            rel = neighbor['relation']
+                            n2id = neighbor['node_id']
+                            line = arrow_fmt.format(rel=rel, type=neighbor['type'], title=neighbor['title'], nid2=n2id)
+                            graph_context[nid].append(line)
+                            if n2id not in graph_related_ids[nid]:
+                                graph_related_ids[nid].append(n2id)
+                            cone_all_neighbor_ids.add(n2id)
+                            cone_edge_count += 1
+                            # 记录强边邻居，用于 2-hop
+                            if rel in DEEP_EDGES:
+                                hop1_deep_ids.append(n2id)
+                    
+                    # 2-hop: 只沿强边再走一层（限制每个源节点最多 6 个 2-hop 邻居）
+                    hop2_count = 0
+                    seen_hop2 = set()
+                    for h1id in hop1_deep_ids:
+                        if hop2_count >= 6:
+                            break
+                        for direction in ["out", "in"]:
+                            hop2_neighbors = self.vault.get_related_nodes(h1id, direction=direction)
+                            for h2 in hop2_neighbors:
+                                h2id = h2['node_id']
+                                h2rel = h2['relation']
+                                if h2id == nid or h2id in seen_hop2:
+                                    continue
+                                if h2rel not in DEEP_EDGES:
+                                    continue
+                                seen_hop2.add(h2id)
+                                hop2_line = f"    (2-hop via {h1id}) --> [{h2rel}] --> <{h2['type']}> {h2['title']} ({h2id})"
+                                graph_context[nid].append(hop2_line)
+                                if h2id not in graph_related_ids[nid]:
+                                    graph_related_ids[nid].append(h2id)
+                                cone_all_neighbor_ids.add(h2id)
+                                cone_edge_count += 1
+                                hop2_count += 1
+                                if hop2_count >= 6:
+                                    break
 
                 all_prereq_ids = set()
                 for r in row_dicts:
@@ -424,89 +468,107 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     )
                 )
 
-                lines = [f"🔍 [知识库智能双向搜索] 查询词: {keywords}"]
+                # === 知识邻域视图（连根拔起） ===
+                total_neighbors = sum(len(v) for v in graph_related_ids.values())
+                lines = [f"🔍 [知识邻域] 查询: {keywords} | 命中 {len(row_dicts)} 节点，关联 {total_neighbors} 邻居"]
                 if normalized_signature:
-                    lines.append(f"SIGNATURE_FILTER: {self.vault.render_metadata_signature(normalized_signature)}")
-                lines.append("RECOMMENDED_ACTIVE_NODES:")
-                if recommended_rows:
-                    for r in recommended_rows[:6]:
-                        nid = r['node_id']
-                        reason = self._active_reason(r)
-                        extras = []
-                        if r.get('prerequisites'):
-                            extras.append(f"reqs:{r.get('prerequisites')}")
-                        if graph_related_ids.get(nid):
-                            extras.append(f"graph:+{', '.join(graph_related_ids[nid][:2])}")
-                        if normalized_signature:
-                            extras.append(f"sig_score:{r.get('signature_match_score', 0)}")
-                        if r.get('signature_closure_text'):
-                            extras.append(f"sig:+{r.get('signature_closure_text')}")
-                        reliability = r.get('reliability') or {}
-                        if reliability.get('validation_status'):
-                            extras.append(f"verify:{reliability.get('validation_status')}")
-                        extras.append(f"trust:{reliability.get('trust_score', 0):.1f}")
-                        extras.append(f"fresh:{reliability.get('freshness_label', 'unknown')}")
-                        # Knowledge Arena: 显示胜负战绩
-                        wins = r.get('usage_success_count', 0) or 0
-                        losses = r.get('usage_fail_count', 0) or 0
-                        if wins or losses:
-                            extras.append(f"arena:{wins}W/{losses}L")
-                        extra_str = f" | {' | '.join(extras)}" if extras else ""
-                        conditional_flag = " [按需挂载]" if self._active_bucket(r) == "conditional" else ""
-                        lines.append(f"- [{nid}] <{r['type']}> {r['title']}{conditional_flag} | why:{reason}{extra_str}")
-                else:
-                    lines.append("- NONE")
+                    lines.append(f"签名: {self.vault.render_metadata_signature(normalized_signature)}")
+                lines.append("")
 
-                lines.append("SUPPORTING_REFERENCE_NODES:")
-                if support_rows:
-                    for r in support_rows[:6]:
-                        nid = r['node_id']
-                        reason = self._active_reason(r)
-                        lines.append(f"- [{nid}] <{r['type']}> {r['title']} | why:{reason}")
-                else:
-                    lines.append("- NONE")
-
-                lines.append("MATCH_DETAILS:")
-                for r in row_dicts:
+                # 直接命中节点 + 维度信息 + 内联边（连根拔起视图）
+                for r in row_dicts[:8]:
                     nid = r['node_id']
-                    source_label = "[语义]" if r['node_id'] in semantic_ids else "[字面]"
-                    reqs = f" | reqs:[{r.get('prerequisites', '')}]" if r.get('prerequisites') else ""
-                    res = f" | resolves:[{r.get('resolves', '')}]" if r.get('resolves') else ""
-                    sig = f" | sig:{r.get('signature_text', '')}" if r.get('signature_text') else ""
-                    sig_score = f" | sig_score:{r.get('signature_match_score', 0)}" if normalized_signature else ""
+                    # 紧凑元数据
+                    meta = []
+                    if r.get('fusion_score'):
+                        meta.append(f"f:{r['fusion_score']:.2f}")
+                    wins = r.get('usage_success_count', 0) or 0
+                    losses = r.get('usage_fail_count', 0) or 0
+                    if wins or losses:
+                        meta.append(f"{wins}W/{losses}L")
                     reliability = r.get('reliability') or {}
-                    tier_label = f" | tier:{reliability.get('trust_tier', r.get('trust_tier', ''))}" if reliability.get('trust_tier') or r.get('trust_tier') else ""
-                    trust = f" | trust:{reliability.get('trust_score', 0):.1f}" if reliability else ""
-                    conf = f" | conf:{reliability.get('confidence_score', 0):.2f}" if reliability else ""
-                    fresh = f" | fresh:{reliability.get('freshness_label', 'unknown')}" if reliability else ""
-                    verify = f" | verify:{reliability.get('validation_status')}" if reliability.get('validation_status') else ""
-                    score_label = f" (相关度:{r['rerank_score']:.2f})" if 'rerank_score' in r else ""
-                    fusion = f" | fusion:{r.get('fusion_score', 0):.3f}" if 'fusion_score' in r else ""
-                    
-                    lines.append(f"{source_label} <{r['type']}> [{nid}] {r['title']} | tags:{r.get('tags', '')}{reqs}{res}{sig}{sig_score}{tier_label}{trust}{conf}{fresh}{verify}{fusion}{score_label}")
-                    
+                    if reliability.get('freshness_label'):
+                        meta.append(reliability['freshness_label'])
+                    match_type = "语义" if nid in semantic_ids else "字面"
+                    meta.append(match_type)
+                    meta_str = " | ".join(meta)
+                    lines.append(f"● <{r['type']}> {r['title']} [{nid}] ({meta_str})")
+                    # 维度信息：tags + signature + resolves（G 决策需要）
+                    detail_parts = []
+                    if r.get('tags'):
+                        detail_parts.append(f"tags:{r['tags']}")
+                    if r.get('signature_text'):
+                        detail_parts.append(f"sig:{r['signature_text']}")
+                    if r.get('resolves'):
+                        detail_parts.append(f"resolves:{r['resolves'][:80]}")
+                    if detail_parts:
+                        lines.append(f"  {' | '.join(detail_parts)}")
+                    # 内联边：展示知识邻域连接（含 2-hop 深度）
                     if nid in graph_context:
-                        for rel_line in graph_context[nid]:
-                            lines.append(f"      {rel_line}")
-                
-                if prereq_nodes:
-                    lines.append("\nPREREQUISITE_HINTS:")
-                    for pr in prereq_nodes:
-                        lines.append(f"- <{pr['type']}> [{pr['node_id']}] {pr['title']} | tags:{pr['tags']}")
+                        for rel_line in graph_context[nid][:6]:
+                            lines.append(f"  {rel_line}")
+                    if r.get('prerequisites'):
+                        lines.append(f"  requires: {r['prerequisites']}")
 
-                lines.append("\nSIGNATURE_CLOSURE_HINTS:")
-                closure_rows = [r for r in recommended_rows[:6] if r.get('signature_closure_text')]
-                if closure_rows:
-                    for r in closure_rows:
-                        lines.append(f"- [{r['node_id']}] min_sig:{r['signature_closure_text']}")
+                # 建议挂载（紧凑列表）
+                lines.append("")
+                suggested_ids = [r['node_id'] for r in recommended_rows[:6]]
+                # 补充：被多个命中节点引用的邻居也值得挂载
+                neighbor_freq = {}
+                for nid, neighbors in graph_related_ids.items():
+                    for neighbor_id in neighbors:
+                        if neighbor_id not in {r['node_id'] for r in row_dicts}:
+                            neighbor_freq[neighbor_id] = neighbor_freq.get(neighbor_id, 0) + 1
+                hot_neighbors = [nid for nid, cnt in sorted(neighbor_freq.items(), key=lambda x: -x[1]) if cnt >= 2][:3]
+                if hot_neighbors:
+                    suggested_ids.extend(hot_neighbors)
+                lines.append(f"[建议挂载] {', '.join(suggested_ids[:8]) if suggested_ids else '无强推荐'}")
+                if hot_neighbors:
+                    lines.append(f"[高频邻居] {', '.join(hot_neighbors)}（被多个命中节点引用，建议一起挂载）")
+
+                # === 圆锥凝实度摘要（含空洞检测） ===
+                cone_node_count = len(row_dicts) + len(cone_all_neighbor_ids)
+                conf_values = [r.get('confidence_score') or 0.5 for r in row_dicts]
+                avg_conf = sum(conf_values) / len(conf_values) if conf_values else 0
+                proven_count = sum(1 for r in row_dicts if (r.get('usage_success_count') or 0) >= 2)
+                untested_count = sum(1 for r in row_dicts if (r.get('usage_count') or 0) == 0)
+                untested_pct = round(untested_count / len(row_dicts) * 100) if row_dicts else 0
+
+                # 交叉查询 void_tasks：找出与本次搜索相关的知识空洞
+                void_count = 0
+                void_hints = []
+                try:
+                    void_conditions = []
+                    void_params = []
+                    for kw in (expanded_keywords or keywords or []):
+                        void_conditions.append("query LIKE ?")
+                        void_params.append(f"%{kw}%")
+                    if void_conditions:
+                        void_sql = f"SELECT void_id, query FROM void_tasks WHERE status = 'open' AND ({' OR '.join(void_conditions)}) LIMIT 5"
+                        void_rows = conn.execute(void_sql, tuple(void_params)).fetchall()
+                        void_count = len(void_rows)
+                        void_hints = [f"  [?] {vr['query'][:60]} ({vr['void_id']})" for vr in void_rows]
+                except Exception:
+                    pass
+
+                # 凝实度判定（综合 PROVEN + UNTESTED 比例 + VOID 空洞）
+                if proven_count >= 3 and avg_conf >= 0.7 and cone_edge_count >= 5 and untested_pct < 40:
+                    density_label = "高凝实 — 已有成熟解法，可直接组装"
+                elif cone_node_count >= 5 and avg_conf >= 0.5:
+                    density_label = "中凝实 — 有基础知识，部分区域需验证"
+                elif cone_node_count >= 2:
+                    density_label = "低凝实 — 知识稀疏，建议先探索再执行"
                 else:
-                    lines.append("- NONE")
-                
-                lines.append("\nACTIVE_NODE_SELECTION_HINT:")
-                lines.append("- 优先挂 ASSET / LESSON / CONTEXT。")
-                lines.append("- EPISODE 仅在你需要延续同一任务脉络时再挂。")
-                lines.append("- ENTITY / EVENT / ACTION 通常作为背景参考；只有在因果链本身重要时再挂。")
-                lines.append("- 如果某节点带有 reqs 或 graph:+ 提示，派发给 Op 时优先把相关依赖也一起考虑进 active_nodes。")
+                    density_label = "近乎未知 — 无成熟积木，需要全面探索"
+
+                density_parts = [f"{cone_node_count} 节点({untested_count} 未验证)", f"置信 {avg_conf:.2f}", f"{cone_edge_count} 条边", f"{proven_count} PROVEN"]
+                if void_count:
+                    density_parts.append(f"{void_count} VOID")
+                lines.append(f"[知识密度] {' | '.join(density_parts)} → {density_label}")
+                if void_hints:
+                    lines.append("[知识空洞]")
+                    lines.extend(void_hints)
+
                 # ── 搜索仪表盘统计 ──
                 top_scores = [r.get('fusion_score', 0.0) for r in row_dicts[:5]]
                 self._record_search_stats(hit=True, top_fusion_scores=top_scores)

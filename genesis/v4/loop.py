@@ -137,6 +137,7 @@ class V4Loop:
         self.execution_messages = []
         self.execution_reports = []
         self.execution_active_nodes: List[str] = []  # Knowledge Arena: 追踪被使用的节点
+        self._op_tool_outcomes: List[Dict[str, Any]] = []  # 环境信号：Op 工具调用客观结果
         self._signature_drift_events: List[Dict[str, Any]] = []  # 签名偏差检测事件
         # 每次请求重置 fusion_score 缓存，防止上次请求的分数污染当前归因
         from genesis.tools.node_tools import SearchKnowledgeNodesTool
@@ -373,8 +374,11 @@ class V4Loop:
             self._evaporate_g_messages()
             
             self._llm_call_count += 1
+            # Jailbreak 位置：在消息末尾注入钢印提醒（不污染 g_messages 本身）
+            jailbreak = {"role": "system", "content": "[Reminder] 你有 Op 和知识库。能动手就动手，能查就查，别空谈。"}
+            messages_to_send = [m.to_dict() for m in self.g_messages] + [jailbreak]
             response = await self.provider.chat(
-                messages=[m.to_dict() for m in self.g_messages],
+                messages=messages_to_send,
                 tools=schema,
                 stream=True,
                 stream_callback=lambda ev, data: self._stream_proxy(step_callback, ev, data),
@@ -639,7 +643,7 @@ class V4Loop:
                 )
             return prepared
 
-        signature_write_tools = {"record_context_node", "record_lesson_node", "create_meta_node", "create_graph_node"}
+        signature_write_tools = {"record_context_node", "record_lesson_node", "create_meta_node"}
         if tool_name not in signature_write_tools:
             return prepared
 
@@ -994,6 +998,32 @@ class V4Loop:
 
         return "\n".join(lines)
 
+    @staticmethod
+    def _classify_tool_result(tool_name: str, result: str) -> bool:
+        """从工具返回值提取客观成功/失败信号（环境信号，非 LLM 自报）。
+        Returns True = 环境确认成功, False = 环境确认失败。"""
+        if not result:
+            return False
+        r = result.strip()
+        # 通用失败信号
+        if r.startswith("Error:") or r.startswith("Error "):
+            return False
+        if "[TIMEOUT]" in r:
+            return False
+        # shell 工具：解析退出码
+        if tool_name == "shell":
+            m = re.search(r"退出码:\s*(\d+)", r)
+            if m and int(m.group(1)) != 0:
+                return False
+        return True
+
+    def _compute_env_success(self) -> Optional[float]:
+        """计算 Op 工具调用的客观成功率。None = 无工具调用（无信号）。"""
+        if not self._op_tool_outcomes:
+            return None
+        success_count = sum(1 for o in self._op_tool_outcomes if o["success"])
+        return success_count / len(self._op_tool_outcomes)
+
     async def _run_op_phase(self, task_payload: Dict[str, Any], step_callback: Any) -> Dict[str, Any]:
         """运行 Op-Process，纯粹的执行器"""
         logger.info(">>> Entering Phase 2: Op-Process (Executor)")
@@ -1083,6 +1113,11 @@ class V4Loop:
                     await self._safe_callback(step_callback, "tool_result", {"name": tc.name, "result": res})
                     
                     self.metrics.tools_used.append(tc.name)
+                    # 环境信号采集：记录工具调用的客观成功/失败
+                    self._op_tool_outcomes.append({
+                        "tool": tc.name,
+                        "success": self._classify_tool_result(tc.name, str(res)),
+                    })
                     
                     self.op_messages.append(Message(role=MessageRole.TOOL, content=res, tool_call_id=tc.id, name=tc.name))
                 continue
@@ -1162,47 +1197,32 @@ class V4Loop:
         self.vault.sync_vector_matrix_incremental()
         
         report_summary = self._build_execution_report_summary()
-        # Knowledge Arena 反馈闭环: 根据任务结果调整被使用节点的置信度
-        # 去重：防止多次 dispatch 同一节点导致 N 倍 boost/decay
+        # Knowledge Arena 反馈闭环（环境信号驱动）
+        # 信号来源：Op 工具调用的客观结果（exit code / Error 前缀），非 Op 自报 STATUS
+        # 阈值：>= 0.7 = 成功, <= 0.3 = 失败, 中间 / 无信号 = 中性（只记 usage_count）
         unique_active_nodes = list(dict.fromkeys(self.execution_active_nodes))
+        env_ratio = self._compute_env_success()
         if unique_active_nodes:
-            # 激活 usage_count：为 GC 防护提供信号（usage_count > 0 的节点免于 purge）
             self.vault.increment_usage(unique_active_nodes)
-            has_success = any(
-                (r.get("status", "") or "").upper() in ["SUCCESS", "PARTIAL"]
-                for r in self.execution_reports
-            )
-            has_failure = any(
-                (r.get("status", "") or "").upper() in ["FAILED"]
-                for r in self.execution_reports
-            )
-            # 节点级信用归因：用 fusion_score 加权 boost/decay
             from genesis.tools.node_tools import SearchKnowledgeNodesTool
             fusion_weights = SearchKnowledgeNodesTool.get_fusion_scores(unique_active_nodes)
-            if has_success and not has_failure:
+            if env_ratio is not None and env_ratio >= 0.7:
                 self.vault.record_usage_outcome(unique_active_nodes, success=True, weights=fusion_weights)
-                logger.info(f"Knowledge Arena: +boost for {len(unique_active_nodes)} nodes (task SUCCESS, weighted)")
-            elif has_failure:
+                logger.info(f"Knowledge Arena: +boost for {len(unique_active_nodes)} nodes (env_ratio={env_ratio:.2f}, tools={len(self._op_tool_outcomes)})")
+            elif env_ratio is not None and env_ratio <= 0.3:
                 self.vault.record_usage_outcome(unique_active_nodes, success=False, weights=fusion_weights)
-                logger.info(f"Knowledge Arena: -decay for {len(unique_active_nodes)} nodes (task FAILED, weighted)")
+                logger.info(f"Knowledge Arena: -decay for {len(unique_active_nodes)} nodes (env_ratio={env_ratio:.2f}, tools={len(self._op_tool_outcomes)})")
+            else:
+                logger.info(f"Knowledge Arena: NEUTRAL for {len(unique_active_nodes)} nodes (env_ratio={env_ratio}, tools={len(self._op_tool_outcomes)})")
 
-        # Persona 在线学习：将任务结果反馈给 Blackboard 的 persona 表现统计
-        # 注意：独立于 unique_active_nodes，即使 Op 没引用知识节点也要记录 persona 表现
+        # Persona 在线学习（同样使用环境信号）
         if self.blackboard and self.blackboard.entries:
-            has_success_p = any(
-                (r.get("status", "") or "").upper() in ["SUCCESS", "PARTIAL"]
-                for r in self.execution_reports
-            )
-            has_failure_p = any(
-                (r.get("status", "") or "").upper() in ["FAILED"]
-                for r in self.execution_reports
-            )
             contributing_personas = list({e.persona for e in self.blackboard.entries})
-            task_success = has_success_p and not has_failure_p
+            task_success = env_ratio is not None and env_ratio >= 0.7
             raw_atk = self.inferred_signature.get("task_kind") or ""
             arena_task_kind = (raw_atk[0] if isinstance(raw_atk, list) and raw_atk else str(raw_atk)).lower()
             Blackboard.record_persona_outcome(contributing_personas, success=task_success, task_kind=arena_task_kind)
-            logger.info(f"Persona Arena: {'WIN' if task_success else 'LOSS'} for {contributing_personas} (task_kind={arena_task_kind})")
+            logger.info(f"Persona Arena: {'WIN' if task_success else 'LOSS/NEUTRAL'} for {contributing_personas} (env_ratio={env_ratio}, task_kind={arena_task_kind})")
 
         # 3. 整理执行总结
         summary_lines = ["[Op 执行过程摘要]"]
@@ -1227,45 +1247,71 @@ class V4Loop:
         if g_final_response and str(g_final_response).strip():
             g_analysis_block = f"\n[G 综合判断]\n{g_final_response}\n"
 
-        # Multi-G 信息空洞：C 可以在 Op 执行结果中发现填补 VOID 的证据时升格它
+        # Multi-G 信息空洞：已记录到 void_tasks 队列，C 只需专注提炼 LESSON
         void_block = ""
         if self.blackboard:
             void_count = len(self.blackboard.search_voids)
             if void_count > 0:
                 void_summaries = [v.get('query', '')[:60] for v in list(self.blackboard.search_voids)[:5]]
                 void_list = '\n'.join(f'  - {q}' for q in void_summaries if q)
-                void_block = f"\n[Multi-G 信息空洞] 本轮有 {void_count} 个搜索未命中（已自动入库为 VOID 节点）：\n{void_list}\n如果本轮 Op 的执行结果恰好能回答其中某个 VOID，你应该将结论写成 LESSON，然后用 delete_node 删除对应的 VOID 节点。\n"
+                void_block = f"\n[Multi-G 信息空洞] 本轮有 {void_count} 个搜索未命中（已记录到任务队列）：\n{void_list}\n如果本轮 Op 的执行结果恰好能回答其中某个空洞，将结论写成 LESSON 即可，VOID 解决会自动处理。\n"
 
         # ⚠️ 前缀缓存优化：稳定指令放前面，每次请求不同的变量内容放后面
-        reflection_system_prompt = f"""你是 Genesis 反思进程 (C-Process)。审查 Op 的执行轨迹，提炼高价值元信息。
+        reflection_system_prompt = f"""你是 Genesis 反思进程 (C-Process)。审查 Op 的执行轨迹，提炼可复用的原子知识积木。
 
-[原则]
+[核心原则：积木，不是预制件]
+IF/THEN/BECAUSE 是好的模板——保留它。但每个 LESSON 必须是原子的：
+- action_steps 只写 1 个核心步骤（不是 8 个焊在一起）
+- 一个 LESSON = 一个触发信号 → 一个动作 → 一个原因
+- 复杂流程 → 拆成多个原子 LESSON，用 create_node_edge(TRIGGERS) 串联
+
+500 块积木的组合多样性远超 50 个预制件。你的工作是生产积木，不是浇筑预制件。
+模板是组装说明书——描述积木之间的关系（边），不是把多件事焊死在一个节点里。
+G 通过边"连根拔起"整个知识邻域，所以边比节点更重要。
+
+[反面案例]
+❌ action_steps 塞 5+ 个步骤（预制件，无法拆开复用）
+❌ 创建节点后不建边（孤立积木无法被连根拔起）
+
+[正面案例]
+✅ LESSON "tag 不匹配时 v2ray 走默认路由" (action_steps=["检查 inbounds[].tag 与 routing 规则是否一致"])
+   + 边 TRIGGERS → LESSON "v2ray tag 修改后需重启服务生效"
+   + 边 REQUIRES → CTX "v2ray routing 靠 inbound tag 精确匹配"
+✅ 一个洞察拆 2-3 个原子 LESSON + CTX，每对之间建一条边
+
+[判断：写还是不写]
 不写日记，不记流水账。先判断这轮有没有长期价值。
-如果 Op 只是读了几个文件且 G 没有新的结构性发现，可以 NO_ACTION。
-但如果 G 的综合判断中包含可复用的认知（如架构缺陷、设计模式、因果关系），即使 Op 是只读的，也应该提炼沉淀。
+Op 只读了几个文件且 G 无结构性发现 → NO_ACTION。
+G 的综合判断含可复用认知（架构缺陷、因果关系、设计模式）→ 即使 Op 只读也提炼。
 
-[VOID 升格 — 最高优先级动作]
-每轮必须检查：本轮 Op 执行结果是否恰好回答了某个已有 VOID 节点？
-VOID 是系统已识别但未验证的知识缺口。当 Op 输出中包含填补 VOID 的实证（命令输出、日志、代码行为）：
-1. 用 search_knowledge_nodes(keywords=..., ntype="CONTEXT") 搜索相关 VOID 节点（VOID 存储为 tags="VOID" 的 CONTEXT 节点）
-2. 将验证结论写成 LESSON（IF→THEN→BECAUSE 结构，附带实证来源）
-3. 用 delete_node 删除已被填补的 VOID
-这是从「观察」升格为「规律」的关键闭环。只在有实证时才升格，不要凭空推测。
+[VOID 升格]
+Op 结果回答了已知知识缺口 → 写成原子 LESSON。VOID 状态由基础设施自动处理。
+只在有 Op 实证时才提炼，不要凭空推测。
 {void_block}
-[沉淀优先级] ASSET > LESSON > CONTEXT > EPISODE > GRAPH(ENTITY/EVENT/ACTION+边)
-选最小、最精准的表示。同一事实不要同时写多种类型。
+[节点类型] LESSON（因果规律）> ASSET（可复用规则/模板）> CONTEXT（环境事实）
+不要创建 ENTITY/EVENT/ACTION/TOOL 节点。
 
-[LESSON 核心]
-不要总结步骤流水。问自己：哪个错误假设导致了这条轨迹？哪个证据推翻了它？下次遇到什么信号该先检查什么？
-不可泛化的一次性过程不写 LESSON。LESSON 必须填 resolves 字段（解决什么问题），尽量填 prerequisites。
+[LESSON 原子性检验]
+写完一个 LESSON 后问自己：action_steps 里的步骤能否独立复用于其他场景？
+如果能 → 它应该是独立的 LESSON，不该塞在这个节点里。
+resolves 必填。不可泛化的一次性流程不写。
+
+[边的使用——每个新节点至少建一条边]
+REQUIRES: A 成立的前提是 B
+RESOLVES: A 解决了 B 描述的问题
+RELATED_TO: A 和 B 在同一领域下互补
+TRIGGERS: A 出现时应检查 B
+
+[认知策略]
+用户嫌保守/激进/浅 → 写原子 LESSON，签名含 cognitive_approach + domain。
+示例：LESSON "消费类调研应直接给深度分析"
+签名：{{task_kind: "research", domain: "consumer_service", cognitive_approach: "aggressive"}}
 
 [metadata_signature]
-为每个节点写精准的签名——只填该节点实际涉及的值。
-核心字段：os_family, runtime, language, framework, task_kind, error_kind, target_kind, environment_scope。
-反堆砌规则：每个字段最多 2 个值。task_kind 只填最核心的 1 个（debug/configure/deploy 等），不要把所有沾边的都塞进去。
-自定义维度鼓励：知识分类型（如 severity, scope, maturity, pattern_type, failure_mode），这些能帮助未来搜索定位。
-自定义维度禁止：运营流水型（timestamp, port, version, daily_count, followup_needed 等），这些对搜索无价值。
-validation_status 只有命令输出/日志明确证实时才填 validated，否则用 unverified。
+精准签名，只填实际涉及的值。核心字段：os_family, runtime, language, framework, task_kind, error_kind, target_kind, environment_scope。
+反堆砌：每字段最多 2 值，task_kind 只填 1 个。
+鼓励分类维度（severity, scope, pattern_type），禁止运营维度（timestamp, port, version）。
+validation_status 只有明确证实时才填 validated。
 
 {signature_block}
 {report_summary}
@@ -1277,7 +1323,7 @@ validation_status 只有命令输出/日志明确证实时才填 validated，否
             Message(role=MessageRole.USER, content="Reflect.")
         ]
         
-        c_tool_names = ["search_knowledge_nodes", "record_context_node", "record_lesson_node", "create_meta_node", "create_graph_node", "create_node_edge", "delete_node", "record_tool_node"]
+        c_tool_names = ["search_knowledge_nodes", "record_context_node", "record_lesson_node", "create_meta_node", "create_node_edge", "delete_node"]
         c_tools = [self.tools.get(n) for n in c_tool_names if self.tools.get(n)]
         c_schema = [t.to_schema() for t in c_tools]
         
@@ -1411,12 +1457,10 @@ validation_status 只有命令输出/日志明确证实时才填 validated，否
 
     def _auto_record_voids(self, blackboard: Blackboard):
         """
-        基础设施层自动记录搜索空洞到 NodeVault。
+        基础设施层自动记录搜索空洞到 void_tasks 任务队列。
         
-        不依赖 C-Process 判断——所有透镜搜索未命中 + 假设型条目的建议搜索方向
-        都直接写成轻量级 VOID 节点，供 Scavenger/Fermentor 定向拾荒。
-        
-        去重逻辑：对 query 做向量相似度检查，相似度 > 0.80 的 VOID 合并。
+        VOID 不再写入 knowledge_nodes（避免污染搜索空间），
+        而是写入独立的 void_tasks 表，作为待处理的知识缺口任务。
         """
         all_voids = list(blackboard.search_voids)
         for entry in blackboard.entries:
@@ -1446,50 +1490,29 @@ validation_status 只有命令输出/日志明确证实时才填 validated，否
         if not unique_voids:
             return
         
-        # 向量去重：检查是否已有相似的 VOID 节点
+        import hashlib
         recorded = 0
-        for v in unique_voids[:10]:  # 每次最多记录 10 个，避免膨胀
+        for v in unique_voids[:10]:
             query = v["query"]
             persona = v.get("persona", "unknown")
-            
-            # 检查是否已有相似的 VOID
-            if self.vault.vector_engine.is_ready:
-                existing = self.vault.vector_engine.search(query, top_k=3, threshold=0.80)
-                # 检查命中的是否为 VOID 节点
-                if existing:
-                    existing_ids = [r[0] for r in existing]
-                    briefs = self.vault.get_node_briefs(existing_ids)
-                    has_similar_void = any(
-                        "VOID" in (b.get("tags") or "")
-                        for b in briefs.values()
-                    )
-                    if has_similar_void:
-                        continue  # 已有相似 VOID，跳过
-            
-            # 生成简洁的 node_id
-            import hashlib
             q_hash = hashlib.md5(query.encode()).hexdigest()[:8].upper()
-            node_id = f"VOID_{q_hash}"
+            void_id = f"VOID_{q_hash}"
             
-            try:
-                self.vault.create_node(
-                    node_id=node_id,
-                    ntype="CONTEXT",
-                    title=f"[信息空洞] {query[:60]}",
-                    human_translation=query,
-                    tags="VOID",
-                    full_content=f"Multi-G 透镜 {persona} 搜索未命中。\n查询: {query}\n来源: {v.get('source', 'search_miss')}\n任务签名: {json.dumps(self.inferred_signature, ensure_ascii=False)}",
-                    source="multi_g_void",
-                    metadata_signature=self.inferred_signature,
-                    confidence_score=0.3,
-                    trust_tier="SCAVENGED"
-                )
+            if self.vault.void_exists(void_id):
+                continue
+            
+            added = self.vault.add_void_task(
+                void_id=void_id,
+                query=query,
+                source=v.get("source", "search_miss"),
+                persona=persona,
+                task_signature=self.inferred_signature
+            )
+            if added:
                 recorded += 1
-            except Exception as e:
-                logger.debug(f"Auto-record void failed for '{query[:40]}': {e}")
         
         if recorded:
-            logger.info(f"Multi-G: auto-recorded {recorded}/{len(unique_voids)} voids to NodeVault")
+            logger.info(f"Multi-G: recorded {recorded}/{len(unique_voids)} voids to void_tasks")
 
     # 需要 Multi-G 的复杂 task_kind 集合
     MULTI_G_TASK_KINDS = frozenset(["debug", "refactor", "build", "optimize", "design", "test", "deploy", "configure"])

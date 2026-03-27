@@ -179,9 +179,8 @@ class ConfigManager:
 
     def _apply_proxies(self):
         """将代理配置应用到当前进程环境
-        ⚠️ 注意：provider.py 的 httpx 客户端使用 trust_env=False 绕过此处注入的代理，
-        以避免国内 API（DeepSeek）绕道代理 +11s 延迟。墙外免费池（groq/cloudflare）
-        因此无法通过代理访问。参见 provider.py:_get_http_client()。
+        2026-03-26: v2rayA tproxy 在内核层做 GeoIP 智能分流，不再需要应用层代理。
+        保留此方法以防万一需要临时回滚，但 .env 中已无 HTTPS_PROXY。
         """
         if self._config.http_proxy:
             os.environ['http_proxy'] = self._config.http_proxy
