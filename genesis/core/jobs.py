@@ -1,5 +1,6 @@
 
 import signal
+import shlex
 import subprocess
 import uuid
 import time
@@ -70,8 +71,8 @@ class JobManager:
         logger.info(f"🚀 Spawning Job {job_id}: {command} (in {work_dir})")
         
         process = subprocess.Popen(
-            command,
-            shell=True,
+            shlex.split(command),
+            shell=False,
             cwd=str(work_dir),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

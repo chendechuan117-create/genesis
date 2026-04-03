@@ -452,7 +452,7 @@ class Blackboard:
                 node_score = conf * weight
                 evidence_score += node_score
                 node_details.append(f"{nid}({conf:.2f}*{weight})")
-                ntypes_seen.add((brief.get("type") or "UNKNOWN").upper())
+                ntypes_seen.add((brief.get("ntype") or brief.get("type") or "UNKNOWN").upper())
                 # 独占节点：只被这一个透镜引用
                 if global_node_refs and global_node_refs.get(nid, 0) <= 1:
                     exclusive_count += 1

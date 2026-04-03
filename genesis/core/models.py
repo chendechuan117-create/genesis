@@ -12,6 +12,14 @@ class DispatchPayload(BaseModel):
     op_intent: str = Field(default="未定义目标", description="Op 需要完成的目标")
     active_nodes: List[str] = Field(default_factory=list, description="挂载的知识节点 ID 列表")
     instructions: str = Field(default="", description="详细执行指令")
+    knowledge_state: Dict[str, Any] = Field(default_factory=dict, description="当前工作记忆")
+
+
+class KnowledgeState(BaseModel):
+    issue: str = Field(default="", description="当前聚焦的问题")
+    verified_facts: List[str] = Field(default_factory=list, description="已被外部观测证实的事实")
+    failed_attempts: List[str] = Field(default_factory=list, description="已证伪或已失败的尝试")
+    next_checks: List[str] = Field(default_factory=list, description="下一步最值得做的检查")
 
 
 class OpResult(BaseModel):
@@ -19,8 +27,11 @@ class OpResult(BaseModel):
     status: str = Field(default="UNKNOWN", description="执行状态: SUCCESS / PARTIAL / FAILED / UNKNOWN")
     summary: str = Field(default="", description="执行摘要")
     findings: str = Field(default="", description="发现与观察")
+    verified_facts: List[str] = Field(default_factory=list, description="已验证事实")
+    failed_attempts: List[str] = Field(default_factory=list, description="已失败尝试")
     changes_made: List[str] = Field(default_factory=list, description="修改的文件/资源列表")
     artifacts: List[str] = Field(default_factory=list, description="产出的制品列表")
+    next_checks: List[str] = Field(default_factory=list, description="下一步检查建议")
     open_questions: List[str] = Field(default_factory=list, description="未解决的问题")
     raw_output: str = Field(default="", description="原始 LLM 输出")
 

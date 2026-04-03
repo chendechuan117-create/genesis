@@ -10,8 +10,15 @@ logger = logging.getLogger(__name__)
 TRUST_SCHEMA_PROPERTIES = {
     "metadata_signature": {
         "type": "object",
-        "description": "环境/任务签名。核心字段: os_family, language, framework, runtime, error_kind, task_kind, target_kind, environment_scope, validation_status。也接受任意自定义维度（如 polarity, maturity, user_preference 等），系统会自动保存和检索。",
-        "properties": {field: {"type": "string", "description": f"{field} 签名"} for field in METADATA_SIGNATURE_FIELDS},
+        "description": "环境/任务签名。核心字段: os_family, language, framework, runtime, error_kind, task_kind, target_kind, environment_scope, validation_status。也接受 observed_environment_scope / applies_to_environment_scope 这类环境元信息，以及任意自定义维度（如 polarity, maturity, user_preference 等），系统会自动保存和检索。",
+        "properties": {
+            **{field: {"type": "string", "description": f"{field} 签名"} for field in METADATA_SIGNATURE_FIELDS if field != "metadata_schema_version"},
+            "metadata_schema_version": {"type": "string", "description": "内部 contract 版本；通常由系统自动补全"},
+            "observed_environment_scope": {"type": "string", "description": "这条知识是在哪个环境面被观察到的"},
+            "observed_environment_epoch": {"type": "string", "description": "观察发生时的环境 epoch"},
+            "applies_to_environment_scope": {"type": "string", "description": "这条知识默认适用于哪个环境面"},
+            "applies_to_environment_epoch": {"type": "string", "description": "这条知识默认适用的环境 epoch"},
+        },
         "additionalProperties": {"type": "string"}
     },
     "confidence_score": {"type": "number", "description": "可选。0-1 之间的弱可信度评分。仅在你有明确把握时填写。"},
@@ -118,7 +125,20 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
         }
 
     def _active_bucket(self, node: Dict[str, Any]) -> str:
-        ntype = (node.get("type") or "").upper()
+        ntype = (node.get("ntype") or node.get("type") or "").upper()
+        reliability = node.get("reliability") or {}
+        invalidation_reason = reliability.get("invalidation_reason")
+        if reliability.get("epoch_stale") or invalidation_reason == "superseded_env":
+            return "support"
+        if invalidation_reason == "manual_outdated":
+            return "support"
+        if invalidation_reason == "audit_outdated":
+            return "conditional"
+        knowledge_state = reliability.get("knowledge_state")
+        if knowledge_state == "unverified":
+            return "support"
+        if knowledge_state == "historical":
+            return "conditional"
         if ntype in ["ASSET", "LESSON", "CONTEXT"]:
             return "recommended"
         if ntype == "EPISODE":
@@ -126,7 +146,22 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
         return "support"
 
     def _active_reason(self, node: Dict[str, Any]) -> str:
-        ntype = (node.get("type") or "").upper()
+        ntype = (node.get("ntype") or node.get("type") or "").upper()
+        reliability = node.get("reliability") or {}
+        if reliability.get("epoch_stale"):
+            return "适用环境来自旧 Doctor epoch 的快照，默认不按当前环境挂载"
+        invalidation_reason = reliability.get("invalidation_reason")
+        if invalidation_reason == "superseded_env":
+            return "适用环境已被新环境取代，仅作为旧快照参考"
+        if invalidation_reason == "audit_outdated":
+            return "经审计判定已过时，默认不直接挂载；仅在兼容旧方案时参考"
+        if invalidation_reason == "manual_outdated":
+            return "已被手动标记为过时，默认不挂载，仅在复盘时参考"
+        knowledge_state = reliability.get("knowledge_state")
+        if knowledge_state == "historical":
+            return "历史知识，仅在复盘或延续旧轨迹时再挂载"
+        if knowledge_state == "unverified":
+            return "未验证知识，先作为背景参考"
         if ntype == "ASSET":
             return "可直接复用给 Op 的产物"
         if ntype == "LESSON":
@@ -138,6 +173,21 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
         if ntype in ["ACTION", "EVENT", "ENTITY"]:
             return "更适合作为因果背景或图谱补充"
         return "作为背景参考"
+
+    def _bucket_label(self, bucket: str) -> str:
+        labels = {
+            "recommended": "推荐",
+            "conditional": "条件",
+            "support": "背景",
+        }
+        return labels.get(bucket or "", "背景")
+
+    def _bucket_summary(self, rows: List[Dict[str, Any]], limit: int = 4) -> str:
+        parts = []
+        for row in rows[:limit]:
+            reason = row.get("active_reason") or self._active_reason(row)
+            parts.append(f"{row['node_id']}({reason})")
+        return " | ".join(parts)
 
     def _metric_score(self, node: Dict[str, Any]) -> float:
         """UCB 战绩评分：未经测试的节点获得探索加成，随数据积累自然衰减。
@@ -159,7 +209,7 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
         return min(1.0, exploitation + 0.15 * exploration)
 
     def _type_rank(self, node: Dict[str, Any]) -> int:
-        ntype = (node.get("type") or "").upper()
+        ntype = (node.get("ntype") or node.get("type") or "").upper()
         ranks = {
             "ASSET": 0,
             "LESSON": 1,
@@ -173,10 +223,29 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
         return ranks.get(ntype, 99)
 
     def _signature_values(self, signature: Dict[str, Any], key: str) -> List[str]:
-        value = (signature or {}).get(key)
-        if not value:
-            return []
-        return value if isinstance(value, list) else [value]
+        signature = signature or {}
+        alias_keys = [key]
+        if key == "environment_scope":
+            alias_keys = ["applies_to_environment_scope", "environment_scope"]
+        elif key == "environment_epoch":
+            alias_keys = ["applies_to_environment_epoch", "environment_epoch"]
+        result: List[str] = []
+        for alias_key in alias_keys:
+            value = signature.get(alias_key)
+            if not value:
+                continue
+            values = value if isinstance(value, list) else [value]
+            for raw in values:
+                if isinstance(raw, str) and "," in raw:
+                    parts = [part.strip() for part in raw.split(",") if part.strip()]
+                    for part in parts:
+                        if part not in result:
+                            result.append(part)
+                    continue
+                item = str(raw).strip()
+                if item and item not in result:
+                    result.append(item)
+        return result
 
     def _signature_gate(self, node_signature: Dict[str, Any], query_signature: Dict[str, Any]) -> bool:
         if not query_signature:
@@ -195,7 +264,7 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
         score = 0
         hard_keys = {"os_family", "runtime", "language", "framework", "environment_scope"}
         soft_keys = {"task_kind", "target_kind", "error_kind", "validation_status"}
-        known_keys = hard_keys | soft_keys
+        known_keys = hard_keys | soft_keys | {"applies_to_environment_scope", "applies_to_environment_epoch", "metadata_schema_version"}
         for key in hard_keys:
             query_values = set(self._signature_values(query_signature, key))
             if not query_values:
@@ -245,6 +314,15 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
         else:
             w = self.FUSION_WEIGHTS_NO_RERANK
             fused = w["trust"] * trust + w["metric"] * metric + w["signature"] * sig
+        if reliability.get('epoch_stale'):
+            fused = max(0.0, fused - 0.18)
+        invalidation_reason = reliability.get('invalidation_reason')
+        if invalidation_reason == 'audit_outdated':
+            fused = max(0.0, fused - 0.08)
+        elif invalidation_reason == 'manual_outdated':
+            fused = max(0.0, fused - 0.14)
+        elif invalidation_reason == 'superseded_env' and not reliability.get('epoch_stale'):
+            fused = max(0.0, fused - 0.18)
         row['fusion_score'] = round(fused, 4)
         return fused
 
@@ -364,6 +442,8 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                         self.vault.merge_metadata_signatures(*closure_sigs) if closure_sigs else {}
                     )
                     row['reliability'] = self.vault.build_reliability_profile(row)
+                    row['active_bucket'] = self._active_bucket(row)
+                    row['active_reason'] = self._active_reason(row)
                 # 分数融合：加权排序代替元组排序
                 max_sig = max((r.get('signature_match_score', 0) for r in row_dicts), default=1) or 1
                 for r in row_dicts:
@@ -446,17 +526,25 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     prereq_nodes = conn.execute(prereq_query, tuple(all_prereq_ids)).fetchall()
 
                 recommended_rows = []
+                conditional_rows = []
                 support_rows = []
                 for row in row_dicts:
-                    bucket = self._active_bucket(row)
-                    if bucket in ["recommended", "conditional"]:
+                    bucket = row.get('active_bucket') or self._active_bucket(row)
+                    if bucket == "recommended":
                         recommended_rows.append(row)
+                    elif bucket == "conditional":
+                        conditional_rows.append(row)
                     else:
                         support_rows.append(row)
 
                 recommended_rows.sort(
                     key=lambda r: (
-                        0 if self._active_bucket(r) == "recommended" else 1,
+                        self._type_rank(r),
+                        -(r.get('fusion_score', 0.0)),
+                    )
+                )
+                conditional_rows.sort(
+                    key=lambda r: (
                         self._type_rank(r),
                         -(r.get('fusion_score', 0.0)),
                     )
@@ -487,8 +575,19 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     if wins or losses:
                         meta.append(f"{wins}W/{losses}L")
                     reliability = r.get('reliability') or {}
+                    if reliability.get('epoch_stale'):
+                        meta.append("旧快照")
+                    elif reliability.get('invalidation_reason') == 'audit_outdated':
+                        meta.append("审计过时")
+                    elif reliability.get('invalidation_reason') == 'manual_outdated':
+                        meta.append("手动作废")
+                    elif reliability.get('knowledge_state') == 'historical':
+                        meta.append("historical")
+                    elif reliability.get('knowledge_state') == 'unverified':
+                        meta.append("unverified")
                     if reliability.get('freshness_label'):
                         meta.append(reliability['freshness_label'])
+                    meta.append(self._bucket_label(r.get('active_bucket') or self._active_bucket(r)))
                     match_type = "语义" if nid in semantic_ids else "字面"
                     meta.append(match_type)
                     meta_str = " | ".join(meta)
@@ -499,6 +598,25 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                         detail_parts.append(f"tags:{r['tags']}")
                     if r.get('signature_text'):
                         detail_parts.append(f"sig:{r['signature_text']}")
+                    if reliability.get('epoch_stale'):
+                        active_epoch = reliability.get('active_environment_epoch') or ""
+                        if active_epoch:
+                            detail_parts.append(f"epoch:stale→{active_epoch[-12:]}")
+                        else:
+                            detail_parts.append("epoch:stale")
+                    elif reliability.get('environment_epoch'):
+                        detail_parts.append(f"epoch:{reliability['environment_epoch'][-12:]}")
+                    observed_scope = reliability.get('observed_environment_scope') or ""
+                    applies_scope = reliability.get('applies_to_environment_scope') or reliability.get('environment_scope') or ""
+                    if observed_scope and observed_scope != applies_scope:
+                        detail_parts.append(f"observed:{observed_scope}")
+                    observed_epoch = reliability.get('observed_environment_epoch') or ""
+                    applies_epoch = reliability.get('applies_to_environment_epoch') or reliability.get('environment_epoch') or ""
+                    if observed_epoch and observed_epoch != applies_epoch:
+                        detail_parts.append(f"observed_epoch:{observed_epoch[-12:]}")
+                    invalidation_reason = reliability.get('invalidation_reason') or ""
+                    if invalidation_reason:
+                        detail_parts.append(f"invalid:{invalidation_reason}")
                     if r.get('resolves'):
                         detail_parts.append(f"resolves:{r['resolves'][:80]}")
                     if detail_parts:
@@ -523,6 +641,10 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 if hot_neighbors:
                     suggested_ids.extend(hot_neighbors)
                 lines.append(f"[建议挂载] {', '.join(suggested_ids[:8]) if suggested_ids else '无强推荐'}")
+                if conditional_rows:
+                    lines.append(f"[条件挂载] {self._bucket_summary(conditional_rows)}")
+                if support_rows:
+                    lines.append(f"[支撑背景] {self._bucket_summary(support_rows)}")
                 if hot_neighbors:
                     lines.append(f"[高频邻居] {', '.join(hot_neighbors)}（被多个命中节点引用，建议一起挂载）")
 

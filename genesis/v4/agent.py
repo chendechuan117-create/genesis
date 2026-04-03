@@ -30,7 +30,7 @@ class GenesisV4:
         self.enable_logging = enable_logging
         self.c_phase_blocking = c_phase_blocking
 
-    async def process(self, user_input: str, step_callback: Optional[Any] = None, image_paths: Optional[List[str]] = None) -> UnifiedResponse:
+    async def process(self, user_input: str, step_callback: Optional[Any] = None, image_paths: Optional[List[str]] = None, c_phase_blocking: Optional[bool] = None, loop_config: Optional[Dict[str, Any]] = None, initial_knowledge_state: Optional[Dict[str, Any]] = None) -> UnifiedResponse:
         """
         处理单轮会话，V4 的管线：
         1. 交由 V4Loop 运行（强制 JSON Blueprint -> 工具调用序列）
@@ -41,11 +41,12 @@ class GenesisV4:
         tracer = Tracer.get_instance()
         trace_id = tracer.start_trace(user_input)
         
+        effective_blocking = c_phase_blocking if c_phase_blocking is not None else self.c_phase_blocking
         loop = V4Loop(
             tools=self.tools,
             provider=self.provider,
             max_iterations=self.max_iterations,
-            c_phase_blocking=self.c_phase_blocking,
+            c_phase_blocking=effective_blocking,
         )
 
         try:
@@ -53,6 +54,8 @@ class GenesisV4:
                 user_input=user_input,
                 step_callback=step_callback,
                 image_paths=image_paths,
+                loop_config=loop_config,
+                initial_knowledge_state=initial_knowledge_state,
             )
             
             # 结束追踪
@@ -74,7 +77,9 @@ class GenesisV4:
                 metrics=metrics,
                 trace_id=trace_id,
                 partial_reason=partial_reason,
-                degraded=False  # 后续可根据具体降级路径检测
+                degraded=False,
+                phase_trace=loop.get_phase_trace(),
+                knowledge_state=loop.get_knowledge_state(),
             )
             
         except Exception as e:

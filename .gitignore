@@ -72,9 +72,40 @@ python_3.14_features_memo.md
 archive/
 health_report.json
 
-# Genesis 容器产出的一次性测试脚本
+# Local-only files (not for GitHub)
+*.exe
+*.patch
+*.original
+*.new
+socket
+exe_files.txt
+api_test_report.json
+record_lesson_node_tool_analysis.txt
+CASCADE_CONTEXT.md
+LEAP_BLUEPRINT.md
+genesis/Untitled-2.txt
+genesis/### *
+
+# Root-level loose scripts (duplicates of scripts/ or one-off probes)
+/auto_dashboard.py
+/kb_watch.py
+/autopilot.py
+
+# Backup files
+*.backup2
+
+# Probe scripts in scripts/ (not formal tooling)
+scripts/*_probe*.py
+scripts/validate_*.py
+scripts/record_lesson_*.py
+scripts/auto_termination_probe.py
+scripts/kb_watch.py
+
+# Genesis 容器产出的一次性测试脚本（不影响 tests/ 目录下的正式测试）
 *_test.py
 test_*.py
+!tests/
+!tests/**
 *_test_*.py
 simple_test*.py
 minimal_test*.py

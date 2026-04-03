@@ -519,7 +519,7 @@ ID: {seed['node_id']} | 标题: {seed['title']} | 解决: {seed.get('resolves', 
         
         # 算法层签名审计（零 LLM 成本，先跑一轮）
         sig_stats = self.vault.audit_signatures(limit=50)
-        sig_fixed = sig_stats.get("fixed_normalize", 0) + sig_stats.get("fixed_blacklist", 0) + sig_stats.get("fixed_contradiction", 0)
+        sig_fixed = sig_stats.get("fixed_normalize", 0) + sig_stats.get("fixed_blacklist", 0) + sig_stats.get("fixed_contradiction", 0) + sig_stats.get("fixed_invalidation_reason", 0)
         if sig_fixed:
             logger.info(f"  🔧 签名审计: {sig_stats['audited']} 扫描, {sig_fixed} 修复")
         
@@ -568,6 +568,10 @@ ID: {node_id} | 类型: {cand['type']} | 标题: {cand['title']}
 
                     sig = self.vault.parse_metadata_signature(cand.get('metadata_signature')) if cand.get('metadata_signature') else {}
                     sig['validation_status'] = v_status
+                    if v_status == 'outdated':
+                        sig['invalidation_reason'] = 'audit_outdated'
+                    else:
+                        sig.pop('invalidation_reason', None)
                     self.vault.patch_node_metadata(
                         node_id,
                         metadata_signature=sig,

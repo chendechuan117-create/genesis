@@ -69,6 +69,12 @@ def create_agent(
     except Exception as e:
         logger.error(f"V4 tool group [node_tools] failed: {e}")
 
+    try:
+        from genesis.tools.dispatch_tool import DispatchTool
+        tools.register(DispatchTool())
+    except Exception as e:
+        logger.error(f"V4 tool group [dispatch_tool] failed: {e}")
+
     # 核心改动：把带有 Failover 能力的 Router 直接传给 Agent
     agent = GenesisV4(tools=tools, provider=provider_router)
     logger.info(f"✓ Genesis V4 ready ({len(tools)} tools, Failover Enabled)")

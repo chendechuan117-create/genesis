@@ -62,7 +62,11 @@ class UnifiedResponse(BaseModel):
     # 错误信息
     error_type: Optional[str] = Field(default=None, description="错误类型")
     error_detail: Optional[str] = Field(default=None, description="错误详情")
-    
+
+    # 经历轨迹：G/Op/C 三阶段完整对话序列，供复盘使用
+    phase_trace: Optional[Dict[str, Any]] = Field(default=None, description="G/Op/C 阶段对话轨迹")
+    knowledge_state: Optional[Dict[str, Any]] = Field(default=None, description="当前工作记忆")
+     
     @classmethod
     def from_op_result(
         cls,
@@ -72,7 +76,9 @@ class UnifiedResponse(BaseModel):
         op_result: Optional[Any] = None,
         degraded: bool = False,
         partial_reason: Optional[str] = None,
-        error_info: Optional[Dict[str, str]] = None
+        error_info: Optional[Dict[str, str]] = None,
+        phase_trace: Optional[Dict[str, Any]] = None,
+        knowledge_state: Optional[Dict[str, Any]] = None,
     ) -> "UnifiedResponse":
         """
         从内部执行结果构建统一响应
@@ -116,8 +122,10 @@ class UnifiedResponse(BaseModel):
             op_tokens=metrics.op_tokens,
             c_tokens=metrics.c_tokens,
             error_type=error_info.get("type") if error_info else None,
-            error_detail=error_info.get("detail") if error_info else None
-        )
+            error_detail=error_info.get("detail") if error_info else None,
+            phase_trace=phase_trace,
+            knowledge_state=knowledge_state,
+         )
     
     @classmethod
     def from_error(cls, error_message: str, trace_id: str = "") -> "UnifiedResponse":
