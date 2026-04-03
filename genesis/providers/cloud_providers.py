@@ -8,8 +8,19 @@ def _build_aixj(config) -> NativeHTTPProvider:
     return NativeHTTPProvider(
         api_key=api_key,
         base_url="https://aixj.vip/v1",
-        default_model="gpt-5.4",
+        default_model="gpt-4.1",
         provider_name="aixj",
+        skip_content_type=True
+    )
+
+def _build_codex(config) -> NativeHTTPProvider:
+    api_key = getattr(config, 'codex_api_key', None)
+    if not api_key: return None
+    return NativeHTTPProvider(
+        api_key=api_key,
+        base_url="https://aixj.vip/v1",
+        default_model="gpt-4.1",
+        provider_name="codex",
         skip_content_type=True
     )
 
@@ -117,6 +128,7 @@ def _build_zen(config) -> NativeHTTPProvider:
 
 # Register all standard cloud providers
 provider_registry.register("aixj", _build_aixj)
+provider_registry.register("codex", _build_codex)
 provider_registry.register("deepseek", _build_deepseek)
 provider_registry.register("gemini", _build_gemini)
 provider_registry.register("openai", _build_openai)
@@ -138,7 +150,7 @@ def _build_aixj_responses(config) -> AIXJResponsesProvider:
     return AIXJResponsesProvider(
         api_key=api_key,
         base_url="https://api.aixj.cn/v1",
-        default_model="gpt-5.4",
+        default_model="gpt-4.1",
         provider_name="aixj_responses",
         skip_content_type=True
     )

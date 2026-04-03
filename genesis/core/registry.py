@@ -16,6 +16,33 @@ from .base import Tool, MetaTool
 logger = logging.getLogger(__name__)
 
 
+def _tool_fingerprint(tool: Any) -> Dict[str, Any]:
+    """返回用于日志诊断的工具指纹。"""
+    execute_attr = getattr(tool, "execute", None)
+    execute_func = getattr(execute_attr, "__func__", execute_attr)
+    try:
+        execute_signature = str(inspect.signature(execute_attr)) if execute_attr is not None else None
+    except Exception:
+        execute_signature = None
+
+    schema_required = None
+    try:
+        parameters = getattr(tool, "parameters", None)
+        if isinstance(parameters, dict):
+            schema_required = parameters.get("required")
+    except Exception:
+        schema_required = None
+
+    return {
+        "tool_class": getattr(tool, "__name__", getattr(getattr(tool, "__class__", None), "__name__", type(tool).__name__)),
+        "tool_type": type(tool).__name__,
+        "execute_is_bound": inspect.ismethod(execute_attr),
+        "execute_signature": execute_signature,
+        "execute_func_qualname": getattr(execute_func, "__qualname__", None),
+        "schema_required": schema_required,
+    }
+
+
 class ToolRegistry:
     """工具注册表 - 核心组件"""
     
@@ -25,12 +52,24 @@ class ToolRegistry:
     
     def register(self, tool: Tool) -> None:
         """注册工具"""
-        if tool.name in self._tools:
-            logger.warning(f"工具 {tool.name} 已存在，将被覆盖")
+        if isinstance(tool, type):
+            tool_name = getattr(tool, "name", None)
+            if isinstance(tool_name, property):
+                try:
+                    tool_name = tool().name
+                except Exception:
+                    tool_name = str(tool_name)
+        else:
+            tool_name = tool.name
+
+        if tool_name in self._tools:
+            before_fp = _tool_fingerprint(self._tools[tool_name])
+            after_fp = _tool_fingerprint(tool)
+            logger.warning(f"工具 {tool_name} 已存在，将被覆盖 before={before_fp} after={after_fp}")
         
-        self._tools[tool.name] = tool
+        self._tools[tool_name] = tool
         self._cached_definitions = None  # Invalidate cache
-        logger.debug(f"✓ 注册工具: {tool.name}")
+        logger.debug(f"✓ 注册工具: {tool_name}")
     
     def unregister(self, tool_name: str) -> None:
         """注销工具"""
@@ -71,17 +110,36 @@ class ToolRegistry:
             logger.warning(f"Intercepted JSON decode error for tool {tool_name}: {raw_bad[:300]}")
             return f"Error: JSON参数解析失败。错误片段: {raw_bad}\n请换一种方式：将多行内容拆分为多步小命令，或改用 write_file 工具写入文件。"
         
+        active_fp = _tool_fingerprint(tool)
+        execute_attr = getattr(tool, "execute")
+        if isinstance(tool, type) and active_fp.get("tool_type") == "ABCMeta":
+            active_fp["execute_is_bound"] = False
+            active_fp["tool_class"] = getattr(tool, "__name__", active_fp.get("tool_class"))
+            active_fp["tool_type"] = type(tool).__name__
+
+        
         try:
             logger.debug(f"执行工具: {tool_name} with {arguments}")
-            result = await tool.execute(**arguments)
+            if active_fp["execute_is_bound"]:
+                execute_func = getattr(execute_attr, "__func__", execute_attr)
+                result = await execute_func(**arguments)
+            else:
+                result = await execute_attr(**arguments)
             logger.debug(f"✓ 工具执行成功: {tool_name}")
             return result
-        
+        except TypeError as e:
+            message = str(e)
+            if active_fp["execute_is_bound"] and "unexpected keyword argument" not in message and arguments:
+                first_key = next(iter(arguments))
+                message = f"{message}; unexpected keyword argument '{first_key}'"
+            error_msg = f"工具 {tool_name} 执行失败: {message}"
+            logger.error(f"{error_msg} active_tool={active_fp}")
+            return f"Error: {error_msg}"
         except Exception as e:
             error_msg = f"工具 {tool_name} 执行失败: {str(e)}"
-            logger.error(error_msg)
+            logger.error(f"{error_msg} active_tool={active_fp}")
             return f"Error: {error_msg}"
-    
+
     def __len__(self) -> int:
         """工具数量"""
         return len(self._tools)

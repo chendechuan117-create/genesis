@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 PROVIDER_KEY_MAP = {
     "aixj": "aixj_api_key",
     "aixj_responses": "aixj_api_key",
+    "codex": "codex_api_key",
     "deepseek": "deepseek_api_key",
     "gemini": "gemini_api_key",
     "openai": "openai_api_key",
@@ -99,9 +100,9 @@ class ProviderRouter(LLMProvider):
         # 设置 GENESIS_DEEPSEEK_FAILOVER=1 可手动启用
         import os
         if os.environ.get('GENESIS_DEEPSEEK_FAILOVER') == '1':
-            self.failover_order = ['aixj', 'deepseek', 'gemini']
+            self.failover_order = ['aixj', 'codex', 'deepseek', 'gemini']
         else:
-            self.failover_order = ['aixj', 'gemini']
+            self.failover_order = ['aixj', 'codex', 'gemini']
         
         self.active_provider_name = 'aixj'
         for name in self.failover_order:

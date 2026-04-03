@@ -61,7 +61,7 @@ class AsyncLimiter:
     
     def _get_monotonic_time(self) -> float:
         """获取单调时钟时间，避免系统时间变化影响"""
-        return asyncio.get_event_loop().time()
+        return time.monotonic()
     
     async def _add_tokens(self) -> None:
         """根据时间流逝添加令牌"""
@@ -182,11 +182,11 @@ class RateLimiterOnly:
         self.max_rate = max_rate
         self._rate_per_token = 1.0 / max_rate
         self._tokens = 0.0
-        self._last_update = asyncio.get_event_loop().time()
+        self._last_update = time.monotonic()
         self._lock = asyncio.Lock()
     
     def _get_monotonic_time(self) -> float:
-        return asyncio.get_event_loop().time()
+        return time.monotonic()
     
     async def _add_tokens(self) -> None:
         now = self._get_monotonic_time()

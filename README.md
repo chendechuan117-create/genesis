@@ -154,15 +154,65 @@ python -m genesis.v4.background_daemon
 systemctl --user start genesis-v4.service
 ```
 
+## 🏗️ 阶级跃迁 — Class Leap Refactoring
+
+Genesis V4 经历了一轮系统性架构重构（"阶级跃迁"），将多个 God Class 拆解为职责单一的模块：
+
+### 跃迁路线图
+
+| 阶段 | 改动 | 效果 |
+|------|------|------|
+| **第一跃** | `manager.py` 2770L → 拆出 `prompt_factory.py`、`signature_constants.py` | 降至 1683L，提示词/常量不再耦合主循环 |
+| **第二跃** | 拆出 `pipeline_config.py`（frozen dataclass） | 魔数集中管理，运行时不可变 |
+| **第三跃** | 拆出 `diagnostics.py`（DiagnosticSignal + 断路器） | 信号体系独立，支持自动降级 |
+| **第四跃** | 碎片治理：`is_project_debris()` 门卫 + `use_scratch=true` 默认翻转 | 写入默认进 scratch，读取/列目录自动标注碎片 |
+
+### 工程防线
+
+```
+写入端: WriteFile/AppendFile 默认 use_scratch=true → 临时产物自动进 runtime/scratch
+读取端: ReadFile 输出 ⚠️ [debris:xxx] 标注 → LLM 不会把碎片当源码
+目录端: ListDirectory 自动过滤 6 个碎片根 → 搜索不受干扰
+Shell端: ShellTool cwd 在碎片区时输出警告 → 提醒操作者
+```
+
+### 测试覆盖
+
+- **51 个单元测试**：覆盖 DiagnosticSignal、SignatureEngine、PipelineConfig、DispatchTool 合约
+- **Auto 产出遥测**：每轮自动记录 G→Op→C pipeline trace（5000+ 事件/轮），作为端到端集成验证
+- **断路器机制**：诊断信号超阈值自动触发降级，带冷却和自动恢复
+
 ## 项目结构
 
 ```
 genesis/
-├── core/           # 基础设施：provider, registry, config
-├── v4/             # V4 引擎：loop, manager, blackboard, daemon
-├── tools/          # 工具集：node_tools, file_tools, web_tool, url_tool
-├── providers/      # LLM provider 注册
-└── mcp_server.py   # MCP 服务端
+├── core/               # 基础设施
+│   ├── artifacts.py    #   产物管理 + 碎片门卫（is_project_debris）
+│   ├── provider.py     #   LLM Provider 抽象
+│   ├── registry.py     #   工具注册表
+│   └── config.py       #   全局配置
+├── v4/                 # V4 引擎
+│   ├── loop.py         #   主循环（G → Op → C pipeline）
+│   ├── manager.py      #   NodeVault 知识库管理
+│   ├── blackboard.py   #   Multi-G 黑板竞争机制
+│   ├── diagnostics.py  #   DiagnosticSignal + 断路器
+│   ├── signature_engine.py  # 元信息签名推断/归一化
+│   ├── signature_constants.py  # 签名维度常量/别名
+│   ├── pipeline_config.py   # 不可变 pipeline 参数
+│   ├── prompt_factory.py    # 提示词工厂
+│   ├── lens_phase.py   #   Multi-G 透镜阶段
+│   └── background_daemon.py # 后台守护进程
+├── tools/              # 工具集
+│   ├── node_tools.py   #   知识库 CRUD（9 个工具）
+│   ├── file_tools.py   #   文件读写（带碎片标注）
+│   ├── shell_tool.py   #   Shell 执行（带碎片警告）
+│   └── dispatch_tool.py #  G → Op 任务分派
+├── providers/          # LLM provider 注册
+├── skills/             # 扩展技能
+└── mcp_server.py       # MCP 服务端（Windsurf/Cascade 用）
+
+tests/                  # 单元测试 + 回归测试
+scripts/                # 运维脚本（doctor.sh、autopilot 等）
 ```
 
 ## 许可证

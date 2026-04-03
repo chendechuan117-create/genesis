@@ -4,21 +4,43 @@ Genesis V4 核心执行引擎 (State Machine)
 """
 
 import json
+import os
 import re
 import time
 import asyncio
 import logging
 import traceback
+import hashlib
 from typing import List, Dict, Any, Tuple, Optional
 
 from genesis.core.base import Message, MessageRole, LLMProvider, PerformanceMetrics, ToolCall
 from genesis.core.registry import ToolRegistry
 from genesis.core.tracer import Tracer
-from genesis.core.models import DispatchPayload, OpResult
+from genesis.core.models import DispatchPayload, OpResult, KnowledgeState
 from genesis.v4.manager import FactoryManager, NodeVault, NodeManagementTools, TRUST_TIER_RANK, TOOL_EXEC_MIN_TIER, PERSONA_ACTIVATION_MAP
 from genesis.v4.blackboard import Blackboard
+from genesis.v4.diagnostics import PipelineDiagnostics
+from genesis.v4.lens_phase import LensPhaseMixin
+from genesis.v4.pipeline_config import PIPELINE_CONFIG
 
 logger = logging.getLogger(__name__)
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(f"Invalid {name}={raw!r}; fallback to {default}")
+        return default
+    return max(minimum, value)
 
 # Op 禁用工具名（G 和 C 可用，但 Op 不能调用）
 OP_BLOCKED_TOOLS = frozenset([
@@ -27,38 +49,11 @@ OP_BLOCKED_TOOLS = frozenset([
     "record_tool_node"
 ])
 
-# ── dispatch_to_op 工具 Schema ──────────────────────────────────
-# 这是一个虚拟工具：LLM 看到它的 Schema 并通过 function calling 调用它，
-# 但 loop 层拦截该调用并路由到 Op-Process，而非走普通 tool.execute 路径。
-# 这从协议层（而非字符串层）消除了 "dispatch 意图" 与 "最终回复" 的歧义。
-DISPATCH_TOOL_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "dispatch_to_op",
-        "description": "派发任务给执行器 Op-Process。当你完成思考和信息收集，需要 Op 去执行具体操作（如读写文件、运行命令、网络请求等）时，调用此工具。调用后系统会挂起你的运行，将参数交给 Op 执行，执行完毕后结果会作为此工具的返回值回传给你。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "op_intent": {
-                    "type": "string",
-                    "description": "对 Op 目标的一句话明确指令"
-                },
-                "active_nodes": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "需要挂载给 Op 参考的节点 ID 列表（如 CTX_XXX, LESSON_XXX）。没有则传空数组 []"
-                },
-                "instructions": {
-                    "type": "string",
-                    "description": "给 Op 的详细执行步骤和上下文信息"
-                }
-            },
-            "required": ["op_intent", "instructions"]
-        }
-    }
-}
+# ── dispatch_to_op ──────────────────────────────────
+# 现在由 genesis.tools.dispatch_tool.DispatchTool 注册在 ToolRegistry 中。
+# V4Loop 在工具调度前拦截该调用并路由到 Op-Process。
 
-class V4Loop:
+class V4Loop(LensPhaseMixin):
     """
     V4 核心管线
     
@@ -68,9 +63,9 @@ class V4Loop:
     3. C_PHASE (反思): (Post-loop) 仅允许节点管理工具，沉淀知识。
     """
 
-    OP_MAX_ITERATIONS = 12  # Op 单次派发上限：短 Op + 多次 dispatch，G 保持控制权
-    C_PHASE_MAX_ITER = {"FULL": 30, "LIGHT": 5, "SKIP": 0}
-    TOOL_EXEC_TIMEOUT = 120  # 工具执行超时（秒），防止挂起的 HTTP/命令阻塞整个管线
+    OP_MAX_ITERATIONS = PIPELINE_CONFIG.op_max_iterations
+    C_PHASE_MAX_ITER = PIPELINE_CONFIG.c_phase_max_iter
+    TOOL_EXEC_TIMEOUT = PIPELINE_CONFIG.tool_exec_timeout
 
     def __init__(
         self,
@@ -95,16 +90,18 @@ class V4Loop:
         self.g_messages: List[Message] = []
         self.op_messages: List[Message] = []
         self.execution_messages: List[Message] = []
+        self.c_messages: List[Message] = []  # C-Phase 对话轨迹，每轮覆写
         self.execution_reports: List[Dict[str, Any]] = []
         self.inferred_signature: Dict[str, Any] = {}
         self.blackboard: Optional[Blackboard] = None  # Multi-G 黑板
+        self._llm_call_seq = 0
         
         # 启动时恢复 persona 学习数据（只在首次 V4Loop 实例化时加载一次）
         Blackboard.load_from_db()
 
     # ── Token 效率退化诊断：类级滑动窗口 ──
     _token_history: List[int] = []  # 最近 N 次请求的总 token 数
-    _TOKEN_WINDOW = 10
+    _TOKEN_WINDOW = PIPELINE_CONFIG.token_window_size
 
     @classmethod
     def _record_token_usage(cls, total_tokens: int):
@@ -127,11 +124,12 @@ class V4Loop:
             "min_tokens": min(cls._token_history),
         }
 
-    async def run(self, user_input: str, step_callback: Any = None, image_paths: Optional[List[str]] = None) -> Tuple[str, PerformanceMetrics]:
+    async def run(self, user_input: str, step_callback: Any = None, image_paths: Optional[List[str]] = None, loop_config: Optional[Dict[str, Any]] = None, initial_knowledge_state: Optional[Dict[str, Any]] = None) -> Tuple[str, PerformanceMetrics]:
         """执行主管线 G -> Op -> G -> C (Subroutine Mode)"""
         self.metrics.start_time = time.time()
         self.user_input = user_input
         self.image_paths = image_paths or []
+        self.loop_config = dict(loop_config or {})
         self.g_messages = []
         self.op_messages = []
         self.execution_messages = []
@@ -148,15 +146,28 @@ class V4Loop:
             _sig_input = user_input.split("[GENESIS_USER_REQUEST_START]", 1)[1]
         self.inferred_signature = self.vault.infer_metadata_signature(_sig_input)
         self.blackboard = None  # 每次请求重置
+        self._llm_call_seq = 0
+        self.knowledge_state = self._normalize_knowledge_state(initial_knowledge_state)
+        seed_lines = [line.strip() for line in _sig_input.splitlines() if line.strip()]
+        if not self.knowledge_state.get("issue") and seed_lines:
+            self.knowledge_state["issue"] = self._truncate_knowledge_state_text(seed_lines[0], 240)
         
         # === Multi-G 透镜预激活 ===
-        if self._should_activate_multi_g(user_input):
+        disable_multi_g = self.loop_config.get("disable_multi_g")
+        if disable_multi_g is None:
+            disable_multi_g = _env_bool("GENESIS_DISABLE_MULTI_G", False)
+        if disable_multi_g:
+            reason = "runtime_disabled" if "disable_multi_g" in self.loop_config else "env_disabled"
+            await self._safe_callback(step_callback, "lens_skipped", {"phase": "LENS_PHASE", "reason": reason})
+        elif self._should_activate_multi_g(user_input):
             try:
                 self.blackboard = await self._run_lens_phase(user_input, step_callback)
                 logger.info(f"Multi-G lens phase completed: {self.blackboard.entry_count} entries, {len(self.blackboard.search_voids)} voids")
             except Exception as e:
                 logger.error(f"Multi-G lens phase failed (falling back to single-G): {e}", exc_info=True)
                 self.blackboard = None
+        else:
+            await self._safe_callback(step_callback, "lens_skipped", {"phase": "LENS_PHASE", "reason": "gate_closed"})
         
         # === Tracing ===
         self.tracer = Tracer.get_instance()
@@ -173,8 +184,8 @@ class V4Loop:
             
         except Exception as e:
             logger.error(f"Pipeline execution error: {traceback.format_exc()}")
-            final_response = f"系统执行异常: {str(e)}"
             self.metrics.success = False
+            raise
             
         # 兜底防护：确保 final_response 永不为空
         if not final_response or not str(final_response).strip():
@@ -245,6 +256,10 @@ class V4Loop:
         # Token 效率退化：记录本次并获取滑动窗口
         self._record_token_usage(self.metrics.total_tokens or 0)
         token_efficiency = self.get_token_efficiency_stats()
+        if token_efficiency and token_efficiency["avg_tokens_per_request"] > 0:
+            PipelineDiagnostics.token_efficiency_degradation.record(
+                (self.metrics.total_tokens or 0) > token_efficiency["avg_tokens_per_request"] * 2
+            )
         # 知识库熵增：低 confidence 节点占比
         kb_entropy = self.vault.get_kb_entropy()
         # 缓存命中率
@@ -255,6 +270,7 @@ class V4Loop:
                 "cache_hit_tokens": self.metrics.prompt_cache_hit_tokens,
                 "cache_hit_rate": round(self.metrics.prompt_cache_hit_tokens / self.metrics.input_tokens, 3),
             }
+        diagnostics_summary = PipelineDiagnostics.summary()
         self.vault.heartbeat("main_loop", "idle",
             f"done G={self.metrics.g_tokens}t Op={self.metrics.op_tokens}t cache={cache_stats['cache_hit_rate']*100:.1f}%" if cache_stats else f"done G={self.metrics.g_tokens}t Op={self.metrics.op_tokens}t",
             extra={
@@ -265,8 +281,11 @@ class V4Loop:
                 "token_efficiency": token_efficiency,
                 "kb_entropy": kb_entropy,
                 "cache_stats": cache_stats,
+                "diagnostics": diagnostics_summary,
             }
         )
+        if diagnostics_summary["firing_count"] > 0:
+            logger.warning(f"🚨 Pipeline diagnostics: {diagnostics_summary['firing_count']}/{diagnostics_summary['total_signals']} signals firing")
         
         # === End Trace ===
         self.tracer.end_trace(
@@ -290,6 +309,122 @@ class V4Loop:
         except Exception as e:
             logger.error(f"C-Process background task failed: {e}", exc_info=True)
 
+    def get_phase_trace(self) -> Dict[str, Any]:
+        """序列化 G/Op/C 三阶段完整对话轨迹，供经历复盘使用。
+        跳过 system prompt（每轮相同且冗长）；保留 assistant 推理和 tool 结果。
+        """
+        def _ser(messages: List[Message], phase: str) -> List[Dict]:
+            out = []
+            for m in messages:
+                if m.role == MessageRole.SYSTEM:
+                    continue
+                entry: Dict[str, Any] = {"role": str(m.role), "phase": phase}
+                if m.role == MessageRole.TOOL:
+                    entry["tool_name"] = m.name or "?"
+                    entry["result"] = (m.content or "")[:600]
+                else:
+                    if m.content:
+                        entry["content"] = m.content[:1500]
+                    if m.tool_calls:
+                        entry["tool_calls"] = [
+                            {
+                                "name": (tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", "?")) or "?",
+                                "args": str(
+                                    tc.get("arguments", "") if isinstance(tc, dict) else getattr(tc, "arguments", "")
+                                )[:400],
+                            }
+                            for tc in (m.tool_calls or [])
+                        ]
+                out.append(entry)
+            return out
+
+        return {
+            "g": _ser(self.g_messages, "G"),
+            "op": _ser(self.op_messages, "Op"),
+            "c": _ser(self.c_messages, "C"),
+            "c_phase_mode": getattr(self, "_last_c_phase_mode", None),
+            "inferred_signature": self.inferred_signature,
+            "knowledge_state": self.get_knowledge_state(),
+        }
+
+    def get_knowledge_state(self) -> Dict[str, Any]:
+        return self._normalize_knowledge_state(getattr(self, "knowledge_state", {}))
+
+    @staticmethod
+    def _truncate_knowledge_state_text(text: Any, limit: int = 220) -> str:
+        compact = " ".join(str(text or "").split())
+        if len(compact) <= limit:
+            return compact
+        return compact[: limit - 3].rstrip() + "..."
+
+    def _normalize_knowledge_state(self, knowledge_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        raw = knowledge_state if isinstance(knowledge_state, dict) else {}
+        normalized = KnowledgeState(
+            issue=self._truncate_knowledge_state_text(raw.get("issue", ""), 240),
+            verified_facts=[],
+            failed_attempts=[],
+            next_checks=[],
+        ).model_dump()
+        for key in ["verified_facts", "failed_attempts", "next_checks"]:
+            values = raw.get(key) or []
+            if isinstance(values, str):
+                values = [values]
+            cleaned_values = []
+            for value in values:
+                cleaned = self._truncate_knowledge_state_text(value, 220)
+                if not cleaned or cleaned.upper() == "NONE" or cleaned in cleaned_values:
+                    continue
+                cleaned_values.append(cleaned)
+                if len(cleaned_values) >= 5:
+                    break
+            normalized[key] = cleaned_values
+        return normalized
+
+    def _merge_knowledge_state(self, base_state: Optional[Dict[str, Any]], update_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        base = self._normalize_knowledge_state(base_state)
+        update = self._normalize_knowledge_state(update_state)
+        if update.get("issue"):
+            base["issue"] = update["issue"]
+        for key in ["verified_facts", "failed_attempts", "next_checks"]:
+            merged = []
+            for item in (update.get(key) or []) + (base.get(key) or []):
+                if item and item not in merged:
+                    merged.append(item)
+                if len(merged) >= 5:
+                    break
+            base[key] = merged
+        return base
+
+    def _finalize_dispatch_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        state_update = payload.get("knowledge_state") if isinstance(payload.get("knowledge_state"), dict) else {}
+        if not state_update.get("issue"):
+            state_update = {**state_update, "issue": payload.get("op_intent") or self.knowledge_state.get("issue", "")}
+        dispatch = DispatchPayload(
+            op_intent=payload.get("op_intent", "未定义目标"),
+            active_nodes=payload.get("active_nodes") or [],
+            instructions=payload.get("instructions", ""),
+            knowledge_state=self._merge_knowledge_state(self.knowledge_state, state_update),
+        ).model_dump()
+        self.knowledge_state = self._merge_knowledge_state(self.knowledge_state, dispatch.get("knowledge_state"))
+        return dispatch
+
+    def _update_knowledge_state_from_op_result(self, op_result: Dict[str, Any]):
+        if not isinstance(op_result, dict):
+            return
+        next_checks = op_result.get("next_checks") or []
+        if not next_checks and (op_result.get("status") or "").upper() in {"PARTIAL", "FAILED"}:
+            next_checks = op_result.get("open_questions") or []
+        issue = self.knowledge_state.get("issue", "") or op_result.get("summary", "")
+        self.knowledge_state = self._merge_knowledge_state(
+            self.knowledge_state,
+            {
+                "issue": issue,
+                "verified_facts": op_result.get("verified_facts") or [],
+                "failed_attempts": op_result.get("failed_attempts") or [],
+                "next_checks": next_checks,
+            },
+        )
+
     async def _run_main_loop(self, user_input: str, step_callback: Any) -> str:
         """运行 G-Process 主循环，按需挂起调用 Op"""
         logger.info(">>> Entering Phase 1: G-Process (Thinker)")
@@ -303,7 +438,8 @@ class V4Loop:
             available_tools_info=self._build_op_tools_info(),
             knowledge_digest=self.vault.get_digest(),
             inferred_signature=self.vault.render_metadata_signature(self.inferred_signature),
-            daemon_status=self.vault.get_daemon_status_summary()
+            daemon_status=self.vault.get_daemon_status_summary(),
+            knowledge_state=self.factory.render_knowledge_state(self.knowledge_state)
         )
         
         # Build User Content (Multimodal if images exist)
@@ -365,8 +501,12 @@ class V4Loop:
         
         search_tools = [self.tools.get("search_knowledge_nodes")]
         search_tools = [t for t in search_tools if t]
-        schema = [t.to_schema() for t in search_tools] + [DISPATCH_TOOL_SCHEMA]
+        dispatch_tool = self.tools.get("dispatch_to_op")
+        g_tools = search_tools + ([dispatch_tool] if dispatch_tool else [])
+        schema = [t.to_schema() for t in g_tools]
         
+        _g_consecutive_errors = 0
+        _G_MAX_CONSECUTIVE_ERRORS = 3
         for i in range(self.max_iterations):
             # === 跨进程向量同步：拉取 Scavenger/Fermentor 新增的节点向量 ===
             self.vault.sync_vector_matrix_incremental()
@@ -377,13 +517,32 @@ class V4Loop:
             # Jailbreak 位置：在消息末尾注入钢印提醒（不污染 g_messages 本身）
             jailbreak = {"role": "system", "content": "[Reminder] 你有 Op 和知识库。能动手就动手，能查就查，别空谈。"}
             messages_to_send = [m.to_dict() for m in self.g_messages] + [jailbreak]
-            response = await self.provider.chat(
-                messages=messages_to_send,
-                tools=schema,
-                stream=True,
-                stream_callback=lambda ev, data: self._stream_proxy(step_callback, ev, data),
-                _trace_id=self.trace_id, _trace_phase="G", _trace_parent=self._g_span
-            )
+            llm_call_started = time.time()
+            llm_call_id = await self._emit_llm_call_start(step_callback, "G_PHASE", i, stream=True)
+            try:
+                response = await self.provider.chat(
+                    messages=messages_to_send,
+                    tools=schema,
+                    stream=True,
+                    stream_callback=lambda ev, data: self._stream_proxy(step_callback, ev, data, phase="G_PHASE", llm_call_id=llm_call_id),
+                    _trace_id=self.trace_id, _trace_phase="G", _trace_parent=self._g_span
+                )
+                await self._emit_llm_call_end(step_callback, "G_PHASE", llm_call_id, i, llm_call_started, stream=True, response=response)
+                _g_consecutive_errors = 0  # 成功则重置计数器
+            except Exception as provider_err:
+                await self._emit_llm_call_end(step_callback, "G_PHASE", llm_call_id, i, llm_call_started, stream=True, error=provider_err)
+                _g_consecutive_errors += 1
+                PipelineDiagnostics.provider_consecutive_failure.record(True)
+                logger.warning(f"G-Process LLM call failed (iter {i}, consecutive={_g_consecutive_errors}): {provider_err}")
+                if _g_consecutive_errors >= _G_MAX_CONSECUTIVE_ERRORS:
+                    logger.error(f"G-Process circuit breaker: {_g_consecutive_errors} consecutive failures, aborting loop.")
+                    raise RuntimeError(f"LLM provider 连续 {_g_consecutive_errors} 次失败，API 可能已下线: {provider_err}") from provider_err
+                await asyncio.sleep(5)
+                self.g_messages.append(Message(
+                    role=MessageRole.SYSTEM,
+                    content=f"[系统提示] 上次 LLM 调用因网络错误失败（{provider_err}），已自动重试。请继续未完成的任务。"
+                ))
+                continue
             
             self._update_metrics(response)
             
@@ -405,7 +564,7 @@ class V4Loop:
                 
                 # ── 先处理普通工具（search 等）──
                 for tc in regular_calls:
-                    await self._safe_callback(step_callback, "tool_start", {"name": tc.name, "args": tc.arguments})
+                    await self._safe_callback(step_callback, "tool_start", {"phase": "G_PHASE", "name": tc.name, "args": tc.arguments, "iteration": i})
                     self._tool_call_count += 1
                     t0 = time.time()
                     
@@ -429,7 +588,8 @@ class V4Loop:
                         except asyncio.TimeoutError:
                             res = f"Error: 搜索超时（{self.TOOL_EXEC_TIMEOUT}秒），请缩小搜索范围后重试。"
                             logger.warning(f"G tool timeout: {tc.name} exceeded {self.TOOL_EXEC_TIMEOUT}s")
-                        await self._safe_callback(step_callback, "search_result", {"name": tc.name, "result": res})
+                        await self._safe_callback(step_callback, "search_result", {"phase": "G_PHASE", "name": tc.name, "result": res, "iteration": i})
+                        PipelineDiagnostics.search_zero_hit.record("未命中" in str(res) or "0 results" in str(res).lower())
                     else:
                         res = f"G-Process has no permission to run tool {tc.name}"
                     
@@ -461,6 +621,7 @@ class V4Loop:
                         continue
                     
                     payload = self._strip_dispatch_review_override(payload)
+                    payload = self._finalize_dispatch_payload(payload)
                     self._merge_signature_from_texts(payload.get("op_intent", ""), payload.get("instructions", ""))
                     self._merge_signature_from_nodes(payload.get("active_nodes", []))
                     logger.info("G-Process dispatched via tool call. Invoking Op-Process...")
@@ -474,10 +635,10 @@ class V4Loop:
                             g_active_nodes=dispatched_nodes,
                             event="dispatch"
                         )
-                        await self._safe_callback(step_callback, "lens_adoption", adoption)
+                        await self._safe_callback(step_callback, "lens_adoption", {**adoption, "phase": "G_PHASE"})
                     
                     rendered = self.factory.render_dispatch_for_human(payload)
-                    await self._safe_callback(step_callback, "blueprint", rendered)
+                    await self._safe_callback(step_callback, "blueprint", {"phase": "G_PHASE", "content": rendered, "op_intent": payload.get("op_intent", ""), "active_nodes": dispatched_nodes})
                     
                     # 阻塞调用 Op-Process（_run_op_phase 内部已 append execution_reports）
                     op_result = await self._run_op_phase(payload, step_callback)
@@ -510,13 +671,14 @@ class V4Loop:
                     continue
 
                 payload = self._strip_dispatch_review_override(payload)
+                payload = self._finalize_dispatch_payload(payload)
                 self._merge_signature_from_texts(payload.get("op_intent", ""), payload.get("instructions", ""))
                 self._merge_signature_from_nodes(payload.get("active_nodes", []))
                 logger.info("G-Process created Task Payload (fallback). Invoking Op-Process Subroutine...")
                 dispatched_nodes = [n for n in payload.get("active_nodes", []) if n and not n.startswith("MEM_CONV")]
                 self.execution_active_nodes.extend(dispatched_nodes)
                 rendered = self.factory.render_dispatch_for_human(payload)
-                await self._safe_callback(step_callback, "blueprint", rendered)
+                await self._safe_callback(step_callback, "blueprint", {"phase": "G_PHASE", "content": rendered, "op_intent": payload.get("op_intent", ""), "active_nodes": dispatched_nodes})
                 
                 op_result = await self._run_op_phase(payload, step_callback)
                 op_result_text = self.factory.render_op_result_for_g(op_result)
@@ -800,19 +962,32 @@ class V4Loop:
         block = match.group(1).strip() if match else content.strip()
 
         status = "UNKNOWN"
+        verified_facts: List[str] = []
+        failed_attempts: List[str] = []
         changes_made: List[str] = []
         artifacts: List[str] = []
+        next_checks: List[str] = []
         open_questions: List[str] = []
 
         current_key = None
         summary_lines: List[str] = []
         findings_lines: List[str] = []
         section_map = {
+            "VERIFIED_FACTS:": "verified_facts",
+            "FAILED_ATTEMPTS:": "failed_attempts",
             "CHANGES_MADE:": "changes_made",
             "ARTIFACTS:": "artifacts",
+            "NEXT_CHECKS:": "next_checks",
             "OPEN_QUESTIONS:": "open_questions"
         }
-        list_buckets = {"changes_made": changes_made, "artifacts": artifacts, "open_questions": open_questions}
+        list_buckets = {
+            "verified_facts": verified_facts,
+            "failed_attempts": failed_attempts,
+            "changes_made": changes_made,
+            "artifacts": artifacts,
+            "next_checks": next_checks,
+            "open_questions": open_questions,
+        }
 
         for raw_line in block.splitlines():
             line = raw_line.strip()
@@ -847,7 +1022,7 @@ class V4Loop:
         summary = "\n".join(summary_lines).strip()
         findings = "\n".join(findings_lines).strip()
 
-        has_structured_signal = match is not None or any(marker in block for marker in ["STATUS:", "SUMMARY:", "FINDINGS:", "CHANGES_MADE:", "ARTIFACTS:", "OPEN_QUESTIONS:"])
+        has_structured_signal = match is not None or any(marker in block for marker in ["STATUS:", "SUMMARY:", "FINDINGS:", "VERIFIED_FACTS:", "FAILED_ATTEMPTS:", "CHANGES_MADE:", "ARTIFACTS:", "NEXT_CHECKS:", "OPEN_QUESTIONS:"])
         if not has_structured_signal:
             fallback_summary = block[:300] + ("..." if len(block) > 300 else "")
             status = "PARTIAL"
@@ -858,7 +1033,9 @@ class V4Loop:
 
         result = OpResult(
             status=status, summary=summary, findings=findings,
+            verified_facts=verified_facts, failed_attempts=failed_attempts,
             changes_made=changes_made, artifacts=artifacts,
+            next_checks=next_checks,
             open_questions=open_questions, raw_output=content.strip()
         )
         return result.model_dump()
@@ -894,7 +1071,6 @@ class V4Loop:
                     logger.warning(f"无法从 TOOL 节点提取工具名称: {node_id}")
         return loaded_tools
 
-
     def _get_op_tools(self) -> List[Any]:
         op_tools = []
         for name in self.tools.list_tools():
@@ -915,7 +1091,6 @@ class V4Loop:
         if not self.execution_reports:
             return "SKIP"
 
-        # 信号质量评估
         high_value = False
         if len(self.execution_reports) > 1:
             high_value = True
@@ -932,22 +1107,16 @@ class V4Loop:
         if tool_steps >= 4:
             high_value = True
 
-        # 上游信号补充（避免 C-Phase 信号盲区 FRAGILITY_acc4）
-        # Multi-G 搜索空洞多 = 知识库有明显缺口，值得 C 记录 LESSON/VOID
         if self.blackboard and len(self.blackboard.search_voids) >= 2:
             high_value = True
-        # 多节点 dispatch = 复杂任务，反思价值更高
         if len(self.execution_active_nodes) >= 3:
             high_value = True
-        # 签名维度多 = 专业领域，C 的精准签名写入更关键
         if len(self.inferred_signature) >= 4:
             high_value = True
 
         if not high_value:
             return "SKIP"
 
-        # LIGHT vs FULL 梯度：信号量少的 high_value 任务用 LIGHT，避免白烧 30 轮
-        # FULL 条件：多报告 / 失败 / 大量变更 / 知识空洞 / 复杂签名
         full_signals = 0
         if len(self.execution_reports) > 1:
             full_signals += 1
@@ -1005,12 +1174,10 @@ class V4Loop:
         if not result:
             return False
         r = result.strip()
-        # 通用失败信号
         if r.startswith("Error:") or r.startswith("Error "):
             return False
         if "[TIMEOUT]" in r:
             return False
-        # shell 工具：解析退出码
         if tool_name == "shell":
             m = re.search(r"退出码:\s*(\d+)", r)
             if m and int(m.group(1)) != 0:
@@ -1055,12 +1222,15 @@ class V4Loop:
 
         schema = [t.to_schema() for t in all_tools]
         
-        for i in range(self.OP_MAX_ITERATIONS):
+        _op_consecutive_errors = 0
+        _OP_MAX_CONSECUTIVE_ERRORS = 3
+        op_max_iterations = _env_int("GENESIS_OP_MAX_ITERATIONS_OVERRIDE", self.OP_MAX_ITERATIONS, minimum=1)
+        for i in range(op_max_iterations):
             # ⚠️ Op 内部不蒸发：Op 的 ReAct 循环需要完整记忆自己做过什么。
             # 蒸发只发生在 G（跨 dispatch）和 Lens（跨搜索轮次）中。
             
             # ── 优雅终止：倒数第 2 轮提醒 Op 收尾 ──
-            if i == self.OP_MAX_ITERATIONS - 2:
+            if i == op_max_iterations - 2:
                 self.op_messages.append(Message(
                     role=MessageRole.SYSTEM,
                     content=(
@@ -1071,13 +1241,32 @@ class V4Loop:
                 ))
             
             self._llm_call_count += 1
-            response = await self.provider.chat(
-                messages=[m.to_dict() for m in self.op_messages],
-                tools=schema,
-                stream=True,
-                stream_callback=lambda ev, data: self._stream_proxy(step_callback, ev, data),
-                _trace_id=self.trace_id, _trace_phase="Op", _trace_parent=op_span
-            )
+            llm_call_started = time.time()
+            llm_call_id = await self._emit_llm_call_start(step_callback, "OP_PHASE", i, stream=True)
+            try:
+                response = await self.provider.chat(
+                    messages=[m.to_dict() for m in self.op_messages],
+                    tools=schema,
+                    stream=True,
+                    stream_callback=lambda ev, data: self._stream_proxy(step_callback, ev, data, phase="OP_PHASE", llm_call_id=llm_call_id),
+                    _trace_id=self.trace_id, _trace_phase="Op", _trace_parent=op_span
+                )
+                await self._emit_llm_call_end(step_callback, "OP_PHASE", llm_call_id, i, llm_call_started, stream=True, response=response)
+                _op_consecutive_errors = 0  # 成功则重置计数器
+            except Exception as provider_err:
+                await self._emit_llm_call_end(step_callback, "OP_PHASE", llm_call_id, i, llm_call_started, stream=True, error=provider_err)
+                _op_consecutive_errors += 1
+                PipelineDiagnostics.provider_consecutive_failure.record(True)
+                logger.warning(f"Op-Process LLM call failed (iter {i}, consecutive={_op_consecutive_errors}): {provider_err}")
+                if _op_consecutive_errors >= _OP_MAX_CONSECUTIVE_ERRORS:
+                    logger.error(f"Op-Process circuit breaker: {_op_consecutive_errors} consecutive failures, aborting.")
+                    raise RuntimeError(f"LLM provider 连续 {_op_consecutive_errors} 次失败，API 可能已下线: {provider_err}") from provider_err
+                await asyncio.sleep(5)
+                self.op_messages.append(Message(
+                    role=MessageRole.SYSTEM,
+                    content=f"[系统提示] 上次 LLM 调用因网络错误失败（{provider_err}），已自动重试。请继续未完成的工具调用序列。"
+                ))
+                continue
             
             self._update_metrics(response, phase="Op")
             
@@ -1089,7 +1278,7 @@ class V4Loop:
             
             if response.tool_calls:
                 for tc in response.tool_calls:
-                    await self._safe_callback(step_callback, "tool_start", {"name": tc.name, "args": tc.arguments})
+                    await self._safe_callback(step_callback, "tool_start", {"phase": "OP_PHASE", "name": tc.name, "args": tc.arguments, "iteration": i})
                     self._tool_call_count += 1
                     t0 = time.time()
                     
@@ -1104,13 +1293,14 @@ class V4Loop:
                         except asyncio.TimeoutError:
                             res = f"Error: 工具 {tc.name} 执行超时（{self.TOOL_EXEC_TIMEOUT}秒），已强制终止。"
                             logger.warning(f"Op tool timeout: {tc.name} exceeded {self.TOOL_EXEC_TIMEOUT}s")
+                            PipelineDiagnostics.op_timeout.record(True)
                     
                     self.tracer.log_tool_call(
                         self.trace_id, parent=op_span, phase="Op",
                         tool_name=tc.name, tool_args=tc.arguments,
                         tool_result=str(res), duration_ms=(time.time() - t0) * 1000
                     )
-                    await self._safe_callback(step_callback, "tool_result", {"name": tc.name, "result": res})
+                    await self._safe_callback(step_callback, "tool_result", {"phase": "OP_PHASE", "name": tc.name, "result": res, "iteration": i})
                     
                     self.metrics.tools_used.append(tc.name)
                     # 环境信号采集：记录工具调用的客观成功/失败
@@ -1137,6 +1327,7 @@ class V4Loop:
 
             self.execution_messages.extend(self.op_messages)
             op_result = self._parse_op_result(response.content)
+            self._update_knowledge_state_from_op_result(op_result)
             self.execution_reports.append(op_result)
             self._merge_signature_from_texts(
                 op_result.get("summary", ""),
@@ -1170,13 +1361,17 @@ class V4Loop:
                 break
         timeout_result = {
             "status": "PARTIAL",
-            "summary": f"Op 达到迭代上限（{self.OP_MAX_ITERATIONS}轮），已执行 {len(partial_work)} 步。",
+            "summary": f"Op 达到迭代上限（{op_max_iterations}轮），已执行 {len(partial_work)} 步。",
             "findings": last_assistant or "Op 未输出阶段性结论",
+            "verified_facts": [],
+            "failed_attempts": [],
             "changes_made": [],
             "artifacts": [],
+            "next_checks": ["让 G 基于已完成步骤和外部观测决定是否需要重新派发。"],
             "open_questions": [f"Op 在 {len(partial_work)} 步后被截断，G 应根据已完成步骤判断是否需要继续派发。"],
             "raw_output": f"已完成步骤：\n{partial_summary}"
         }
+        self._update_knowledge_state_from_op_result(timeout_result)
         self.execution_reports.append(timeout_result)
         self._merge_signature_from_texts(timeout_result.get("summary", ""), "\n".join(timeout_result.get("open_questions", []) or []))
         self.tracer.end_span(op_span, status="timeout")
@@ -1189,7 +1384,9 @@ class V4Loop:
 
     async def _run_c_phase(self, step_callback: Any, mode: str = "FULL", g_final_response: str = ""):
         """运行 C-Process 反思循环，基于 Op 的执行轨迹。mode: FULL/LIGHT"""
+        self._last_c_phase_mode = mode  # 供 get_phase_trace() 读取
         max_iter = self.C_PHASE_MAX_ITER.get(mode, 30)
+        self._c_consecutive_errors = 0  # 每次 C-Phase 开始时重置，防止跨请求累积
         logger.info(f">>> Entering Phase 3: C-Process (Reflector) mode={mode}, max_iter={max_iter}")
         
         # 跨进程向量同步：拉取 Daemon/Scavenger 在 G/Op 期间新增的节点向量，
@@ -1247,6 +1444,17 @@ class V4Loop:
         if g_final_response and str(g_final_response).strip():
             g_analysis_block = f"\n[G 综合判断]\n{g_final_response}\n"
 
+        # 自改进任务：Doctor 沙箱运行结果即为有效 Op 实证
+        self_improvement_block = """
+[自改进任务规则 — 覆盖默认 NO_ACTION 启发式]
+本轮 Op 属于 Genesis 自改进内省任务（Doctor 沙箱诊断/修复）。
+- shell 命令结果（diff 输出、测试通过/失败、py_compile 结果）= 有效 Op 实证
+- G 的架构分析和系统诊断 = “结构性发现”，无需 search_knowledge_nodes 才能提炼
+- 不适用“Op 只读了几个文件 → NO_ACTION”规则
+- 诊断结论、架构缺陷 → CONTEXT 节点（target_kind: genesis_internals）
+- 修复方案、因果规律 → 原子 LESSON 节点
+"""
+
         # Multi-G 信息空洞：已记录到 void_tasks 队列，C 只需专注提炼 LESSON
         void_block = ""
         if self.blackboard:
@@ -1279,7 +1487,7 @@ G 通过边"连根拔起"整个知识邻域，所以边比节点更重要。
    + 边 REQUIRES → CTX "v2ray routing 靠 inbound tag 精确匹配"
 ✅ 一个洞察拆 2-3 个原子 LESSON + CTX，每对之间建一条边
 
-[判断：写还是不写]
+{self_improvement_block}[判断：写还是不写]
 不写日记，不记流水账。先判断这轮有没有长期价值。
 Op 只读了几个文件且 G 无结构性发现 → NO_ACTION。
 G 的综合判断含可复用认知（架构缺陷、因果关系、设计模式）→ 即使 Op 只读也提炼。
@@ -1301,6 +1509,14 @@ REQUIRES: A 成立的前提是 B
 RESOLVES: A 解决了 B 描述的问题
 RELATED_TO: A 和 B 在同一领域下互补
 TRIGGERS: A 出现时应检查 B
+
+[负向确认 — 防返鬼]
+如果这轮 G 调查了某个信号，最终结论是"这是历史遗留/已修复/不复现"，你必须写一个 LESSON 记录这个结论：
+- title: "信号 [XXX] 已确认为历史问题，无需再次调查"
+- because_reason: 调查过程和结论证据
+- metadata_signature 中加 resolution_status: "historical"
+这条 LESSON 的作用是：下一个 session 的 G 搜到它时，直接跳过该信号，不重复调查。
+不写这条 LESSON = 下轮 G 会从零重来，浪费整轮 token。
 
 [认知策略]
 用户嫌保守/激进/浅 → 写原子 LESSON，签名含 cognitive_approach + domain。
@@ -1352,14 +1568,43 @@ validation_status 只有明确证实时才填 validated。
                 if not tool_calls:
                     break
                     
+                c_tool_fail_fingerprints = getattr(self, "_c_tool_fail_fingerprints", {})
                 for tc in tool_calls:
                     if tc.name not in c_tool_names:
                         res = f"Error: C-Process 禁止使用工具 {tc.name}"
-                    else:
-                        prepared_args = self._prepare_c_tool_args(tc.name, tc.arguments)
-                        res = await self.tools.execute(tc.name, prepared_args)
-                        await self._safe_callback(step_callback, "tool_result", {"name": f"C-Process::{tc.name}", "result": res})
-                    
+                        c_messages.append(Message(role=MessageRole.TOOL, content=res, tool_call_id=tc.id, name=tc.name))
+                        continue
+
+                    prepared_args = self._prepare_c_tool_args(tc.name, tc.arguments)
+                    try:
+                        arg_repr = json.dumps(prepared_args, ensure_ascii=False, sort_keys=True, default=str)
+                    except Exception:
+                        arg_repr = repr(prepared_args)
+
+                    # 去重：防止 C 反复调同一个失败工具（死循环）
+                    cached_error = None
+                    for known_fp, meta in c_tool_fail_fingerprints.items():
+                        if meta.get("tool") == tc.name and meta.get("args_repr") == arg_repr:
+                            cached_error = meta.get("error")
+                            meta["count"] += 1
+                            logger.warning(f"[C_TOOL_REPLAY] suppressed duplicate failed tool={tc.name} count={meta['count']}")
+                            break
+
+                    if cached_error is not None:
+                        res = cached_error
+                        c_messages.append(Message(role=MessageRole.TOOL, content=res, tool_call_id=tc.id, name=tc.name))
+                        continue
+
+                    res = await self.tools.execute(tc.name, prepared_args)
+                    await self._safe_callback(step_callback, "tool_result", {"name": f"C-Process::{tc.name}", "result": res})
+
+                    if isinstance(res, str) and res.startswith("Error:"):
+                        fp_src = f"{tc.name}|{arg_repr}|{res}"
+                        fp = hashlib.sha1(fp_src.encode("utf-8", errors="replace")).hexdigest()[:12]
+                        c_tool_fail_fingerprints[fp] = {"count": 1, "tool": tc.name, "args_repr": arg_repr, "error": res}
+                        self._c_tool_fail_fingerprints = c_tool_fail_fingerprints
+                        logger.warning(f"[C_TOOL_REPLAY] first failure recorded tool={tc.name} fp={fp}")
+
                     c_messages.append(Message(role=MessageRole.TOOL, content=res, tool_call_id=tc.id, name=tc.name))
             except Exception as e:
                 logger.error(f"Reflection step failed (continuing): {e}")
@@ -1370,557 +1615,17 @@ validation_status 只有明确证实时才填 validated。
                 self._c_consecutive_errors = _c_consecutive_errors
                 continue
         
-        logger.info(f"C-Process finished. c_tokens={self.metrics.c_tokens}, total={self.metrics.total_tokens}")
+        self.c_messages = list(c_messages)  # 落盘 C-Phase 对话轨迹
+        c_node_created = any(
+            m.role == MessageRole.TOOL and m.name in ("record_context_node", "record_lesson_node", "create_meta_node")
+            and not str(m.content).startswith("Error")
+            for m in c_messages
+        )
+        PipelineDiagnostics.c_phase_zero_output.record(not c_node_created)
+        logger.info(f"C-Process finished. c_tokens={self.metrics.c_tokens}, total={self.metrics.total_tokens}, nodes_created={c_node_created}")
         await self._safe_callback(step_callback, "c_phase_done", {"mode": mode, "c_tokens": self.metrics.c_tokens})
 
-    # ─── Multi-G 采纳率追踪 ─────────────────────────────────────────────
-
-    def _check_lens_adoption(
-        self,
-        g_text: str,
-        g_active_nodes: List[str] = None,
-        event: str = "dispatch"
-    ) -> Dict[str, Any]:
-        """检测 G 是否采纳了 Multi-G 透镜的建议。零额外 LLM 调用。
-        
-        两层检测：
-        1. 节点采纳：G 的 active_nodes ∩ 透镜 evidence_node_ids
-        2. 语义采纳：向量引擎算 G 输出文本 vs 透镜 framework 的余弦相似度
-        
-        返回 {"adopted": [...], "ignored": [...], "adoption_rate": float}
-        """
-        if not self.blackboard or not self.blackboard.entries:
-            return {"adopted": [], "ignored": [], "adoption_rate": 0.0, "event": event}
-        
-        g_nodes = set(g_active_nodes or [])
-        adopted = []
-        ignored = []
-        
-        for entry in self.blackboard.entries:
-            persona = entry.persona
-            framework = entry.framework or ""
-            signals = []
-            
-            # 层1：节点重合
-            if hasattr(entry, "evidence_node_ids") and entry.evidence_node_ids:
-                overlap = g_nodes & set(entry.evidence_node_ids)
-                if overlap:
-                    signals.append(f"node_overlap={list(overlap)}")
-            
-            # 层2：语义相似度（用已有的向量引擎，不额外调 LLM）
-            if g_text and framework and len(framework) > 10:
-                try:
-                    from genesis.v4.vector_engine import VectorEngine
-                    ve = VectorEngine.get_instance()
-                    if ve.is_ready:
-                        g_vec = ve.encode(g_text[:300])
-                        f_vec = ve.encode(framework[:300])
-                        import numpy as np
-                        sim = float(np.dot(g_vec, f_vec) / (np.linalg.norm(g_vec) * np.linalg.norm(f_vec) + 1e-9))
-                        if sim > 0.65:
-                            signals.append(f"semantic_sim={sim:.3f}")
-                except Exception:
-                    pass  # 向量引擎不可用时跳过
-            
-            if signals:
-                adopted.append({"persona": persona, "signals": signals, "framework": framework[:80]})
-            else:
-                ignored.append({"persona": persona, "framework": framework[:80]})
-        
-        total = len(self.blackboard.entries)
-        rate = len(adopted) / total if total > 0 else 0.0
-        
-        report = {
-            "event": event,
-            "adopted": adopted,
-            "ignored": ignored,
-            "adoption_rate": rate,
-            "adopted_count": len(adopted),
-            "total_lenses": total,
-        }
-        
-        logger.info(
-            f"[Multi-G 采纳率] event={event} | {len(adopted)}/{total} adopted ({rate:.0%}) | "
-            f"adopted={[a['persona'] for a in adopted]} | "
-            f"ignored={[i['persona'] for i in ignored]}"
-        )
-        
-        # 记录到 persona 采纳统计
-        for a in adopted:
-            Blackboard.record_persona_adoption(a["persona"], adopted=True)
-        for i in ignored:
-            Blackboard.record_persona_adoption(i["persona"], adopted=False)
-        
-        return report
-
-    # ─── Multi-G 透镜编排 ──────────────────────────────────────────────
-
-    def _auto_record_voids(self, blackboard: Blackboard):
-        """
-        基础设施层自动记录搜索空洞到 void_tasks 任务队列。
-        
-        VOID 不再写入 knowledge_nodes（避免污染搜索空间），
-        而是写入独立的 void_tasks 表，作为待处理的知识缺口任务。
-        """
-        all_voids = list(blackboard.search_voids)
-        for entry in blackboard.entries:
-            if hasattr(entry, 'suggested_search_directions'):
-                for d in (entry.suggested_search_directions or []):
-                    all_voids.append({
-                        "persona": entry.persona,
-                        "query": d,
-                        "source": "hypothesis_suggestion"
-                    })
-        
-        if not all_voids:
-            return
-        
-        # 去重：按 query 文本粗去重
-        seen_queries = set()
-        unique_voids = []
-        for v in all_voids:
-            q = v.get("query", "").strip()
-            if not q or len(q) < 5:
-                continue
-            q_key = q[:80].lower()
-            if q_key not in seen_queries:
-                seen_queries.add(q_key)
-                unique_voids.append(v)
-        
-        if not unique_voids:
-            return
-        
-        import hashlib
-        recorded = 0
-        for v in unique_voids[:10]:
-            query = v["query"]
-            persona = v.get("persona", "unknown")
-            q_hash = hashlib.md5(query.encode()).hexdigest()[:8].upper()
-            void_id = f"VOID_{q_hash}"
-            
-            if self.vault.void_exists(void_id):
-                continue
-            
-            added = self.vault.add_void_task(
-                void_id=void_id,
-                query=query,
-                source=v.get("source", "search_miss"),
-                persona=persona,
-                task_signature=self.inferred_signature
-            )
-            if added:
-                recorded += 1
-        
-        if recorded:
-            logger.info(f"Multi-G: recorded {recorded}/{len(unique_voids)} voids to void_tasks")
-
-    # 需要 Multi-G 的复杂 task_kind 集合
-    MULTI_G_TASK_KINDS = frozenset(["debug", "refactor", "build", "optimize", "design", "test", "deploy", "configure"])
-    LENS_MAX_ITERATIONS = 2   # 每个透镜子程序最多 2 轮搜索（+ 1 次强制输出）
-    LENS_TIMEOUT_SECS = 60    # 单个透镜超时
-
-    def _should_activate_multi_g(self, user_input: str) -> bool:
-        """判断是否应启用 Multi-G 透镜阶段
-        
-        策略：默认开启，仅在以下情况跳过：
-        - 用户 /quick 强制跳过
-        - 输入太短（闲聊/打招呼，< 10 个有效字符）
-        """
-        # 提取实际用户请求（跳过频道历史噪音）—— 必须先做，否则 /deep /quick 被频道历史淹没
-        actual_input = user_input
-        if "[GENESIS_USER_REQUEST_START]" in user_input:
-            actual_input = user_input.split("[GENESIS_USER_REQUEST_START]", 1)[1]
-        actual_input = actual_input.strip()
-        
-        # 用户强制开关（在提取后的实际请求中检查）
-        if "/quick" in actual_input[:20]:
-            logger.info("Multi-G skipped by /quick prefix")
-            return False
-        if "/deep" in actual_input[:20]:
-            logger.info("Multi-G activated by /deep prefix (force 7 lenses)")
-            return True
-        
-        # 太短的输入不值得激活透镜
-        if len(actual_input) < 10:
-            logger.info(f"Multi-G skipped: input too short ({len(actual_input)} chars)")
-            return False
-        
-        logger.info(f"Multi-G activated (default-on, input={len(actual_input)} chars)")
-        return True
-
-    # 从 PERSONA_ACTIVATION_MAP 的 3 个基础人格扩展到 5/7 时的补充池
-    # 按认知维度互补排列，确保新增人格带来差异化视角
-    PERSONA_EXTENSION_POOL = ["ISTP", "ENTJ", "ISFJ", "ENFP", "ESTJ", "INFJ", "ISTJ", "INTP", "INTJ"]
-
-    # 全 16 型 MBTI 池（供动态淘汰/递补选择）
-    ALL_PERSONAS = [
-        "ISTJ", "ISFJ", "INFJ", "INTJ", "ISTP", "ISFP", "INFP", "INTP",
-        "ESTP", "ESFP", "ENFP", "ENTP", "ESTJ", "ESFJ", "ENFJ", "ENTJ",
-    ]
-
-    def _select_personas(self, target_count: int = 3) -> List[str]:
-        """根据签名映射选择激活的人格透镜，支持自适应数量 + 动态淘汰/递补"""
-        raw_tk = self.inferred_signature.get("task_kind") or ""
-        task_kind = (raw_tk[0] if isinstance(raw_tk, list) and raw_tk else str(raw_tk)).lower()
-        base = list(PERSONA_ACTIVATION_MAP.get(task_kind, PERSONA_ACTIVATION_MAP["_default"]))
-        # 动态淘汰/递补：基于 task_kind 历史胜率替换表现差的 persona
-        base = Blackboard.suggest_persona_swap(base, task_kind, self.ALL_PERSONAS)
-        if target_count <= len(base):
-            return base[:target_count]
-        # 从扩展池中补充，跳过已在 base 中的人格
-        for p in self.PERSONA_EXTENSION_POOL:
-            if len(base) >= target_count:
-                break
-            if p not in base:
-                base.append(p)
-        return base
-
-    async def _probe_knowledge_density(self, user_input: str) -> int:
-        """G 的'第一搜'：快速探测知识库对当前任务的覆盖密度，返回命中节点数"""
-        try:
-            # 清理前缀
-            text = user_input
-            for prefix in ["/deep ", "/quick "]:
-                if text.startswith(prefix):
-                    text = text[len(prefix):]
-            # 提取关键词（中文+英文 token，取前 5 个有意义的）
-            tokens = re.findall(r'[\w\u4e00-\u9fff]{2,}', text)
-            keywords = tokens[:5] if tokens else []
-            if not keywords:
-                return 0
-            query_str = " ".join(keywords)
-            # 向量搜索
-            hits = 0
-            if self.vault.vector_engine.is_ready:
-                results = self.vault.vector_engine.search(query_str, top_k=10, threshold=0.55)
-                hits = len(results)
-            logger.info(f"Multi-G probe: query='{query_str}' → {hits} vector hits")
-            return hits
-        except Exception as e:
-            logger.warning(f"Multi-G probe failed: {e}")
-            return 0
-
-
-    async def _build_g_interpretation(self, clean_input: str, knowledge_digest: str, shared_knowledge: str) -> str:
-        """G 先对用户问题产出自己的理解，发布到黑板供透镜补充。
-        
-        不是旧版的搜索方向预嚼——是 G 作为主脑说出自己对问题的理解，
-        透镜再从各自的认知角度补充、挑战、扩展。
-        """
-        digest_hint = f"\n知识库概况：\n{knowledge_digest[:400]}\n" if knowledge_digest else ""
-        knowledge_hint = f"\n预搜到的相关信息：\n{shared_knowledge[:800]}\n" if shared_knowledge else ""
-        
-        prompt = f"""你是 Genesis 主脑（G-Process）。在透镜团队分析之前，先简明说出你对用户问题的理解。
-
-用户原话：{clean_input}
-{digest_hint}{knowledge_hint}
-用 3-5 句话回答：
-1. 用户真正想知道/想做什么？（底层意图）
-2. 你目前的初步判断是什么？
-3. 你觉得哪些方面需要更多视角？
-
-直接输出，不要格式化。"""
-        
-        try:
-            resp = await asyncio.wait_for(
-                self.provider.chat(
-                    messages=[{"role": "user", "content": prompt}],
-                    timeout=15
-                ),
-                timeout=15
-            )
-            interpretation = (resp.content or "").strip()
-            if interpretation:
-                logger.info(f"G interpretation: {interpretation[:120]}...")
-                return interpretation
-        except Exception as e:
-            logger.warning(f"G interpretation generation failed: {e}")
-        
-        return ""
-
-    async def _run_lens_phase(self, user_input: str, step_callback: Any) -> Blackboard:
-        """
-        运行 Multi-G 透镜阶段（v2 架构：G 先说理解 → 透镜补充建议）：
-        1. 探针搜索 → 根据命中密度自适应选择透镜数量
-        2. 预搜一次 → 拉取相关节点内容 → 构建共享知识包
-        3. G 先产出自己的理解（发布到黑板）
-        4. 并行 spawn 透镜，基于 G 的理解 + 共享知识，输出补充建议
-        
-        核心：G 说理解，透镜说补充。
-        """
-        blackboard = Blackboard()
-        
-        # ── 提取干净的用户请求 ──
-        _actual = user_input
-        if "[GENESIS_USER_REQUEST_START]" in user_input:
-            _actual = user_input.split("[GENESIS_USER_REQUEST_START]", 1)[1]
-        force_deep = "/deep" in _actual.strip()[:20]
-        probe_hits = 0
-        if not force_deep:
-            probe_hits = await self._probe_knowledge_density(user_input)
-            if probe_hits <= 2:
-                target_count = 3
-            elif probe_hits <= 6:
-                target_count = 5
-            else:
-                target_count = 7
-            logger.info(f"Multi-G probe: {probe_hits} hits → {target_count} lenses")
-        else:
-            target_count = 7
-            logger.info(f"Multi-G /deep: forcing {target_count} lenses")
-        
-        personas = self._select_personas(target_count)
-        
-        logger.info(f">>> Multi-G Lens Phase: spawning {len(personas)} lenses: {personas}")
-        
-        clean_input = _actual.strip()
-        for prefix in ["/deep ", "/quick "]:
-            if clean_input.startswith(prefix):
-                clean_input = clean_input[len(prefix):]
-        clean_input = clean_input.strip()
-        
-        # ── 预搜共享知识：一次搜索，所有透镜共享 ──
-        shared_knowledge = await self._prefetch_shared_knowledge(clean_input)
-        knowledge_digest = self.vault.get_digest()
-        conversation_digest = self.vault.get_conversation_digest(limit=10)
-        signature_text = self.vault.render_metadata_signature(self.inferred_signature)
-        
-        # ── G 先说自己的理解 ──
-        g_interpretation = await self._build_g_interpretation(clean_input, knowledge_digest, shared_knowledge)
-        
-        await self._safe_callback(step_callback, "lens_start", {
-            "personas": personas, "probe_hits": probe_hits,
-            "g_interpretation": g_interpretation[:200] if g_interpretation else "",
-        })
-        
-        # ── 并行运行所有透镜（限流：最多 2 并发，防止打爆 API 并发限制）──
-        sem = asyncio.Semaphore(2)
-        async def _throttled_lens(p):
-            async with sem:
-                return await self._run_single_lens(
-                    persona=p,
-                    user_question=clean_input,
-                    blackboard=blackboard,
-                    shared_knowledge=shared_knowledge,
-                    g_interpretation=g_interpretation,
-                    knowledge_digest=knowledge_digest,
-                    conversation_digest=conversation_digest,
-                    signature_text=signature_text,
-                    step_callback=step_callback
-                )
-        tasks = [_throttled_lens(p) for p in personas]
-        
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for persona, result in zip(personas, results):
-            if isinstance(result, Exception):
-                logger.error(f"Lens-{persona} failed: {result}")
-        
-        await self._safe_callback(step_callback, "lens_done", {
-            "entries": blackboard.entry_count,
-            "voids": len(blackboard.search_voids)
-        })
-        
-        return blackboard
-
-    async def _prefetch_shared_knowledge(self, clean_input: str) -> str:
-        """预搜一次 NodeVault，拉取相关节点的元数据和内容，构建共享知识包。"""
-        # 搜索元数据
-        search_args = {"keywords": [clean_input[:80]]}
-        if self.inferred_signature:
-            search_args["signature"] = self.inferred_signature
-        
-        try:
-            search_result = await asyncio.wait_for(
-                self.tools.execute("search_knowledge_nodes", search_args),
-                timeout=self.TOOL_EXEC_TIMEOUT
-            )
-        except Exception as e:
-            logger.warning(f"Multi-G prefetch search failed: {e}")
-            return ""
-        
-        if not search_result or "未找到" in str(search_result) or "未命中" in str(search_result):
-            return ""
-        
-        # 从搜索结果中提取节点 ID（匹配 [NODE_ID] 模式）
-        import re
-        node_ids = re.findall(r'\[([A-Z_]+_[^\]]+)\]', str(search_result))
-        # 去重，保留顺序，取前 5 个
-        seen = set()
-        unique_ids = []
-        for nid in node_ids:
-            if nid not in seen and not nid.startswith("MEM_CONV"):
-                seen.add(nid)
-                unique_ids.append(nid)
-                if len(unique_ids) >= 5:
-                    break
-        
-        # 拉取节点完整内容
-        contents = self.vault.get_multiple_contents(unique_ids) if unique_ids else {}
-        
-        # 组装共享知识包
-        lines = [str(search_result)[:2000]]  # 搜索结果摘要（截断）
-        if contents:
-            lines.append("\n--- 相关节点详细内容 ---")
-            for nid in unique_ids:
-                content = contents.get(nid, "")
-                if content:
-                    lines.append(f"\n[{nid}] 内容：\n{content[:500]}")
-        
-        knowledge = "\n".join(lines)
-        logger.info(f"Multi-G prefetch: {len(unique_ids)} nodes, {len(knowledge)} chars shared knowledge")
-        return knowledge
-
-    async def _run_single_lens(
-        self,
-        persona: str,
-        user_question: str,
-        blackboard: Blackboard,
-        shared_knowledge: str,
-        g_interpretation: str,
-        knowledge_digest: str,
-        conversation_digest: str,
-        signature_text: str,
-        step_callback: Any
-    ):
-        """运行单个透镜：基于 G 的理解 + 共享知识，输出补充建议。"""
-        lens_prompt = self.factory.build_lens_prompt(
-            persona=persona,
-            user_question=user_question,
-            shared_knowledge=shared_knowledge,
-            g_interpretation=g_interpretation,
-            blackboard_state=blackboard.render_for_g() if blackboard.entry_count > 0 else "",
-            knowledge_digest=knowledge_digest,
-            inferred_signature=signature_text,
-            conversation_digest=conversation_digest
-        )
-        
-        messages = [
-            Message(role=MessageRole.SYSTEM, content=lens_prompt),
-            Message(role=MessageRole.USER, content="从你的认知视角分析这个问题。直接输出 JSON。")
-        ]
-        
-        try:
-            response = await asyncio.wait_for(
-                self.provider.chat(
-                    messages=[m.to_dict() for m in messages],
-                    tools=[],  # 不提供任何工具：透镜只思考
-                    stream=False
-                ),
-                timeout=self.LENS_TIMEOUT_SECS
-            )
-        except asyncio.TimeoutError:
-            logger.warning(f"Lens-{persona} timeout")
-            return
-        except Exception as e:
-            logger.error(f"Lens-{persona} LLM call failed: {e}")
-            return
-        
-        self._update_metrics(response, phase="G")
-        
-        if response.content:
-            self._parse_lens_output(persona, response.content, blackboard)
-            await self._safe_callback(step_callback, "lens_analysis", {
-                "persona": persona,
-                "content_preview": response.content[:150]
-            })
-        
-        logger.info(f"Lens-{persona} finished")
-
-    def _parse_lens_output(self, persona: str, content: str, blackboard: Blackboard):
-        """解析透镜 LLM 输出的 JSON 三元组，写入黑板"""
-        # 尝试从文本中提取 JSON
-        text = content.strip()
-        
-        # 剥离可能的 markdown 代码块包裹
-        if text.startswith("```"):
-            lines = text.split("\n")
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            text = "\n".join(lines).strip()
-        
-        # 防御性清洗：provider 层已做一级 DSML 剥离，此处为二级兜底
-        if "DSML" in text or "tool_call" in text.lower():
-            text = re.sub(r'<[｜|](?:DSML|tool_call|function_call)[｜|][^>]*>', '', text, flags=re.IGNORECASE)
-            text = re.sub(r'</[｜|](?:DSML|tool_call|function_call)[｜|][^>]*>', '', text, flags=re.IGNORECASE)
-            text = re.sub(r'[｜|](?:DSML|tool_call|function_call)[｜|]', '', text, flags=re.IGNORECASE)
-            text = text.strip()
-            if not text:
-                logger.warning(f"Lens-{persona}: control markers stripped, no content remaining")
-                text = ""
-        
-        # 多层 JSON 解析容错
-        parsed = None
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            # 尝试找到第一个 { 和最后一个 }
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end > start:
-                try:
-                    parsed = json.loads(text[start:end + 1])
-                except json.JSONDecodeError:
-                    pass
-        
-        if not parsed or not isinstance(parsed, dict):
-            logger.warning(f"Lens-{persona} output not valid JSON, treating as hypothesis: {text[:100]}")
-            # 回退：把整个输出当做一个假设
-            blackboard.add_hypothesis(
-                persona=persona,
-                framework=text[:200] if text else "无法解析的输出",
-                reasoning_chain=text,
-                suggested_search_directions=[]
-            )
-            return
-        
-        entry_type = parsed.get("type", "hypothesis")
-        
-        if entry_type == "analysis":
-            # v2 透镜输出：丰富的分析型条目，映射到 evidence/hypothesis
-            interpretation = parsed.get("interpretation", "")
-            key_insight = parsed.get("key_insight", "")
-            solution = parsed.get("solution_approach", "")
-            risk = parsed.get("risk_or_blind_spot", "")
-            node_ids = parsed.get("evidence_node_ids", [])
-            
-            # framework 承载解读 + 洞察
-            rich_framework = interpretation
-            if key_insight:
-                rich_framework += f" | 洞察: {key_insight}"
-            
-            if node_ids:
-                # 有证据支撑 → evidence 条目
-                rich_action = solution
-                if risk:
-                    rich_action += f" [风险: {risk}]"
-                blackboard.add_evidence(
-                    persona=persona,
-                    framework=rich_framework,
-                    evidence_node_ids=node_ids,
-                    verification_action=rich_action
-                )
-            else:
-                # 纯推理 → hypothesis 条目
-                blackboard.add_hypothesis(
-                    persona=persona,
-                    framework=rich_framework,
-                    reasoning_chain=solution,
-                    suggested_search_directions=[risk] if risk else []
-                )
-        elif entry_type == "evidence":
-            blackboard.add_evidence(
-                persona=persona,
-                framework=parsed.get("framework", "未指定框架"),
-                evidence_node_ids=parsed.get("evidence_node_ids", []),
-                verification_action=parsed.get("verification_action", "")
-            )
-        else:
-            blackboard.add_hypothesis(
-                persona=persona,
-                framework=parsed.get("framework", "未指定框架"),
-                reasoning_chain=parsed.get("reasoning_chain", ""),
-                suggested_search_directions=parsed.get("suggested_search_directions", [])
-            )
+    # ─── Lens methods provided by LensPhaseMixin ──────────────────────
 
     # ─── 蒸发机制 ─────────────────────────────────────────────────────
     # 注意：Op 不蒸发（ReAct 循环需要完整记忆），仅 G 蒸发旧 TOOL 消息。
@@ -2001,6 +1706,53 @@ validation_status 只有明确证实时才填 validated。
         except Exception as e:
             logger.error(f"Callback error ({event}): {e}")
 
-    async def _stream_proxy(self, callback, event, data):
+    async def _stream_proxy(self, callback, event, data, phase: Optional[str] = None, llm_call_id: Optional[str] = None):
         """LLM 流式回调代理"""
-        if callback: await self._safe_callback(callback, event, data)
+        if not callback:
+            return
+        payload = dict(data) if isinstance(data, dict) else {"result": str(data)}
+        if phase and not payload.get("phase"):
+            payload["phase"] = phase
+        if llm_call_id:
+            payload["llm_call_id"] = llm_call_id
+        if event in ("content", "reasoning"):
+            payload["chunk_chars"] = len(payload.get("result", "") or "")
+        await self._safe_callback(callback, event, payload)
+
+    async def _emit_llm_call_start(self, step_callback: Any, phase: str, iteration: int, stream: bool, label: Optional[str] = None) -> str:
+        self._llm_call_seq += 1
+        llm_call_id = f"{phase.lower()}_{self._llm_call_seq}"
+        payload = {
+            "phase": phase,
+            "llm_call_id": llm_call_id,
+            "iteration": iteration,
+            "stream": stream,
+        }
+        if label:
+            payload["label"] = label
+        await self._safe_callback(step_callback, "llm_call_start", payload)
+        return llm_call_id
+
+    async def _emit_llm_call_end(self, step_callback: Any, phase: str, llm_call_id: str, iteration: int, started_at: float, stream: bool, response: Any = None, error: Any = None, label: Optional[str] = None):
+        payload = {
+            "phase": phase,
+            "llm_call_id": llm_call_id,
+            "iteration": iteration,
+            "stream": stream,
+            "duration_ms": round((time.time() - started_at) * 1000, 1),
+        }
+        if label:
+            payload["label"] = label
+        if response is not None:
+            payload.update({
+                "finish_reason": getattr(response, "finish_reason", None),
+                "tool_call_count": len(getattr(response, "tool_calls", []) or []),
+                "content_chars": len(getattr(response, "content", "") or ""),
+                "reasoning_chars": len(getattr(response, "reasoning_content", "") or ""),
+                "input_tokens": getattr(response, "input_tokens", 0),
+                "output_tokens": getattr(response, "output_tokens", 0),
+                "total_tokens": getattr(response, "total_tokens", 0),
+            })
+        if error is not None:
+            payload["error"] = str(error)[:300]
+        await self._safe_callback(step_callback, "llm_call_end", payload)

@@ -9,6 +9,7 @@ import logging
 
 from genesis.core.base import Tool
 from genesis.core.sandbox import SandboxManager
+from genesis.core.artifacts import is_project_debris
 
 
 logger = logging.getLogger(__name__)
@@ -149,32 +150,108 @@ class ShellTool(Tool):
 
     def health_check(self) -> str:
         """System health diagnostics"""
-        if not self.job_manager: return "No JobManager"
+        if not self.job_manager:
+            return "No JobManager"
+
         import json
+
+        def _format_health_check_item(value):
+            if value is None:
+                return None
+            if isinstance(value, bytearray):
+                value = bytes(value)
+            if isinstance(value, bytes):
+                return value.decode("utf-8", errors="replace")
+            if isinstance(value, tuple):
+                value = list(value)
+            if isinstance(value, list):
+                return "; ".join(
+                    formatted for item in value
+                    if (formatted := _format_health_check_item(item)) is not None
+                )
+            if isinstance(value, dict):
+                return json.dumps(value, ensure_ascii=False, sort_keys=True)
+            return str(value)
+
         report = self.job_manager.health_check()
         self.job_manager.cleanup_stale()
-        
+
         lines = ["=== Genesis Health Check ==="]
-        lines.append(f"Jobs: {report['jobs_running']} running / {report['jobs_total']} total")
-        
+        if not isinstance(report, dict):
+            lines.append("Report: invalid health report")
+            return "\n".join(lines)
+
+        lines.append(f"Jobs: {report.get('jobs_running', 0)} running / {report.get('jobs_total', 0)} total")
+
+        for key, label in (("status", "Status"), ("overall", "Overall"), ("summary", "Summary")):
+            value = _format_health_check_item(report.get(key))
+            if value:
+                lines.append(f"{label}: {value}")
+
+        for key, label in (("warnings", "Warnings"), ("issues", "Issues")):
+            value = _format_health_check_item(report.get(key))
+            if value:
+                lines.append(f"{label}: {value}")
+
         sys_info = report.get("system", {})
-        if sys_info.get("mem_usage_pct") is not None:
-            lines.append(f"Memory: {sys_info['mem_usage_pct']}% used ({sys_info.get('mem_available_mb', '?')} MB free)")
-        if sys_info.get("disk_usage_pct") is not None:
-            lines.append(f"Disk: {sys_info['disk_usage_pct']}% used ({sys_info.get('disk_free_gb', '?')} GB free)")
-        if sys_info.get("load_1m") is not None:
-            lines.append(f"Load: {sys_info['load_1m']} / {sys_info['load_5m']} / {sys_info['load_15m']}")
-        
+        if isinstance(sys_info, dict):
+            if sys_info.get("mem_usage_pct") is not None:
+                lines.append(
+                    f"Memory: {sys_info['mem_usage_pct']}% used ({sys_info.get('mem_available_mb', '?')} MB free)"
+                )
+            if sys_info.get("disk_usage_pct") is not None:
+                lines.append(
+                    f"Disk: {sys_info['disk_usage_pct']}% used ({sys_info.get('disk_free_gb', '?')} GB free)"
+                )
+            load_values = [sys_info.get("load_1m"), sys_info.get("load_5m"), sys_info.get("load_15m")]
+            load_values = [str(v) for v in load_values if v is not None]
+            if load_values:
+                lines.append(f"Load: {' / '.join(load_values)}")
+        else:
+            rendered = _format_health_check_item(sys_info)
+            if rendered:
+                lines.append(f"System: {rendered}")
+
+        network_probe = report.get("network_probe")
+        if isinstance(network_probe, dict):
+            probe_status = network_probe.get("status")
+            if not probe_status and network_probe.get("ok") is True:
+                probe_status = "ok"
+            elif not probe_status:
+                probe_status = "unknown"
+            lines.append(f"Network probe: {probe_status}")
+            for key, label in (("summary", "Summary"), ("error", "Error"), ("http_status", "HTTP status"), ("url", "URL")):
+                value = _format_health_check_item(network_probe.get(key))
+                if value:
+                    lines.append(f"{label}: {value}")
+        elif network_probe is not None:
+            rendered = _format_health_check_item(network_probe)
+            lines.append(f"Network probe: {rendered or 'unknown'}")
+
         zombie = report.get("zombie_check", {})
-        genesis_procs = zombie.get("genesis_processes", [])
-        lines.append(f"Genesis instances: {len(genesis_procs)}")
-        for p in genesis_procs:
-            lines.append(f"  PID {p['pid']} | CPU {p['cpu']}% | MEM {p['mem']}%")
-        if zombie.get("zombie_count", 0) > 0:
-            lines.append(f"⚠️ Zombie processes: {zombie['zombie_count']}")
-        
+        if isinstance(zombie, dict):
+            genesis_procs = zombie.get("genesis_processes")
+            if not isinstance(genesis_procs, list):
+                genesis_procs = []
+            lines.append(f"Genesis instances: {len(genesis_procs)}")
+            for p in genesis_procs:
+                if isinstance(p, dict):
+                    lines.append(f"  PID {p.get('pid', '?')} | CPU {p.get('cpu', '?')}% | MEM {p.get('mem', '?')}%")
+                else:
+                    rendered = _format_health_check_item(p)
+                    if rendered:
+                        lines.append(f"  {rendered}")
+            zombie_count = zombie.get("zombie_count", 0)
+            if isinstance(zombie_count, int) and zombie_count > 0:
+                lines.append(f"⚠️ Zombie processes: {zombie_count}")
+        else:
+            rendered = _format_health_check_item(zombie)
+            lines.append("Genesis instances: 0")
+            if rendered:
+                lines.append(f"Zombie check: {rendered}")
+
         return "\n".join(lines)
-    
+
     async def execute(self, command: str = None, action: str = "execute", job_id: str = None, cwd: str = None, is_daemon: bool = False) -> str:
         """统一执行入口"""
         
@@ -289,7 +366,10 @@ class ShellTool(Tool):
         # 安全网：限制输出总长度，防止单次工具输出撑爆上下文
         MAX_OUTPUT_CHARS = 30000  # ~7500 tokens，足以容纳绝大多数有意义输出
         
-        result = [f"命令: {command}"]
+        result = []
+        if cwd and is_project_debris(Path(str(cwd))):
+            result.append("⚠️ [debris] 工作目录位于 Genesis 自生成碎片区，输出可能包含非正式源码")
+        result.append(f"命令: {command}")
         if cwd:
             result.append(f"目录: {cwd}")
         result.append(f"退出码: {code}")

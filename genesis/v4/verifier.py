@@ -129,18 +129,22 @@ ID: {node_id}
                     self.vault.promote_node_confidence(node_id, boost=delta)
                 elif delta < 0:
                     self.vault.decay_node_confidence(node_id, penalty=abs(delta))
-                    
-                import json as pyjson
+
                 # 更新签名里的 validation_status
                 row = self.vault._conn.execute("SELECT metadata_signature FROM knowledge_nodes WHERE node_id=?", (node_id,)).fetchone()
                 sig = self.vault.parse_metadata_signature(row[0]) if row and row[0] else {}
                 sig['validation_status'] = v_status
-                
-                self.vault._conn.execute(
-                    "UPDATE knowledge_nodes SET metadata_signature = ?, last_verified_at = CURRENT_TIMESTAMP, verification_source = 'auditor_daemon' WHERE node_id = ?",
-                    (pyjson.dumps(sig, ensure_ascii=False), node_id)
+                if v_status == 'outdated':
+                    sig['invalidation_reason'] = 'audit_outdated'
+                else:
+                    sig.pop('invalidation_reason', None)
+
+                self.vault.patch_node_metadata(
+                    node_id,
+                    metadata_signature=sig,
+                    last_verified_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+                    verification_source='auditor_daemon'
                 )
-                self.vault._conn.commit()
             else:
                 logger.warning(f"    -> 解析验证结果失败: {result_text[:100]}")
                 

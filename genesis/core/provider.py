@@ -246,7 +246,7 @@ class NativeHTTPProvider(BaseLLMProvider):
                 try:
                     err_json = e.response.json()
                     error_msg = err_json.get('error', {}).get('message', error_body)
-                except:
+                except Exception:
                     error_msg = error_body
                 # skip_content_type 偶发 400：服务器代理层解析失败，重试通常能恢复
                 if status == 400 and self.skip_content_type and attempt < retries - 1:
@@ -489,12 +489,12 @@ class NativeHTTPProvider(BaseLLMProvider):
                         try:
                             with open(f"/tmp/genesis_400_{int(time.time())}.json", 'wb') as f:
                                 f.write(body_bytes)
-                        except: pass
+                        except Exception: pass
                     logger.warning(f"400 retry {attempt+1}/{retries} ({len(body_bytes)}B), fresh client")
                     # 销毁旧 client，下次循环 _get_http_client() 会创新的
                     if self._http_client:
                         try: await self._http_client.aclose()
-                        except: pass
+                        except Exception: pass
                         self._http_client = None
                     client = self._get_http_client()
                     await asyncio.sleep(1)
@@ -544,7 +544,7 @@ class NativeHTTPProvider(BaseLLMProvider):
                         name=tc_data["name"],
                         arguments=args
                     ))
-                except:
+                except Exception:
                      final_tool_calls.append(ToolCall(
                         id=tc_data["id"] or f"call_{idx}",
                         name=tc_data["name"],

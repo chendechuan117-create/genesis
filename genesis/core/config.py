@@ -7,7 +7,7 @@ import os
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -17,6 +17,7 @@ class GlobalConfig:
     """全局配置对象"""
     # API Keys
     aixj_api_key: Optional[str] = None
+    aixj_api_keys: List[str] = None
     deepseek_api_key: Optional[str] = None
     gemini_api_key: Optional[str] = None
     openai_api_key: Optional[str] = None
@@ -42,6 +43,7 @@ class GlobalConfig:
     # Network & Limits
     http_proxy: Optional[str] = None
     https_proxy: Optional[str] = None
+    no_proxy: Optional[str] = None
     connect_timeout: int = 15
     request_timeout: int = 120
     
@@ -123,6 +125,7 @@ class ConfigManager:
     # ENV_KEY (upper) -> GlobalConfig attribute name
     _KEY_MAP = {
         "AIXJ_API_KEY": "aixj_api_key",
+        "AIXJ_API_KEYS": "aixj_api_keys",
         "DEEPSEEK_API_KEY": "deepseek_api_key",
         "GEMINI_API_KEY": "gemini_api_key",
         "OPENAI_API_KEY": "openai_api_key",
@@ -141,19 +144,29 @@ class ConfigManager:
         "LANGFUSE_HOST": "langfuse_host",
         "HTTP_PROXY": "http_proxy",
         "HTTPS_PROXY": "https_proxy",
+        "NO_PROXY": "no_proxy",
     }
 
     # 需要从环境变量加载的所有 key（含大小写变体）
     _ENV_KEYS_TO_CHECK = list(_KEY_MAP.keys()) + [
-        "API_KEY", "NANOGENESIS_DEBUG", "http_proxy", "https_proxy"
+        "API_KEY", "NANOGENESIS_DEBUG", "http_proxy", "https_proxy", "no_proxy"
     ]
 
     def _load_env_vars(self):
         """加载系统环境变量（仅检查已知 key，避免遍历全量 environ）"""
+        proxy_preferred_values = {}
         for key in self._ENV_KEYS_TO_CHECK:
             val = os.environ.get(key)
-            if val is not None:
-                self._set_config_by_key(key, val)
+            if val is None:
+                continue
+            upper_key = key.upper()
+            if upper_key in {"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"}:
+                proxy_preferred_values.setdefault(upper_key, val)
+                continue
+            self._set_config_by_key(key, val)
+
+        for upper_key, val in proxy_preferred_values.items():
+            self._set_config_by_key(upper_key, val)
 
     def _set_config_by_key(self, key: str, val: str):
         """根据键名映射到配置对象"""
@@ -162,7 +175,13 @@ class ConfigManager:
         # 通用映射
         attr = self._KEY_MAP.get(upper_key)
         if attr:
-            setattr(self._config, attr, val)
+            if upper_key == "AIXJ_API_KEYS":
+                keys = [k.strip() for k in val.split(",") if k.strip()]
+                setattr(self._config, attr, keys)
+                if keys and not self._config.aixj_api_key:
+                    self._config.aixj_api_key = keys[0]
+            else:
+                setattr(self._config, attr, val)
             return
 
         # 特殊情况：API_KEY 作为 deepseek 的 fallback
@@ -174,6 +193,8 @@ class ConfigManager:
             self._config.http_proxy = val
         elif key in ("https_proxy",):
             self._config.https_proxy = val
+        elif key in ("no_proxy",):
+            self._config.no_proxy = val
         elif upper_key == "NANOGENESIS_DEBUG":
             self._config.debug = (val.lower() == "true")
 
@@ -191,6 +212,11 @@ class ConfigManager:
             os.environ['https_proxy'] = self._config.https_proxy
             os.environ['HTTPS_PROXY'] = self._config.https_proxy
             logger.info(f"🌐 自动注入 HTTPS Proxy: {self._config.https_proxy}")
+
+        if self._config.no_proxy:
+            os.environ['no_proxy'] = self._config.no_proxy
+            os.environ['NO_PROXY'] = self._config.no_proxy
+            logger.info(f"🌐 自动注入 NO_PROXY: {self._config.no_proxy}")
 
     def _validate(self):
         """验证必要配置"""
