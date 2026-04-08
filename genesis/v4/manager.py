@@ -846,7 +846,7 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             normalized_last_verified = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         normalized_verification_source = verification_source or (source if normalized_last_verified else None)
         # V4.3: 支持 ENTITY/EVENT/ACTION 进行向量化
-        embeddable_types = ["LESSON", "CONTEXT", "ASSET", "EPISODE", "ENTITY", "EVENT", "ACTION", "DISCOVERY"]
+        embeddable_types = ["LESSON", "CONTEXT", "ASSET", "EPISODE", "ENTITY", "EVENT", "ACTION", "DISCOVERY", "PATTERN"]
         if ntype in embeddable_types and self.vector_engine.is_ready:
             text_to_encode = f"{title} {tags} {resolves or ''} {signature_text}".strip()
             vec = self.vector_engine.encode(text_to_encode)

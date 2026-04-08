@@ -209,7 +209,9 @@ class CPhaseMixin:
         promotion_result = {"patterns_promoted": 0}
         if mode != "SKIP":
             try:
-                promotion_result = self._try_promote_discoveries_to_pattern()
+                promotion_result = self._try_promote_discoveries_to_pattern(
+                    discoveries_this_session=discovery_result.get("discoveries_recorded", 0)
+                )
                 if promotion_result.get("patterns_promoted", 0) > 0:
                     logger.info(f"PATTERN promotion: {promotion_result['patterns_promoted']} patterns created")
             except Exception as e:
@@ -367,18 +369,20 @@ class CPhaseMixin:
 
     PATTERN_PROMOTION_THRESHOLD = 3  # 同 subject 前缀 ≥3 个 DISCOVERY → 提升
 
-    def _try_promote_discoveries_to_pattern(self) -> Dict[str, Any]:
+    def _try_promote_discoveries_to_pattern(self, discoveries_this_session: int = 0) -> Dict[str, Any]:
         """确定性逻辑：同 subject 前缀累积 ≥3 个 DISCOVERY 时自动合并为 PATTERN。
 
         零 LLM，纯 SQL + Python。在 _run_c_phase 末尾调用。
         PATTERN 半衰期 180 天（DISCOVERY 90 天），置信度取子节点最大值 +0.1。
+        短路：本轮未录入新 DISCOVERY 时跳过（避免每轮空跑 200 条查询）。
         """
-        from genesis.v4.manager import NodeVault
-        vault = NodeVault()
+        if discoveries_this_session <= 0:
+            return {"patterns_promoted": 0, "reason": "no_new_discoveries"}
+        vault = self.vault
         promoted = []
 
         try:
-            rows = vault._conn.execute(
+            rows = vault._conn.execute(  # 使用 self.vault 的连接，能看到本轮刚录入的 DISCOVERY
                 """SELECT kn.node_id, nc.full_content, kn.confidence_score
                    FROM knowledge_nodes kn
                    JOIN node_contents nc ON kn.node_id = nc.node_id

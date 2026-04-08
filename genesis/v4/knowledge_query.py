@@ -280,36 +280,49 @@ class KnowledgeQuery:
         """
         from genesis.v4.arena_mixin import ArenaConfidenceMixin
 
-        rows = self._conn.execute(
-            """SELECT node_id, type, title, confidence_score, tags,
-                      updated_at, last_verified_at, trust_tier,
-                      usage_success_count, usage_fail_count, usage_count
-               FROM knowledge_nodes
-               WHERE node_id NOT LIKE 'MEM_CONV%'
-               ORDER BY updated_at DESC
-               LIMIT 200"""
+        # 分层采样：每种类型取最近 30 条，避免单一类型垄断候选池
+        type_names = self._conn.execute(
+            "SELECT DISTINCT type FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%'"
         ).fetchall()
-        if not rows:
+        all_candidates = []
+        for tr in type_names:
+            t = tr['type']
+            type_rows = self._conn.execute(
+                """SELECT node_id, type, title, confidence_score, tags,
+                          updated_at, last_verified_at, trust_tier,
+                          usage_success_count, usage_fail_count, usage_count
+                   FROM knowledge_nodes
+                   WHERE node_id NOT LIKE 'MEM_CONV%' AND type = ?
+                   ORDER BY updated_at DESC
+                   LIMIT 30""", (t,)
+            ).fetchall()
+            all_candidates.extend(type_rows)
+
+        if not all_candidates:
             return "[L1] 知识库为空"
 
-        # 计算 effective_confidence 并过滤
-        scored = []
-        for r in rows:
+        # 计算 effective_confidence 并过滤，按类型分组
+        by_type_all = defaultdict(list)
+        for r in all_candidates:
             d = dict(r)
             eff = ArenaConfidenceMixin.effective_confidence(d)
             if eff >= 0.2:
                 d['eff_conf'] = eff
-                scored.append(d)
-        scored.sort(key=lambda x: x['eff_conf'], reverse=True)
-        scored = scored[:max_nodes]
+                by_type_all[d['type']].append(d)
 
-        if not scored:
+        if not by_type_all:
             return "[L1] 所有节点已衰减（eff<0.2），知识库需要刷新"
 
-        # 按 type 分组
+        # 按类型分配配额：每种类型至少 1 个，剩余按比例
+        for items in by_type_all.values():
+            items.sort(key=lambda x: x['eff_conf'], reverse=True)
+        n_types = len(by_type_all)
+        remaining = max(0, max_nodes - n_types)
+        total_candidates = sum(len(v) for v in by_type_all.values())
         by_type = defaultdict(list)
-        for d in scored:
-            by_type[d['type']].append(d)
+        for t, items in by_type_all.items():
+            quota = 1 + int(remaining * len(items) / max(total_candidates, 1))
+            by_type[t] = items[:quota]
 
         # 统计
         type_rows = self._conn.execute(
@@ -323,7 +336,8 @@ class KnowledgeQuery:
         except Exception:
             pass
 
-        lines = [f"[L1 Knowledge · {total} nodes · {void_count} VOID · top {len(scored)} by freshness]"]
+        selected_count = sum(len(v) for v in by_type.values())
+        lines = [f"[L1 Knowledge · {total} nodes · {void_count} VOID · top {selected_count} by freshness]"]
 
         type_order = ["LESSON", "CONTEXT", "DISCOVERY", "ASSET", "PATTERN", "EPISODE", "ENTITY", "EVENT", "ACTION", "TOOL"]
         seen_types = set()
