@@ -532,7 +532,8 @@ class V4Loop(LensPhaseMixin, CPhaseMixin, ChallengerMixin):
                         self.g_messages.append(Message(role=MessageRole.TOOL, content=res, tool_call_id=tc.id, name=tc.name))
                         continue
                     
-                    if tc.name in GP_BLOCKED_TOOLS:
+                    _unblock = set(self.loop_config.get("gp_unblock_tools") or [])
+                    if tc.name in GP_BLOCKED_TOOLS and tc.name not in _unblock:
                         res = f"Error: GP 禁止使用工具 {tc.name}（该工具仅限反思进程使用）"
                     else:
                         # ── 普通执行工具（shell, read_file, write_file 等）──
