@@ -280,6 +280,23 @@ def _get_auto_signals(round_num: int = 1, session_shown_voids: set | None = None
                 for nid, title in rows:
                     lines.append(f"  {nid}: {title}")
                 sections.append("\n".join(lines))
+
+            # ── 4. C-Phase 产出：DISCOVERY 和 PATTERN 节点可见性 ──
+            disc_rows = conn.execute(
+                "SELECT node_id, title, confidence_score FROM knowledge_nodes "
+                "WHERE type = 'DISCOVERY' ORDER BY created_at DESC LIMIT 5"
+            ).fetchall()
+            pat_rows = conn.execute(
+                "SELECT node_id, title, confidence_score FROM knowledge_nodes "
+                "WHERE type = 'PATTERN' ORDER BY created_at DESC LIMIT 3"
+            ).fetchall()
+            if disc_rows or pat_rows:
+                lines = ["[C-Phase 产出 — DISCOVERY/PATTERN 节点]"]
+                for r in pat_rows:
+                    lines.append(f"  {r['node_id']}: {r['title']} (conf:{r['confidence_score']:.2f})")
+                for r in disc_rows:
+                    lines.append(f"  {r['node_id']}: {r['title']} (conf:{r['confidence_score']:.2f})")
+                sections.append("\n".join(lines))
         except Exception as e:
             sections.append(f"[DB 查询异常: {e}]")
         finally:
@@ -788,19 +805,25 @@ def _pick_focused_fallback(signals: str, round_num: int = 1) -> str:
     arena_items, void_items, low_conf_items = [], [], []
     current_section = None
     for line in lines:
-        if "Arena 失败" in line:
+        if "反复失效" in line or "Arena" in line:
             current_section = "arena"
         elif "知识空洞" in line or "VOID" in line:
             current_section = "void"
-        elif "低置信度" in line:
+        elif "待验证" in line or "置信度" in line:
             current_section = "low_conf"
-        elif line.strip().startswith("LESSON_") or line.strip().startswith("CTX_"):
+        elif "C-Phase" in line or "DISCOVERY" in line:
+            current_section = "c_phase"
+        elif line.strip()[:2] == "  " and ":" in line:
+            # 缩进行 = 某 section 下的具体条目
+            item = line.strip()
             if current_section == "arena":
-                arena_items.append(line.strip())
+                arena_items.append(item)
             elif current_section == "low_conf":
-                low_conf_items.append(line.strip())
-        elif line.strip().startswith("VOID_"):
-            void_items.append(line.strip())
+                low_conf_items.append(item)
+            elif current_section == "void":
+                void_items.append(item)
+            elif current_section == "c_phase":
+                low_conf_items.append(item)  # C-Phase 产出也可作为验证方向
     # 轮换选择：奇数轮选 Arena/VOID，偶数轮选低置信
     if round_num % 2 == 1:
         if arena_items:
@@ -829,6 +852,12 @@ def _compact_round_history(round_log: list, last_n: int = 10) -> str:
         parts.append(r.get("progress_class", "?"))
         if r.get("kb_delta_summary"):
             parts.append(f"KB:{r['kb_delta_summary']}")
+        c_sum = r.get("c_phase_summary") or {}
+        if c_sum:
+            parts.append(f"C:disc={c_sum.get('discoveries_recorded', 0)}/pat={c_sum.get('patterns_promoted', 0)}")
+        ks = r.get("knowledge_search_count", 0)
+        if ks:
+            parts.append(f"search={ks}")
         if r.get("frontier_preview"):
             parts.append(r["frontier_preview"][:80])
         elif r.get("response_preview"):
