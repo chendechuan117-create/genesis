@@ -129,7 +129,6 @@ class FactoryManager:
         lines = []
         issue = " ".join(str(knowledge_state.get("issue") or "").split())
         if issue:
-            issue = issue[:240] if len(issue) <= 240 else issue[:237].rstrip() + "..."
             lines.append(f"issue: {issue}")
         for key in ["verified_facts", "failed_attempts", "next_checks"]:
             values = knowledge_state.get(key) or []
@@ -140,22 +139,49 @@ class FactoryManager:
                 cleaned = " ".join(str(value or "").split())
                 if not cleaned or cleaned.upper() == "NONE" or cleaned in normalized:
                     continue
-                normalized.append(cleaned[:220] if len(cleaned) <= 220 else cleaned[:217].rstrip() + "...")
-                if len(normalized) >= 5:
-                    break
+                normalized.append(cleaned)
             if normalized:
                 lines.append(f"{key}:")
                 lines.extend([f"- {value}" for value in normalized])
         return "\n".join(lines)
 
-    def build_g_prompt(self, recent_memory: str = "", available_tools_info: str = "", knowledge_digest: str = "", inferred_signature: str = "", daemon_status: str = "", knowledge_state: str = "") -> str:
-        """为 G (Thinker) 构建系统提示词"""
+    @staticmethod
+    def _build_tool_section(tool_names: list) -> str:
+        """从 GP 实际可用工具列表动态生成工具描述段。
 
-        digest_block = ""
-        if knowledge_digest:
-            digest_block = f"""[你的认知摘要 DIGEST]
-以下是当前知识库的固定尺寸摘要。先读它，建立全局判断，再决定是否需要搜索细节：
-{knowledge_digest}
+        这是消除 prompt-registry-blocked 三层脱节的关键：
+        注册了什么工具，prompt 里就出现什么工具，不再手写。
+        """
+        if not tool_names:
+            return "- 当前无可用工具。"
+        names = sorted(tool_names)
+        lines = [
+            f"你有以下 {len(names)} 个内置工具，直接调用即可：{', '.join(names)}",
+            "**绝对不要用 shell 的 which/whereis/type 去找它们**——它们不是 shell 命令。",
+            "shell 仅用于系统命令和无专用工具的操作。",
+        ]
+        # 知识相关工具的使用提示
+        if "trace_query" in names:
+            lines.append("环境问题用 trace_query(mode='recall') 回忆经验。")
+        return "\n- ".join([""] + lines).lstrip()
+
+    def build_gp_prompt(self, recent_memory: str = "", inferred_signature: str = "", daemon_status: str = "", knowledge_state: str = "", knowledge_map: str = "", trace_experience: str = "", gp_tool_names: list = None) -> str:
+        """为 GP (统一思考+执行进程) 构建系统提示词"""
+
+        map_block = ""
+        if knowledge_map:
+            map_block = f"""[L1 Knowledge — 声明式知识摘要]
+按鲜活度排序的知识节点。eff 越高越可信，低于 0.2 的已自动淘汰。
+需要详情用 search_knowledge_nodes(keywords=[...]) 或 get_knowledge_node_content(node_id=...)。
+{knowledge_map}
+"""
+
+        experience_block = ""
+        if trace_experience:
+            experience_block = f"""[Experience Map — 程序性记忆]
+以下是从历史执行轨迹中积累的关联记忆。这不是有人写下的规则，而是系统实际做过什么的统计。
+用 trace_query(mode='recall', query='关键词') 回忆某个话题的完整经验。
+{trace_experience}
 """
 
         signature_block = ""
@@ -179,33 +205,46 @@ class FactoryManager:
 {knowledge_state}
 """
 
-        tools_block = ""
-        if available_tools_info:
-            tools_block = f"""[Op 可用执行工具库]
-请注意，除了你在搜索阶段使用的工具外，执行器(Op)在执行阶段可以使用以下工具。
-你在向 Op 派发任务时，可以参考这些能力：
-{available_tools_info}
-"""
-
         daemon_block = ""
         if daemon_status:
             daemon_block = f"""{daemon_status}
 """
 
-        # ⚠️ 前缀缓存优化：稳定指令放前面（跨请求不变），变量内容放后面
-        return f"""你是 Genesis，用户的个人 AI 助手。用简体中文回复。
-你不是普通聊天 AI。你有执行器 Op，能在用户的环境里跑命令、读写文件、搜索网络。你有知识库，记着用户环境的经验和教训。用户选择你而不是普通 AI，就是因为你能动手、有记忆。
-Op 是独立上下文，没有你看到的对话，instructions 写自包含。自主完成完整请求，按需多次 dispatch。
-检索时注意 [知识密度] 行：高凝实→直接用积木组装方案；低凝实→先让 Op 探索再执行；[知识空洞] 是已知的未知，优先调查。
-PROVEN 节点久经考验，UNTESTED 节点优先挂载让它们证明自己。
-带 cognitive_approach 签名的知识节点是认知策略，按它调整态度和深度。
-如果需要临时脚本、探针、审计输出或补丁草稿，优先使用 write_file/append_file 的 use_scratch=true，让文件落在 runtime/scratch；不要把一次性产物散落到 repo 根目录或正式源码旁边。
+        # 动态生成工具描述（从 registry 派生，消除手写不同步）
+        tool_section = self._build_tool_section(gp_tool_names or [])
 
-{digest_block}
+        # ⚠️ 前缀缓存优化：稳定指令放前面（跨请求不变），变量内容放后面
+        return f"""你是 Genesis，一个能动手的 agent。用简体中文回复。
+你拥有用户本机的完整操作权限——读写文件、运行命令、搜索网络、查询知识库。你不是聊天机器人，你是执行者。
+
+# 行为铁律（违反任何一条都是失败）
+1. **先动手，后汇报。** 用户说了问题，你第一反应是用工具去查，而不是反问"能否提供更多信息"。能用工具获取的信息，绝不问用户要。
+2. **禁止空谈。** 不说"我建议你..."、"你可以尝试..."、"请提供..."。要么直接做，要么说"我查了X，结果是Y，下一步我会Z"。
+3. **禁止免责声明。** 不说"作为AI我无法..."、"我的能力有限..."、"这超出了我的范围..."。碰到真做不了的事，说具体原因（"没有sudo权限"），而不是泛泛推脱。
+4. **一次做到位。** 不要分步骤征求同意。用户给了任务就全力执行，中间遇到障碍自己想办法绕过，只在真正卡死时才问用户。
+5. **像人一样说话。** 简洁、直接、有温度。不要列一堆bullet point敷衍。回答的目标是解决问题，不是展示知识面。
+
+# 执行准则
+- 先查知识库了解已有经验，再动手。
+- 先读代码再改代码，先诊断再修复。
+- 方法失败时诊断原因，不盲目重试，也不轻易放弃。
+- 只做用户要求的事，不加戏。
+- 临时脚本用 write_file 的 use_scratch=true。
+
+# 工具使用
+{tool_section}
+
+# 知识检索
+接到任务后浏览 Knowledge Map，执行双规划：
+1. [任务路径] 怎么完成请求
+2. [知识路径] 执行过程能否顺便填补知识空洞（不超过2步额外操作）
+高凝实→直接组装；低凝实→先探索；知识空洞→优先调查。
+
+{map_block}
+{experience_block}
 {signature_block}
 {memory_block}
 {knowledge_state_block}
-{tools_block}
 {daemon_block}
 """
 
@@ -286,179 +325,6 @@ G 已经说了它的理解。现在轮到你从自己的认知角度补充：
 {blackboard_block}
 """
 
-    def build_op_prompt(self, task_payload: dict) -> str:
-        """为 Op (Executor) 构建系统提示词"""
-
-        op_intent = task_payload.get("op_intent", "未定义目标")
-        instructions = task_payload.get("instructions", "无")
-        node_ids = task_payload.get("active_nodes", [])
-        knowledge_state_text = self.render_knowledge_state(task_payload.get("knowledge_state") or {})
-
-        injection_text = ""
-        if node_ids:
-            node_contents = self.vault.get_multiple_contents(node_ids)
-            if node_contents:
-                injection_text = "\n[系统注入：G 为你准备的认知参考节点]\n"
-                for nid, text in node_contents.items():
-                    injection_text += f"--- NODE: {nid} ---\n{text}\n"
-
-        knowledge_state_block = ""
-        if knowledge_state_text:
-            knowledge_state_block = f"""
-[当前工作记忆]
-{knowledge_state_text}
-"""
-
-        return f"""你是 Genesis 执行器 (Op-Process)。只管干活，不需要历史背景。
-用简体中文回复。
-
-[任务]
-目标: {op_intent}
-
-执行建议:
-{instructions}
-{injection_text}
-{knowledge_state_block}
-
-[规则]
-1. 立即用工具（Shell、File、Web 等）执行目标。遇到报错自行调整重试。
-2. 你可能是来执行命令的，也可能是来当侦察兵读取文件的——仔细看 G 的指令。
-3. 你是 G 调用的子程序，不直接面向用户。侦察任务必须在 FINDINGS 里写出读到的关键内容，否则 G 看不到。只有工具输出、测试结果、diff、日志支持的内容才能写进 VERIFIED_FACTS。
-4. 任务完成、阶段性完成、或穷尽方法失败时，输出执行报告：
-
-```op_result
-STATUS: SUCCESS | PARTIAL | FAILED
-SUMMARY:
-<达成了什么、没达成什么>
-
-FINDINGS:
-<侦察结果（文件内容/日志/配置），纯执行任务写 NONE>
-
-VERIFIED_FACTS:
-- <已被外部观测证实的事实，没有写 NONE>
-
-FAILED_ATTEMPTS:
-- <已证伪或已失败的尝试，没有写 NONE>
-
-CHANGES_MADE:
-- <实际修改/关键动作，没有写 NONE>
-
-ARTIFACTS:
-- <生成或修改的文件路径，没有写 NONE>
-
-NEXT_CHECKS:
-- <若还要继续，下一步最值得做的检查，没有写 NONE>
-
-OPEN_QUESTIONS:
-- <未解决问题/需要 G 决策的点，没有写 NONE>
-"""
-
-    def render_op_result_for_g(self, op_result: dict) -> str:
-        """将 Op 的执行报告压缩成适合注入给 G 的结构化摘要"""
-        try:
-            status = op_result.get("status", "UNKNOWN")
-            summary = op_result.get("summary", "") or "无摘要"
-            findings = op_result.get("findings", "") or "无侦察结果"
-            verified_facts = op_result.get("verified_facts", []) or []
-            failed_attempts = op_result.get("failed_attempts", []) or []
-            changes = op_result.get("changes_made", []) or []
-            artifacts = op_result.get("artifacts", []) or []
-            next_checks = op_result.get("next_checks", []) or []
-            open_questions = op_result.get("open_questions", []) or []
-            raw_output = (op_result.get("raw_output", "") or "").strip()
-
-            output = [
-                "[Op 子程序执行报告]",
-                f"STATUS: {status}",
-                "SUMMARY:",
-                summary,
-                "",
-                "FINDINGS:",
-                findings,
-                ""
-            ]
-
-            output.append("VERIFIED_FACTS:")
-            if verified_facts:
-                output.extend([f"- {item}" for item in verified_facts])
-            else:
-                output.append("- NONE")
-
-            output.append("FAILED_ATTEMPTS:")
-            if failed_attempts:
-                output.extend([f"- {item}" for item in failed_attempts])
-            else:
-                output.append("- NONE")
-
-            output.append("CHANGES_MADE:")
-            if changes:
-                output.extend([f"- {item}" for item in changes])
-            else:
-                output.append("- NONE")
-
-            output.append("ARTIFACTS:")
-            if artifacts:
-                output.extend([f"- {item}" for item in artifacts])
-            else:
-                output.append("- NONE")
-
-            output.append("NEXT_CHECKS:")
-            if next_checks:
-                output.extend([f"- {item}" for item in next_checks])
-            else:
-                output.append("- NONE")
-
-            output.append("OPEN_QUESTIONS:")
-            if open_questions:
-                output.extend([f"- {item}" for item in open_questions])
-            else:
-                output.append("- NONE")
-
-            if raw_output and raw_output != summary:
-                preview = raw_output[:2000] + ("..." if len(raw_output) > 2000 else "")
-                output.extend(["RAW_OUTPUT:", preview])
-
-            return "\n".join(output)
-
-        except Exception as e:
-            return f"[Op 子程序执行报告]\nSTATUS: UNKNOWN\nSUMMARY:\n渲染 Op 结果失败: {e}"
-
-    def render_dispatch_for_human(self, task_payload: dict) -> str:
-        """渲染 G 派发给 Op 的任务书给人类看"""
-        try:
-            nodes = task_payload.get("active_nodes", [])
-            translations = self.vault.translate_nodes(nodes)
-            knowledge_state_text = self.render_knowledge_state(task_payload.get("knowledge_state") or {})
-
-            output = [
-                "🧠 **[大脑 (G) 已完成思考，正在派发任务给执行器 (Op)]**",
-                f"**目标：** {task_payload.get('op_intent', '未定义')}",
-                "",
-            ]
-
-            if nodes:
-                output.append("**挂载认知节点：**")
-                for node_id in nodes:
-                    trans = translations.get(node_id, "未知节点")
-                    prefix = "🧰" if "ASSET" in node_id else "🔌" if "TOOL" in node_id else "🧠" if "CTX" in node_id or "EP" in node_id else "📖"
-                    output.append(f"{prefix} `[{node_id}]` {trans}")
-                output.append("")
-
-            if knowledge_state_text:
-                output.append("**当前工作记忆：**")
-                output.append(f"> {knowledge_state_text.replace(chr(10), chr(10)+'> ')}")
-                output.append("")
-
-            output.append("**执行建议：**")
-            instr = task_payload.get("instructions", "")
-            if len(instr) > 200:
-                instr = instr[:200] + "..."
-            output.append(f"> {instr.replace(chr(10), chr(10)+'> ')}")
-
-            return "\n".join(output)
-        except Exception as e:
-            return f"⚠️ 渲染派发书时发生异常: {e}"
-
 
 class NodeManagementTools:
     """对话记忆管理器 — 负责短期记忆的写入与滑动窗口清理"""
@@ -474,7 +340,7 @@ class NodeManagementTools:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         node_id = f"MEM_CONV_{ts}"
         title = user_msg[:40].replace("\n", " ").strip()
-        memory_content = f"用户: {user_msg[:500]}\nGenesis: {agent_response[:800]}"
+        memory_content = f"用户: {user_msg}\nGenesis: {agent_response}"
 
         self.vault.create_node(
             node_id=node_id,

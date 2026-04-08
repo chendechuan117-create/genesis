@@ -58,22 +58,28 @@ def create_agent(
 
     try:
         from genesis.tools.node_tools import (
-            SearchKnowledgeNodesTool, RecordContextNodeTool, RecordLessonNodeTool,
+            RecordContextNodeTool, RecordLessonNodeTool,
             CreateMetaNodeTool, DeleteNodeTool, CreateGraphNodeTool, CreateNodeEdgeTool,
-            RecordToolNodeTool
+            RecordToolNodeTool, RecordDiscoveryTool
         )
-        for t in [SearchKnowledgeNodesTool(), RecordContextNodeTool(), RecordLessonNodeTool(),
+        for t in [RecordContextNodeTool(), RecordLessonNodeTool(),
                    CreateMetaNodeTool(), DeleteNodeTool(), CreateGraphNodeTool(), CreateNodeEdgeTool(),
-                   RecordToolNodeTool()]:
+                   RecordToolNodeTool(), RecordDiscoveryTool()]:
             tools.register(t)
     except Exception as e:
         logger.error(f"V4 tool group [node_tools] failed: {e}")
 
     try:
-        from genesis.tools.dispatch_tool import DispatchTool
-        tools.register(DispatchTool())
+        from genesis.tools.search_tool import SearchKnowledgeNodesTool
+        tools.register(SearchKnowledgeNodesTool())
     except Exception as e:
-        logger.error(f"V4 tool group [dispatch_tool] failed: {e}")
+        logger.error(f"V4 tool group [search_tool] failed: {e}")
+
+    try:
+        from genesis.tools.trace_query_tool import TraceQueryTool
+        tools.register(TraceQueryTool())
+    except Exception as e:
+        logger.error(f"V4 tool group [trace_query] failed: {e}")
 
     # 核心改动：把带有 Failover 能力的 Router 直接传给 Agent
     agent = GenesisV4(tools=tools, provider=provider_router)
