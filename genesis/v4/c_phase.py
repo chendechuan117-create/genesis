@@ -230,6 +230,49 @@ class CPhaseMixin:
 
     # ─── Discovery Recording（阶段1: 信号提取 + 阶段2: 受限 tool calling）───
 
+    def _build_discovery_context(self) -> str:
+        """为 C-Phase 分类器构建 vault 上下文（确定性，零 LLM）。
+
+        让 C 知道：vault 已有什么 DISCOVERY、GP 本轮是否搜了知识库。
+        避免重复录入，提升录入决策质量。
+        """
+        lines = []
+        try:
+            # 已有 DISCOVERY 统计 + 最近 5 条 subject
+            row = self.vault._conn.execute(
+                "SELECT COUNT(*) as cnt FROM knowledge_nodes WHERE type = 'DISCOVERY'"
+            ).fetchone()
+            disc_count = row['cnt'] if row else 0
+            lines.append(f"VAULT_STATE: {disc_count} existing DISCOVERY nodes")
+
+            if disc_count > 0:
+                recent = self.vault._conn.execute(
+                    """SELECT nc.full_content FROM knowledge_nodes kn
+                       JOIN node_contents nc ON kn.node_id = nc.node_id
+                       WHERE kn.type = 'DISCOVERY'
+                       ORDER BY kn.created_at DESC LIMIT 5"""
+                ).fetchall()
+                subjects = []
+                for r in recent:
+                    try:
+                        c = json.loads(r['full_content'])
+                        subjects.append(c.get('subject', '?'))
+                    except Exception:
+                        pass
+                if subjects:
+                    lines.append(f"RECENT_SUBJECTS: {', '.join(subjects)}")
+
+            # GP 本轮是否使用了 search_knowledge_nodes
+            gp_searched = any(
+                m.role == MessageRole.TOOL and m.name == "search_knowledge_nodes"
+                for m in self.g_messages
+            )
+            lines.append(f"GP_KNOWLEDGE_SEARCH: {'yes' if gp_searched else 'no'}")
+        except Exception as e:
+            logger.debug(f"Discovery context build failed (non-fatal): {e}")
+
+        return "\n".join(lines)
+
     def _extract_execution_signals(self, g_final_response: str) -> str:
         """阶段1：确定性信号提取，从执行数据中生成结构化候选列表。
 
@@ -306,21 +349,27 @@ class CPhaseMixin:
         if not signals_text:
             return {"discoveries_recorded": 0, "c_tokens": 0, "reason": "no_signals"}
 
+        # 构建 vault 上下文（让 C 知道已有什么，避免重复）
+        discovery_context = self._build_discovery_context()
+
         # 构建 record_discovery 工具的 schema（约束 LLM 输出空间）
         from genesis.tools.node_tools import RecordDiscoveryTool
         discovery_tool = RecordDiscoveryTool()
         tool_schema = [discovery_tool.to_schema()]
 
+        context_block = f"\n\nVault context:\n{discovery_context}" if discovery_context else ""
         messages = [
             {"role": "system", "content": (
                 "You are a signal classifier. You receive structured execution signals.\n"
                 "For each signal worth recording, call record_discovery ONCE.\n"
                 "Rules:\n"
                 "- Only record genuinely NEW observations, not common knowledge\n"
+                "- Do NOT record observations whose subject overlaps with RECENT_SUBJECTS below\n"
                 "- subject: dot notation, max 3 levels (e.g. nginx.port.conflict)\n"
                 "- description: max 30 tokens, use → | + symbols for compression\n"
                 "- If no signal is worth recording, do NOT call any tool\n"
                 "- Max 5 discoveries per session"
+                f"{context_block}"
             )},
             {"role": "user", "content": f"Classify these execution signals:\n\n{signals_text}"},
         ]
