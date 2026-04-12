@@ -46,7 +46,7 @@ async def run_exam_question(qid: str, prompt: str, provider, tools) -> dict:
     """运行单道考题，返回完整的透镜输出"""
     loop = V4Loop(tools=tools, provider=provider, max_iterations=5)
     loop.user_input = prompt
-    loop.inferred_signature = loop.vault.infer_metadata_signature(prompt)
+    loop.inferred_signature = loop.vault.signature.infer(prompt)
     loop._select_personas = lambda target_count=3: PERSONAS
     loop.metrics = PerformanceMetrics()
 

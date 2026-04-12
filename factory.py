@@ -30,8 +30,8 @@ def create_agent(
 
     # 逐组注册，单组失败不影响其余工具
     try:
-        from genesis.tools.file_tools import ReadFileTool, WriteFileTool, AppendFileTool, ListDirectoryTool
-        for t in [ReadFileTool(), WriteFileTool(), AppendFileTool(), ListDirectoryTool()]:
+        from genesis.tools.file_tools import ReadFileTool, WriteFileTool, AppendFileTool, ListDirectoryTool, GrepFilesTool
+        for t in [ReadFileTool(), WriteFileTool(), AppendFileTool(), ListDirectoryTool(), GrepFilesTool()]:
             tools.register(t)
     except Exception as e:
         logger.error(f"V4 tool group [file_tools] failed: {e}")
@@ -81,7 +81,54 @@ def create_agent(
     except Exception as e:
         logger.error(f"V4 tool group [trace_query] failed: {e}")
 
+    # TOOL 节点自动激活：从 vault 加载 C-Phase 创建的动态工具
+    activate_vault_tools(tools)
+
     # 核心改动：把带有 Failover 能力的 Router 直接传给 Agent
     agent = GenesisV4(tools=tools, provider=provider_router)
     logger.info(f"✓ Genesis V4 ready ({len(tools)} tools, Failover Enabled)")
     return agent
+
+
+def activate_vault_tools(registry: ToolRegistry) -> int:
+    """从 vault 加载所有 TOOL 节点并注册到运行时 registry。
+
+    桥接 record_tool_node（存储）→ register_from_source（激活）。
+    可在启动时和 auto 轮次间调用，幂等安全。
+
+    Returns:
+        成功激活的工具数量
+    """
+    try:
+        from genesis.v4.manager import NodeVault, TOOL_EXEC_MIN_TIER
+        vault = NodeVault()
+        tool_nodes = vault.get_tool_nodes(min_tier=TOOL_EXEC_MIN_TIER)
+    except Exception as e:
+        logger.warning(f"activate_vault_tools: cannot read vault — {e}")
+        return 0
+
+    activated = 0
+    for tn in tool_nodes:
+        name = tn["tool_name"]
+        # 跳过已注册的同名工具（内置工具优先）
+        if name in registry:
+            logger.debug(f"activate_vault_tools: skip '{name}' (already registered)")
+            continue
+        try:
+            ok = registry.register_from_source(
+                name=name,
+                source_code=tn["source_code"],
+                node_id=tn["node_id"],
+                trust_tier=tn["trust_tier"],
+            )
+            if ok:
+                activated += 1
+                logger.info(f"activate_vault_tools: ✓ '{name}' loaded from vault (node={tn['node_id']})")
+            else:
+                logger.warning(f"activate_vault_tools: ✗ '{name}' failed to register (node={tn['node_id']})")
+        except Exception as e:
+            logger.warning(f"activate_vault_tools: ✗ '{name}' error — {e}")
+
+    if activated:
+        logger.info(f"activate_vault_tools: {activated} vault tools activated")
+    return activated

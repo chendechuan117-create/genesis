@@ -16,22 +16,8 @@ logger = logging.getLogger(__name__)
 class GlobalConfig:
     """全局配置对象"""
     # API Keys
-    aixj_api_key: Optional[str] = None
-    aixj_api_keys: List[str] = None
-    deepseek_api_key: Optional[str] = None
-    gemini_api_key: Optional[str] = None
-    openai_api_key: Optional[str] = None
-    openrouter_api_key: Optional[str] = None
-    openrouter_model: Optional[str] = "trinity-large-preview"
-    
-    # Consumables Pool (Phase 3)
-    siliconflow_api_key: Optional[str] = None
-    dashscope_api_key: Optional[str] = None
-    qianfan_api_key: Optional[str] = None
-    zhipu_api_key: Optional[str] = None
-    groq_api_key: Optional[str] = None
-    cloudflare_api_key: Optional[str] = None
-    zen_api_key: Optional[str] = None
+    xcode_api_key: Optional[str] = None
+    xcode_api_keys: List[str] = None
     
     tavily_api_key: Optional[str] = None
     
@@ -124,20 +110,10 @@ class ConfigManager:
 
     # ENV_KEY (upper) -> GlobalConfig attribute name
     _KEY_MAP = {
-        "AIXJ_API_KEY": "aixj_api_key",
-        "AIXJ_API_KEYS": "aixj_api_keys",
-        "DEEPSEEK_API_KEY": "deepseek_api_key",
-        "GEMINI_API_KEY": "gemini_api_key",
-        "OPENAI_API_KEY": "openai_api_key",
-        "OPENROUTER_API_KEY": "openrouter_api_key",
-        "OPENROUTER_MODEL": "openrouter_model",
-        "SILICONFLOW_API_KEY": "siliconflow_api_key",
-        "DASHSCOPE_API_KEY": "dashscope_api_key",
-        "QIANFAN_API_KEY": "qianfan_api_key",
-        "ZHIPU_API_KEY": "zhipu_api_key",
-        "GROQ_API_KEY": "groq_api_key",
-        "CLOUDFLARE_API_KEY": "cloudflare_api_key",
-        "ZEN_API_KEY": "zen_api_key",
+        "XCODE_API_KEY": "xcode_api_key",
+        "XCODE_API_KEYS": "xcode_api_keys",
+        "AIXJ_API_KEY": "xcode_api_key",
+        "AIXJ_API_KEYS": "xcode_api_keys",
         "TAVILY_API_KEY": "tavily_api_key",
         "LANGFUSE_PUBLIC_KEY": "langfuse_public_key",
         "LANGFUSE_SECRET_KEY": "langfuse_secret_key",
@@ -149,7 +125,7 @@ class ConfigManager:
 
     # 需要从环境变量加载的所有 key（含大小写变体）
     _ENV_KEYS_TO_CHECK = list(_KEY_MAP.keys()) + [
-        "API_KEY", "NANOGENESIS_DEBUG", "http_proxy", "https_proxy", "no_proxy"
+        "NANOGENESIS_DEBUG", "http_proxy", "https_proxy", "no_proxy"
     ]
 
     def _load_env_vars(self):
@@ -175,19 +151,15 @@ class ConfigManager:
         # 通用映射
         attr = self._KEY_MAP.get(upper_key)
         if attr:
-            if upper_key == "AIXJ_API_KEYS":
+            if upper_key in ("XCODE_API_KEYS", "AIXJ_API_KEYS"):
                 keys = [k.strip() for k in val.split(",") if k.strip()]
-                setattr(self._config, attr, keys)
-                if keys and not self._config.aixj_api_key:
-                    self._config.aixj_api_key = keys[0]
+                setattr(self._config, "xcode_api_keys", keys)
+                if keys and not self._config.xcode_api_key:
+                    self._config.xcode_api_key = keys[0]
             else:
                 setattr(self._config, attr, val)
             return
 
-        # 特殊情况：API_KEY 作为 deepseek 的 fallback
-        if upper_key == "API_KEY":
-            if not self._config.deepseek_api_key:
-                self._config.deepseek_api_key = val
         # 代理的小写变体也需要处理（_load_env_vars 原样传入 key）
         elif key in ("http_proxy",):
             self._config.http_proxy = val
@@ -220,8 +192,8 @@ class ConfigManager:
 
     def _validate(self):
         """验证必要配置"""
-        if not self._config.deepseek_api_key:
-            logger.warning("⚠️ 未检测到 DeepSeek API Key (将仅使用本地大脑)")
+        if not self._config.xcode_api_key:
+            logger.warning("⚠️ 未检测到 xcode API Key")
         
         if not self._config.http_proxy and not self._config.https_proxy:
             # 检查是否有 curl

@@ -1,0 +1,68 @@
+# Genesis Project Rules — Cascade Meta-Information Bootstrap
+# This file is automatically loaded every session. It is the equivalent of
+# Genesis's build_gp_prompt() — forced knowledge injection, not optional.
+
+## Identity
+You are working on Genesis, an autonomous AI agent framework.
+You have a dedicated meta-information system in the `genesis-nodevault` MCP server
+containing 140+ validated observations about this codebase: constraints, patterns,
+fragilities, architecture, debug paths, and design philosophy.
+
+## Mandatory Bootstrap (EVERY session, BEFORE writing any code)
+1. Run `mcp0_get_code_digest()` to see observation overview
+2. Run `mcp0_get_file_observations(file_path="<target_file>")` for any file you plan to modify
+3. For architecture questions: `mcp0_search_code_observations(signature={"component": "meta_information_system"})`
+4. For infrastructure: `mcp0_search_code_observations(signature={"component": "infrastructure"})`
+
+## Critical Constraints (inline — no query needed)
+
+### Infrastructure
+- Bot managed by systemd: `systemctl --user restart genesis-v4.service`
+- Logs: `journalctl --user -u genesis-v4.service`
+- NEVER use `nohup python discord_bot.py &` — systemd auto-restarts, nohup creates ghost processes
+- Network: v2rayA tproxy at kernel level, no application-level HTTPS_PROXY
+
+### Databases (3 SQLite files)
+- `~/.nanogenesis/workshop_v4.sqlite` — NodeVault (knowledge_nodes, node_content, edges, arena_results, void_tasks)
+  - MCP sqlite server connected, use `mcp2_read_query()` for SELECT
+  - For PRAGMA/schema: use `run_command` with python3, NOT mcp2
+- `runtime/traces.db` — Execution traces (traces, spans). started_at is unix timestamp.
+- `runtime/trace_entities.db` — Trace pipeline entities/relationships/communities
+
+### Architecture (Mixin inheritance)
+- V4Loop(LensPhaseMixin, CPhaseMixin, ChallengerMixin) in loop.py
+- Methods split across: loop.py, lens_phase.py, c_phase.py, challenger.py
+- All Mixins share: self.vault, self.provider, self.tools, self.trace_id, self.user_input
+- NodeVault is singleton (manager.py), initialized with SignatureEngine + VectorEngine
+- build_gp_prompt() in prompt_factory.py: params = recent_memory, inferred_signature, daemon_status, knowledge_state, knowledge_map, trace_experience
+
+### Knowledge Flow (6-layer system)
+- Storage: NodeVault + TraceEntityStore + Tracer
+- Intelligence: SignatureEngine (39 dims) + VectorEngine (BGE-small-zh + reranker)
+- Injection: Knowledge Map + Experience Map + Knowledge Routing + Multi-G Blackboard
+- Production: C-Phase Extraction + Challenger + Arena + Trace Pipeline
+- Quality: Trust tiers, confidence scoring, semantic dedup (>=0.85 merge, 0.65-0.85 relate)
+- Consumption: search_knowledge_nodes, get_knowledge_node_content, trace_query (6 modes)
+
+### Known Traps
+- RecordLessonNodeTool hardcodes tags="auto_managed" — use vault.create_node() directly for custom tags
+- knowledge_nodes.tags is plain TEXT, not JSON
+- full_content is in node_content table (separate from knowledge_nodes)
+- Auto mode: c_phase_blocking=True, disable_multi_g=True
+- Multi-G only activates for input >= 50 chars
+
+### Design Philosophy (user decisions — DO NOT violate)
+- A-b-C model: G thinks, Op executes (stateless), C reflects. User wants A->b->A (subroutine), not G->Op (relay)
+- Atomicity: Each LESSON = 1 core action step. Complex flows = multiple LESSSONs + TRIGGERS edges
+- Cone model: Dense knowledge = execute directly, VOID holes = investigate first
+- No new node types: 7 types are sufficient. Evolve metadata_signature dimensions instead
+- MBTI personalities for Multi-G, not functional roles (architect/reviewer)
+- Scavenger OFF, Hypothesis engine OFF (user decision 2026-03-26)
+
+## After Completing Tasks
+Record new observations with `mcp0_record_code_observation()` for:
+- New constraints discovered
+- Bugs fixed and their root causes
+- Architecture patterns identified
+- Traps that wasted debugging time
+Use structured signatures: component, language, framework, applies_to_environment_scope, validation_status

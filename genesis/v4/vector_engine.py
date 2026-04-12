@@ -47,8 +47,8 @@ class VectorEngine:
                     self.reranker_ready = False
             threading.Thread(target=_load_reranker, daemon=True).start()
                 
-        except ImportError:
-            logger.warning("VectorEngine: sentence-transformers not installed. Vector search disabled.")
+        except ImportError as e:
+            logger.warning(f"VectorEngine: ImportError during model load: {e}. Vector search disabled.")
             self.is_ready = False
         except Exception as e:
             logger.error(f"VectorEngine: Failed to load model: {e}")

@@ -16,15 +16,15 @@ from genesis.core.provider import NativeHTTPProvider, LLMResponse
 
 
 class AIXJResponsesProvider(NativeHTTPProvider):
-    """AIXJ Responses API Provider
+    """xcode Responses API Provider
     
-    适配 AIXJ 的 Responses API 格式，将 messages 转换为 input 字符串。
+    适配 xcode 的 Responses API 格式，将 messages 转换为 input 字符串。
     """
     
     def __init__(
         self,
         api_key: Optional[str] = None,
-        base_url: Optional[str] = "https://api.aixj.cn/v1",
+        base_url: Optional[str] = "https://api.xcode.best/v1",
         default_model: str = "gpt-5.4",
         connect_timeout: int = 30,
         request_timeout: int = 180,
@@ -32,7 +32,7 @@ class AIXJResponsesProvider(NativeHTTPProvider):
         stop_sequences: Optional[List[str]] = None,
         provider_name: str = "aixj_responses",
         use_proxy: bool = False,
-        skip_content_type: bool = True
+        skip_content_type: bool = False
     ):
         super().__init__(
             api_key=api_key,
@@ -69,11 +69,11 @@ class AIXJResponsesProvider(NativeHTTPProvider):
         Returns:
             LLMResponse: 响应对象
         """
-        # aixj.vip = 标准 OpenAI chat completions，直接用父类（已验证能跑）
-        if "aixj.vip" in self.base_url:
+        # xcode.best = 标准 OpenAI chat completions，直接用父类（已验证能跑）
+        if "xcode.best" in self.base_url:
             return await super().chat(messages, tools, model, stream, stream_callback, **kwargs)
         
-        # ── 以下仅用于 api.aixj.cn responses 端点 ──
+        # ── 以下仅用于 responses 端点 ──
         messages = self._sanitize_messages(messages)
         
         endpoint = "/responses"
@@ -105,7 +105,7 @@ class AIXJResponsesProvider(NativeHTTPProvider):
         logger.debug(f"Using endpoint: {endpoint}")
         logger.debug(f"Request params before sending: {request_params}")
         
-        # AIXJ Responses API 可能不支持 tools，这里暂时忽略
+        # xcode Responses API 可能不支持 tools，这里暂时忽略
         # if tools:
         #     logger.warning("AIXJ Responses API may not support tools parameter")
         
@@ -317,7 +317,7 @@ class AIXJResponsesProvider(NativeHTTPProvider):
             tool_calls = []
         
         else:
-            raise Exception(f"Invalid AIXJ Responses API Response: {resp_data}")
+            raise Exception(f"Invalid xcode Responses API Response: {resp_data}")
         
         # 提取 token 使用情况
         usage = resp_data.get('usage', {})
@@ -328,7 +328,7 @@ class AIXJResponsesProvider(NativeHTTPProvider):
         
         return LLMResponse(
             content=content,
-            reasoning_content="",  # AIXJ Responses API 可能不支持 reasoning
+            reasoning_content="",  # xcode Responses API 可能不支持 reasoning
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             input_tokens=input_tokens,

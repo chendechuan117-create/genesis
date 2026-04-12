@@ -165,10 +165,24 @@ class ShellTool(Tool):
             if isinstance(value, tuple):
                 value = list(value)
             if isinstance(value, list):
-                return "; ".join(
-                    formatted for item in value
-                    if (formatted := _format_health_check_item(item)) is not None
-                )
+                formatted_items = []
+                for item in value:
+                    if isinstance(item, tuple):
+                        item = list(item)
+                    if isinstance(item, list):
+                        normalized = []
+                        for nested in item:
+                            if isinstance(nested, tuple):
+                                nested = list(nested)
+                            normalized.append(nested)
+                        formatted_items.append(json.dumps(normalized, ensure_ascii=False, sort_keys=True))
+                    elif isinstance(item, dict):
+                        formatted_items.append(json.dumps(item, ensure_ascii=False, sort_keys=True))
+                    else:
+                        formatted = _format_health_check_item(item)
+                        if formatted is not None:
+                            formatted_items.append(formatted)
+                return "; ".join(formatted_items)
             if isinstance(value, dict):
                 return json.dumps(value, ensure_ascii=False, sort_keys=True)
             return str(value)

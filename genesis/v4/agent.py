@@ -29,6 +29,8 @@ class GenesisV4:
         self.max_iterations = max_iterations
         self.enable_logging = enable_logging
         self.c_phase_blocking = c_phase_blocking
+        # 知识游标：跨轮持久化，让 GP 在连续任务中沿图谱边导航而非每次全量搜索
+        self._knowledge_cursor: Optional[Dict[str, Any]] = None
 
     async def process(self, user_input: str, step_callback: Optional[Any] = None, image_paths: Optional[List[str]] = None, c_phase_blocking: Optional[bool] = None, loop_config: Optional[Dict[str, Any]] = None, initial_knowledge_state: Optional[Dict[str, Any]] = None) -> UnifiedResponse:
         """
@@ -56,7 +58,10 @@ class GenesisV4:
                 image_paths=image_paths,
                 loop_config=loop_config,
                 initial_knowledge_state=initial_knowledge_state,
+                knowledge_cursor=self._knowledge_cursor,
             )
+            # 更新知识游标供下一轮使用
+            self._knowledge_cursor = loop.export_knowledge_cursor()
             
             # 结束追踪
             tracer.end_trace(trace_id, final_response=final_response)
@@ -72,7 +77,7 @@ class GenesisV4:
             elif not metrics.success:
                 status = "FAILED"
             
-            return UnifiedResponse.from_op_result(
+            return UnifiedResponse.from_result(
                 response_text=final_response,
                 metrics=metrics,
                 trace_id=trace_id,
@@ -89,7 +94,7 @@ class GenesisV4:
             # 创建失败的 metrics
             metrics = PerformanceMetrics(success=False, total_time=0)
             
-            return UnifiedResponse.from_op_result(
+            return UnifiedResponse.from_result(
                 response_text=f"V4 Execution Error: {e}",
                 metrics=metrics,
                 trace_id=trace_id,

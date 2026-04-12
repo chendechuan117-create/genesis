@@ -1,0 +1,19 @@
+services:
+  doctor:
+    image: nanogenesis-sandbox:latest
+    container_name: genesis-doctor
+    working_dir: /workspace
+    entrypoint: ["/bin/bash", "/doctor/entrypoint.sh"]
+    stdin_open: true
+    tty: true
+    volumes:
+      - ..:/src/genesis:ro
+      - ../venv:/opt/venv:ro
+      - /home/chendechusn/.genesis/workshop_v4.sqlite:/src/db/workshop_v4.sqlite:ro
+      - ./entrypoint.sh:/doctor/entrypoint.sh:ro
+      - genesis-doctor-workspace:/workspace
+      - /usr:/usr:ro
+      - /lib:/lib:ro
+      - /lib64:/lib64:ro
+volumes:
+  genesis-doctor-workspace:

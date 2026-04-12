@@ -742,14 +742,15 @@ class V4Loop(LensPhaseMixin, CPhaseMixin, ChallengerMixin):
         loaded_ids = []
         DEEP_EDGES = {"REQUIRES", "TRIGGERS", "RESOLVES"}
         
+        from genesis.v4.arena_mixin import ArenaConfidenceMixin
         for nid in node_ids:
             brief = briefs.get(nid)
             if not brief:
                 continue
             title = brief.get("title", nid)
             ntype = brief.get("type", "?")
-            conf = brief.get("confidence_score", 0)
-            meta_parts = [f"conf={conf:.2f}"]
+            conf = ArenaConfidenceMixin.effective_confidence(brief)
+            meta_parts = [f"q={conf:.2f}"]
             if similarity_scores and nid in similarity_scores:
                 meta_parts.insert(0, f"sim={similarity_scores[nid]:.2f}")
             wins = brief.get("usage_success_count", 0) or 0

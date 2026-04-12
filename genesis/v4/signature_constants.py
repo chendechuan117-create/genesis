@@ -17,6 +17,8 @@ METADATA_SIGNATURE_FIELDS = [
     "validation_status",
     "knowledge_state",
     "invalidation_reason",
+    "valid_from",
+    "valid_until",
 ]
 
 METADATA_SCHEMA_VERSION = "2"
@@ -76,6 +78,7 @@ _DIM_OPERATIONAL_BLACKLIST = frozenset({
     "observed_environment_scope", "observed_environment_epoch",
     "applies_to_environment_scope", "applies_to_environment_epoch",
     "invalidation_reason",
+    "valid_from", "valid_until",
     METADATA_SCHEMA_VERSION_FIELD,
 })
 _DIM_MIN_FREQ = 3

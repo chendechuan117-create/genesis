@@ -323,6 +323,34 @@ class CPhaseMixin:
         if repeated:
             signals.append(f"SIGNAL[TOOL_BEHAVIOR]: repeated_calls={repeated}")
 
+        # 信号5: 知识操作模式（KNOWLEDGE_OPS 候选）— auto 模式下主要信号源
+        kb_search_count = 0
+        kb_empty_searches = 0
+        kb_record_count = 0
+        web_search_count = 0
+        for msg in self.g_messages:
+            if msg.role == MessageRole.TOOL:
+                if msg.name == "search_knowledge_nodes":
+                    kb_search_count += 1
+                    content_str = str(msg.content or "")[:300]
+                    if "0 个结果" in content_str or "未找到" in content_str or "no results" in content_str.lower():
+                        kb_empty_searches += 1
+                elif msg.name == "record_lesson_node":
+                    kb_record_count += 1
+                elif msg.name == "web_search":
+                    web_search_count += 1
+        kb_signals = []
+        if kb_search_count > 0:
+            kb_signals.append(f"searches={kb_search_count}")
+            if kb_empty_searches > 0:
+                kb_signals.append(f"empty_searches={kb_empty_searches}")
+        if kb_record_count > 0:
+            kb_signals.append(f"records={kb_record_count}")
+        if web_search_count > 0:
+            kb_signals.append(f"web_searches={web_search_count}")
+        if kb_signals:
+            signals.append(f"SIGNAL[KNOWLEDGE_OPS]: {', '.join(kb_signals)}")
+
         # 如果没有信号，返回空
         if not signals:
             return ""
@@ -432,7 +460,7 @@ class CPhaseMixin:
 
         try:
             rows = vault._conn.execute(  # 使用 self.vault 的连接，能看到本轮刚录入的 DISCOVERY
-                """SELECT kn.node_id, nc.full_content, kn.confidence_score
+                """SELECT kn.node_id, nc.full_content
                    FROM knowledge_nodes kn
                    JOIN node_contents nc ON kn.node_id = nc.node_id
                    WHERE kn.type = 'DISCOVERY'
@@ -457,7 +485,6 @@ class CPhaseMixin:
                             'node_id': r['node_id'],
                             'subject': subject,
                             'description': description,
-                            'confidence': float(r['confidence_score'] or 0.5),
                         })
                 except (json.JSONDecodeError, TypeError):
                     continue
@@ -475,13 +502,11 @@ class CPhaseMixin:
 
                 pattern_id = f"PAT_{hashlib.md5(prefix.encode()).hexdigest()[:8].upper()}"
                 if pattern_id in existing_patterns:
-                    vault.promote_node_confidence(pattern_id, boost=0.05, max_score=0.95)
-                    logger.info(f"PATTERN [{pattern_id}] already exists, confidence boosted")
+                    vault.touch_node(pattern_id)
+                    logger.info(f"PATTERN [{pattern_id}] already exists, marked active")
                     continue
 
                 descriptions = [f"- {d['subject']}: {d['description']}" for d in discoveries[:10]]
-                max_conf = max(d['confidence'] for d in discoveries)
-                pattern_conf = min(max_conf + 0.1, 0.95)
 
                 pattern_content = json.dumps({
                     "subject_prefix": prefix,
@@ -503,7 +528,6 @@ class CPhaseMixin:
                         "promotion_source": "auto",
                         "observation_count": len(discoveries),
                     },
-                    confidence_score=pattern_conf,
                     trust_tier="REFLECTION",
                 )
 

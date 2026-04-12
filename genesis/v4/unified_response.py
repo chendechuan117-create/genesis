@@ -55,25 +55,29 @@ class UnifiedResponse(BaseModel):
     input_tokens: int = Field(default=0, description="输入token数")
     output_tokens: int = Field(default=0, description="输出token数")
     total_tokens: int = Field(default=0, description="总token数")
-    g_tokens: int = Field(default=0, description="G-Phase token数")
-    op_tokens: int = Field(default=0, description="Op-Phase token数")
+    g_tokens: int = Field(default=0, description="GP-Phase token数")
+    op_tokens: int = Field(default=0, description="(废弃，保持兼容) 始终为0")
     c_tokens: int = Field(default=0, description="C-Phase token数")
     
     # 错误信息
     error_type: Optional[str] = Field(default=None, description="错误类型")
     error_detail: Optional[str] = Field(default=None, description="错误详情")
 
-    # 经历轨迹：G/Op/C 三阶段完整对话序列，供复盘使用
-    phase_trace: Optional[Dict[str, Any]] = Field(default=None, description="G/Op/C 阶段对话轨迹")
+    # 经历轨迹：GP/C 两阶段完整对话序列，供复盘使用
+    phase_trace: Optional[Dict[str, Any]] = Field(default=None, description="GP/C 阶段对话轨迹")
     knowledge_state: Optional[Dict[str, Any]] = Field(default=None, description="当前工作记忆")
      
+    # 向后兼容别名
     @classmethod
-    def from_op_result(
+    def from_op_result(cls, **kwargs) -> "UnifiedResponse":
+        return cls.from_result(**kwargs)
+
+    @classmethod
+    def from_result(
         cls,
         response_text: str,
         metrics: Any,
         trace_id: str = "",
-        op_result: Optional[Any] = None,
         degraded: bool = False,
         partial_reason: Optional[str] = None,
         error_info: Optional[Dict[str, str]] = None,
@@ -81,21 +85,12 @@ class UnifiedResponse(BaseModel):
         knowledge_state: Optional[Dict[str, Any]] = None,
     ) -> "UnifiedResponse":
         """
-        从内部执行结果构建统一响应
-        
-        Args:
-            response_text: 最终响应文本
-            metrics: PerformanceMetrics 对象
-            trace_id: 追踪ID
-            op_result: OpResult 对象（可选）
-            degraded: 是否降级
-            partial_reason: 部分成功原因
-            error_info: 错误信息字典 {type, detail}
+        从 GP 执行结果构建统一响应
         """
         # 确定状态
         if metrics.success:
             status = ExecutionStatus.SUCCESS
-            if partial_reason or (op_result and op_result.status == "PARTIAL"):
+            if partial_reason:
                 status = ExecutionStatus.PARTIAL
         else:
             status = ExecutionStatus.FAILED
@@ -110,11 +105,6 @@ class UnifiedResponse(BaseModel):
             iterations=metrics.iterations,
             duration_ms=metrics.total_time * 1000,
             trace_id=trace_id,
-            summary=op_result.summary if op_result else None,
-            findings=op_result.findings if op_result else None,
-            changes_made=op_result.changes_made if op_result else None,
-            artifacts=op_result.artifacts if op_result else None,
-            open_questions=op_result.open_questions if op_result else None,
             input_tokens=metrics.input_tokens,
             output_tokens=metrics.output_tokens,
             total_tokens=metrics.total_tokens,

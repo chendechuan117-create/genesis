@@ -333,7 +333,11 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
 
             conn = self.vault._conn
             with conn:
-                query = "SELECT node_id, type, title, tags, prerequisites, resolves, metadata_signature, usage_count, usage_success_count, usage_fail_count, confidence_score, last_verified_at, verification_source, updated_at, trust_tier, epistemic_status FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%'"
+                query = ("SELECT node_id, type, title, tags, prerequisites, resolves, metadata_signature, "
+                         "usage_count, usage_success_count, usage_fail_count, last_verified_at, "
+                         "verification_source, updated_at, trust_tier FROM knowledge_nodes "
+                         "WHERE node_id NOT LIKE 'MEM_CONV%'"
+                         " AND node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS')")
                 params = []
 
                 if ntype != "ALL":
@@ -577,10 +581,6 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                         meta.append("已过期")
                     if reliability.get('freshness_label'):
                         meta.append(reliability['freshness_label'])
-                    # Epistemic status tag
-                    ep = r.get('epistemic_status') or 'BELIEF'
-                    ep_label = {"FACT": "事实", "BELIEF": "信念", "HYPOTHESIS": "假说"}.get(ep, ep)
-                    meta.append(ep_label)
                     meta.append(self._bucket_label(r.get('active_bucket') or self._active_bucket(r)))
                     match_type = "语义" if nid in semantic_ids else "字面"
                     meta.append(match_type)
@@ -644,7 +644,7 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
 
                 # === 圆锥凝实度摘要（含空洞检测） ===
                 cone_node_count = len(row_dicts) + len(cone_all_neighbor_ids)
-                conf_values = [r.get('confidence_score') or 0.5 for r in row_dicts]
+                conf_values = [self.vault.effective_confidence(r) for r in row_dicts]
                 avg_conf = sum(conf_values) / len(conf_values) if conf_values else 0
                 proven_count = sum(1 for r in row_dicts if (r.get('usage_success_count') or 0) >= 2)
                 untested_count = sum(1 for r in row_dicts if (r.get('usage_count') or 0) == 0)

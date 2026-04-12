@@ -4,6 +4,7 @@ Genesis V4 — Auto Mode
 从 discord_bot.py 提取，减少主文件复杂度。
 """
 
+import gc
 import os
 import re
 import json
@@ -19,6 +20,18 @@ from genesis.core.models import CallbackEvent
 from genesis.v4.manager import NodeVault
 
 logger = logging.getLogger("DiscordBot.Auto")
+
+# ─── Memory Management ────────────────────────────────────────────
+_ROUND_LOG_KEEP = 12  # keep last N rounds full; older rounds compacted (heavy fields dropped)
+
+def _release_memory():
+    """Force GC and return freed pages to OS (Linux malloc_trim)."""
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 
 # ─── Utilities ───────────────────────────────────────────────────
@@ -58,28 +71,36 @@ AUTO_DRY_SLEEP_STEP = _env_int("GENESIS_AUTO_DRY_SLEEP_STEP", 5, minimum=0)
 AUTO_ROUND_TIMEOUT_SECS = _env_int("GENESIS_AUTO_ROUND_TIMEOUT_SECS", 0, minimum=0)
 AUTO_SYNC_DOCTOR_SANDBOX = _env_bool("GENESIS_AUTO_SYNC_DOCTOR_SANDBOX", True)
 AUTO_DOCTOR_SYNC_TIMEOUT_SECS = _env_int("GENESIS_AUTO_DOCTOR_SYNC_TIMEOUT_SECS", 420, minimum=30)
+SPIRAL_CONCURRENCY = _env_int("GENESIS_SPIRAL_CONCURRENCY", 3, minimum=1)
 
-AUTO_PROMPT_FIRST = """你正在执行自主探索任务。
+AUTO_PROMPT_FIRST = """你是 Genesis 的自主探索者。你的目标不是修 bug 或填空洞——而是基于已有知识，发现 Genesis 还没想到的新可能性。
 
 ## 用户方向
 {directive}
 
-## 本轮任务
-1. 先用 `search_knowledge_nodes` 搜索知识库中与方向相关的已有知识，避免重复劳动
-2. 使用可用工具（shell、读写文件等）进行探索和调研
-3. 将新发现记录到知识库（调用 `record_lesson_node`）
-4. 如果发现值得深入的子方向，在回复中标注供下轮继续
+## 方法
+1. 用 `search_knowledge_nodes` 了解已有知识——这是你的起点，不是终点
+2. 基于已有知识，提出一个大胆假设：Genesis 还可以怎样变得更强？
+3. 在 Doctor 沙箱中实验验证你的假设
+4. 记录发现——假设成立记录为什么成立，不成立记录为什么不成立，两者同样有价值
 
 ## 规则
-- 围绕用户方向行动，不要偏离主题
-- 每轮聚焦一个具体子目标，做到位
-- 先搜后写：记录前先确认知识库中没有同类知识
-- 如果方向过于宽泛，先拆分为可执行的子步骤
+- 围绕用户方向行动
+- 每轮聚焦一个假设，做到位
+- 已有知识直接用，你的价值在于发现新的
+- 不要做琐碎的环境检查——只在实验需要时才检查环境
+
+## 沙箱规则（严格遵守）
+- **禁止直接修改 genesis/ 目录下的任何 .py 源文件**——那是正在运行的本体
+- 所有代码修改必须通过 Doctor 沙箱执行：`shell doctor.sh exec <command>`
+- 修改后在沙箱中测试：`shell doctor.sh test`
+- 查看修改差异：`shell doctor.sh diff`
+- 你可以自由读取本体代码（read_file）用于诊断，但写入只能进沙箱
 
 当前系统信号（仅供参考）：
 {signals}"""
 
-AUTO_PROMPT_CONTINUE = """继续自主探索。不要重复上一轮已完成的工作。
+AUTO_PROMPT_CONTINUE = """继续自主探索。上一轮的结论是这一轮的起点。
 
 ## 用户方向
 {directive}
@@ -93,18 +114,83 @@ AUTO_PROMPT_CONTINUE = """继续自主探索。不要重复上一轮已完成的
 {history}
 
 ## 续跑原则
-- 沿上一轮的前沿继续深入
-- 如果上一轮遗留了未解决的问题，优先处理
-- 先用 `search_knowledge_nodes` 确认相关知识，再用 `record_lesson_node` 记录新发现
-- 每轮聚焦一个子目标，做到位
+- 上一轮的结论直接作为已知事实，在此基础上推进
+- 如果上一轮的假设已验证或已证伪，提出新的假设
+- 追求让人意想不到的发现，不是流水线式的节点记录
+- 每轮聚焦一个假设，做到位
+
+## 沙箱规则（严格遵守）
+- **禁止直接修改 genesis/ 目录下的任何 .py 源文件**——那是正在运行的本体
+- 所有代码修改必须通过 Doctor 沙箱执行：`shell doctor.sh exec <command>`
+- 修改后在沙箱中测试：`shell doctor.sh test`
+- 查看修改差异：`shell doctor.sh diff`
+- 你可以自由读取本体代码（read_file）用于诊断，但写入只能进沙箱
 
 当前信号（仅供参考）：
 {signals}"""
 
 
-AUTO_DEFAULT_DIRECTIVE = ("基于当前系统信号和知识库状态，"
-    "选择最有价值的改进方向进行自主探索。"
-    "优先处理：知识空洞(VOID)填充、过时知识更新、系统效率优化。")
+AUTO_DEFAULT_DIRECTIVE = (
+    "基于 Genesis 的元信息系统（知识库、经验图谱、Arena），探索 Genesis 系统的新可能性。"
+    "方法：读已有知识 → 提出假设 → 在 Doctor 沙箱中实验 → 记录发现。"
+    "方向：不局限于修 bug——可以探索架构改进、新机制、性能优化、知识利用的新方式。"
+    "所有代码修改必须在 Doctor 沙箱中进行（doctor.sh exec），严禁直接改本体源码。"
+    "每轮只做一件事，做到位。追求让人意想不到的发现。"
+)
+
+SPIRAL_PROMPT = """你的任务：为 Genesis 代码库中的一个文件创建 **结构性理解锚点**。
+
+## 目标文件
+`{filepath}`
+来源：{discovered_from}
+
+## 步骤
+1. 用 `read_file` 读取目标文件的源码
+2. 理解这个文件在 Genesis 系统中的角色和职责
+3. 识别关键的类和函数，各一句话概括
+4. 用 `record_context_node` 创建锚点节点：
+   - node_id: `{anchor_id}`
+   - title: 模块名 + 一句话职责
+   - state_description: 角色 + 关键组件列表 + 对外接口
+
+## 规则
+- 只关注目标文件，一轮只做一个文件
+- 大文件聚焦公开接口和关键逻辑，不需要逐行分析
+- 不要做环境检查、不要搜索知识库、不要验证已有知识
+- 锚点是组织索引，不是重复描述碎片已有内容
+- 边连接由系统自动完成，你只需创建锚点
+
+探索进度：{progress}"""
+
+CROSS_MODULE_PROMPT = """你的任务：分析两个 Genesis 模块之间的 **因果协作关系**。
+
+## 模块 A
+`{filepath_a}` — {anchor_title_a}
+
+## 模块 B
+`{filepath_b}` — {anchor_title_b}
+
+## 共享知识线索
+{shared_context}
+
+## 步骤
+1. 用 `read_file` 读取两个模块的源码
+2. 找到它们之间的**具体调用链**：A 的哪个函数/类调用了 B 的什么？或反过来？
+3. 理解这个调用的**目的**：为什么 A 需要 B？去掉这个连接会怎样？
+4. 用 `record_lesson_node` 记录一条因果关系：
+   - title: "A → B: 一句话描述协作关系"
+   - content: 具体调用链 + 目的 + 如果修改一方需要注意什么
+   - tags: 两个模块名
+   - resolves: "cross_module_understanding"
+
+## 规则
+- 只关注这两个模块之间的关系，不发散
+- 找**具体代码证据**（函数名、import 路径），不要泛泛而谈
+- 如果两个模块没有直接交互，记录"无直接依赖"也是有价值的发现
+- 不要做环境检查、不要搜索知识库
+
+进度：{progress}"""
+
 
 _ERROR_RESPONSE_PATTERNS = [
     "V4 Execution Error",
@@ -180,7 +266,7 @@ def _reset_provider(agent):
     """每轮行动前强制回到首选 provider，避免残留 failover 影响 /auto。"""
     try:
         router = agent.provider
-        preferred = getattr(router, "_preferred_provider_name", "aixj")
+        preferred = getattr(router, "_preferred_provider_name", "xcode")
         active = getattr(router, "active_provider_name", "")
         providers = getattr(router, "providers", {}) or {}
         if active != preferred and preferred in providers:
@@ -209,35 +295,27 @@ def _get_auto_signals(round_num: int = 1, session_shown_voids: set | None = None
         try:
             conn = sqlite3.connect(str(db))
 
-            # ── 1. 低有效置信度节点：用 effective_confidence（读时衰减）而非 raw confidence ──
-            # 这样能发现 raw conf 高但长期未验证而衰减致死的节点
+            # ── 1. 实践中失败的知识：失败次数 > 成功次数，需要修正 ──
             conn.row_factory = sqlite3.Row
-            try:
-                from genesis.v4.arena_mixin import ArenaConfidenceMixin
-                _eff_conf = ArenaConfidenceMixin.effective_confidence
-            except ImportError:
-                _eff_conf = lambda d: d.get("confidence_score", 0.5)
-            candidate_rows = conn.execute(
-                "SELECT node_id, title, type, confidence_score, updated_at, last_verified_at, trust_tier "
+            failing_rows = conn.execute(
+                "SELECT node_id, title, type, usage_success_count, usage_fail_count "
                 "FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV_%' "
-                "ORDER BY updated_at DESC LIMIT 200"
+                "AND usage_fail_count > 0 AND usage_fail_count > usage_success_count "
+                "AND node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS') "
+                "ORDER BY usage_fail_count DESC LIMIT 5"
             ).fetchall()
-            low_eff = []
-            for r in candidate_rows:
-                d = dict(r)
-                if session_shown_nodes and d["node_id"] in session_shown_nodes:
-                    continue
-                eff = _eff_conf(d)
-                if eff < 0.35:
-                    low_eff.append((d["node_id"], d["title"], d["type"], eff))
-            low_eff.sort(key=lambda x: x[3])
-            if low_eff:
-                lines = ["[待验证知识 — 有效置信度低于 0.35，可能过时或衰减]"]
-                for nid, title, node_type, eff in low_eff[:5]:
-                    lines.append(f"  {nid}: {title} (eff:{eff:.2f})")
+            if failing_rows:
+                lines = ["[实践中反复失败的知识 — 失败>成功，需要修正或重写]"]
+                for r in failing_rows:
+                    nid = r['node_id']
+                    if session_shown_nodes and nid in session_shown_nodes:
+                        continue
+                    w, l = r['usage_success_count'] or 0, r['usage_fail_count'] or 0
+                    lines.append(f"  {nid}: {r['title']} ({w}W/{l}L)")
                     if session_shown_nodes is not None:
                         session_shown_nodes.add(nid)
-                sections.append("\n".join(lines))
+                if len(lines) > 1:
+                    sections.append("\n".join(lines))
 
             # ── 2. 知识空洞(VOID)：已知的未知，填补它们是核心价值 ──
             void_count = conn.execute("SELECT COUNT(*) FROM void_tasks").fetchone()[0]
@@ -267,35 +345,36 @@ def _get_auto_signals(round_num: int = 1, session_shown_voids: set | None = None
                         session_shown_voids.add(vid)
                 sections.append("\n".join(lines))
 
-            # ── 3. Arena 真正失效的知识：仅保留低置信+高失败率的条目 ──
-            # 高置信节点偶尔失败是环境边界情况，不是知识缺陷，不展示
-            rows = conn.execute(
-                "SELECT node_id, title "
+            # ── 3. 未经测试的新节点：从未使用过但最近创建，需要拝入实践 ──
+            untested_rows = conn.execute(
+                "SELECT node_id, title, type "
                 "FROM knowledge_nodes "
-                "WHERE usage_fail_count > 0 AND confidence_score < 0.7 "
-                "ORDER BY usage_fail_count DESC LIMIT 3"
+                "WHERE usage_count = 0 AND node_id NOT LIKE 'MEM_CONV_%' "
+                "AND type IN ('LESSON', 'PATTERN', 'ASSET') "
+                "AND node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS') "
+                "ORDER BY created_at DESC LIMIT 3"
             ).fetchall()
-            if rows:
-                lines = ["[实践中反复失效的知识 — 需要修正或重写]"]
-                for nid, title in rows:
-                    lines.append(f"  {nid}: {title}")
+            if untested_rows:
+                lines = ["[未经实践的新知识 — 优先尝试挂载]"]
+                for r in untested_rows:
+                    lines.append(f"  {r['node_id']}: {r['title']} <{r['type']}>")
                 sections.append("\n".join(lines))
 
             # ── 4. C-Phase 产出：DISCOVERY 和 PATTERN 节点可见性 ──
             disc_rows = conn.execute(
-                "SELECT node_id, title, confidence_score FROM knowledge_nodes "
+                "SELECT node_id, title FROM knowledge_nodes "
                 "WHERE type = 'DISCOVERY' ORDER BY created_at DESC LIMIT 5"
             ).fetchall()
             pat_rows = conn.execute(
-                "SELECT node_id, title, confidence_score FROM knowledge_nodes "
+                "SELECT node_id, title FROM knowledge_nodes "
                 "WHERE type = 'PATTERN' ORDER BY created_at DESC LIMIT 3"
             ).fetchall()
             if disc_rows or pat_rows:
                 lines = ["[C-Phase 产出 — DISCOVERY/PATTERN 节点]"]
                 for r in pat_rows:
-                    lines.append(f"  {r['node_id']}: {r['title']} (conf:{r['confidence_score']:.2f})")
+                    lines.append(f"  {r['node_id']}: {r['title']}")
                 for r in disc_rows:
-                    lines.append(f"  {r['node_id']}: {r['title']} (conf:{r['confidence_score']:.2f})")
+                    lines.append(f"  {r['node_id']}: {r['title']}")
                 sections.append("\n".join(lines))
         except Exception as e:
             sections.append(f"[DB 查询异常: {e}]")
@@ -573,6 +652,8 @@ def _build_frontier_state(round_index, response, kb_delta_summary, kb_changed, n
     reanchor_required, reanchor_reason = _detect_reanchor_signal(response, round_events)
     reanchor_streak = prior_reanchor_streak + 1 if reanchor_required else 0
     observations = [f"KB {kb_delta_summary}", node_telemetry]
+    if candidate_issue and candidate_issue not in ("未提取", "未从上轮回复中提取到稳定问题定义"):
+        observations.insert(0, f"已确认: {candidate_issue[:150]}")
     if tool_names:
         observations.append("工具结果: " + ", ".join(tool_names))
     if reanchor_required:
@@ -580,18 +661,18 @@ def _build_frontier_state(round_index, response, kb_delta_summary, kb_changed, n
     observations.append("文本回复: 有" if response and str(response).strip() else "文本回复: 无")
     carry_warnings = []
     if response and not kb_changed:
-        carry_warnings.append("上轮有文本回复但 KB 无变化；其中\u201c已完成/已写入/已验证\u201d表述不得直接当作已证实事实")
+        carry_warnings.append("上轮无新知识写入，该方向可能已探索充分——优先切换到新方向")
     if not tool_names:
-        carry_warnings.append("上轮未记录到有效 tool_result；如继续同方向，需重新取证")
+        carry_warnings.append("上轮无工具调用——如果相关知识已存在，直接转向新问题")
     if reanchor_required:
         carry_warnings.insert(0, f"检测到信息错位：{reanchor_reason}")
     if reanchor_streak >= 2:
         carry_warnings.insert(0, f"信息错位已连续 {reanchor_streak} 轮出现；如重锚后仍无新的外部证据，应停止当前路径")
     if not next_checks:
         if kb_changed:
-            next_checks = ["基于本轮外部观测继续推进尚未证实的相邻问题", "避免重复已完成动作"]
+            next_checks = ["在已确认事实基础上探索新的相邻问题", "避免重复验证已知事实"]
         else:
-            next_checks = ["回到本轮工具输出、测试结果和 diff 重新取证", "必要时换一个问题方向"]
+            next_checks = ["当前方向已无新信息，切换到新问题方向", "不要重复验证已有结论"]
     if reanchor_required:
         next_checks = ["先确认 Doctor /workspace 快照、实际导入目标和测试入口是否一致", "确认当前 diff/修改落在哪个副本，再继续沿当前问题推进", *next_checks]
     if reanchor_streak >= 2:
@@ -637,19 +718,23 @@ def _format_frontier_state(frontier_state: dict) -> str:
 
 def _build_auto_knowledge_state(frontier_state, round_events, raw_state=None):
     raw_state = raw_state if isinstance(raw_state, dict) else {}
+    # issue: frontier 优先（反映本轮实际发现），raw_state 仅做兜底
+    # 旧逻辑：非 reanchor 时 raw_state.issue 优先 → V4Loop 纯透传不修改 → 自引用循环冻结
     issue_seed = (
         frontier_state.get("candidate_issue") or frontier_state.get("local_goal") or raw_state.get("issue") or "待重新锁定"
-    ) if frontier_state.get("reanchor_required") else (
-        raw_state.get("issue") or frontier_state.get("candidate_issue") or frontier_state.get("local_goal") or "待重新锁定"
     )
     issue = _trim_frontier_item(issue_seed, 240)
-    verified_facts = _dedupe_trimmed_items(raw_state.get("verified_facts") or [], 220, 5)
-    if not verified_facts:
-        verified_facts = _dedupe_trimmed_items(frontier_state.get("observations") or [], 220, 3)
-    failed_attempts = _dedupe_trimmed_items(raw_state.get("failed_attempts") or [], 220, 5)
-    next_checks = _dedupe_trimmed_items((raw_state.get("next_checks") or frontier_state.get("next_checks") or []), 180, 5)
-    if not failed_attempts:
-        failed_attempts = _dedupe_trimmed_items(frontier_state.get("carry_warnings") or [], 220, 3)
+    # verified_facts: frontier observations 优先（本轮新鲜数据），raw_state 补充
+    frontier_obs = _dedupe_trimmed_items(frontier_state.get("observations") or [], 220, 3)
+    raw_facts = _dedupe_trimmed_items(raw_state.get("verified_facts") or [], 220, 3)
+    verified_facts = _dedupe_trimmed_items(frontier_obs + raw_facts, 220, 5)
+    # failed_attempts / next_checks: frontier 优先，raw_state 补充
+    frontier_warnings = _dedupe_trimmed_items(frontier_state.get("carry_warnings") or [], 220, 3)
+    raw_failures = _dedupe_trimmed_items(raw_state.get("failed_attempts") or [], 220, 3)
+    failed_attempts = _dedupe_trimmed_items(frontier_warnings + raw_failures, 220, 5)
+    next_checks = _dedupe_trimmed_items(
+        (frontier_state.get("next_checks") or []) + (raw_state.get("next_checks") or []), 180, 5
+    )
     if frontier_state.get("reanchor_required"):
         anchor_warning = f"信息错位风险：{frontier_state.get('reanchor_reason') or '当前修改目标与实际生效环境可能不一致'}"
         failed_attempts = _dedupe_trimmed_items([anchor_warning, *failed_attempts], 220, 5)
@@ -709,7 +794,8 @@ def _classify_auto_round_progress(response, round_events, kb_changed, frontier_s
     stable_issue = bool(frontier_state and frontier_state.get("candidate_issue")
                         and frontier_state.get("candidate_issue") not in ("未提取", "未从上轮回复中提取到稳定问题定义"))
     reanchor_required = bool(frontier_state and frontier_state.get("reanchor_required"))
-    strong_progress = bool(kb_changed or touched_files or ran_tests or inspected_diff)
+    gp_wrote_kb = kb_changed and any(name == "record_lesson_node" for name in tool_names)
+    strong_progress = bool(gp_wrote_kb or touched_files or ran_tests or inspected_diff)
     evidence_progress = bool(not strong_progress and result_events)
     soft_progress = bool(not strong_progress and not evidence_progress and (response_text or stable_issue))
     if strong_progress:
@@ -761,7 +847,7 @@ SESSION_PLANNER_INITIAL = """## 用户指令
   "agenda": [
     {{"topic": "具体方向描述", "budget": 3, "priority": 1, "status": "pending"}}
   ],
-  "next_focus": "第一轮的具体执行指令",
+  "next_focus": "第一轮的方向性目标（描述要调查/修复什么，不要写工具命令）",
   "should_continue": true,
   "reasoning": "选择理由（一句话）"
 }}"""
@@ -784,7 +870,7 @@ SESSION_PLANNER_REVIEW = """## 用户指令
   "agenda": [
     {{"topic": "方向描述", "budget": 3, "priority": 1, "status": "pending|in_progress|done|stuck"}}
   ],
-  "next_focus": "下一轮的具体执行指令",
+  "next_focus": "下一轮的方向性目标（描述要调查/修复什么，不要写工具命令）",
   "should_continue": true,
   "reasoning": "选择理由（一句话）"
 }}"""
@@ -824,24 +910,14 @@ def _pick_focused_fallback(signals: str, round_num: int = 1) -> str:
                 void_items.append(item)
             elif current_section == "c_phase":
                 low_conf_items.append(item)  # C-Phase 产出也可作为验证方向
-    # 轮换选择：奇数轮选 Arena/VOID，偶数轮选低置信
-    if round_num % 2 == 1:
-        if arena_items:
-            pick = arena_items[0]
-            return f"聚焦验证这条翻车知识并改进: {pick[:120]}"
-        if void_items:
-            pick = void_items[0]
-            return f"调查这个知识空洞并尝试填充: {pick[:120]}"
-    else:
-        if low_conf_items:
-            pick = low_conf_items[0]
-            return f"验证并更新这个低置信节点: {pick[:120]}"
-        if void_items:
-            pick = void_items[(round_num // 2) % max(len(void_items), 1)]
-            return f"调查这个知识空洞并尝试填充: {pick[:120]}"
+    # 优先级：Arena 翻车 > VOID 空洞 > 通用探索（不再轮换低置信）
     if arena_items:
-        return f"聚焦验证这条翻车知识并改进: {arena_items[0][:120]}"
-    return "检查知识库中置信度最低的节点，验证其准确性并更新"
+        pick = arena_items[0]
+        return f"聚焦验证这条翻车知识并改进: {pick[:120]}"
+    if void_items:
+        pick = void_items[round_num % max(len(void_items), 1)]
+        return f"调查这个知识空洞并尝试填充: {pick[:120]}"
+    return "继续探索 Genesis 系统，寻找可改进之处并在沙箱中实践"
 
 
 def _compact_round_history(round_log: list, last_n: int = 10) -> str:
@@ -943,6 +1019,671 @@ def describe_auto_state(auto_state: dict, channel_id: int) -> str:
     return " ".join(parts)
 
 
+# ─── Session-Level Structural Controls ──────────────────────────────
+
+class TopicTracker:
+    """Structural topic tracking — hard round limit per topic.
+
+    Uses character bigram Jaccard similarity (Chinese-friendly)
+    to detect when GP keeps working on the same topic across rounds.
+    """
+
+    MAX_ROUNDS_PER_TOPIC = 5
+    SIMILARITY_THRESHOLD = 0.35
+
+    def __init__(self):
+        self.topics: list = []
+        self.active_idx: int | None = None
+
+    @staticmethod
+    def _bigrams(text: str) -> set:
+        t = text.strip().lower()
+        return {t[i:i+2] for i in range(len(t) - 1)} if len(t) >= 2 else ({t} if t else set())
+
+    def _similarity(self, a: str, b: str) -> float:
+        sa, sb = self._bigrams(a), self._bigrams(b)
+        if not sa or not sb:
+            return 0.0
+        return len(sa & sb) / len(sa | sb)
+
+    def _find_match(self, candidate: str) -> int | None:
+        best_idx, best_sim = None, 0.0
+        for i, t in enumerate(self.topics):
+            sim = self._similarity(candidate, t["topic"])
+            if sim >= self.SIMILARITY_THRESHOLD and sim > best_sim:
+                best_idx, best_sim = i, sim
+        return best_idx
+
+    def update(self, round_num: int, candidate_issue: str, had_progress: bool) -> dict:
+        _skip = ("未提取", "未从上轮回复中提取到稳定问题定义", "待重新锁定", "")
+        if not candidate_issue or candidate_issue in _skip:
+            return {"action": "continue", "topic_info": None, "message": ""}
+        match_idx = self._find_match(candidate_issue)
+        if match_idx is not None:
+            topic = self.topics[match_idx]
+            topic["rounds_spent"] += 1
+            topic["last_round"] = round_num
+            self.active_idx = match_idx
+            if topic["rounds_spent"] >= self.MAX_ROUNDS_PER_TOPIC:
+                topic["verdict"] = "exhausted"
+                self.active_idx = None
+                return {
+                    "action": "force_switch",
+                    "topic_info": topic,
+                    "message": f"话题「{topic['topic'][:60]}」已持续 {topic['rounds_spent']} 轮，强制切换",
+                }
+            if topic["rounds_spent"] >= 3 and not had_progress:
+                return {
+                    "action": "suggest_switch",
+                    "topic_info": topic,
+                    "message": f"话题「{topic['topic'][:60]}」已 {topic['rounds_spent']} 轮且无新进展",
+                }
+            return {"action": "continue", "topic_info": topic, "message": ""}
+        new_topic = {
+            "topic": candidate_issue[:200], "first_round": round_num,
+            "last_round": round_num, "rounds_spent": 1, "verdict": "active",
+        }
+        self.topics.append(new_topic)
+        self.active_idx = len(self.topics) - 1
+        return {"action": "continue", "topic_info": new_topic, "message": ""}
+
+    def get_exhausted_topics(self) -> list:
+        return [t["topic"][:80] for t in self.topics if t["verdict"] == "exhausted"]
+
+    def format_for_prompt(self) -> str:
+        if not self.topics:
+            return ""
+        lines = ["[已探索话题——标记为✗的话题不得再次探索]"]
+        for t in self.topics:
+            if t["verdict"] == "exhausted":
+                lines.append(f"  ✗ {t['topic'][:80]} ({t['rounds_spent']}轮, 已用尽)")
+            else:
+                lines.append(f"  → {t['topic'][:80]} ({t['rounds_spent']}轮)")
+        return "\n".join(lines)
+
+
+class ActionHistory:
+    """Session-level cross-round action deduplication.
+
+    Records tool calls + results. Surfaces repeated actions in prompt
+    so GP sees *exactly* what has already been executed.
+    """
+
+    REPEAT_THRESHOLD = 2
+
+    def __init__(self):
+        self.actions: dict = {}  # key → {count, last_round}
+
+    def record_round(self, round_num: int, round_events: list):
+        for event in round_events:
+            if event.get("type") not in ("tool_result", "search_result"):
+                continue
+            name = (event.get("name") or "").strip()
+            if not name or name in ("search_knowledge_nodes", "record_lesson_node"):
+                continue
+            preview = (event.get("result_preview") or "").strip()
+            key = f"{name}:{preview[:80]}" if preview else name
+            if key in self.actions:
+                self.actions[key]["count"] += 1
+                self.actions[key]["last_round"] = round_num
+            else:
+                self.actions[key] = {"count": 1, "last_round": round_num}
+
+    def get_repeated(self) -> list:
+        return [
+            (key, info["count"])
+            for key, info in sorted(self.actions.items(), key=lambda x: -x[1]["count"])
+            if info["count"] >= self.REPEAT_THRESHOLD
+        ][:8]
+
+    def format_for_prompt(self) -> str:
+        repeated = self.get_repeated()
+        if not repeated:
+            return ""
+        lines = ["[以下操作已多次执行——结果已知，不要重复]"]
+        for key, count in repeated:
+            desc = key.split(":", 1)[-1][:80] if ":" in key else key
+            lines.append(f"  ×{count}: {desc}")
+        return "\n".join(lines)
+
+
+class SpiralPioneer:
+    """Vault-grounded organic traversal of Genesis codebase.
+
+    Base  = vault knowledge nodes (what Genesis already knows about itself).
+    Priority = files with scattered fragments but no organizing anchor (CTX_MODULE_).
+    Growth = after anchoring fragmented files, follow imports to pioneer new territory.
+    State persists to disk across sessions.
+    """
+
+    SEED = "discord_bot.py"
+    ANCHOR_PREFIX = "CTX_MODULE_"
+    # Noise filter for deterministic edge building
+    _EDGE_NOISE_RE = re.compile(
+        r'read_file\s*\('
+        r'|\[ENV_FACT\]'
+        r'|\[TOOL_BEHAVIOR\]'
+        r'|(无需|不用|避免|跳过|不再).*(shell|list_directory)'
+        r'|全程不?使?用\s*(shell|search)'
+    )
+
+    def __init__(self, state_path: str | None = None, project_root: str | None = None):
+        self._state_path = Path(state_path) if state_path else Path("runtime/spiral_pioneer_state.json")
+        self._root = Path(project_root) if project_root else Path(".")
+        # 与 NodeVault 使用相同的 DB 路径（新路径优先，旧路径兜底）
+        _new_db = Path.home() / ".genesis" / "workshop_v4.sqlite"
+        _legacy_db = Path.home() / ".nanogenesis" / "workshop_v4.sqlite"
+        self._db_path = _new_db if _new_db.exists() else _legacy_db
+        self.covered: list = []
+        self.frontier: list = []
+        self._load()
+        self._refresh_from_vault()
+        self._refresh_all_edges()
+
+    def _refresh_all_edges(self):
+        """Rebuild edges for all covered files in one pass (idempotent — INSERT OR IGNORE)."""
+        if not self.covered or not self._db_path.exists():
+            return
+        try:
+            conn = sqlite3.connect(str(self._db_path))
+            rows = conn.execute(
+                "SELECT n.node_id, n.title, nc.full_content "
+                "FROM knowledge_nodes n "
+                "LEFT JOIN node_contents nc ON n.node_id = nc.node_id "
+                "WHERE n.node_id NOT LIKE 'MEM_CONV_%' AND n.node_id NOT LIKE 'CTX_MODULE_%'"
+            ).fetchall()
+            # Pre-compute file patterns and generic-node counts once
+            all_files = self._discover_genesis_files()
+            generic_stems = {"__init__", "base", "models", "utils", "config", "constants", "types"}
+            all_patterns = {}
+            for fp in all_files:
+                s = Path(fp).stem
+                md = fp.replace("/", ".").replace(".py", "")
+                all_patterns[fp] = [fp, md] if s in generic_stems else [fp, md, f"/{s}.py"]
+            node_file_counts = {}
+            for nid, title, content in rows:
+                text = f"{title or ''} {content or ''}"
+                node_file_counts[nid] = sum(1 for _, pats in all_patterns.items() if any(p in text for p in pats))
+            # Build edges for each covered file
+            total = 0
+            for filepath in self.covered:
+                anchor_id = self.anchor_id_for(filepath)
+                patterns = all_patterns.get(filepath, [])
+                if not patterns:
+                    continue
+                for nid, title, content in rows:
+                    text = f"{title or ''} {content or ''}"
+                    if not any(p in text for p in patterns):
+                        continue
+                    if self._EDGE_NOISE_RE.search(title or ''):
+                        continue
+                    if node_file_counts.get(nid, 0) >= 5:
+                        continue
+                    conn.execute(
+                        "INSERT OR IGNORE INTO node_edges (source_id, target_id, relation, weight) VALUES (?,?,?,?)",
+                        (anchor_id, nid, "RELATED_TO", 0.5)
+                    )
+                    total += 1
+            conn.commit()
+            conn.close()
+            if total:
+                logger.info(f"SpiralPioneer: refreshed edges for {len(self.covered)} files ({total} inserts)")
+        except Exception as e:
+            logger.warning(f"SpiralPioneer: edge refresh failed: {e}")
+
+    def _load(self):
+        try:
+            if self._state_path.exists():
+                data = json.loads(self._state_path.read_text(encoding="utf-8"))
+                self.covered = data.get("covered", [])
+                self.frontier = data.get("frontier", [])
+        except Exception:
+            self.covered = []
+            self.frontier = []
+
+    def _save(self):
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            self._state_path.write_text(json.dumps({
+                "covered": self.covered,
+                "frontier": self.frontier,
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"SpiralPioneer state save failed: {e}")
+
+    # ── vault coverage check ──
+
+    def _discover_genesis_files(self) -> list:
+        files = []
+        for pkg in ["genesis"]:
+            pkg_path = self._root / pkg
+            if pkg_path.is_dir():
+                for py in pkg_path.rglob("*.py"):
+                    rel = str(py.relative_to(self._root))
+                    if "__pycache__" not in rel:
+                        files.append(rel)
+        for py in self._root.glob("*.py"):
+            files.append(py.name)
+        return sorted(set(files))
+
+    def _query_vault_file_map(self) -> dict:
+        """Query vault → {filepath: {fragments: [{id,title}], has_anchor: bool}}"""
+        if not self._db_path.exists():
+            return {}
+        try:
+            import sqlite3
+            conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True)
+            rows = conn.execute(
+                "SELECT n.node_id, n.title, nc.full_content "
+                "FROM knowledge_nodes n "
+                "LEFT JOIN node_contents nc ON n.node_id = nc.node_id"
+            ).fetchall()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"SpiralPioneer vault query failed: {e}")
+            return {}
+        all_files = self._discover_genesis_files()
+        generic_stems = {"__init__", "base", "models", "utils", "config", "constants", "types"}
+        file_patterns = {}
+        for fp in all_files:
+            stem = Path(fp).stem
+            module_dot = fp.replace("/", ".").replace(".py", "")
+            if stem in generic_stems:
+                file_patterns[fp] = [fp, module_dot]
+            else:
+                file_patterns[fp] = [fp, module_dot, f"/{stem}.py"]
+        file_map = {}
+        for node_id, title, content in rows:
+            text = f"{title or ''} {content or ''}"
+            for fp, patterns in file_patterns.items():
+                if any(p in text for p in patterns):
+                    if fp not in file_map:
+                        file_map[fp] = {"fragments": [], "has_anchor": False}
+                    file_map[fp]["fragments"].append({"id": node_id, "title": title or ""})
+                    if node_id.startswith(self.ANCHOR_PREFIX):
+                        file_map[fp]["has_anchor"] = True
+        return file_map
+
+    def _query_existing_anchors(self) -> set:
+        """Query vault for all files that already have CTX_MODULE_ anchor nodes."""
+        if not self._db_path.exists():
+            return set()
+        try:
+            import sqlite3
+            conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True)
+            rows = conn.execute(
+                "SELECT node_id FROM knowledge_nodes WHERE node_id LIKE 'CTX_MODULE_%'"
+            ).fetchall()
+            conn.close()
+        except Exception:
+            return set()
+        # Reverse map: anchor_id → filepath
+        all_files = self._discover_genesis_files()
+        anchor_to_file = {self.anchor_id_for(fp): fp for fp in all_files}
+        anchored = set()
+        for (nid,) in rows:
+            fp = anchor_to_file.get(nid)
+            if fp:
+                anchored.add(fp)
+        return anchored
+
+    def _refresh_from_vault(self):
+        """Rebuild frontier: vault fragments first, then import-graph expansion."""
+        file_map = self._query_vault_file_map()
+        covered_set = set(self.covered)
+        frontier_files = {item["filepath"] for item in self.frontier}
+
+        # Auto-cover: files that already have CTX_MODULE_ anchors in vault
+        already_anchored = self._query_existing_anchors()
+        for fp in already_anchored:
+            if fp not in covered_set:
+                self.covered.append(fp)
+                covered_set.add(fp)
+                logger.debug(f"SpiralPioneer: auto-covered {fp} (anchor exists)")
+
+        # Phase 1: files with vault fragments but no anchor → HIGH priority
+        fragmented = [
+            (fp, info) for fp, info in file_map.items()
+            if info["fragments"]
+            and fp not in already_anchored
+            and fp not in covered_set and fp not in frontier_files
+        ]
+        fragmented.sort(key=lambda x: len(x[1]["fragments"]), reverse=True)
+        insert_pos = 0
+        for fp, info in fragmented:
+            self.frontier.insert(insert_pos, {
+                "filepath": fp, "from": "vault_fragments",
+                "fragments": info["fragments"][:10],
+            })
+            frontier_files.add(fp)
+            insert_pos += 1
+
+        # Phase 2: from known files (covered + fragmented), follow imports → new territory
+        known_files = set(covered_set) | set(file_map.keys())
+        for fp in sorted(known_files):
+            for imp in self._extract_local_imports(fp):
+                if imp not in covered_set and imp not in frontier_files:
+                    frags = file_map.get(imp, {}).get("fragments", [])
+                    self.frontier.append({
+                        "filepath": imp, "from": fp,
+                        "fragments": frags[:10] if frags else [],
+                    })
+                    frontier_files.add(imp)
+
+        # Seed fallback
+        if not self.covered and not self.frontier:
+            self.frontier.append({"filepath": self.SEED, "from": "(入口)", "fragments": []})
+
+        self._save()
+
+    # ── ast import extraction ──
+
+    def _extract_local_imports(self, filepath: str) -> list:
+        import ast as _ast
+        full_path = self._root / filepath
+        if not full_path.exists():
+            return []
+        try:
+            source = full_path.read_text(encoding="utf-8")
+            tree = _ast.parse(source)
+        except Exception:
+            return []
+        found = []
+        for node in _ast.walk(tree):
+            modules = []
+            if isinstance(node, _ast.Import):
+                for alias in node.names:
+                    if alias.name:
+                        modules.append(alias.name)
+            elif isinstance(node, _ast.ImportFrom) and node.module:
+                modules.append(node.module)
+                for alias in node.names:
+                    if alias.name and alias.name != "*":
+                        modules.append(f"{node.module}.{alias.name}")
+            for mod in modules:
+                rel = mod.replace(".", "/")
+                for cand in [rel + ".py", rel + "/__init__.py"]:
+                    if (self._root / cand).exists():
+                        if cand not in found:
+                            found.append(cand)
+                        break
+        return found
+
+    # ── task selection ──
+
+    @staticmethod
+    def anchor_id_for(filepath: str) -> str:
+        parts = Path(filepath).with_suffix("").parts
+        if parts and parts[0] == "genesis":
+            parts = parts[1:]
+        return "CTX_MODULE_" + "_".join(p.upper() for p in parts)
+
+    def next_task(self) -> dict | None:
+        covered_set = set(self.covered)
+        for item in self.frontier:
+            fp = item["filepath"]
+            if fp not in covered_set and (self._root / fp).exists():
+                return {
+                    "filepath": fp,
+                    "discovered_from": item.get("from", ""),
+                    "fragments": item.get("fragments", []),
+                    "anchor_id": self.anchor_id_for(fp),
+                }
+        if self._expand_frontier_with_all_files() > 0:
+            return self.next_task()
+        return None
+
+    def _build_edges_for_anchor(self, filepath: str) -> int:
+        """Deterministic edge building: match vault nodes to filepath, filter noise, INSERT edges."""
+        anchor_id = self.anchor_id_for(filepath)
+        if not self._db_path.exists():
+            return 0
+        stem = Path(filepath).stem
+        module_dot = filepath.replace("/", ".").replace(".py", "")
+        generic_stems = {"__init__", "base", "models", "utils", "config", "constants", "types"}
+        patterns = [filepath, module_dot]
+        if stem not in generic_stems:
+            patterns.append(f"/{stem}.py")
+        try:
+            conn = sqlite3.connect(str(self._db_path))
+            rows = conn.execute(
+                "SELECT n.node_id, n.title, nc.full_content "
+                "FROM knowledge_nodes n "
+                "LEFT JOIN node_contents nc ON n.node_id = nc.node_id "
+                "WHERE n.node_id NOT LIKE 'MEM_CONV_%' AND n.node_id NOT LIKE 'CTX_MODULE_%'"
+            ).fetchall()
+            # Pre-compute: skip nodes matching too many files (generic)
+            all_files = self._discover_genesis_files()
+            all_patterns = {}
+            for fp in all_files:
+                s = Path(fp).stem
+                md = fp.replace("/", ".").replace(".py", "")
+                all_patterns[fp] = [fp, md] if s in generic_stems else [fp, md, f"/{s}.py"]
+            node_file_counts = {}
+            for nid, title, content in rows:
+                text = f"{title or ''} {content or ''}"
+                node_file_counts[nid] = sum(1 for fp2, pats in all_patterns.items() if any(p in text for p in pats))
+            inserted = 0
+            for nid, title, content in rows:
+                text = f"{title or ''} {content or ''}"
+                if not any(p in text for p in patterns):
+                    continue
+                if self._EDGE_NOISE_RE.search(title or ''):
+                    continue
+                if node_file_counts.get(nid, 0) >= 5:
+                    continue
+                conn.execute(
+                    "INSERT OR IGNORE INTO node_edges (source_id, target_id, relation, weight) VALUES (?,?,?,?)",
+                    (anchor_id, nid, "RELATED_TO", 0.5)
+                )
+                inserted += 1
+            conn.commit()
+            conn.close()
+            logger.info(f"SpiralPioneer: built {inserted} edges for {anchor_id}")
+            return inserted
+        except Exception as e:
+            logger.warning(f"SpiralPioneer: edge building failed for {filepath}: {e}")
+            return 0
+
+    def _expand_frontier_with_all_files(self):
+        """When import-graph frontier is exhausted, add all undiscovered genesis files."""
+        covered_set = set(self.covered)
+        frontier_fps = {item["filepath"] for item in self.frontier}
+        all_files = self._discover_genesis_files()
+        added = 0
+        for fp in all_files:
+            if fp not in covered_set and fp not in frontier_fps:
+                self.frontier.append({"filepath": fp, "from": "(全量扫描)", "fragments": []})
+                added += 1
+        if added:
+            self._save()
+            logger.info(f"SpiralPioneer: expanded frontier with {added} undiscovered files")
+        return added
+
+    def next_batch(self, n: int) -> list:
+        """Get up to n distinct tasks for parallel processing."""
+        tasks = []
+        covered_set = set(self.covered)
+        taken = set()
+        for item in self.frontier:
+            if len(tasks) >= n:
+                break
+            fp = item["filepath"]
+            if fp not in covered_set and fp not in taken and (self._root / fp).exists():
+                tasks.append({
+                    "filepath": fp,
+                    "discovered_from": item.get("from", ""),
+                    "fragments": item.get("fragments", []),
+                    "anchor_id": self.anchor_id_for(fp),
+                })
+                taken.add(fp)
+        if not tasks:
+            if self._expand_frontier_with_all_files() > 0:
+                return self.next_batch(n)
+        return tasks
+
+    def mark_done(self, filepath: str):
+        if filepath not in self.covered:
+            self.covered.append(filepath)
+        self._build_edges_for_anchor(filepath)
+        new_imports = self._extract_local_imports(filepath)
+        covered_set = set(self.covered)
+        frontier_files = {item["filepath"] for item in self.frontier}
+        for imp in new_imports:
+            if imp not in covered_set and imp not in frontier_files:
+                self.frontier.append({"filepath": imp, "from": filepath, "fragments": []})
+        self._save()
+
+    def get_progress(self) -> str:
+        covered_set = set(self.covered)
+        pending = [f for f in self.frontier if f["filepath"] not in covered_set]
+        has_frags = sum(1 for f in pending if f.get("fragments"))
+        return f"已锚定 {len(self.covered)} | 待组织 {has_frags} | 待探索 {len(pending) - has_frags}"
+
+
+class CrossModuleExplorer:
+    """Phase 2: 确定性跨模块配对分析器。
+    
+    从 vault 查询共享边的锚点对，按共享边数排序，
+    每轮分析一对模块的因果协作关系，记录为 LESSON。
+    """
+
+    _state_path = Path("runtime/cross_module_explorer_state.json")
+
+    def __init__(self):
+        self._db_path = Path.home() / ".genesis" / "workshop_v4.sqlite"
+        self._root = Path(".")
+        self.analyzed: list = []  # list of [anchor_a, anchor_b] pairs already done
+        self.pair_queue: list = []  # list of {a_id, b_id, a_fp, b_fp, a_title, b_title, shared_nodes, shared}
+        self._load()
+        if not self.pair_queue:
+            self._build_pair_queue()
+
+    def _load(self):
+        try:
+            if self._state_path.exists():
+                data = json.loads(self._state_path.read_text(encoding="utf-8"))
+                self.analyzed = data.get("analyzed", [])
+                self.pair_queue = data.get("pair_queue", [])
+        except Exception:
+            self.analyzed = []
+            self.pair_queue = []
+
+    def _save(self):
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            self._state_path.write_text(json.dumps({
+                "analyzed": self.analyzed,
+                "pair_queue": self.pair_queue,
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"CrossModuleExplorer state save failed: {e}")
+
+    def _anchor_to_filepath(self, anchor_id: str) -> str:
+        """CTX_MODULE_V4_LOOP → genesis/v4/loop.py (best effort from vault title or heuristic)"""
+        if not self._db_path.exists():
+            return ""
+        try:
+            import sqlite3
+            conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True)
+            row = conn.execute(
+                "SELECT nc.full_content FROM node_contents nc WHERE nc.node_id = ?", (anchor_id,)
+            ).fetchone()
+            conn.close()
+            if row and row[0]:
+                for line in row[0].split("\n"):
+                    stripped = line.strip().strip("`").strip()
+                    if stripped.endswith(".py") and "/" in stripped:
+                        return stripped
+        except Exception:
+            pass
+        # Heuristic fallback: CTX_MODULE_V4_LOOP → genesis/v4/loop.py
+        parts = anchor_id.replace("CTX_MODULE_", "").lower().split("_")
+        candidates = [
+            "/".join(parts) + ".py",
+            "genesis/" + "/".join(parts) + ".py",
+        ]
+        for c in candidates:
+            if (self._root / c).exists():
+                return c
+        return ""
+
+    def _build_pair_queue(self):
+        """Query vault for anchor pairs sharing edges to common knowledge nodes."""
+        if not self._db_path.exists():
+            return
+        try:
+            import sqlite3
+            conn = sqlite3.connect(f"file:{self._db_path}?mode=ro", uri=True)
+            # Find pairs sharing edges + get titles
+            rows = conn.execute("""
+                SELECT e1.source_id, e2.source_id, COUNT(*) as shared,
+                       GROUP_CONCAT(e1.target_id, '|')
+                FROM node_edges e1
+                JOIN node_edges e2 ON e1.target_id = e2.target_id
+                WHERE e1.source_id LIKE 'CTX_MODULE_%'
+                  AND e2.source_id LIKE 'CTX_MODULE_%'
+                  AND e1.source_id < e2.source_id
+                GROUP BY e1.source_id, e2.source_id
+                HAVING shared >= 1
+                ORDER BY shared DESC
+            """).fetchall()
+            # Get anchor titles
+            titles = {}
+            for r in conn.execute("SELECT node_id, title FROM knowledge_nodes WHERE node_id LIKE 'CTX_MODULE_%'"):
+                titles[r[0]] = r[1] or r[0]
+            # Get shared node titles for context
+            all_node_titles = {}
+            for r in conn.execute("SELECT node_id, title FROM knowledge_nodes"):
+                all_node_titles[r[0]] = r[1] or r[0]
+            conn.close()
+
+            analyzed_set = {tuple(sorted(p)) for p in self.analyzed}
+            for a_id, b_id, shared, shared_ids_str in rows:
+                pair_key = tuple(sorted([a_id, b_id]))
+                if pair_key in analyzed_set:
+                    continue
+                shared_node_ids = shared_ids_str.split("|") if shared_ids_str else []
+                shared_titles = [all_node_titles.get(nid, nid) for nid in shared_node_ids[:5]]
+                a_fp = self._anchor_to_filepath(a_id)
+                b_fp = self._anchor_to_filepath(b_id)
+                if not a_fp or not b_fp:
+                    continue
+                self.pair_queue.append({
+                    "a_id": a_id, "b_id": b_id,
+                    "a_fp": a_fp, "b_fp": b_fp,
+                    "a_title": titles.get(a_id, a_id),
+                    "b_title": titles.get(b_id, b_id),
+                    "shared": shared,
+                    "shared_titles": shared_titles,
+                })
+            self._save()
+            logger.info(f"CrossModuleExplorer: built queue with {len(self.pair_queue)} pairs")
+        except Exception as e:
+            logger.warning(f"CrossModuleExplorer: queue build failed: {e}")
+
+    def next_batch(self, n: int) -> list:
+        """Get up to n pairs for parallel analysis."""
+        analyzed_set = {tuple(sorted(p)) for p in self.analyzed}
+        tasks = []
+        for pair in self.pair_queue:
+            if len(tasks) >= n:
+                break
+            pair_key = tuple(sorted([pair["a_id"], pair["b_id"]]))
+            if pair_key not in analyzed_set:
+                tasks.append(pair)
+        return tasks
+
+    def mark_done(self, a_id: str, b_id: str):
+        self.analyzed.append([a_id, b_id])
+        self._save()
+
+    def get_progress(self) -> str:
+        analyzed_set = {tuple(sorted(p)) for p in self.analyzed}
+        pending = sum(1 for p in self.pair_queue if tuple(sorted([p["a_id"], p["b_id"]])) not in analyzed_set)
+        return f"已分析 {len(self.analyzed)} 对 | 待分析 {pending} 对"
+
+
 # ─── Main Entry Point ─────────────────────────────────────────────
 
 async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, directive: str = ""):
@@ -972,6 +1713,13 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
     planner_call_count: int = 0
     final_node_telemetry = "节点计数观测: 无法判断"
     doctor_sync_summary = "disabled"
+    topic_tracker = TopicTracker()
+    action_history = ActionHistory()
+    spiral_mode = (directive == AUTO_DEFAULT_DIRECTIVE)
+    pioneer = SpiralPioneer() if spiral_mode else None
+    cross_module_mode = False
+    explorer = None
+    _current_pioneer_file = None
 
     _report_dir = Path("runtime/auto_reports")
     _report_dir.mkdir(parents=True, exist_ok=True)
@@ -997,11 +1745,18 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
         except Exception as _e:
             logger.debug(f"Round JSON write failed: {_e}")
 
-    await channel.send(
-        f"🚀 **自主改进模式启动** ({'无上限' if AUTO_MAX_ROUNDS == 0 else f'上限 {AUTO_MAX_ROUNDS} 轮'})\n"
-        f"Genesis 将基于真实信号，在 Doctor 沙箱中动手改进自身。\n"
-        f"发送 `/auto stop` 停止。"
-    )
+    if spiral_mode:
+        await channel.send(
+            f"🌿 **螺旋拓荒模式启动** ({'无上限' if AUTO_MAX_ROUNDS == 0 else f'上限 {AUTO_MAX_ROUNDS} 轮'})\n"
+            f"以 vault 已有碎片为底座，为每个文件创建结构性锚点 (CTX_MODULE_) 并连边。\n"
+            f"{pioneer.get_progress()} | 发送 `/auto stop` 停止。"
+        )
+    else:
+        await channel.send(
+            f"🚀 **自主改进模式启动** ({'无上限' if AUTO_MAX_ROUNDS == 0 else f'上限 {AUTO_MAX_ROUNDS} 轮'})\n"
+            f"Genesis 将基于真实信号，在 Doctor 沙箱中动手改进自身。\n"
+            f"发送 `/auto stop` 停止。"
+        )
     if AUTO_SYNC_DOCTOR_SANDBOX:
         await channel.send("🩺 正在同步 Doctor 沙箱代码快照...")
         sync_ok, doctor_sync_summary = await _sync_doctor_sandbox()
@@ -1026,59 +1781,215 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
         round_start_utc_iso = _time_module.strftime("%Y-%m-%d %H:%M:%S", _time_module.gmtime(round_start_ts))
 
         signals = _get_auto_signals(round_num=round_num, session_shown_voids=session_shown_voids, session_shown_nodes=session_shown_nodes)
+        _struct = [topic_tracker.format_for_prompt(), action_history.format_for_prompt()]
+        _struct_text = "\n\n".join(p for p in _struct if p)
+        if _struct_text:
+            signals = signals + "\n\n" + _struct_text
 
-        # ── Session Planner：初始规划 / 定期审查 / 错误后审查 ──
-        need_planner = (
-            round_num == 1
-            or (round_num - last_planner_round >= PLANNER_REVIEW_INTERVAL)
-            or (consecutive_error > 0 and round_num - last_planner_round >= 2)
-        )
-        if need_planner and consecutive_error < 5:
-            await channel.send(f"🧭 Session Planner {'制定初始议程' if round_num == 1 else '审查进展'}...")
-            planner_result = await _call_session_planner(
-                provider=agent.provider, directive=directive, signals=signals,
-                round_log=round_log if round_num > 1 else None,
-                current_agenda=planner_agenda if round_num > 1 else None,
-            )
-            planner_agenda = planner_result.get("agenda", [])
-            planner_call_count += 1
-            last_planner_round = round_num
-            _append_md(
-                f"\n### Session Planner (call #{planner_call_count})\n\n"
-                f"```json\n{json.dumps(planner_result, ensure_ascii=False, indent=1)}\n```\n\n"
-            )
+        # ── 任务选择：螺旋拓荒模式 vs 经典 planner 模式 ──
+        _current_pioneer_file = None
+        if spiral_mode and pioneer:
+            # ── Parallel batch processing ──
+            _batch = pioneer.next_batch(SPIRAL_CONCURRENCY)
+            if not _batch:
+                await channel.send(
+                    "🌿 **拓荒阶段完成！** 所有文件已锚定。\n"
+                    "🔗 **升级到第二阶段：自然连接** — 分析跨模块因果关系。"
+                )
+                _append_md("\n---\n## 🔗 金字塔升级：拓荒 → 自然连接\n\n")
+                spiral_mode = False
+                cross_module_mode = True
+                explorer = CrossModuleExplorer()
+                await channel.send(f"🔗 {explorer.get_progress()}")
+                continue
+
+            _batch_t0 = _time_module.time()
+            _file_list = " / ".join(f"`{t['filepath']}`" for t in _batch)
             await channel.send(
-                f"📋 {planner_result.get('assessment', '')[:200]}\n"
-                f"🎯 next: {planner_result.get('next_focus', '')[:200]}"
+                f"{'─'*40}\n🌿 **第 {round_num} 批** ({len(_batch)} 并行) | {pioneer.get_progress()}\n{_file_list}"
             )
-            if not planner_result.get("should_continue", True):
-                stop_reason = f"planner: {planner_result.get('reasoning', 'all directions explored')}"
-                await channel.send(f"🏁 Planner 建议停止: {stop_reason}")
-                break
 
-        # 从 planner 获取本轮 focus（fallback 到聚焦信号，而非宽泛 directive）
-        round_focus = planner_result.get("next_focus", "").strip()
-        if not round_focus:
-            round_focus = _pick_focused_fallback(signals, round_num) if signals else directive
+            async def _spiral_one(_task_item):
+                _p = SPIRAL_PROMPT.format(
+                    filepath=_task_item["filepath"],
+                    discovered_from=_task_item["discovered_from"],
+                    anchor_id=_task_item["anchor_id"],
+                    progress=pioneer.get_progress(),
+                )
+                try:
+                    _r = await agent.process(
+                        f"[GENESIS_USER_REQUEST_START]\n{_p}",
+                        c_phase_blocking=True,
+                        loop_config={"disable_multi_g": True, "gp_unblock_tools": ["record_lesson_node", "record_context_node"]},
+                    )
+                    _resp = _r.response if hasattr(_r, 'response') else ""
+                    _tok = _r.total_tokens if hasattr(_r, 'total_tokens') else 0
+                    return {"task": _task_item, "ok": not _is_error_response(_resp, _tok), "tokens": _tok, "response": _resp}
+                except Exception as _e:
+                    return {"task": _task_item, "ok": False, "tokens": 0, "response": str(_e)}
 
-        if round_num == 1:
-            prompt = AUTO_PROMPT_FIRST.format(directive=round_focus, signals=signals)
+            _results = await asyncio.gather(*[_spiral_one(t) for t in _batch], return_exceptions=True)
+
+            _ok_files, _fail_files, _batch_tokens = [], [], 0
+            for _br in _results:
+                if isinstance(_br, Exception):
+                    _fail_files.append("exception")
+                    continue
+                _batch_tokens += _br.get("tokens", 0)
+                if _br["ok"]:
+                    pioneer.mark_done(_br["task"]["filepath"])
+                    _ok_files.append(_br["task"]["filepath"])
+                else:
+                    _fail_files.append(_br["task"]["filepath"])
+
+            _batch_dur = _time_module.time() - _batch_t0
+            _append_md(
+                f"\n---\n## 第 {round_num} 批 ({len(_batch)} 并行)\n\n"
+                f"✅ {len(_ok_files)}/{len(_batch)} | {_batch_dur:.0f}s | {_batch_tokens}t\n\n"
+            )
+            for _br in _results:
+                if not isinstance(_br, Exception):
+                    _st = "✅" if _br["ok"] else "❌"
+                    _append_md(f"- {_st} `{_br['task']['filepath']}` → `{_br['task']['anchor_id']}` ({_br.get('tokens', 0)}t)\n")
+
+            await channel.send(f"✅ {len(_ok_files)}/{len(_batch)} 成功 | {_batch_dur:.0f}s | {_batch_tokens}t | {pioneer.get_progress()}")
+            if _ok_files:
+                await channel.send("锚定: " + ", ".join(f"`{f}`" for f in _ok_files))
+            if _fail_files:
+                await channel.send("失败: " + ", ".join(f"`{f}`" for f in _fail_files))
+
+            consecutive_error = consecutive_error + len(_batch) if not _ok_files else 0
+            round_num += len(_batch) - 1
+
+            if AUTO_SLEEP_BASE > 0 and state.get("active", False):
+                await asyncio.sleep(AUTO_SLEEP_BASE)
+            continue
+
+        elif cross_module_mode and explorer:
+            # ── Phase 2: Cross-module parallel batch ──
+            _cm_batch = explorer.next_batch(SPIRAL_CONCURRENCY)
+            if not _cm_batch:
+                await channel.send("🔗 **自然连接阶段完成！** 所有配对已分析。")
+                _append_md("\n---\n## ✅ 自然连接阶段完成\n\n")
+                cross_module_mode = False
+                continue
+
+            _cm_t0 = _time_module.time()
+            _pair_list = " / ".join(f"`{p['a_fp']}` ↔ `{p['b_fp']}`" for p in _cm_batch)
+            await channel.send(
+                f"{'─'*40}\n🔗 **第 {round_num} 批** ({len(_cm_batch)} 配对并行) | {explorer.get_progress()}\n{_pair_list}"
+            )
+
+            async def _cross_one(_pair):
+                _shared_ctx = "\n".join(f"- {t}" for t in _pair.get("shared_titles", [])[:5]) or "(无共享线索)"
+                _p = CROSS_MODULE_PROMPT.format(
+                    filepath_a=_pair["a_fp"], anchor_title_a=_pair["a_title"],
+                    filepath_b=_pair["b_fp"], anchor_title_b=_pair["b_title"],
+                    shared_context=_shared_ctx,
+                    progress=explorer.get_progress(),
+                )
+                try:
+                    _r = await agent.process(
+                        f"[GENESIS_USER_REQUEST_START]\n{_p}",
+                        c_phase_blocking=True,
+                        loop_config={"disable_multi_g": True, "gp_unblock_tools": ["record_lesson_node", "record_context_node"]},
+                    )
+                    _resp = _r.response if hasattr(_r, 'response') else ""
+                    _tok = _r.total_tokens if hasattr(_r, 'total_tokens') else 0
+                    return {"pair": _pair, "ok": not _is_error_response(_resp, _tok), "tokens": _tok, "response": _resp}
+                except Exception as _e:
+                    return {"pair": _pair, "ok": False, "tokens": 0, "response": str(_e)}
+
+            _cm_results = await asyncio.gather(*[_cross_one(p) for p in _cm_batch], return_exceptions=True)
+
+            _cm_ok, _cm_fail, _cm_tokens = [], [], 0
+            for _cr in _cm_results:
+                if isinstance(_cr, Exception):
+                    _cm_fail.append("exception")
+                    continue
+                _cm_tokens += _cr.get("tokens", 0)
+                if _cr["ok"]:
+                    explorer.mark_done(_cr["pair"]["a_id"], _cr["pair"]["b_id"])
+                    _cm_ok.append(f"{_cr['pair']['a_fp']} ↔ {_cr['pair']['b_fp']}")
+                else:
+                    _cm_fail.append(f"{_cr['pair']['a_fp']} ↔ {_cr['pair']['b_fp']}")
+
+            _cm_dur = _time_module.time() - _cm_t0
+            _append_md(
+                f"\n---\n## 第 {round_num} 批 跨模块 ({len(_cm_batch)} 配对)\n\n"
+                f"✅ {len(_cm_ok)}/{len(_cm_batch)} | {_cm_dur:.0f}s | {_cm_tokens}t\n\n"
+            )
+            for _cr in _cm_results:
+                if not isinstance(_cr, Exception):
+                    _st = "✅" if _cr["ok"] else "❌"
+                    _append_md(f"- {_st} `{_cr['pair']['a_fp']}` ↔ `{_cr['pair']['b_fp']}` ({_cr.get('tokens', 0)}t)\n")
+
+            await channel.send(f"✅ {len(_cm_ok)}/{len(_cm_batch)} 成功 | {_cm_dur:.0f}s | {_cm_tokens}t | {explorer.get_progress()}")
+            if _cm_ok:
+                await channel.send("连接: " + ", ".join(_cm_ok[:5]))
+
+            consecutive_error = consecutive_error + len(_cm_batch) if not _cm_ok else 0
+            round_num += len(_cm_batch) - 1
+
+            if AUTO_SLEEP_BASE > 0 and state.get("active", False):
+                await asyncio.sleep(AUTO_SLEEP_BASE)
+            continue
+
         else:
-            history_entries = [
-                f"R{e['round']}: {e.get('activity_summary') or e['kb_delta_summary']} | {e.get('frontier_preview') or e['response_preview']}"
-                for e in round_log[-5:]
-            ]
-            history = "[已完成的行动]\n" + "\n".join(history_entries) + "\n不要重复以上内容。" if history_entries else ""
-            frontier = last_frontier if last_frontier and last_frontier.strip() != "(无输出)" else "(上轮无可复用前沿，换个方向)"
-            knowledge_state_text = _format_knowledge_state(last_knowledge_state)
-            prompt = AUTO_PROMPT_CONTINUE.format(
-                directive=round_focus,
-                knowledge_state=knowledge_state_text, frontier_state=frontier,
-                history=history, signals=signals,
+            # ── Session Planner：初始规划 / 定期审查 / 错误后审查 ──
+            need_planner = (
+                round_num == 1
+                or (round_num - last_planner_round >= PLANNER_REVIEW_INTERVAL)
+                or (consecutive_error > 0 and round_num - last_planner_round >= 2)
             )
+            if need_planner and consecutive_error < 5:
+                await channel.send(f"🧭 Session Planner {'制定初始议程' if round_num == 1 else '审查进展'}...")
+                planner_result = await _call_session_planner(
+                    provider=agent.provider, directive=directive, signals=signals,
+                    round_log=round_log if round_num > 1 else None,
+                    current_agenda=planner_agenda if round_num > 1 else None,
+                )
+                planner_agenda = planner_result.get("agenda", [])
+                planner_call_count += 1
+                last_planner_round = round_num
+                _append_md(
+                    f"\n### Session Planner (call #{planner_call_count})\n\n"
+                    f"```json\n{json.dumps(planner_result, ensure_ascii=False, indent=1)}\n```\n\n"
+                )
+                await channel.send(
+                    f"📋 {planner_result.get('assessment', '')[:200]}\n"
+                    f"🎯 next: {planner_result.get('next_focus', '')[:200]}"
+                )
+                if not planner_result.get("should_continue", True):
+                    stop_reason = f"planner: {planner_result.get('reasoning', 'all directions explored')}"
+                    await channel.send(f"🏁 Planner 建议停止: {stop_reason}")
+                    break
 
-        _append_md(f"\n---\n## 第 {round_num} 轮\n\n### 信号\n```\n{signals}\n```\n\n### Prompt\n```\n{prompt[:2000]}\n```\n\n")
-        await channel.send(f"{'─'*40}\n🔧 **第 {round_num} 轮**")
+            if need_planner and last_planner_round == round_num:
+                round_focus = planner_result.get("next_focus", "").strip()
+            else:
+                round_focus = ""
+            if not round_focus:
+                round_focus = _pick_focused_fallback(signals, round_num) if signals else directive
+
+            if round_num == 1:
+                prompt = AUTO_PROMPT_FIRST.format(directive=round_focus, signals=signals)
+            else:
+                history_entries = [
+                    f"R{e['round']}: {e.get('activity_summary') or e['kb_delta_summary']} | {e.get('frontier_preview') or e['response_preview']}"
+                    for e in round_log[-5:]
+                ]
+                history = "[已完成的行动]\n" + "\n".join(history_entries) + "\n不要重复以上内容。" if history_entries else ""
+                frontier = last_frontier if last_frontier and last_frontier.strip() != "(无输出)" else "(上轮无可复用前沿，换个方向)"
+                knowledge_state_text = _format_knowledge_state(last_knowledge_state)
+                prompt = AUTO_PROMPT_CONTINUE.format(
+                    directive=round_focus,
+                    knowledge_state=knowledge_state_text, frontier_state=frontier,
+                    history=history, signals=signals,
+                )
+
+            _append_md(f"\n---\n## 第 {round_num} 轮\n\n### 信号\n```\n{signals}\n```\n\n### Prompt\n```\n{prompt[:2000]}\n```\n\n")
+            await channel.send(f"{'─'*40}\n🔧 **第 {round_num} 轮**")
 
         round_events: list = []
 
@@ -1142,13 +2053,12 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                             round_record["knowledge_search_count"] = round_record.get("knowledge_search_count", 0) + 1
                     elif evt.event_type in ("content", "reasoning"):
                         chunk_text = evt.result or ""
-                        entry["chunk_chars"] = (data.get("chunk_chars") if isinstance(data, dict) else None) or len(chunk_text)
-                        if chunk_text:
-                            entry["preview"] = chunk_text[:80]
+                        chunk_chars = (data.get("chunk_chars") if isinstance(data, dict) else None) or len(chunk_text)
                         stream_key = f"{evt.event_type}_chars"
                         chunk_key = f"{evt.event_type}_chunks"
-                        round_record["stream_stats"][stream_key] += entry["chunk_chars"]
+                        round_record["stream_stats"][stream_key] += chunk_chars
                         round_record["stream_stats"][chunk_key] += 1
+                        return  # skip storing streaming chunks in events list (OOM prevention)
                     elif evt.event_type in ("llm_call_start", "llm_call_end"):
                         if isinstance(data, dict):
                             entry["data"] = {
@@ -1276,7 +2186,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 c_phase_blocking=True,
                 loop_config={
                     "disable_multi_g": True,
-                    "gp_unblock_tools": ["record_lesson_node"],
+                    "gp_unblock_tools": ["record_lesson_node", "record_context_node"],
                 },
                 initial_knowledge_state=last_knowledge_state or None,
             )
@@ -1367,6 +2277,8 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 for i in range(0, len(preview), 1990):
                     await channel.send(preview[i:i+1990])
 
+            # Spiral Pioneer mark_done is handled in batch handler above (parallel mode)
+
         except asyncio.TimeoutError:
             duration = _time_module.time() - t0
             err_str = f"round_timeout>{AUTO_ROUND_TIMEOUT_SECS}s" if AUTO_ROUND_TIMEOUT_SECS > 0 else "round_timeout"
@@ -1409,6 +2321,8 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             })
             _flush_round_record()
             last_frontier = ""
+            # 与 error 路径一致：不污染 knowledge_state，回退到上次成功值
+            last_knowledge_state = last_good_knowledge_state.copy() if last_good_knowledge_state else last_knowledge_state
 
         except asyncio.CancelledError:
             stop_reason = f"cancelled during round {round_num}"
@@ -1458,9 +2372,32 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             })
             _flush_round_record()
             last_frontier = ""
+            # 与 error 路径一致：不污染 knowledge_state，回退到上次成功值
+            last_knowledge_state = last_good_knowledge_state.copy() if last_good_knowledge_state else last_knowledge_state
 
         finally:
             _finalize_incomplete_round("interrupted_before_round_finalize")
+
+        # ─── Structural Controls Update ───
+        action_history.record_round(round_num, round_events)
+        _latest_fs = round_record.get("frontier_state") or {}
+        _topic_result = topic_tracker.update(
+            round_num, _latest_fs.get("candidate_issue", ""),
+            round_record.get("activity_detected", False),
+        )
+        if _topic_result["action"] == "force_switch":
+            last_frontier = ""
+            last_knowledge_state = {
+                "issue": "上一话题已用尽轮次预算——必须切换到完全不同的新方向",
+                "verified_facts": [],
+                "failed_attempts": [_topic_result["message"]],
+                "next_checks": ["选择一个与已探索话题完全不同的新方向"],
+            }
+            await channel.send(f"🔀 {_topic_result['message']}")
+        elif _topic_result["action"] == "suggest_switch" and isinstance(last_knowledge_state, dict):
+            _fa = last_knowledge_state.get("failed_attempts") or []
+            _fa.insert(0, _topic_result["message"])
+            last_knowledge_state["failed_attempts"] = _fa[:5]
 
         # ── 熔断：连续错误 ──
         if consecutive_error >= 5:
@@ -1480,6 +2417,23 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 stop_reason = f"{AUTO_DRY_LIMIT} consecutive idle rounds"
                 await channel.send(f"⏸️ 连续 {AUTO_DRY_LIMIT} 轮未观察到新的外部证据或修改，自动停止。")
             break
+
+        # ── Memory hygiene: compact old round records + release pages ──
+        if len(round_log) > _ROUND_LOG_KEEP:
+            for _old_rec in round_log[:-_ROUND_LOG_KEEP]:
+                for _heavy_key in ("events", "response_full", "signals", "prompt_preview",
+                                   "frontier_text", "knowledge_state_text", "phase_trace"):
+                    _old_rec.pop(_heavy_key, None)
+        _release_memory()
+
+        # TOOL 节点热加载：C/Challenger 后台写的 TOOL 节点在此激活，下一轮 GP 可用
+        try:
+            from factory import activate_vault_tools
+            _new_tools = activate_vault_tools(agent.tools)
+            if _new_tools:
+                logger.info(f"/auto tool_hotload | {_new_tools} new vault tools activated")
+        except Exception as _e:
+            logger.debug(f"/auto tool_hotload skip: {_e}")
 
         # 轮间休息（错误轮指数退避 + provider reset）
         if state.get("active", False):

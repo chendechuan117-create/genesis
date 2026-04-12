@@ -132,7 +132,7 @@ class NativeHTTPProvider(BaseLLMProvider):
             m = dict(msg)  # shallow copy
             role = m.get("role", "")
             
-            # 修复空 content（aixj API 要求所有消息 content 非空非 null）
+            # 修复空 content（xcode API 要求所有消息 content 非空非 null）
             if m.get("content") is None or m.get("content") == "":
                 if role == "tool":
                     m["content"] = "(empty)"
@@ -300,7 +300,7 @@ class NativeHTTPProvider(BaseLLMProvider):
         finish_reason = choice.get('finish_reason')
         
         # 提取工具调用
-        # 修复 aixj.vip split-chunk：非流式响应也会把一个 tool call 拆成两个条目
+        # 修复 xcode split-chunk：非流式响应也会把一个 tool call 拆成两个条目
         # 第一个有 name/id 但 arguments 为空，第二个有 arguments 但 name/id 为空
         tool_calls = []
         if 'tool_calls' in message and message['tool_calls']:
@@ -345,6 +345,7 @@ class NativeHTTPProvider(BaseLLMProvider):
                     ))
         
         content = message.get('content') or ""
+        reasoning = message.get('reasoning_content') or ""
         
         if "<reflection>" in content:
             content = re.sub(r"<reflection>.*?</reflection>", "", content, flags=re.DOTALL)
@@ -354,10 +355,16 @@ class NativeHTTPProvider(BaseLLMProvider):
         if _CONTROL_MARKER_RE.search(content):
             content = _CONTROL_MARKER_RE.sub('', content).strip()
 
+        # 兜底：DeepSeek 等模型可能把输出放在 reasoning_content 而非 content
+        # 与流式路径 (_stream_with_httpx line 560-563) 保持一致
+        if not content and not tool_calls and reasoning.strip():
+            content = reasoning
+
         usage = resp_data.get('usage', {})
         
         return LLMResponse(
             content=content,
+            reasoning_content=reasoning or None,
             tool_calls=tool_calls,
             finish_reason=finish_reason,
             input_tokens=usage.get('prompt_tokens', 0),
@@ -436,13 +443,13 @@ class NativeHTTPProvider(BaseLLMProvider):
                                         if asyncio.iscoroutine(res): await res
                             
                             # Tool Calls
-                            if 'tool_calls' in delta:
+                            if delta.get('tool_calls'):
                                 for tc in delta['tool_calls']:
                                     idx = tc['index']
                                     has_id = 'id' in tc and tc['id']
                                     has_name = 'function' in tc and 'name' in tc['function'] and tc['function']['name']
                                     
-                                    # aixj.vip 特殊格式：名字在 index N，参数在 index N+1（无 name/id）
+                                    # xcode 特殊格式：名字在 index N，参数在 index N+1（无 name/id）
                                     # 检测：新 index 且无 name/id，只有 args → 合并到上一个有名字的 call
                                     if idx not in tool_call_chunks and not has_id and not has_name:
                                         # 找最近一个有 name 的 index

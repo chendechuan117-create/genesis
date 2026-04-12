@@ -53,6 +53,7 @@ class KnowledgeQuery:
             """SELECT node_id, type, title, usage_success_count, usage_fail_count
                FROM knowledge_nodes
                WHERE node_id NOT LIKE 'MEM_CONV%' AND (usage_success_count > 0 OR usage_count > 2)
+                 AND node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS')
                ORDER BY CAST(usage_success_count AS REAL) / (usage_success_count + usage_fail_count + 1) DESC,
                         usage_count DESC
                LIMIT ?""",
@@ -61,11 +62,13 @@ class KnowledgeQuery:
 
         # 待探索节点：从未使用过、最近创建的高潜力节点（打破马太效应的关键）
         untested_rows = self._conn.execute(
-            """SELECT node_id, type, title, confidence_score, tags, updated_at, last_verified_at, trust_tier
+            """SELECT node_id, type, title, tags, updated_at, last_verified_at, trust_tier,
+                      usage_success_count, usage_fail_count
                FROM knowledge_nodes
                WHERE node_id NOT LIKE 'MEM_CONV%'
                  AND usage_count = 0
                  AND type IN ('ASSET', 'LESSON', 'CONTEXT', 'DISCOVERY')
+                 AND node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS')
                ORDER BY created_at DESC
                LIMIT ?""",
             (top_k,)
@@ -74,16 +77,8 @@ class KnowledgeQuery:
         # 知识缺口：从 void_tasks 队列读取（不再污染 knowledge_nodes）
         void_rows = self.get_recent_voids(limit=3)
 
-        # Epistemic status distribution
-        ep_rows = self._conn.execute(
-            "SELECT COALESCE(epistemic_status, 'BELIEF') as ep, COUNT(*) as cnt "
-            "FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%' GROUP BY ep ORDER BY cnt DESC"
-        ).fetchall()
-        ep_counts = {r['ep']: r['cnt'] for r in ep_rows}
-
         cats = " | ".join(f"{t}:{c}" for t, c in type_counts.items() if c > 0)
-        ep_str = " ".join(f"{k}:{v}" for k, v in ep_counts.items() if v > 0)
-        lines = [f"[认知目录] {total}节点 | {cats}", f"认知论: {ep_str}"]
+        lines = [f"[认知目录] {total}节点 | {cats}"]
         if top_rows:
             lines.append("PROVEN:")
             for r in top_rows:
@@ -238,7 +233,8 @@ class KnowledgeQuery:
 
         # UNTESTED: 从未使用过的高潜力节点（打破马太效应）
         untested_rows = self._conn.execute(
-            """SELECT node_id, type, title, confidence_score, updated_at, last_verified_at, trust_tier
+            """SELECT node_id, type, title, tags, updated_at, last_verified_at, trust_tier,
+                      usage_success_count, usage_fail_count
                FROM knowledge_nodes
                WHERE node_id NOT LIKE 'MEM_CONV%'
                  AND usage_count = 0
@@ -288,11 +284,12 @@ class KnowledgeQuery:
         for tr in type_names:
             t = tr['type']
             type_rows = self._conn.execute(
-                """SELECT node_id, type, title, confidence_score, tags,
+                """SELECT node_id, type, title, tags,
                           updated_at, last_verified_at, trust_tier,
                           usage_success_count, usage_fail_count, usage_count
                    FROM knowledge_nodes
                    WHERE node_id NOT LIKE 'MEM_CONV%' AND type = ?
+                     AND node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS')
                    ORDER BY updated_at DESC
                    LIMIT 30""", (t,)
             ).fetchall()
@@ -491,7 +488,7 @@ class KnowledgeQuery:
             return {}
         placeholders = ','.join('?' * len(node_ids))
         rows = self._conn.execute(
-            f"SELECT node_id, type AS ntype, title, human_translation, tags, prerequisites, resolves, metadata_signature, usage_count, confidence_score, last_verified_at, verification_source, updated_at, trust_tier FROM knowledge_nodes WHERE node_id IN ({placeholders})",
+            f"SELECT node_id, type AS ntype, title, human_translation, tags, prerequisites, resolves, metadata_signature, usage_count, usage_success_count, usage_fail_count, last_verified_at, verification_source, updated_at, trust_tier FROM knowledge_nodes WHERE node_id IN ({placeholders})",
             tuple(node_ids)
         ).fetchall()
         return {r['node_id']: normalize_node_dict(dict(r)) for r in rows}

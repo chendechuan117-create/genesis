@@ -14,21 +14,8 @@ logger = logging.getLogger(__name__)
 
 # provider_name -> config attribute that must be truthy for it to be valid
 PROVIDER_KEY_MAP = {
-    "aixj": "aixj_api_key",
-    "aixj_responses": "aixj_api_key",
-    "codex": "codex_api_key",
-    "deepseek": "deepseek_api_key",
-    "gemini": "gemini_api_key",
-    "openai": "openai_api_key",
-    "openrouter": "openrouter_api_key",
-    "sambanova": "sambanova_api_key",
-    "siliconflow": "siliconflow_api_key",
-    "dashscope": "dashscope_api_key",
-    "qianfan": "qianfan_api_key",
-    "zhipu": "zhipu_api_key",
-    "groq": "groq_api_key",
-    "cloudflare": "cloudflare_api_key",
-    "zen": "zen_api_key"
+    "xcode": "xcode_api_key",
+    "xcode_responses": "xcode_api_key",
 }
 
 class ProviderRouter(LLMProvider):
@@ -46,7 +33,7 @@ class ProviderRouter(LLMProvider):
     def __init__(self, config: Any, api_key: str = None, base_url: str = None, model: str = None):
         self.config = config
         self.providers: Dict[str, Any] = {}
-        self.active_provider_name = 'aixj'
+        self.active_provider_name = 'xcode'
         self._preferred_provider_name: Optional[str] = None  # 首选 provider
         self._failover_time: float = 0  # 上次 failover 时间戳
         self._last_recovery_attempt: float = 0  # 上次探活时间戳
@@ -56,14 +43,10 @@ class ProviderRouter(LLMProvider):
         self.active_provider = self.providers.get(self.active_provider_name)
         self._preferred_provider_name = self.active_provider_name
         
-        # Fallback if preferred provider not available
+        # Fallback if xcode not available
         if not self.active_provider:
-            if 'gemini' in self.providers:
-                self._switch_provider('gemini')
-            else:
-                 # Last resort mock
-                 self.providers['mock'] = MockLLMProvider()
-                 self._switch_provider('mock')
+            self.providers['mock'] = MockLLMProvider()
+            self._switch_provider('mock')
 
     def _initialize_providers(self, api_key: str, base_url: str, model: str):
         """Initialize all available providers based on the dynamically registered factories"""
@@ -76,39 +59,17 @@ class ProviderRouter(LLMProvider):
                 provider_instance = builder(self.config)
                 if not provider_instance:
                     continue
-                    
-                # Legacy override: explicit runtime key for deepseek
-                if name == "deepseek" and api_key:
-                    provider_instance.api_key = api_key
                 
-                # Validate: each provider needs its OWN config key
                 required_attr = PROVIDER_KEY_MAP.get(name)
-                is_valid = (
-                    (name == "deepseek" and api_key)
-                    or (required_attr and getattr(self.config, required_attr, None))
-                )
-                
-                if is_valid:
+                if required_attr and getattr(self.config, required_attr, None):
                     self.providers[name] = provider_instance
                     logger.info(f"Initialized Provider from Registry: {name}")
                              
             except Exception as e:
                 logger.warning(f"Failed to build provider plugin '{name}': {e}")
         
-        # Determine Activation & Failover Order
-        # deepseek 默认不参与自动 failover（烧付费额度）
-        # 设置 GENESIS_DEEPSEEK_FAILOVER=1 可手动启用
-        import os
-        if os.environ.get('GENESIS_DEEPSEEK_FAILOVER') == '1':
-            self.failover_order = ['aixj', 'codex', 'deepseek', 'gemini']
-        else:
-            self.failover_order = ['aixj', 'codex', 'gemini']
-        
-        self.active_provider_name = 'aixj'
-        for name in self.failover_order:
-            if name in self.providers:
-                self.active_provider_name = name
-                break
+        self.failover_order = ['xcode']
+        self.active_provider_name = 'xcode'
                 
     def _switch_provider(self, target: str):
         """Switch active provider"""
@@ -251,202 +212,6 @@ class ProviderRouter(LLMProvider):
         return self.active_provider
 
     def get_consumable_provider(self):
-        """Returns the first available cheap/free provider from the consumables pool.
-        Deprecated: 新代码请用 FreePoolManager。保留此方法供旧调用方兼容。"""
-        pool = FreePoolManager.get_instance(self)
-        name, provider = pool.get_best_provider()
-        return provider
+        """Returns the active provider (xcode only)."""
+        return self.active_provider
 
-
-# ════════════════════════════════════════════════════════════
-#  FreePoolManager — 傻瓜式免费池自管理
-#  单一注册表 + 健康追踪 + 周期性重探 + deepseek 限频兜底
-# ════════════════════════════════════════════════════════════
-
-class FreePoolManager:
-    """
-    免费 LLM 池的统一管理器（单例）。
-    
-    设计目标：
-    1. 单一注册表 — 免费 provider 列表只在这里定义一次
-    2. 健康追踪 — 每个 provider 记录 success/fail 计数，自动计算健康分
-    3. 周期性重探 — 死掉的 provider 每 REPROBE_INTERVAL 秒重试一次
-    4. 自动排序 — 按健康分降序，优先用最稳定的
-    5. deepseek 兜底 — 所有免费池失败时，用 deepseek 但限频
-    
-    用法：
-        pool = FreePoolManager.get_instance(router)
-        name, provider = pool.get_best_provider()
-        try:
-            result = await provider.chat(...)
-            pool.report_success(name)
-        except:
-            pool.report_failure(name)
-    """
-    
-    _instance = None
-    
-    # ── 免费池注册表（唯一定义处）──
-    FREE_POOL_NAMES = ["groq", "cloudflare", "siliconflow", "dashscope", "zhipu", "qianfan", "zen"]
-    
-    # ── 配置 ──
-    REPROBE_INTERVAL = 600       # 死亡 provider 重探间隔（秒）
-    DEAD_THRESHOLD = 3           # 连续失败 N 次标记为 dead
-    DEEPSEEK_HOURLY_LIMIT = 20   # deepseek 兜底每小时最多 N 次调用
-    
-    @classmethod
-    def get_instance(cls, router: 'ProviderRouter') -> 'FreePoolManager':
-        if cls._instance is None:
-            cls._instance = cls(router)
-        return cls._instance
-    
-    def __init__(self, router: 'ProviderRouter'):
-        self.router = router
-        self._health: Dict[str, Dict[str, Any]] = {}
-        self._deepseek_calls_this_hour: int = 0
-        self._deepseek_hour_start: float = time.time()
-        self._probed = False
-        
-        # 初始化健康记录
-        for name in self.FREE_POOL_NAMES:
-            if name in router.providers:
-                self._health[name] = {
-                    "success": 0,
-                    "fail": 0,
-                    "consecutive_fail": 0,
-                    "dead": False,
-                    "last_fail_at": 0.0,
-                    "last_success_at": 0.0,
-                }
-        
-        available = list(self._health.keys())
-        if available:
-            logger.info(f"FreePool: {len(available)} providers registered: {', '.join(available)}")
-        else:
-            logger.warning("FreePool: no free providers available!")
-    
-    async def probe_all(self):
-        """并行探活所有 provider，更新健康状态。"""
-        logger.info("FreePool: probing all providers (parallel)...")
-        
-        async def _probe_one(name: str):
-            provider = self.router.providers.get(name)
-            if not provider:
-                return
-            try:
-                await asyncio.wait_for(
-                    provider.chat(messages=[{"role": "user", "content": "ping"}], stream=False),
-                    timeout=15
-                )
-                self._health[name]["dead"] = False
-                self._health[name]["consecutive_fail"] = 0
-                self._health[name]["last_success_at"] = time.time()
-                self._health[name]["success"] += 1
-                logger.info(f"  ✅ {name}: alive")
-            except Exception as e:
-                self._health[name]["dead"] = True
-                self._health[name]["consecutive_fail"] += 1
-                self._health[name]["last_fail_at"] = time.time()
-                self._health[name]["fail"] += 1
-                logger.warning(f"  ❌ {name}: {type(e).__name__}: {str(e)[:60]}")
-        
-        await asyncio.gather(*[_probe_one(n) for n in list(self._health.keys())])
-        
-        self._probed = True
-        alive = [n for n, h in self._health.items() if not h["dead"]]
-        logger.info(f"FreePool: {len(alive)}/{len(self._health)} alive: {', '.join(alive) or 'NONE'}")
-    
-    def report_success(self, name: str):
-        """调用成功反馈"""
-        h = self._health.get(name)
-        if h:
-            h["success"] += 1
-            h["consecutive_fail"] = 0
-            h["dead"] = False
-            h["last_success_at"] = time.time()
-    
-    def report_failure(self, name: str):
-        """调用失败反馈"""
-        h = self._health.get(name)
-        if h:
-            h["fail"] += 1
-            h["consecutive_fail"] += 1
-            h["last_fail_at"] = time.time()
-            if h["consecutive_fail"] >= self.DEAD_THRESHOLD:
-                h["dead"] = True
-                logger.warning(f"FreePool: {name} marked DEAD ({h['consecutive_fail']} consecutive failures)")
-    
-    def _health_score(self, name: str) -> float:
-        """计算健康分（越高越好）"""
-        h = self._health[name]
-        if h["dead"]:
-            return -1.0
-        total = h["success"] + h["fail"]
-        if total == 0:
-            return 0.5  # 未知 = 中等优先级
-        return h["success"] / total
-    
-    def get_best_provider(self) -> tuple:
-        """返回 (name, provider)。按健康分排序，优先返回最健康的。
-        所有免费池不可用时返回 deepseek 兜底（受限频）。
-        返回 (None, None) 表示完全不可用。"""
-        
-        # 检查是否需要重探死亡 provider
-        now = time.time()
-        for name, h in self._health.items():
-            if h["dead"] and (now - h["last_fail_at"]) > self.REPROBE_INTERVAL:
-                h["dead"] = False  # 解除死亡标记，给一次机会
-                h["consecutive_fail"] = 0
-                logger.info(f"FreePool: {name} un-dead for re-probe (cooldown elapsed)")
-        
-        # 按健康分排序
-        ranked = sorted(self._health.keys(), key=lambda n: self._health_score(n), reverse=True)
-        
-        for name in ranked:
-            if not self._health[name]["dead"]:
-                provider = self.router.providers.get(name)
-                if provider:
-                    return (name, provider)
-        
-        # 所有免费 provider 都 dead → 不兜底，不烧付费额度
-        logger.warning("FreePool: all free providers dead. No fallback (deepseek disabled).")
-        return (None, None)
-    
-    def _deepseek_fallback(self) -> tuple:
-        """deepseek 限频兜底"""
-        now = time.time()
-        # 每小时重置计数
-        if now - self._deepseek_hour_start > 3600:
-            self._deepseek_calls_this_hour = 0
-            self._deepseek_hour_start = now
-        
-        if self._deepseek_calls_this_hour >= self.DEEPSEEK_HOURLY_LIMIT:
-            logger.warning(f"FreePool: deepseek hourly limit reached ({self.DEEPSEEK_HOURLY_LIMIT}/h). No provider available.")
-            return (None, None)
-        
-        ds = self.router.providers.get("deepseek")
-        if ds:
-            self._deepseek_calls_this_hour += 1
-            logger.info(f"FreePool: all free dead, using deepseek fallback ({self._deepseek_calls_this_hour}/{self.DEEPSEEK_HOURLY_LIMIT} this hour)")
-            return ("deepseek", ds)
-        
-        return (None, None)
-    
-    def get_status(self) -> Dict[str, Any]:
-        """返回池状态摘要（供 heartbeat / 诊断）"""
-        alive = []
-        dead = []
-        for name, h in self._health.items():
-            entry = {"name": name, "score": round(self._health_score(name), 2),
-                     "success": h["success"], "fail": h["fail"]}
-            if h["dead"]:
-                dead.append(entry)
-            else:
-                alive.append(entry)
-        return {
-            "alive": sorted(alive, key=lambda x: x["score"], reverse=True),
-            "dead": dead,
-            "deepseek_fallback_used": self._deepseek_calls_this_hour,
-            "deepseek_hourly_limit": self.DEEPSEEK_HOURLY_LIMIT,
-            "probed": self._probed,
-        }

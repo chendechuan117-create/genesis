@@ -53,7 +53,7 @@ PIDFILE = RUNTIME_DIR / "autopilot.pid"
 # ── 任务库 ──────────────────────────────────────────────
 
 TASKS = {
-    # ─── 知识探索 (Multi-G + G + Op + C 全管线) ───
+    # ─── 知识探索 (Multi-G + GP + C 全管线) ───
     "explore": [
         {
             "label": "explore_ai_agents",
@@ -106,7 +106,7 @@ TASKS = {
         },
         {
             "label": "doctor_provider_audit",
-            "input": "用 Doctor 沙箱检查 provider 健康状态。运行：./scripts/doctor.sh python \"from genesis.core.provider_manager import FreePoolManager; print(FreePoolManager.FREE_POOL_NAMES)\"。然后检查 provider.py 的重试逻辑是否有 token 浪费风险。",
+            "input": "用 Doctor 沙箱检查 provider 健康状态。检查 provider.py 的重试逻辑是否有 token 浪费风险。",
             "covers": ["op_shell", "analysis"],
         },
         {
@@ -116,7 +116,7 @@ TASKS = {
         },
         {
             "label": "doctor_daemon_health",
-            "input": "检查后台守护进程的健康状态。运行：cat runtime/daemon.log | tail -50。分析最近的 cycle 产出，是否有异常或零产出。然后检查 FreePoolManager 的 pool_status。",
+            "input": "检查后台守护进程的健康状态。运行：cat runtime/daemon.log | tail -50。分析最近的 cycle 产出，是否有异常或零产出。",
             "covers": ["op_shell", "op_file", "analysis"],
         },
     ],
@@ -150,17 +150,17 @@ TASKS = {
         {
             "label": "challenge_async_debug",
             "input": "帮我写一个 Python asyncio 的并发限流器（semaphore + rate limiter 组合），要求：1) 最大并发数可配置 2) 每秒最大请求数可配置 3) 支持 async with 语法 4) 有完整的单元测试。写完后在 Doctor 沙箱中运行测试。",
-            "covers": ["g_dispatch", "op_file", "op_shell", "multi_dispatch"],
+            "covers": ["gp_execute", "gp_file", "gp_shell"],
         },
         {
             "label": "challenge_sqlite_tool",
             "input": "帮我写一个 SQLite 数据库健康检查脚本，功能：1) 检查 WAL 文件大小 2) 统计各表行数和大小 3) 检测碎片率 4) 输出 JSON 格式报告。对 runtime/genesis_v4.db 运行测试。",
-            "covers": ["g_dispatch", "op_file", "op_shell"],
+            "covers": ["gp_execute", "gp_file", "gp_shell"],
         },
         {
             "label": "challenge_log_analyzer",
             "input": "分析 runtime/daemon.log 的内容，写一个 Python 脚本统计：1) 每个 cycle 的耗时 2) 各任务（拾荒/发酵/验证/GC）的成功率 3) 免费池各 provider 的使用频率 4) 输出可视化报告（文本格式即可）。",
-            "covers": ["g_dispatch", "op_file", "op_shell", "analysis"],
+            "covers": ["gp_execute", "gp_file", "gp_shell", "analysis"],
         },
     ],
 
@@ -183,7 +183,7 @@ TASKS = {
         },
     ],
 
-    # ─── 快速任务 (/quick 跳过 Multi-G，测试纯 G+Op 路径) ───
+    # ─── 快速任务 (/quick 跳过 Multi-G，测试纯 GP 路径) ───
     "quick": [
         {
             "label": "quick_system_check",
@@ -286,7 +286,7 @@ class Autopilot:
         self.agent = create_agent()
         # Autopilot 模式：C-Phase 阻塞等待完成（保证知识写入）
         self.agent.c_phase_blocking = True
-        self._preferred_provider = getattr(self.agent.provider, '_preferred_provider_name', 'aixj')
+        self._preferred_provider = getattr(self.agent.provider, '_preferred_provider_name', 'xcode')
         logger.info(f"✅ Agent 就绪 | 首选 provider: {self._preferred_provider}")
 
     def _check_provider_guard(self) -> tuple:
@@ -300,7 +300,9 @@ class Autopilot:
 
     def _get_node_count(self) -> dict:
         """获取 knowledge_nodes 节点计数观测状态（中性 telemetry）。"""
-        db = Path.home() / ".nanogenesis" / "workshop_v4.sqlite"
+        db = Path.home() / ".genesis" / "workshop_v4.sqlite"
+        if not db.exists():
+            db = Path.home() / ".nanogenesis" / "workshop_v4.sqlite"
         try:
             import sqlite3
             if not db.exists():

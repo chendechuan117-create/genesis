@@ -8,6 +8,9 @@ import logging
 import fcntl
 import os
 import shutil
+import urllib.request
+import urllib.error
+import socket
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List
 from pathlib import Path
@@ -191,6 +194,9 @@ class JobManager:
         # System resources
         report["system"] = self._get_system_info()
         
+        # Lightweight HTTPS reachability probe
+        report["network_probe"] = self._probe_https()
+
         # Zombie processes check
         report["zombie_check"] = self._check_zombies()
         
@@ -236,6 +242,45 @@ class JobManager:
             pass
         
         return info
+
+
+    @staticmethod
+    def _probe_https(url: str = "https://example.com", timeout: int = 5) -> Dict[str, Any]:
+        """Perform a lightweight HTTPS reachability probe with explicit timeout."""
+        try:
+            try:
+                import requests  # type: ignore
+            except ImportError:
+                requests = None
+
+            if requests is not None:
+                response = requests.get(url, timeout=timeout)
+                return {
+                    "url": url,
+                    "ok": True,
+                    "status": "ok",
+                    "http_status": getattr(response, "status_code", None),
+                }
+
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                return {
+                    "url": url,
+                    "ok": True,
+                    "status": "ok",
+                    "http_status": getattr(response, "status", None) or response.getcode(),
+                }
+        except Exception as e:
+            status = "timeout" if isinstance(e, (socket.timeout, TimeoutError)) else "error"
+            if e.__class__.__name__ == "ReadTimeout":
+                status = "timeout"
+            return {
+                "url": url,
+                "ok": False,
+                "status": status,
+                "timeout_seconds": timeout,
+                "error": str(e),
+            }
 
     @staticmethod
     def _check_zombies() -> Dict[str, Any]:

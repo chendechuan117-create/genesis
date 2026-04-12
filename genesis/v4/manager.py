@@ -182,19 +182,8 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
                 "SELECT 1 FROM knowledge_nodes WHERE epistemic_status = 'FACT' LIMIT 1"
             ).fetchone()
             if not has_facts:
-                conn.execute("""
-                    UPDATE knowledge_nodes SET epistemic_status = 'FACT'
-                    WHERE trust_tier = 'HUMAN'
-                       OR (usage_success_count >= 5
-                           AND CAST(usage_success_count AS REAL) / (usage_success_count + usage_fail_count + 1) >= 0.8)
-                """)
-                conn.execute("""
-                    UPDATE knowledge_nodes SET epistemic_status = 'HYPOTHESIS'
-                    WHERE usage_count = 0 AND confidence_score < 0.5
-                      AND epistemic_status = 'BELIEF'
-                """)
+                # epistemic_status backfill removed (2026-04 restructure: field phased out)
                 conn.commit()
-                logger.info("NodeVault: epistemic_status backfill complete")
         except Exception:
             pass
         # 心跳水位线：进程间协调表
@@ -367,12 +356,12 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
     def patch_node_metadata(self, node_id: str, **kwargs) -> bool:
         """统一的节点元数据补丁接口（daemon/工具共用）。
         
-        支持的字段：confidence_score, trust_tier, verification_source,
-        metadata_signature, last_verified_at, epistemic_status。
+        支持的字段：trust_tier, verification_source,
+        metadata_signature, last_verified_at。
         签名自动经过 normalize_metadata_signature 标准化。
         """
-        allowed = {"confidence_score", "trust_tier", "verification_source",
-                    "metadata_signature", "last_verified_at", "epistemic_status"}
+        allowed = {"trust_tier", "verification_source",
+                    "metadata_signature", "last_verified_at"}
         updates = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
         if not updates:
             return False
@@ -402,10 +391,6 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             if updates["trust_tier"] not in valid_tiers:
                 logger.warning(f"patch_node_metadata: invalid trust_tier '{updates['trust_tier']}', ignoring")
                 del updates["trust_tier"]
-        if "epistemic_status" in updates:
-            if updates["epistemic_status"] not in ("FACT", "BELIEF", "HYPOTHESIS"):
-                logger.warning(f"patch_node_metadata: invalid epistemic_status '{updates['epistemic_status']}', ignoring")
-                del updates["epistemic_status"]
         if not updates:
             return False
         set_clause = ", ".join(f"{k} = ?" for k in updates)
@@ -563,16 +548,16 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         """守护进程摘要 → 委托给 KnowledgeQuery"""
         return self.query.get_daemon_status_summary()
 
-    def promote_node_confidence(self, node_id: str, boost: float = 0.05, max_score: float = 0.95):
-        """提升节点置信度（用于 PATTERN 累积增强）"""
+    def touch_node(self, node_id: str):
+        """标记节点为近期活跃（更新 updated_at），用于去重合并、PATTERN 累积等场景。"""
         try:
             self._conn.execute(
-                "UPDATE knowledge_nodes SET confidence_score = MIN(confidence_score + ?, ?) WHERE node_id = ?",
-                (boost, max_score, node_id)
+                "UPDATE knowledge_nodes SET updated_at = CURRENT_TIMESTAMP WHERE node_id = ?",
+                (node_id,)
             )
             self._conn.commit()
         except Exception as e:
-            logger.warning(f"promote_node_confidence failed for {node_id}: {e}")
+            logger.warning(f"touch_node failed for {node_id}: {e}")
 
     def add_edge(self, source_id: str, target_id: str, relation: str, weight: float = 1.0):
         """添加一条图谱边 (Idempotent)"""
@@ -611,16 +596,15 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
     def purge_forgotten_knowledge(self, days_threshold: int = 7) -> int:
         """
         垃圾回收 (GC)：
-        清理置信度低（< 0.5，如拾荒来的数据），且超过 `days_threshold` 天未使用过的节点。
+        清理未使用过且超过 `days_threshold` 天的节点（排除 HUMAN tier）。
         返回清理的节点数量。
         """
         query = f"""
             SELECT node_id FROM knowledge_nodes
-            WHERE confidence_score < 0.5
-            AND usage_count = 0
+            WHERE usage_count = 0
+            AND trust_tier NOT IN ('HUMAN')
             AND created_at < datetime('now', '-{days_threshold} days')
             AND node_id NOT LIKE 'MEM_CONV%'
-            AND COALESCE(epistemic_status, 'BELIEF') != 'FACT'
         """
         rows = self._conn.execute(query).fetchall()
 
@@ -819,6 +803,8 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
                     verification_source: Optional[str] = None,
                     trust_tier: str = "REFLECTION",
                     epistemic_status: str = "BELIEF"):
+        # NOTE: confidence_score, parent_node_id, epistemic_status params kept for API compat but ignored.
+        # Quality is derived from usage stats. Epistemic status derived from verification.
         """创建一个新的双层节点（索引 + 内容），支持注入因果属性和自动向量化"""
         # 如果是知识类节点，自动计算其向量
         embedding_json = None
@@ -837,16 +823,12 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         signature_json = json.dumps(normalized_signature, ensure_ascii=False) if normalized_signature else None
         signature_text = self.signature.render(normalized_signature)
         validated_tier = trust_tier if trust_tier in TRUST_TIERS else "REFLECTION"
-        normalized_confidence = self._clamp_confidence_score(
-            confidence_score,
-            default=self._default_confidence_score(normalized_signature, source, validated_tier)
-        )
         normalized_last_verified = last_verified_at
         if not normalized_last_verified and normalized_signature.get("validation_status") == "validated":
             normalized_last_verified = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         normalized_verification_source = verification_source or (source if normalized_last_verified else None)
         # V4.3: 支持 ENTITY/EVENT/ACTION 进行向量化
-        embeddable_types = ["LESSON", "CONTEXT", "ASSET", "EPISODE", "ENTITY", "EVENT", "ACTION", "DISCOVERY", "PATTERN"]
+        embeddable_types = ["LESSON", "CONTEXT", "ASSET", "EPISODE", "ENTITY", "EVENT", "ACTION", "TOOL", "DISCOVERY", "PATTERN"]
         if ntype in embeddable_types and self.vector_engine.is_ready:
             text_to_encode = f"{title} {tags} {resolves or ''} {signature_text}".strip()
             vec = self.vector_engine.encode(text_to_encode)
@@ -857,31 +839,24 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         # 版本链：如果节点已存在，先快照旧版本
         self._snapshot_if_exists(node_id)
 
-        validated_epistemic = epistemic_status if epistemic_status in ("FACT", "BELIEF", "HYPOTHESIS") else "BELIEF"
-        # HUMAN tier 节点自动标记为 FACT
-        if validated_tier == "HUMAN" and validated_epistemic != "FACT":
-            validated_epistemic = "FACT"
         self._conn.execute(
             """INSERT INTO knowledge_nodes
                (node_id, type, title, human_translation, tags, prerequisites, resolves,
-                parent_node_id, metadata_signature, embedding, confidence_score,
-                last_verified_at, verification_source, trust_tier, epistemic_status)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                metadata_signature, embedding,
+                last_verified_at, verification_source, trust_tier)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(node_id) DO UPDATE SET
                  type=excluded.type, title=excluded.title,
                  human_translation=excluded.human_translation, tags=excluded.tags,
                  prerequisites=excluded.prerequisites, resolves=excluded.resolves,
-                 parent_node_id=excluded.parent_node_id,
                  metadata_signature=excluded.metadata_signature,
                  embedding=excluded.embedding,
-                 confidence_score=excluded.confidence_score,
                  last_verified_at=excluded.last_verified_at,
                  verification_source=excluded.verification_source,
                  trust_tier=excluded.trust_tier,
-                 epistemic_status=excluded.epistemic_status,
                  updated_at=CURRENT_TIMESTAMP
             """,
-            (node_id, ntype, title, human_translation, tags, prerequisites, resolves, parent_node_id, signature_json, embedding_json, normalized_confidence, normalized_last_verified, normalized_verification_source, validated_tier, validated_epistemic)
+            (node_id, ntype, title, human_translation, tags, prerequisites, resolves, signature_json, embedding_json, normalized_last_verified, normalized_verification_source, validated_tier)
         )
         self._conn.execute(
             """INSERT INTO node_contents (node_id, full_content, source) VALUES (?,?,?)
@@ -941,6 +916,46 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         self._load_embeddings_to_memory()
         logger.info(f"NodeVault: Backfill complete. total={total}, success={success}, failed={failed}, skipped={skipped}")
         return {"total_missing": total, "success": success, "failed": failed, "skipped": skipped}
+
+    # ─── TOOL 节点激活桥 ─────────────────────────────────────────
+
+    def get_tool_nodes(self, min_tier: str = "REFLECTION") -> List[Dict[str, Any]]:
+        """查询所有可激活的 TOOL 节点（含源码）。
+
+        Returns:
+            List of dicts: {node_id, tool_name, title, source_code, trust_tier}
+        """
+        min_rank = TRUST_TIER_RANK.get(min_tier, 3)
+        rows = self._conn.execute(
+            "SELECT n.node_id, n.title, n.human_translation, n.trust_tier, "
+            "       nc.full_content "
+            "FROM knowledge_nodes n "
+            "JOIN node_contents nc ON n.node_id = nc.node_id "
+            "WHERE n.type = 'TOOL' AND nc.full_content IS NOT NULL "
+            "  AND length(nc.full_content) > 20"
+        ).fetchall()
+        results = []
+        for r in rows:
+            tier = r["trust_tier"] or "REFLECTION"
+            if TRUST_TIER_RANK.get(tier, 0) < min_rank:
+                continue
+            # 从 human_translation 提取 tool_name（格式: "Python工具: xxx"）
+            ht = r["human_translation"] or ""
+            if ht.startswith("Python工具: "):
+                tool_name = ht[len("Python工具: "):].strip()
+            else:
+                # fallback: 从 node_id 推导（TOOL_xxx → xxx）
+                nid = r["node_id"] or ""
+                tool_name = nid[5:].lower() if nid.startswith("TOOL_") else nid.lower()
+            results.append({
+                "node_id": r["node_id"],
+                "tool_name": tool_name,
+                "title": r["title"],
+                "source_code": r["full_content"],
+                "trust_tier": tier,
+            })
+        logger.info(f"NodeVault: found {len(results)} activatable TOOL nodes (min_tier={min_tier})")
+        return results
 
     # ─── promote/decay/record_usage_outcome/_try_promote_epistemic → arena_mixin.py ───
 

@@ -296,7 +296,7 @@ class LensPhaseMixin:
         shared_knowledge = await self._prefetch_shared_knowledge(clean_input)
         knowledge_digest = self.vault.get_digest()
         conversation_digest = self.vault.get_conversation_digest(limit=10)
-        signature_text = self.vault.render_metadata_signature(self.inferred_signature)
+        signature_text = self.vault.signature.render(self.inferred_signature)
 
         # ── G 先说自己的理解 ──
         g_interpretation = await self._build_g_interpretation(clean_input, knowledge_digest, shared_knowledge)
@@ -339,36 +339,28 @@ class LensPhaseMixin:
         return blackboard
 
     async def _prefetch_shared_knowledge(self, clean_input: str) -> str:
-        """预搜一次 NodeVault，构建共享知识包。"""
-        search_args = {"keywords": [clean_input[:80]]}
-        if self.inferred_signature:
-            search_args["signature"] = self.inferred_signature
+        """预搜一次 NodeVault（向量引擎），构建共享知识包。"""
+        if not self.vault.vector_engine.is_ready:
+            return ""
 
         try:
-            search_result = await asyncio.wait_for(
-                self.tools.execute("search_knowledge_nodes", search_args),
-                timeout=self.TOOL_EXEC_TIMEOUT
-            )
+            results = self.vault.vector_engine.search(clean_input[:200], top_k=5, threshold=0.45)
         except Exception as e:
-            logger.warning(f"Multi-G prefetch search failed: {e}")
+            logger.warning(f"Multi-G prefetch vector search failed: {e}")
             return ""
 
-        if not search_result or "未找到" in str(search_result) or "未命中" in str(search_result):
+        if not results:
             return ""
 
-        node_ids = re.findall(r'\[([A-Z_]+_[^\]]+)\]', str(search_result))
-        seen = set()
-        unique_ids = []
-        for nid in node_ids:
-            if nid not in seen and not nid.startswith("MEM_CONV"):
-                seen.add(nid)
-                unique_ids.append(nid)
-                if len(unique_ids) >= 5:
-                    break
-
+        unique_ids = [r[0] for r in results if not r[0].startswith("MEM_CONV")][:5]
+        briefs = self.vault.get_node_briefs(unique_ids)
         contents = self.vault.get_multiple_contents(unique_ids) if unique_ids else {}
 
-        lines = [str(search_result)[:2000]]
+        lines = []
+        for nid in unique_ids:
+            brief = briefs.get(nid, {})
+            sim = dict(results).get(nid, 0)
+            lines.append(f"● <{brief.get('type','?')}> {brief.get('title', nid)} [{nid}] sim={sim:.2f}")
         if contents:
             lines.append("\n--- 相关节点详细内容 ---")
             for nid in unique_ids:

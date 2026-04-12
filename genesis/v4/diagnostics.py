@@ -89,17 +89,11 @@ class DiagnosticSignal:
 # ── 熔断回调（每个信号的自动止血动作） ─────────────────────
 
 def _breaker_op_timeout(sig: DiagnosticSignal):
-    """Op 频繁超时 → 下一次请求自动缩短 Op 迭代上限"""
-    from genesis.v4.pipeline_config import PIPELINE_CONFIG
-    # 将 Op 上限临时缩为一半（通过类属性覆盖——不修改 frozen config）
-    try:
-        from genesis.v4 import loop as _loop_mod
-        orig = PIPELINE_CONFIG.op_max_iterations
-        halved = max(5, orig // 2)
-        _loop_mod.V4Loop.OP_MAX_ITERATIONS = halved
-        logger.warning(f"⚡ Breaker [op_timeout]: OP_MAX_ITERATIONS {orig} → {halved}")
-    except Exception as e:
-        logger.error(f"Breaker [op_timeout] failed: {e}")
+    """GP 工具执行频繁超时 → 记录告警，提示可能需要检查工具或网络"""
+    logger.warning(
+        f"⚡ Breaker [op_timeout]: GP 工具执行频繁超时 "
+        f"(fire_rate={sig.fire_rate:.0%})，请检查工具执行环境或网络连接"
+    )
 
 
 def _breaker_provider_failure(sig: DiagnosticSignal):
@@ -123,14 +117,16 @@ def _breaker_search_zero(sig: DiagnosticSignal):
 
 
 def _breaker_token_degradation(sig: DiagnosticSignal):
-    """Token 膨胀 → 强制缩短 G 最大迭代数"""
+    """Token 膨胀 → 通过环境变量降级下次请求的 GP 最大迭代数"""
+    import os
     try:
-        from genesis.v4 import loop as _loop_mod
-        current = _loop_mod.V4Loop.max_iterations if hasattr(_loop_mod.V4Loop, 'max_iterations') else 20
-        # This is instance-level; set class default for next request
+        current = int(os.environ.get("GENESIS_GP_MAX_ITERATIONS_OVERRIDE", "0")) or 20
+        degraded = max(current // 2, 5)
+        os.environ["GENESIS_GP_MAX_ITERATIONS_OVERRIDE"] = str(degraded)
         logger.warning(
             f"⚡ Breaker [token_degradation]: token bloat detected "
-            f"({sig.fire_rate:.0%} anomaly rate). Consider reducing dispatch depth."
+            f"({sig.fire_rate:.0%} anomaly rate). "
+            f"GP max iterations degraded {current} → {degraded} for next request."
         )
     except Exception as e:
         logger.error(f"Breaker [token_degradation] failed: {e}")
@@ -159,7 +155,7 @@ class PipelineDiagnostics:
         name="op_timeout",
         window_size=5,
         threshold=0.6,
-        description="Op-Phase 频繁超时，工具执行或 LLM 响应可能阻塞",
+        description="GP-Phase 工具执行频繁超时，工具执行或 LLM 响应可能阻塞",
         on_fire=_breaker_op_timeout,
         cooldown_secs=180.0,
     )

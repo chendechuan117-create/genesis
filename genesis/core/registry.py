@@ -110,6 +110,11 @@ class ToolRegistry:
             logger.warning(f"Intercepted JSON decode error for tool {tool_name}: {raw_bad[:300]}")
             return f"Error: JSON参数解析失败。错误片段: {raw_bad}\n请换一种方式：将多行内容拆分为多步小命令，或改用 write_file 工具写入文件。"
         
+        # ── LLM 参数名规范化（一劳永逸）──
+        # LLM 常把 ntype 误写为 type（JSON Schema 关键字 "type" 与参数名混淆）
+        if "type" in arguments and "ntype" not in arguments:
+            arguments["ntype"] = arguments.pop("type")
+
         active_fp = _tool_fingerprint(tool)
         execute_attr = getattr(tool, "execute")
         if isinstance(tool, type) and active_fp.get("tool_type") == "ABCMeta":
@@ -120,11 +125,7 @@ class ToolRegistry:
         
         try:
             logger.debug(f"执行工具: {tool_name} with {arguments}")
-            if active_fp["execute_is_bound"]:
-                execute_func = getattr(execute_attr, "__func__", execute_attr)
-                result = await execute_func(**arguments)
-            else:
-                result = await execute_attr(**arguments)
+            result = await execute_attr(**arguments)
             logger.debug(f"✓ 工具执行成功: {tool_name}")
             return result
         except TypeError as e:

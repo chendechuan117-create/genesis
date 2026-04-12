@@ -13,13 +13,9 @@ from typing import Dict
 class PipelineConfig:
     """V4 管线全局配置。frozen=True 保证运行时不可变。"""
 
-    # ── G-Phase ──────────────────────────────────
+    # ── GP-Phase (统一思考+执行) ──────────────────────────────────
     g_max_iterations: int = 20
     g_max_consecutive_errors: int = 3
-
-    # ── Op-Phase ──────────────────────────────────
-    op_max_iterations: int = 60
-    op_max_consecutive_errors: int = 3
 
     # ── C-Phase ──────────────────────────────────
     c_phase_max_iter: Dict[str, int] = field(default_factory=lambda: {
