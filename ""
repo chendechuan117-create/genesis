@@ -1,5 +1,0 @@
-scripts/governance_preflight.py: line 52: warning: here-document at line 1 delimited by end-of-file (wanted `PY')
-  File "<stdin>", line 3
-    path.write_text("""import shutil
-                    ^
-SyntaxError: unterminated triple-quoted string literal (detected at line 51)

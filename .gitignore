@@ -131,3 +131,7 @@ SECURITY.md
 CONTRIBUTING.md
 README_Tavily_Assessment.md
 time
+tests/__pycache__/
+os
+requests
+file
