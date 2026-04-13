@@ -30,6 +30,8 @@ os.environ.setdefault("GENESIS_SELF_EVOLUTION", "1")
 os.environ.setdefault("GENESIS_SELF_EVOLUTION_COOLDOWN", "10")
 # 不因空转停止 — Yogg 是放生的，永远跑
 os.environ.setdefault("GENESIS_AUTO_DRY_LIMIT", "0")
+# 每 session 最多跑 10 轮，然后外循环重启新 session 释放内存（Yoga 只有 8G RAM）
+os.environ.setdefault("GENESIS_AUTO_MAX_ROUNDS", "10")
 
 from dotenv import load_dotenv
 load_dotenv()
