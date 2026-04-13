@@ -930,7 +930,7 @@ def _compact_round_history(round_log: list, last_n: int = 10) -> str:
             parts.append(f"KB:{r['kb_delta_summary']}")
         c_sum = r.get("c_phase_summary") or {}
         if c_sum:
-            parts.append(f"C:lessons={c_sum.get('lessons_recorded', 0)}/pat={c_sum.get('patterns_promoted', 0)}")
+            parts.append(f"C:lessons={c_sum.get('lessons_recorded', 0)}")
         ks = r.get("knowledge_search_count", 0)
         if ks:
             parts.append(f"search={ks}")
@@ -2033,13 +2033,11 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                     elif evt.event_type == "c_phase_done":
                         if isinstance(data, dict):
                             refl = data.get("reflection") or {}
-                            prom = data.get("pattern_promotion") or {}
                             round_record["c_phase_summary"] = {
                                 "mode": data.get("mode", "?"),
                                 "c_tokens": data.get("c_tokens", 0),
                                 "lessons_recorded": refl.get("lessons_recorded", 0),
                                 "lesson_titles": [l.get("title", "?") for l in refl.get("lessons", [])][:3],
-                                "patterns_promoted": prom.get("patterns_promoted", 0),
                                 "reflection_reason": refl.get("reason", ""),
                             }
                             entry["data"] = round_record["c_phase_summary"]
@@ -2256,7 +2254,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             # C-Phase + 知识闭环诊断行
             c_sum = round_record.get("c_phase_summary") or {}
             ks_count = round_record.get("knowledge_search_count", 0)
-            c_diag = f"C[lessons={c_sum.get('lessons_recorded', 0)} pat={c_sum.get('patterns_promoted', 0)}]" if c_sum else "C[skip]"
+            c_diag = f"C[lessons={c_sum.get('lessons_recorded', 0)}]" if c_sum else "C[skip]"
             k_diag = f"search={ks_count}" if ks_count else "search=0"
 
             _append_md(
@@ -2425,7 +2423,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                     _old_rec.pop(_heavy_key, None)
         _release_memory()
 
-        # TOOL 节点热加载：C/Challenger 后台写的 TOOL 节点在此激活，下一轮 GP 可用
+        # TOOL 节点热加载：C 后台写的 TOOL 节点在此激活，下一轮 GP 可用
         try:
             from factory import activate_vault_tools
             _new_tools = activate_vault_tools(agent.tools)

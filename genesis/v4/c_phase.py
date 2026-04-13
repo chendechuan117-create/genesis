@@ -191,9 +191,6 @@ class CPhaseMixin:
             else:
                 logger.info(f"Reflection: PASS (c_tokens={r_tokens}, reason={reflection_result.get('reason', 'none')})")
 
-        # ── PATTERN 自动提升（确定性，零 LLM）── 基于已有 DISCOVERY 节点
-        promotion_result = {"patterns_promoted": 0}
-
         c_tokens_total = reflection_result.get("c_tokens", 0)
         self.c_messages = []
         logger.info(f"C-Process finished (Arena + Trace + Reflection). c_tokens={c_tokens_total}, lessons={reflection_result.get('lessons_recorded', 0)}, total={self.metrics.total_tokens}")
@@ -201,7 +198,6 @@ class CPhaseMixin:
             "mode": mode, "c_tokens": c_tokens_total,
             "trace_pipeline": trace_pipeline_result,
             "reflection": reflection_result,
-            "pattern_promotion": promotion_result,
         })
 
     # ─── Reflector: 内容级反思 ───────────────────────────────────────
@@ -417,111 +413,3 @@ class CPhaseMixin:
             logger.warning(f"Reflection LLM call failed (non-fatal): {e}")
             return {"lessons_recorded": 0, "c_tokens": 0, "error": str(e)}
 
-    # ─── 阶段3: PATTERN 自动提升 ───
-
-    PATTERN_PROMOTION_THRESHOLD = 3  # 同 subject 前缀 ≥3 个 DISCOVERY → 提升
-
-    def _try_promote_discoveries_to_pattern(self, discoveries_this_session: int = 0) -> Dict[str, Any]:
-        """确定性逻辑：同 subject 前缀累积 ≥3 个 DISCOVERY 时自动合并为 PATTERN。
-
-        零 LLM，纯 SQL + Python。在 _run_c_phase 末尾调用。
-        PATTERN 半衰期 180 天（DISCOVERY 90 天），置信度取子节点最大值 +0.1。
-        短路：本轮未录入新 DISCOVERY 时跳过（避免每轮空跑 200 条查询）。
-        """
-        if discoveries_this_session <= 0:
-            return {"patterns_promoted": 0, "reason": "no_new_discoveries"}
-        vault = self.vault
-        promoted = []
-
-        try:
-            rows = vault._conn.execute(  # 使用 self.vault 的连接，能看到本轮刚录入的 DISCOVERY
-                """SELECT kn.node_id, nc.full_content
-                   FROM knowledge_nodes kn
-                   JOIN node_contents nc ON kn.node_id = nc.node_id
-                   WHERE kn.type = 'DISCOVERY'
-                   ORDER BY kn.created_at DESC
-                   LIMIT 200"""
-            ).fetchall()
-
-            if len(rows) < self.PATTERN_PROMOTION_THRESHOLD:
-                return {"patterns_promoted": 0, "reason": "too_few_discoveries"}
-
-            from collections import defaultdict
-            subject_groups = defaultdict(list)
-            for r in rows:
-                try:
-                    content = json.loads(r['full_content'])
-                    subject = content.get('subject', '')
-                    description = content.get('description', '')
-                    parts = subject.split('.')
-                    prefix = '.'.join(parts[:2]) if len(parts) >= 2 else subject
-                    if prefix:
-                        subject_groups[prefix].append({
-                            'node_id': r['node_id'],
-                            'subject': subject,
-                            'description': description,
-                        })
-                except (json.JSONDecodeError, TypeError):
-                    continue
-
-            existing_patterns = set()
-            pat_rows = vault._conn.execute(
-                "SELECT node_id FROM knowledge_nodes WHERE type = 'PATTERN'"
-            ).fetchall()
-            for pr in pat_rows:
-                existing_patterns.add(pr['node_id'])
-
-            for prefix, discoveries in subject_groups.items():
-                if len(discoveries) < self.PATTERN_PROMOTION_THRESHOLD:
-                    continue
-
-                pattern_id = f"PAT_{hashlib.md5(prefix.encode()).hexdigest()[:8].upper()}"
-                if pattern_id in existing_patterns:
-                    vault.touch_node(pattern_id)
-                    logger.info(f"PATTERN [{pattern_id}] already exists, marked active")
-                    continue
-
-                descriptions = [f"- {d['subject']}: {d['description']}" for d in discoveries[:10]]
-
-                pattern_content = json.dumps({
-                    "subject_prefix": prefix,
-                    "observation_count": len(discoveries),
-                    "observations": descriptions,
-                }, ensure_ascii=False)
-
-                vault.create_node(
-                    node_id=pattern_id,
-                    ntype="PATTERN",
-                    title=f"[PATTERN] {prefix} ({len(discoveries)} observations)",
-                    human_translation=f"{prefix}: consolidated from {len(discoveries)} discoveries",
-                    tags=f"pattern,auto_promoted,{prefix.replace('.', ',')}",
-                    full_content=pattern_content,
-                    source="c_phase_promotion",
-                    resolves=prefix,
-                    metadata_signature={
-                        "subject_prefix": prefix,
-                        "promotion_source": "auto",
-                        "observation_count": len(discoveries),
-                    },
-                    trust_tier="REFLECTION",
-                )
-
-                for d in discoveries:
-                    try:
-                        vault.add_edge(d['node_id'], pattern_id, "RELATED_TO", weight=0.8)
-                    except Exception:
-                        pass
-
-                promoted.append({
-                    "pattern_id": pattern_id,
-                    "prefix": prefix,
-                    "discovery_count": len(discoveries),
-                    "confidence": pattern_conf,
-                })
-                logger.info(f"PATTERN promoted: [{pattern_id}] {prefix} from {len(discoveries)} discoveries (conf={pattern_conf:.2f})")
-
-            return {"patterns_promoted": len(promoted), "patterns": promoted}
-
-        except Exception as e:
-            logger.warning(f"PATTERN promotion failed (non-fatal): {e}")
-            return {"patterns_promoted": 0, "error": str(e)}
