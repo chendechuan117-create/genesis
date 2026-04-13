@@ -1709,8 +1709,7 @@ class SelfEvolution:
     def __init__(self, cooldown: int = SELF_EVOLUTION_COOLDOWN):
         self.cooldown = cooldown
         self.last_diff_hash: str = ""
-        self.last_diff_round: int = 0
-        self.rounds_since_change: int = 0
+        self.stable_count: int = 0  # 持久化：diff 连续未变的轮数（跨 session）
         self.applied_this_session: bool = False
         self.apply_history: list = []
         self._load()
@@ -1720,6 +1719,8 @@ class SelfEvolution:
             if self._STATE_PATH.exists():
                 data = json.loads(self._STATE_PATH.read_text(encoding="utf-8"))
                 self.apply_history = data.get("apply_history", [])
+                self.last_diff_hash = data.get("last_diff_hash", "")
+                self.stable_count = data.get("stable_count", 0)
         except Exception:
             pass
 
@@ -1728,14 +1729,18 @@ class SelfEvolution:
             self._STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
             self._STATE_PATH.write_text(json.dumps({
                 "last_diff_hash": self.last_diff_hash,
-                "last_diff_round": self.last_diff_round,
+                "stable_count": self.stable_count,
                 "apply_history": self.apply_history[-10:],
             }, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as e:
             logger.warning(f"SelfEvolution state save failed: {e}")
 
     async def check_round(self, round_num: int, channel):
-        """Called each round after GP execution. Manages cooling + auto-apply."""
+        """Called each round after GP execution. Manages cooling + auto-apply.
+
+        Uses a persistent stable_count (survives session restarts) instead of
+        session-local round_num to avoid dead-loops when MAX_ROUNDS < cooldown.
+        """
         if self.applied_this_session:
             return
 
@@ -1747,20 +1752,20 @@ class SelfEvolution:
         if diff_hash != self.last_diff_hash:
             # New/changed modifications — reset cooling
             self.last_diff_hash = diff_hash
-            self.last_diff_round = round_num
-            self.rounds_since_change = 0
+            self.stable_count = 0
             self._save()
             await channel.send(
                 f"🧬 沙箱有新修改 | 冷却计数器重置 → 0/{self.cooldown}"
             )
             return
 
-        # Same diff as before — increment cooling
-        self.rounds_since_change = round_num - self.last_diff_round
-        if self.rounds_since_change < self.cooldown:
-            if self.rounds_since_change % 3 == 0:  # periodic reminder
+        # Same diff as before — increment persistent counter
+        self.stable_count += 1
+        self._save()
+        if self.stable_count < self.cooldown:
+            if self.stable_count % 3 == 0:  # periodic reminder
                 await channel.send(
-                    f"🧬 冷却中 {self.rounds_since_change}/{self.cooldown}"
+                    f"🧬 冷却中 {self.stable_count}/{self.cooldown}"
                 )
             return
 
@@ -1787,7 +1792,7 @@ class SelfEvolution:
     async def _try_apply(self, round_num: int, channel):
         """Test → apply → write restart marker."""
         await channel.send(
-            f"🧬 冷却完成 ({self.rounds_since_change} 轮) | 开始自进化应用流程..."
+            f"🧬 冷却完成 ({self.stable_count} 轮) | 开始自进化应用流程..."
         )
 
         # 1. Run tests in sandbox
@@ -1799,7 +1804,7 @@ class SelfEvolution:
             )
             # Reset cooling — GP might fix the issue
             self.last_diff_hash = ""
-            self.rounds_since_change = 0
+            self.stable_count = 0
             self._save()
             return
 
