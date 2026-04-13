@@ -72,6 +72,8 @@ AUTO_ROUND_TIMEOUT_SECS = _env_int("GENESIS_AUTO_ROUND_TIMEOUT_SECS", 0, minimum
 AUTO_SYNC_DOCTOR_SANDBOX = _env_bool("GENESIS_AUTO_SYNC_DOCTOR_SANDBOX", True)
 AUTO_DOCTOR_SYNC_TIMEOUT_SECS = _env_int("GENESIS_AUTO_DOCTOR_SYNC_TIMEOUT_SECS", 420, minimum=30)
 SPIRAL_CONCURRENCY = _env_int("GENESIS_SPIRAL_CONCURRENCY", 3, minimum=1)
+SELF_EVOLUTION_ENABLED = _env_bool("GENESIS_SELF_EVOLUTION", False)
+SELF_EVOLUTION_COOLDOWN = _env_int("GENESIS_SELF_EVOLUTION_COOLDOWN", 10, minimum=3)
 
 AUTO_PROMPT_FIRST = """你是 Genesis 的自主探索者。你的目标不是修 bug 或填空洞——而是基于已有知识，发现 Genesis 还没想到的新可能性。
 
@@ -1684,6 +1686,236 @@ class CrossModuleExplorer:
         return f"已分析 {len(self.analyzed)} 对 | 待分析 {pending} 对"
 
 
+# ─── Self-Evolution ──────────────────────────────────────────────
+
+class SelfEvolution:
+    """Tracks Doctor sandbox modifications and auto-applies after cooling period.
+
+    Flow:
+    1. Each round, check `doctor.sh diff` for pending sandbox changes
+    2. If diff content changed → reset cooling counter (GP still actively modifying)
+    3. If diff unchanged for COOLDOWN rounds → GP moved on → safe to apply
+    4. Run `doctor.sh test` → if pass → `doctor.sh auto-apply` → restart service
+
+    Safety:
+    - Git commit before apply (rollback point stored in state)
+    - Max 1 apply per session
+    - Crash-loop detection in yogg_auto.py triggers rollback on next startup
+    """
+
+    _STATE_PATH = Path("runtime/self_evolution_state.json")
+    _RESTART_MARKER = Path("runtime/.self_evolution_restart")
+
+    def __init__(self, cooldown: int = SELF_EVOLUTION_COOLDOWN):
+        self.cooldown = cooldown
+        self.last_diff_hash: str = ""
+        self.last_diff_round: int = 0
+        self.rounds_since_change: int = 0
+        self.applied_this_session: bool = False
+        self.apply_history: list = []
+        self._load()
+
+    def _load(self):
+        try:
+            if self._STATE_PATH.exists():
+                data = json.loads(self._STATE_PATH.read_text(encoding="utf-8"))
+                self.apply_history = data.get("apply_history", [])
+        except Exception:
+            pass
+
+    def _save(self):
+        try:
+            self._STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            self._STATE_PATH.write_text(json.dumps({
+                "last_diff_hash": self.last_diff_hash,
+                "last_diff_round": self.last_diff_round,
+                "apply_history": self.apply_history[-10:],
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            logger.warning(f"SelfEvolution state save failed: {e}")
+
+    async def check_round(self, round_num: int, channel):
+        """Called each round after GP execution. Manages cooling + auto-apply."""
+        if self.applied_this_session:
+            return
+
+        # Check sandbox diff
+        has_diff, diff_hash = await self._get_diff_hash()
+        if not has_diff:
+            return  # no pending changes in sandbox
+
+        if diff_hash != self.last_diff_hash:
+            # New/changed modifications — reset cooling
+            self.last_diff_hash = diff_hash
+            self.last_diff_round = round_num
+            self.rounds_since_change = 0
+            self._save()
+            await channel.send(
+                f"🧬 沙箱有新修改 | 冷却计数器重置 → 0/{self.cooldown}"
+            )
+            return
+
+        # Same diff as before — increment cooling
+        self.rounds_since_change = round_num - self.last_diff_round
+        if self.rounds_since_change < self.cooldown:
+            if self.rounds_since_change % 3 == 0:  # periodic reminder
+                await channel.send(
+                    f"🧬 冷却中 {self.rounds_since_change}/{self.cooldown}"
+                )
+            return
+
+        # Cooling period complete — try apply
+        await self._try_apply(round_num, channel)
+
+    async def _get_diff_hash(self) -> tuple:
+        """Check Doctor sandbox for pending diff. Returns (has_diff, hash)."""
+        import hashlib
+        try:
+            ok, output = await _run_doctor_sync_command("diff", timeout_secs=30)
+            if not ok or not output.strip():
+                return False, ""
+            # Strip the command header line from output
+            lines = output.strip().split("\n", 1)
+            diff_content = lines[1] if len(lines) > 1 else lines[0]
+            if not diff_content.strip():
+                return False, ""
+            return True, hashlib.md5(diff_content.encode()).hexdigest()[:12]
+        except Exception as e:
+            logger.warning(f"SelfEvolution diff check failed: {e}")
+            return False, ""
+
+    async def _try_apply(self, round_num: int, channel):
+        """Test → apply → write restart marker."""
+        await channel.send(
+            f"🧬 冷却完成 ({self.rounds_since_change} 轮) | 开始自进化应用流程..."
+        )
+
+        # 1. Run tests in sandbox
+        await channel.send("🧬 [1/3] 沙箱测试中...")
+        test_ok, test_output = await _run_doctor_sync_command("test", timeout_secs=180)
+        if not test_ok:
+            await channel.send(
+                f"🧬 ❌ 沙箱测试失败，放弃本次应用\n```\n{test_output[-500:]}\n```"
+            )
+            # Reset cooling — GP might fix the issue
+            self.last_diff_hash = ""
+            self.rounds_since_change = 0
+            self._save()
+            return
+
+        await channel.send("🧬 ✅ 测试通过")
+
+        # 2. Auto-apply with git safety net
+        await channel.send("🧬 [2/3] 应用沙箱修改到本体...")
+        apply_ok, apply_output = await _run_doctor_sync_command("auto-apply", timeout_secs=60)
+
+        # Parse output for rollback point
+        rollback_commit = ""
+        applied_commit = ""
+        for line in apply_output.split("\n"):
+            if line.startswith("ROLLBACK_POINT:"):
+                rollback_commit = line.split(":", 1)[1].strip()
+            elif line.startswith("APPLIED_COMMIT:"):
+                applied_commit = line.split(":", 1)[1].strip()
+
+        if not apply_ok or "APPLY_SUCCESS" not in apply_output:
+            await channel.send(
+                f"🧬 ❌ 应用失败\n```\n{apply_output[-500:]}\n```"
+            )
+            self.last_diff_hash = ""
+            self._save()
+            return
+
+        await channel.send(f"🧬 ✅ 代码已应用 | commit={applied_commit[:8]}")
+
+        # 3. Write restart marker + record history
+        self.applied_this_session = True
+        self.apply_history.append({
+            "round": round_num,
+            "timestamp": _time_module.strftime("%Y-%m-%d %H:%M:%S"),
+            "rollback_commit": rollback_commit,
+            "applied_commit": applied_commit,
+        })
+        self._save()
+
+        # Write restart marker for yogg_auto.py crash-loop detection
+        try:
+            self._RESTART_MARKER.parent.mkdir(parents=True, exist_ok=True)
+            self._RESTART_MARKER.write_text(json.dumps({
+                "rollback_commit": rollback_commit,
+                "applied_commit": applied_commit,
+                "timestamp": _time_module.strftime("%Y-%m-%d %H:%M:%S"),
+            }), encoding="utf-8")
+        except Exception as e:
+            logger.error(f"SelfEvolution: restart marker write failed: {e}")
+
+        await channel.send(
+            f"🧬 [3/3] 自进化完成 | rollback={rollback_commit[:8]} → applied={applied_commit[:8]}\n"
+            f"🔄 正在重启服务以加载新代码..."
+        )
+
+        # 4. Restart — this kills the current process, systemd restarts it
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "sudo", "systemctl", "restart", "yogg-auto.service",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=10)
+        except Exception as e:
+            logger.error(f"SelfEvolution: restart failed: {e}")
+            # Not fatal — user/systemd can restart manually
+
+    @staticmethod
+    def check_and_rollback_if_needed():
+        """Called at startup. If restart marker exists and we're crash-looping, rollback.
+        Returns True if rollback was performed."""
+        marker = SelfEvolution._RESTART_MARKER
+        if not marker.exists():
+            return False
+        try:
+            data = json.loads(marker.read_text(encoding="utf-8"))
+            rollback_commit = data.get("rollback_commit", "")
+            applied_commit = data.get("applied_commit", "")
+            ts = data.get("timestamp", "?")
+
+            # Check if this is a crash-loop: marker exists = we restarted after apply
+            # If we get here normally, the apply was successful — clear marker
+            # The crash-loop case is handled by yogg_auto.py consecutive_crash counter
+            logger.info(
+                f"SelfEvolution: post-apply startup | "
+                f"applied={applied_commit[:8]} rollback={rollback_commit[:8]} ts={ts}"
+            )
+            # Clear marker — if we got this far, basic import/init succeeded
+            marker.unlink(missing_ok=True)
+            return False
+        except Exception as e:
+            logger.error(f"SelfEvolution: marker check failed: {e}")
+            try:
+                marker.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return False
+
+    @staticmethod
+    def force_rollback(rollback_commit: str) -> bool:
+        """Emergency rollback to a known-good commit."""
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["git", "reset", "--hard", rollback_commit],
+                capture_output=True, text=True, timeout=30,
+            )
+            logger.warning(f"SelfEvolution: ROLLBACK to {rollback_commit[:8]} | {result.stdout.strip()}")
+            try:
+                SelfEvolution._RESTART_MARKER.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return result.returncode == 0
+        except Exception as e:
+            logger.error(f"SelfEvolution: rollback failed: {e}")
+            return False
+
+
 # ─── Main Entry Point ─────────────────────────────────────────────
 
 async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, directive: str = ""):
@@ -1720,6 +1952,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
     cross_module_mode = False
     explorer = None
     _current_pioneer_file = None
+    self_evolution = SelfEvolution() if SELF_EVOLUTION_ENABLED else None
 
     _report_dir = Path("runtime/auto_reports")
     _report_dir.mkdir(parents=True, exist_ok=True)
@@ -2431,6 +2664,13 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 logger.info(f"/auto tool_hotload | {_new_tools} new vault tools activated")
         except Exception as _e:
             logger.debug(f"/auto tool_hotload skip: {_e}")
+
+        # ── Self-Evolution: 沙箱冷却追踪 + 自动应用 ──
+        if self_evolution and not spiral_mode and not cross_module_mode and consecutive_error == 0:
+            try:
+                await self_evolution.check_round(round_num, channel)
+            except Exception as _se_e:
+                logger.warning(f"SelfEvolution check_round failed: {_se_e}")
 
         # 轮间休息（错误轮指数退避 + provider reset）
         if state.get("active", False):

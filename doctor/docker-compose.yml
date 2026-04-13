@@ -1,6 +1,9 @@
 services:
   doctor:
-    image: nanogenesis-sandbox:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: genesis-sandbox:latest
     container_name: genesis-doctor
     working_dir: /workspace
     entrypoint: ["/bin/bash", "/doctor/entrypoint.sh"]
@@ -9,7 +12,7 @@ services:
     volumes:
       - ..:/src/genesis:ro
       - ../venv:/opt/venv:ro
-      - /home/chendechusn/.genesis/workshop_v4.sqlite:/src/db/workshop_v4.sqlite:ro
+      - ${GENESIS_DB_PATH:-~/.genesis/workshop_v4.sqlite}:/src/db/workshop_v4.sqlite:ro
       - ./entrypoint.sh:/doctor/entrypoint.sh:ro
       - genesis-doctor-workspace:/workspace
       - /usr:/usr:ro

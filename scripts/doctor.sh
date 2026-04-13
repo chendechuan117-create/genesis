@@ -12,6 +12,7 @@
 #   doctor.sh diff           查看相对于本体的所有修改
 #   doctor.sh patch          导出修改为 patch 文件
 #   doctor.sh apply          将 Doctor 的修改应用到本体（需人工确认）
+#   doctor.sh auto-apply     非交互式应用（自进化用，带 git 安全网）
 #   doctor.sh status         查看容器状态
 #   doctor.sh cat <file>     查看容器内文件
 #   doctor.sh edit <file>    用 sed/heredoc 修改容器内文件（配合 exec）
@@ -240,6 +241,62 @@ cmd_restore() {
     "
 }
 
+cmd_auto_apply() {
+    # 非交互式应用：自进化专用，带 git 安全网
+    _ensure_running
+
+    local diff
+    diff=$(docker exec -w /workspace "$CONTAINER" git diff HEAD)
+
+    if [ -z "$diff" ]; then
+        echo "NO_CHANGES"
+        return 0
+    fi
+
+    local lines_changed
+    lines_changed=$(echo "$diff" | wc -l)
+    echo "PENDING_CHANGES: $lines_changed lines"
+
+    # 1. Git commit current state as rollback point
+    cd "$PROJECT_DIR"
+    local pre_commit
+    pre_commit=$(git rev-parse HEAD 2>/dev/null)
+    git add -A 2>/dev/null
+    git commit -q -m "[self-evolution] pre-apply snapshot" --allow-empty 2>/dev/null
+    echo "ROLLBACK_POINT: $pre_commit"
+
+    # 2. Apply the diff
+    if echo "$diff" | git apply - 2>&1; then
+        echo "APPLY_OK"
+    else
+        echo "APPLY_FAILED"
+        git checkout -- . 2>/dev/null
+        return 1
+    fi
+
+    # 3. Commit the applied changes
+    git add -A 2>/dev/null
+    local apply_commit_msg="[self-evolution] auto-apply $(date +%Y%m%d_%H%M%S) ($lines_changed lines)"
+    git commit -q -m "$apply_commit_msg" 2>/dev/null
+    local new_commit
+    new_commit=$(git rev-parse HEAD 2>/dev/null)
+    echo "APPLIED_COMMIT: $new_commit"
+    echo "APPLY_SUCCESS"
+}
+
+cmd_rollback() {
+    # 回滚到指定 commit（自进化安全网）
+    local target="$1"
+    if [ -z "$target" ]; then
+        echo -e "${RED}Usage: doctor.sh rollback <commit-hash>${NC}"
+        exit 1
+    fi
+    cd "$PROJECT_DIR"
+    echo "Rolling back to $target..."
+    git reset --hard "$target" 2>&1
+    echo "ROLLBACK_DONE: $(git rev-parse HEAD)"
+}
+
 # ── 路由 ──
 case "${1:-help}" in
     start)  cmd_start ;;
@@ -251,6 +308,8 @@ case "${1:-help}" in
     diff)   cmd_diff ;;
     patch)  cmd_patch ;;
     apply)  cmd_apply ;;
+    auto-apply) cmd_auto_apply ;;
+    rollback) shift; cmd_rollback "$@" ;;
     status) cmd_status ;;
     cat)    shift; cmd_cat "$@" ;;
     snapshots) cmd_snapshots ;;
@@ -270,6 +329,8 @@ case "${1:-help}" in
         echo "  diff           查看所有修改"
         echo "  patch          导出修改为 .patch 文件"
         echo "  apply          将修改应用到本体（需确认）"
+        echo "  auto-apply     非交互式应用（自进化用，带 git 安全网）"
+        echo "  rollback <hash> 回滚到指定 commit"
         echo "  status         查看容器状态"
         echo "  cat <file>     查看容器内文件"
         echo "  snapshots      列出所有快照（保留最近 3 个）"
