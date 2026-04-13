@@ -1833,7 +1833,15 @@ class SelfEvolution:
 
         await channel.send(f"🧬 ✅ 代码已应用 | commit={applied_commit[:8]}")
 
-        # 3. Write restart marker + record history
+        # 3. Reset sandbox to new production baseline (production now has the changes)
+        await channel.send("🧬 [3/4] 重置沙箱到新基线...")
+        reset_ok, reset_output = await _run_doctor_sync_command("reset", timeout_secs=60)
+        if reset_ok:
+            await channel.send("🧬 ✅ 沙箱已同步到新基线")
+        else:
+            await channel.send(f"🧬 ⚠️ 沙箱重置失败（不影响本体）: {reset_output[-200:]}")
+
+        # 4. Write restart marker + record history + clear cooling state
         self.applied_this_session = True
         self.apply_history.append({
             "round": round_num,
@@ -1841,6 +1849,8 @@ class SelfEvolution:
             "rollback_commit": rollback_commit,
             "applied_commit": applied_commit,
         })
+        self.last_diff_hash = ""  # 沙箱已 reset，diff 应为空
+        self.stable_count = 0
         self._save()
 
         # Write restart marker for yogg_auto.py crash-loop detection
@@ -1855,11 +1865,11 @@ class SelfEvolution:
             logger.error(f"SelfEvolution: restart marker write failed: {e}")
 
         await channel.send(
-            f"🧬 [3/3] 自进化完成 | rollback={rollback_commit[:8]} → applied={applied_commit[:8]}\n"
+            f"🧬 [4/4] 自进化完成 | rollback={rollback_commit[:8]} → applied={applied_commit[:8]}\n"
             f"🔄 正在重启服务以加载新代码..."
         )
 
-        # 4. Restart — this kills the current process, systemd restarts it
+        # 5. Restart — this kills the current process, systemd restarts it
         try:
             proc = await asyncio.create_subprocess_exec(
                 "sudo", "systemctl", "restart", "yogg-auto.service",

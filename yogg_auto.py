@@ -24,9 +24,9 @@ import sys
 import time
 from pathlib import Path
 
-# ── 启用 Doctor 沙箱 + 自进化 ──
-os.environ.setdefault("GENESIS_AUTO_SYNC_DOCTOR_SANDBOX", "1")
-os.environ.setdefault("GENESIS_SELF_EVOLUTION", "1")
+# ── 自进化模式：沙箱生命周期由 SelfEvolution 管理，不自动 reset ──
+os.environ.setdefault("GENESIS_AUTO_SYNC_DOCTOR_SANDBOX", "0")  # 不在 session 开头 reset 沙箱
+os.environ.setdefault("GENESIS_SELF_EVOLUTION", "1")             # SelfEvolution 接管沙箱
 os.environ.setdefault("GENESIS_SELF_EVOLUTION_COOLDOWN", "10")
 # 不因空转停止 — Yogg 是放生的，永远跑
 os.environ.setdefault("GENESIS_AUTO_DRY_LIMIT", "0")
