@@ -1777,12 +1777,14 @@ class SelfEvolution:
         import hashlib
         try:
             ok, output = await _run_doctor_sync_command("diff", timeout_secs=30)
-            if not ok or not output.strip():
+            if not ok:
                 return False, ""
-            # Strip the command header line from output
+            # _run_doctor_sync_command prepends "$ ./scripts/doctor.sh diff\n"
+            # Strip that header line; also ignore "(exit=N)" placeholder for empty output
             lines = output.strip().split("\n", 1)
-            diff_content = lines[1] if len(lines) > 1 else lines[0]
-            if not diff_content.strip():
+            diff_content = lines[1].strip() if len(lines) > 1 else ""
+            # Filter out non-diff content (e.g. "(exit=0)" placeholder)
+            if not diff_content or not diff_content.startswith(("diff ", "---", "+++")):
                 return False, ""
             return True, hashlib.md5(diff_content.encode()).hexdigest()[:12]
         except Exception as e:
@@ -1882,8 +1884,9 @@ class SelfEvolution:
 
     @staticmethod
     def check_and_rollback_if_needed():
-        """Called at startup. If restart marker exists and we're crash-looping, rollback.
-        Returns True if rollback was performed."""
+        """Called at startup. Logs marker info but does NOT clear it.
+        Marker is cleared only after first successful round (see clear_restart_marker).
+        This ensures yogg_auto.py crash-loop detector can still see the marker."""
         marker = SelfEvolution._RESTART_MARKER
         if not marker.exists():
             return False
@@ -1892,24 +1895,23 @@ class SelfEvolution:
             rollback_commit = data.get("rollback_commit", "")
             applied_commit = data.get("applied_commit", "")
             ts = data.get("timestamp", "?")
-
-            # Check if this is a crash-loop: marker exists = we restarted after apply
-            # If we get here normally, the apply was successful — clear marker
-            # The crash-loop case is handled by yogg_auto.py consecutive_crash counter
             logger.info(
                 f"SelfEvolution: post-apply startup | "
-                f"applied={applied_commit[:8]} rollback={rollback_commit[:8]} ts={ts}"
+                f"applied={applied_commit[:8]} rollback={rollback_commit[:8]} ts={ts} | "
+                f"marker preserved for crash-loop detection"
             )
-            # Clear marker — if we got this far, basic import/init succeeded
-            marker.unlink(missing_ok=True)
             return False
         except Exception as e:
             logger.error(f"SelfEvolution: marker check failed: {e}")
-            try:
-                marker.unlink(missing_ok=True)
-            except Exception:
-                pass
             return False
+
+    @staticmethod
+    def clear_restart_marker():
+        """Clear marker after first successful round — confirms apply didn't break anything."""
+        try:
+            SelfEvolution._RESTART_MARKER.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     @staticmethod
     def force_rollback(rollback_commit: str) -> bool:
@@ -2467,6 +2469,9 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 )
                 consecutive_error = 0
                 last_good_knowledge_state = knowledge_state.copy()
+                # 首轮成功完成后清除自进化重启标记（证明 apply 的新代码能正常工作）
+                if round_num == 1 and SELF_EVOLUTION_ENABLED:
+                    SelfEvolution.clear_restart_marker()
             knowledge_state_text = _format_knowledge_state(knowledge_state)
             progress_profile = _classify_auto_round_progress(
                 response=response, round_events=round_events,
@@ -2681,7 +2686,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             logger.debug(f"/auto tool_hotload skip: {_e}")
 
         # ── Self-Evolution: 沙箱冷却追踪 + 自动应用 ──
-        if self_evolution and not spiral_mode and not cross_module_mode and consecutive_error == 0:
+        if self_evolution and consecutive_error == 0:
             try:
                 await self_evolution.check_round(round_num, channel)
             except Exception as _se_e:

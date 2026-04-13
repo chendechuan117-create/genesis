@@ -9,10 +9,10 @@ Yogg — Genesis 放生模式
     python -u yogg_auto.py "自定义探索方向"      # 自定义 directive
 
 环境变量 (继承 auto_mode 全部配置):
-    GENESIS_AUTO_SYNC_DOCTOR_SANDBOX=1   # 启用沙箱同步
+    GENESIS_AUTO_SYNC_DOCTOR_SANDBOX=0   # 沙箱生命周期由 SelfEvolution 管理
     GENESIS_SELF_EVOLUTION=1             # 启用自进化（沙箱修改冷却后自动应用）
-    GENESIS_SELF_EVOLUTION_COOLDOWN=10   # 冷却轮数
-    GENESIS_AUTO_MAX_ROUNDS=0            # 不限轮次
+    GENESIS_SELF_EVOLUTION_COOLDOWN=10   # 冷却轮数（持久化，跨 session 累计）
+    GENESIS_AUTO_MAX_ROUNDS=10           # 每 session 10 轮（防 OOM）
     GENESIS_AUTO_DRY_LIMIT=0             # 不因空转停止
 """
 
@@ -43,6 +43,64 @@ logging.basicConfig(
 )
 logger = logging.getLogger("Yogg")
 
+
+# ── 自进化安全网：在 import genesis 之前检查崩溃循环 ──
+# 如果 apply 的代码有语法错误，genesis.auto_mode import 会直接失败
+# 所以必须在 import 之前用纯标准库做崩溃检测和回滚
+
+_CRASH_COUNTER_PATH = Path("runtime/.yogg_crash_counter")
+_RESTART_MARKER_PATH = Path("runtime/.self_evolution_restart")
+_ROLLBACK_CRASH_THRESHOLD = 3
+
+
+def _pre_import_crash_guard():
+    """在 import genesis 之前运行。持久化崩溃计数 + 回滚。"""
+    # 递增持久化崩溃计数器
+    crash_count = 0
+    try:
+        if _CRASH_COUNTER_PATH.exists():
+            crash_count = int(_CRASH_COUNTER_PATH.read_text().strip())
+    except Exception:
+        pass
+    crash_count += 1
+    try:
+        _CRASH_COUNTER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _CRASH_COUNTER_PATH.write_text(str(crash_count))
+    except Exception:
+        pass
+
+    logger.info(f"Yogg: startup crash_count={crash_count}")
+
+    # 检查是否需要回滚
+    if crash_count >= _ROLLBACK_CRASH_THRESHOLD and _RESTART_MARKER_PATH.exists():
+        try:
+            import subprocess
+            data = json.loads(_RESTART_MARKER_PATH.read_text(encoding="utf-8"))
+            rollback_commit = data.get("rollback_commit", "")
+            if rollback_commit:
+                logger.warning(
+                    f"Yogg: {crash_count} consecutive crashes after self-evolution. "
+                    f"Rolling back to {rollback_commit[:8]}..."
+                )
+                result = subprocess.run(
+                    ["git", "reset", "--hard", rollback_commit],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if result.returncode == 0:
+                    logger.warning(f"Yogg: ROLLBACK SUCCESS to {rollback_commit[:8]}")
+                    _RESTART_MARKER_PATH.unlink(missing_ok=True)
+                    _CRASH_COUNTER_PATH.unlink(missing_ok=True)
+                    # 退出让 systemd 用回滚后的代码重启
+                    sys.exit(42)
+                else:
+                    logger.error(f"Yogg: git reset failed: {result.stderr}")
+        except Exception as e:
+            logger.error(f"Yogg: rollback attempt failed: {e}")
+
+
+_pre_import_crash_guard()
+
+# ── 现在安全 import genesis（如果上面没有回滚退出的话） ──
 from factory import create_agent
 from genesis.auto_mode import run_auto, SelfEvolution
 
@@ -99,35 +157,19 @@ async def _run_session(agent, directive: str, session_num: int):
         logger.info(f"=== Yogg session #{session_num} end ===")
 
 
-# ── 自进化安全网：启动时检查是否需要回滚 ──
-
-_ROLLBACK_CRASH_THRESHOLD = 3  # 连续崩溃 N 次后触发回滚
-
-def _check_self_evolution_safety():
-    """启动时检查 restart marker。如果上次自进化应用后立即崩溃循环，回滚。"""
-    marker = Path("runtime/.self_evolution_restart")
-    if not marker.exists():
-        return
+def _clear_crash_counter():
+    """Session 正常启动后清除崩溃计数器。"""
     try:
-        data = json.loads(marker.read_text(encoding="utf-8"))
-        rollback_commit = data.get("rollback_commit", "")
-        applied_commit = data.get("applied_commit", "")
-        logger.info(
-            f"Yogg: self-evolution marker found | "
-            f"applied={applied_commit[:8]} rollback={rollback_commit[:8]}"
-        )
-        # Marker will be cleared by SelfEvolution.check_and_rollback_if_needed()
-        # during normal import. We just log here.
-    except Exception as e:
-        logger.warning(f"Yogg: marker read failed: {e}")
-
-_check_self_evolution_safety()
+        _CRASH_COUNTER_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 async def main():
     directive = " ".join(sys.argv[1:]).strip() if len(sys.argv) > 1 else ""
 
-    # Check post-apply marker
+    # 正常启动成功，清除崩溃计数器
+    _clear_crash_counter()
     SelfEvolution.check_and_rollback_if_needed()
 
     logger.info("Yogg initializing agent...")
@@ -159,24 +201,6 @@ async def main():
                 f"(consecutive={consecutive_crash}, backoff={backoff}s)",
                 exc_info=True,
             )
-
-            # 自进化安全网：连续崩溃超过阈值 + restart marker 存在 → 回滚
-            marker = Path("runtime/.self_evolution_restart")
-            if consecutive_crash >= _ROLLBACK_CRASH_THRESHOLD and marker.exists():
-                try:
-                    data = json.loads(marker.read_text(encoding="utf-8"))
-                    rollback_commit = data.get("rollback_commit", "")
-                    if rollback_commit:
-                        logger.warning(
-                            f"Yogg: {consecutive_crash} consecutive crashes after self-evolution. "
-                            f"Rolling back to {rollback_commit[:8]}..."
-                        )
-                        if SelfEvolution.force_rollback(rollback_commit):
-                            logger.warning("Yogg: ROLLBACK SUCCESS. Restarting...")
-                            # Exit — systemd will restart us with rolled-back code
-                            sys.exit(42)
-                except Exception as rb_e:
-                    logger.error(f"Yogg: rollback attempt failed: {rb_e}")
 
             await asyncio.sleep(backoff)
 
