@@ -278,15 +278,30 @@ class CPhaseMixin:
             # 最多取 8 条关键交互
             parts.append("[关键工具交互]\n" + "\n".join(tool_interactions[-8:]))
 
-        # 6. Vault 中相关的已有知识（用于矛盾/扩展检测）
+        # 6. Vault 中相关的已有知识（含内容，用于矛盾/扩展检测）
         vault_related = self._query_vault_related_knowledge(g_final_response)
         if vault_related:
             parts.append(f"[Vault 已有相关知识]\n{vault_related}")
 
+        # 7. Multi-G 发现的知识空洞（已知的未知）
+        if self.blackboard and self.blackboard.search_voids:
+            void_lines = [f"  - {v}" for v in self.blackboard.search_voids[:5]]
+            parts.append("[知识空洞 — Multi-G 搜索未命中的方向]\n" + "\n".join(void_lines))
+
+        # 8. 任务签名（领域上下文）
+        if self.inferred_signature:
+            sig_text = self.vault.signature.render(self.inferred_signature)
+            if sig_text:
+                parts.append(f"[任务签名]\n{sig_text}")
+
         return "\n\n".join(parts)
 
     def _query_vault_related_knowledge(self, g_final_response: str) -> str:
-        """查询 vault 中与 GP 本轮工作相关的已有知识，供矛盾/扩展检测。"""
+        """查询 vault 中与 GP 本轮工作相关的已有知识（含内容），供矛盾/扩展检测。
+
+        与 Lens 的 _prefetch_shared_knowledge 对称：
+        不只给标题，还给内容，C 才能判断矛盾/扩展/重复。
+        """
         if not g_final_response or not self.vault.vector_engine.is_ready:
             return ""
 
@@ -298,15 +313,20 @@ class CPhaseMixin:
 
             node_ids = [nid for nid, _ in results]
             briefs = self.vault.get_node_briefs(node_ids) if hasattr(self.vault, 'get_node_briefs') else {}
+            contents = self.vault.get_multiple_contents(node_ids) if node_ids else {}
 
             lines = []
-            for nid, score in results:
+            for nid, score in results[:5]:
                 brief = briefs.get(nid, {})
                 ntype = brief.get('type', '?')
                 title = brief.get('title', '?')[:80]
                 lines.append(f"  [{ntype}] {nid}: {title} (sim={score:.2f})")
+                # 附加内容摘要（C 需要看到内容才能判断矛盾）
+                content = contents.get(nid, "")
+                if content:
+                    lines.append(f"    内容: {str(content)[:300]}")
 
-            return "\n".join(lines[:5])
+            return "\n".join(lines)
         except Exception as e:
             logger.debug(f"Vault related query failed (non-fatal): {e}")
             return ""
