@@ -22,7 +22,6 @@ from genesis.v4.blackboard import Blackboard
 from genesis.v4.diagnostics import PipelineDiagnostics
 from genesis.v4.lens_phase import LensPhaseMixin
 from genesis.v4.c_phase import CPhaseMixin
-from genesis.v4.challenger import ChallengerMixin
 from genesis.v4.pipeline_config import PIPELINE_CONFIG
 
 logger = logging.getLogger(__name__)
@@ -51,7 +50,7 @@ GP_BLOCKED_TOOLS = frozenset([
     "record_tool_node", "record_discovery",
 ])
 
-class V4Loop(LensPhaseMixin, CPhaseMixin, ChallengerMixin):
+class V4Loop(LensPhaseMixin, CPhaseMixin):
     """
     V4 核心管线 (GP 统一模式)
     

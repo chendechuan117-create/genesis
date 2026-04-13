@@ -930,7 +930,7 @@ def _compact_round_history(round_log: list, last_n: int = 10) -> str:
             parts.append(f"KB:{r['kb_delta_summary']}")
         c_sum = r.get("c_phase_summary") or {}
         if c_sum:
-            parts.append(f"C:disc={c_sum.get('discoveries_recorded', 0)}/pat={c_sum.get('patterns_promoted', 0)}")
+            parts.append(f"C:lessons={c_sum.get('lessons_recorded', 0)}/pat={c_sum.get('patterns_promoted', 0)}")
         ks = r.get("knowledge_search_count", 0)
         if ks:
             parts.append(f"search={ks}")
@@ -2032,16 +2032,15 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                                 entry["active_nodes"] = list(data.get("active_nodes") or [])[:10]
                     elif evt.event_type == "c_phase_done":
                         if isinstance(data, dict):
-                            disc = data.get("discovery_recording") or {}
+                            refl = data.get("reflection") or {}
                             prom = data.get("pattern_promotion") or {}
-                            chal = data.get("challenger_review") or {}
                             round_record["c_phase_summary"] = {
                                 "mode": data.get("mode", "?"),
                                 "c_tokens": data.get("c_tokens", 0),
-                                "discoveries_recorded": disc.get("discoveries_recorded", 0),
-                                "discovery_subjects": [d.get("subject", "?") for d in disc.get("discoveries", [])][:5],
+                                "lessons_recorded": refl.get("lessons_recorded", 0),
+                                "lesson_titles": [l.get("title", "?") for l in refl.get("lessons", [])][:3],
                                 "patterns_promoted": prom.get("patterns_promoted", 0),
-                                "challenger_status": chal.get("status", "n/a"),
+                                "reflection_reason": refl.get("reason", ""),
                             }
                             entry["data"] = round_record["c_phase_summary"]
                     elif evt.event_type in ("lens_start", "lens_analysis", "lens_adoption", "lens_done", "lens_skipped"):
@@ -2257,7 +2256,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             # C-Phase + 知识闭环诊断行
             c_sum = round_record.get("c_phase_summary") or {}
             ks_count = round_record.get("knowledge_search_count", 0)
-            c_diag = f"C[disc={c_sum.get('discoveries_recorded', 0)} pat={c_sum.get('patterns_promoted', 0)}]" if c_sum else "C[skip]"
+            c_diag = f"C[lessons={c_sum.get('lessons_recorded', 0)} pat={c_sum.get('patterns_promoted', 0)}]" if c_sum else "C[skip]"
             k_diag = f"search={ks_count}" if ks_count else "search=0"
 
             _append_md(

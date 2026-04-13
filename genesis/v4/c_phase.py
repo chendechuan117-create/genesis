@@ -1,15 +1,20 @@
 """
-Genesis V4 - C-Phase Mixin (Reflector / Knowledge Extraction / Challenger)
+Genesis V4 - C-Phase Mixin (Reflector)
 
-从 V4Loop 中提取的 C-Phase 相关方法：
-- _determine_c_phase_mode: 信号质量 → C-Phase 模式判断
-- _classify_tool_result: 工具返回值客观成功/失败信号
-- _compute_env_success: Op 工具调用客观成功率
-- _run_c_phase_safe: 后台安全包装器
-- _run_c_phase: C-Process 反思循环主体
-- _extract_execution_signals: 确定性信号提取（阶段1，零 LLM）
-- _run_discovery_recording: 受限 tool calling 记录 DISCOVERY（阶段2）
-- _run_c_phase 通过 asyncio.gather 并发调用 ChallengerMixin._run_challenger_review
+C 与 GP 等值但方向相反：
+- GP 面向现在：执行 + 记录（错题本）
+- C 面向过去：回顾 + 提炼（自我反思）
+
+确定性组件（零 LLM）：
+- Knowledge Arena 反馈
+- Persona 在线学习
+- Trace Analysis Pipeline
+- PATTERN 自动提升
+
+LLM 组件：
+- Reflector: 内容级反思，审视 GP 工作的实际内容（非工具效率）
+  输入：GP 的完整推理链 + 工具输出 + 写入的知识 + vault 已有相关知识
+  输出：GP 遗漏的深层洞察（LESSON 节点，通过 record_lesson_node）
 
 V4Loop 通过 Mixin 继承获得这些方法，无需改变调用方式。
 """
@@ -38,7 +43,6 @@ class CPhaseMixin:
     - self._safe_callback, self._update_metrics
     - self._c_consecutive_errors, self._last_c_phase_mode
     - self.C_PHASE_MAX_ITER
-    - self._run_challenger_review (来自 ChallengerMixin，通过 MRO 解析)
     """
 
     def _determine_c_phase_mode(self) -> str:
@@ -167,239 +171,186 @@ class CPhaseMixin:
             except Exception as e:
                 logger.warning(f"Trace pipeline failed (non-fatal): {e}")
 
-        # ── Discovery Recording + Challenger Review（并发 LLM 调用）────
-        # Discovery: 从结构化信号中分类+压缩观察（DISCOVERY 节点）
-        # Challenger: 审查路径效率，产出 METHOD_REVIEW（方法效率知识）
-        discovery_result = {"discoveries_recorded": 0, "c_tokens": 0}
-        challenger_result = {"status": "skipped", "challenger_tokens": 0}
-        if mode != "SKIP":
-            results = await asyncio.gather(
-                self._run_discovery_recording(g_final_response),
-                self._run_challenger_review(g_final_response),
-                return_exceptions=True,
-            )
-            if isinstance(results[0], Exception):
-                logger.warning(f"Discovery recording failed (non-fatal): {results[0]}")
-            else:
-                discovery_result = results[0]
-            if isinstance(results[1], Exception):
-                logger.warning(f"Challenger review failed (non-fatal): {results[1]}")
-            else:
-                challenger_result = results[1]
-
-            # Log discovery results
-            disc_n = discovery_result.get("discoveries_recorded", 0)
-            c_tokens = discovery_result.get("c_tokens", 0)
-            if disc_n > 0:
-                logger.info(f"Discovery Recording: {disc_n} discoveries (c_tokens={c_tokens})")
-                for d in discovery_result.get("discoveries", []):
-                    logger.info(f"  → [{d.get('category','?')}] {d.get('subject','?')}: {d.get('result','')[:60]}")
-            else:
-                logger.info(f"Discovery Recording: 0 discoveries (c_tokens={c_tokens}, reason={discovery_result.get('reason', 'none')})")
-
-            # Log challenger results
-            ch_status = challenger_result.get("status", "unknown")
-            ch_tokens = challenger_result.get("challenger_tokens", 0)
-            if ch_status == "suggestion":
-                logger.info(f"Challenger: METHOD_REVIEW written → {challenger_result.get('node_id', '?')} (tokens={ch_tokens})")
-            else:
-                logger.info(f"Challenger: {ch_status} (tokens={ch_tokens})")
-
-        # ── PATTERN 自动提升（确定性，零 LLM）──
-        promotion_result = {"patterns_promoted": 0}
+        # ── Reflector: 内容级反思（单次 LLM 调用）─────────────────────
+        # C 与 GP 等值但方向相反：GP 记录现在，C 回顾过去
+        # 输入：GP 的完整推理链 + 工具输出 + 写入的知识 + vault 已有相关知识
+        # 输出：GP 遗漏的深层洞察（LESSON 节点）
+        reflection_result = {"lessons_recorded": 0, "c_tokens": 0}
         if mode != "SKIP":
             try:
-                promotion_result = self._try_promote_discoveries_to_pattern(
-                    discoveries_this_session=discovery_result.get("discoveries_recorded", 0)
-                )
-                if promotion_result.get("patterns_promoted", 0) > 0:
-                    logger.info(f"PATTERN promotion: {promotion_result['patterns_promoted']} patterns created")
+                reflection_result = await self._run_reflection(g_final_response)
             except Exception as e:
-                logger.warning(f"PATTERN promotion failed (non-fatal): {e}")
+                logger.warning(f"Reflection failed (non-fatal): {e}", exc_info=True)
 
-        c_tokens_total = discovery_result.get("c_tokens", 0) + challenger_result.get("challenger_tokens", 0)
+            r_n = reflection_result.get("lessons_recorded", 0)
+            r_tokens = reflection_result.get("c_tokens", 0)
+            if r_n > 0:
+                logger.info(f"Reflection: {r_n} lessons (c_tokens={r_tokens})")
+                for lesson in reflection_result.get("lessons", []):
+                    logger.info(f"  → {lesson.get('node_id', '?')}: {lesson.get('title', '?')[:80]}")
+            else:
+                logger.info(f"Reflection: PASS (c_tokens={r_tokens}, reason={reflection_result.get('reason', 'none')})")
+
+        # ── PATTERN 自动提升（确定性，零 LLM）── 基于已有 DISCOVERY 节点
+        promotion_result = {"patterns_promoted": 0}
+
+        c_tokens_total = reflection_result.get("c_tokens", 0)
         self.c_messages = []
-        logger.info(f"C-Process finished (Arena + Trace + Discovery + Challenger + Promotion). c_tokens={c_tokens_total}, discoveries={discovery_result.get('discoveries_recorded', 0)}, patterns={promotion_result.get('patterns_promoted', 0)}, challenger={challenger_result.get('status', 'n/a')}, total={self.metrics.total_tokens}")
+        logger.info(f"C-Process finished (Arena + Trace + Reflection). c_tokens={c_tokens_total}, lessons={reflection_result.get('lessons_recorded', 0)}, total={self.metrics.total_tokens}")
         await self._safe_callback(step_callback, "c_phase_done", {
             "mode": mode, "c_tokens": c_tokens_total,
             "trace_pipeline": trace_pipeline_result,
-            "discovery_recording": discovery_result,
+            "reflection": reflection_result,
             "pattern_promotion": promotion_result,
-            "challenger_review": challenger_result,
         })
 
-    # ─── Discovery Recording（阶段1: 信号提取 + 阶段2: 受限 tool calling）───
+    # ─── Reflector: 内容级反思 ───────────────────────────────────────
 
-    def _build_discovery_context(self) -> str:
-        """为 C-Phase 分类器构建 vault 上下文（确定性，零 LLM）。
+    def _build_reflection_input(self, g_final_response: str) -> str:
+        """构建 C 的反思输入：GP 的完整执行上下文（内容级，非工具级）。
 
-        让 C 知道：vault 已有什么 DISCOVERY、GP 本轮是否搜了知识库。
-        避免重复录入，提升录入决策质量。
+        设计原则：C 应该能看到 GP 看到的一切核心内容，
+        但以回顾视角审视，而非重复执行。
         """
-        lines = []
-        try:
-            # 已有 DISCOVERY 统计 + 最近 5 条 subject
-            row = self.vault._conn.execute(
-                "SELECT COUNT(*) as cnt FROM knowledge_nodes WHERE type = 'DISCOVERY'"
-            ).fetchone()
-            disc_count = row['cnt'] if row else 0
-            lines.append(f"VAULT_STATE: {disc_count} existing DISCOVERY nodes")
+        parts = []
 
-            if disc_count > 0:
-                recent = self.vault._conn.execute(
-                    """SELECT nc.full_content FROM knowledge_nodes kn
-                       JOIN node_contents nc ON kn.node_id = nc.node_id
-                       WHERE kn.type = 'DISCOVERY'
-                       ORDER BY kn.created_at DESC LIMIT 5"""
-                ).fetchall()
-                subjects = []
-                for r in recent:
-                    try:
-                        c = json.loads(r['full_content'])
-                        subjects.append(c.get('subject', '?'))
-                    except Exception:
-                        pass
-                if subjects:
-                    lines.append(f"RECENT_SUBJECTS: {', '.join(subjects)}")
+        # 1. 任务
+        parts.append(f"[任务]\n{self.user_input}")
 
-            # GP 本轮是否使用了 search_knowledge_nodes
-            gp_searched = any(
-                m.role == MessageRole.TOOL and m.name == "search_knowledge_nodes"
-                for m in self.g_messages
-            )
-            lines.append(f"GP_KNOWLEDGE_SEARCH: {'yes' if gp_searched else 'no'}")
-        except Exception as e:
-            logger.debug(f"Discovery context build failed (non-fatal): {e}")
+        # 2. GP 的最终回复（完整——这是核心）
+        if g_final_response:
+            parts.append(f"[GP 最终回复]\n{g_final_response}")
 
-        return "\n".join(lines)
-
-    def _extract_execution_signals(self, g_final_response: str) -> str:
-        """阶段1：确定性信号提取，从执行数据中生成结构化候选列表。
-
-        不用自然语言流水账，而是提取具体的、可分类的信号点。
-        输出供 LLM 做分类+压缩（不做自由发挥）。
-        """
-        signals = []
-
-        # 信号1: 工具失败（ERROR_PATTERN 候选）
-        failed_tools = [o for o in self._op_tool_outcomes if not o["success"]]
-        if failed_tools:
-            tool_names = [o["tool"] for o in failed_tools]
-            signals.append(f"SIGNAL[ERROR_PATTERN]: tools_failed={tool_names}")
-            # 从 g_messages 中提取失败工具的错误信息
-            for msg in self.g_messages:
-                if (msg.role == MessageRole.TOOL and msg.name in tool_names
-                        and msg.content and "Error" in str(msg.content)[:200]):
-                    signals.append(f"  error_detail[{msg.name}]: {str(msg.content)[:150]}")
-
-        # 信号2: 失败→成功序列（APPROACH 候选）
-        if len(self._op_tool_outcomes) >= 2:
-            for i in range(1, len(self._op_tool_outcomes)):
-                prev, curr = self._op_tool_outcomes[i-1], self._op_tool_outcomes[i]
-                if not prev["success"] and curr["success"]:
-                    signals.append(
-                        f"SIGNAL[APPROACH]: failed({prev['tool']}) → succeeded({curr['tool']})"
-                    )
-
-        # 信号3: 环境事实（ENV_FACT 候选）— 从工具输出中提取关键路径/配置
-        env_facts = []
+        # 3. GP 的推理过程——提取有实质内容的 assistant 消息
+        reasoning_steps = []
         for msg in self.g_messages:
-            if msg.role == MessageRole.TOOL and msg.content and msg.name in ("shell", "read_file"):
-                content_str = str(msg.content)[:500]
-                # 检测配置/版本/路径信息
-                if any(kw in content_str.lower() for kw in
-                       ["version", "config", "port", "path", "installed", "running", "active",
-                        "listening", "enabled", "disabled"]):
-                    env_facts.append(f"  [{msg.name}] {content_str[:120]}")
-        if env_facts:
-            signals.append("SIGNAL[ENV_FACT]: environment_observations")
-            signals.extend(env_facts[:5])
+            if msg.role == MessageRole.ASSISTANT and msg.content:
+                text = msg.content.strip()
+                if len(text) > 100:  # 跳过空转或纯 tool_calls 的短回复
+                    reasoning_steps.append(text[:600])
+        if reasoning_steps:
+            # 取最后 2 个关键推理步骤（更早的已被最终回复覆盖）
+            recent = reasoning_steps[-2:]
+            parts.append("[GP 推理过程（最近 2 步）]\n" + "\n---\n".join(recent))
 
-        # 信号4: 工具行为（TOOL_BEHAVIOR 候选）— 超时/重试/断路器
-        tool_counts = {}
-        for o in self._op_tool_outcomes:
-            tool_counts[o["tool"]] = tool_counts.get(o["tool"], 0) + 1
-        repeated = {t: c for t, c in tool_counts.items() if c >= 3}
-        if repeated:
-            signals.append(f"SIGNAL[TOOL_BEHAVIOR]: repeated_calls={repeated}")
-
-        # 信号5: 知识操作模式（KNOWLEDGE_OPS 候选）— auto 模式下主要信号源
-        kb_search_count = 0
-        kb_empty_searches = 0
-        kb_record_count = 0
-        web_search_count = 0
+        # 4. GP 本轮写入的知识——从 tool_calls 提取 arguments（比 result 更有信息量）
+        gp_knowledge_writes = []
         for msg in self.g_messages:
-            if msg.role == MessageRole.TOOL:
-                if msg.name == "search_knowledge_nodes":
-                    kb_search_count += 1
-                    content_str = str(msg.content or "")[:300]
-                    if "0 个结果" in content_str or "未找到" in content_str or "no results" in content_str.lower():
-                        kb_empty_searches += 1
-                elif msg.name == "record_lesson_node":
-                    kb_record_count += 1
-                elif msg.name == "web_search":
-                    web_search_count += 1
-        kb_signals = []
-        if kb_search_count > 0:
-            kb_signals.append(f"searches={kb_search_count}")
-            if kb_empty_searches > 0:
-                kb_signals.append(f"empty_searches={kb_empty_searches}")
-        if kb_record_count > 0:
-            kb_signals.append(f"records={kb_record_count}")
-        if web_search_count > 0:
-            kb_signals.append(f"web_searches={web_search_count}")
-        if kb_signals:
-            signals.append(f"SIGNAL[KNOWLEDGE_OPS]: {', '.join(kb_signals)}")
+            if msg.role == MessageRole.ASSISTANT and hasattr(msg, 'tool_calls') and msg.tool_calls:
+                for tc in (msg.tool_calls or []):
+                    tc_dict = tc if isinstance(tc, dict) else getattr(tc, '__dict__', {})
+                    tc_name = tc_dict.get('name', '')
+                    tc_args = tc_dict.get('arguments', {})
+                    if isinstance(tc_args, str):
+                        try:
+                            tc_args = json.loads(tc_args)
+                        except (json.JSONDecodeError, TypeError):
+                            tc_args = {}
+                    if tc_name in ('record_lesson_node', 'record_context_node'):
+                        title = tc_args.get('title', '')
+                        reason = tc_args.get('because_reason', '')
+                        resolves = tc_args.get('resolves', '')
+                        gp_knowledge_writes.append(
+                            f"  [{tc_name}] {title}"
+                            + (f" | 因为: {reason[:150]}" if reason else "")
+                            + (f" | 解决: {resolves[:80]}" if resolves else "")
+                        )
+        if gp_knowledge_writes:
+            parts.append("[GP 本轮写入的知识]\n" + "\n".join(gp_knowledge_writes))
 
-        # 如果没有信号，返回空
-        if not signals:
+        # 5. 关键工具交互（内容摘要，非成功/失败计数）
+        tool_interactions = []
+        for msg in self.g_messages:
+            if msg.role == MessageRole.TOOL and msg.content:
+                content_str = str(msg.content)
+                # 跳过知识工具的结果（已在上面单独提取）
+                if msg.name in ('record_lesson_node', 'record_context_node', 'record_discovery'):
+                    continue
+                if msg.name == "shell":
+                    tool_interactions.append(f"  [shell] {content_str[:250]}")
+                elif msg.name == "read_file":
+                    tool_interactions.append(f"  [read_file] {content_str[:200]}")
+                elif msg.name == "search_knowledge_nodes":
+                    tool_interactions.append(f"  [search_kb] {content_str[:250]}")
+                elif msg.name in ("grep_files", "web_search"):
+                    tool_interactions.append(f"  [{msg.name}] {content_str[:200]}")
+        if tool_interactions:
+            # 最多取 8 条关键交互
+            parts.append("[关键工具交互]\n" + "\n".join(tool_interactions[-8:]))
+
+        # 6. Vault 中相关的已有知识（用于矛盾/扩展检测）
+        vault_related = self._query_vault_related_knowledge(g_final_response)
+        if vault_related:
+            parts.append(f"[Vault 已有相关知识]\n{vault_related}")
+
+        return "\n\n".join(parts)
+
+    def _query_vault_related_knowledge(self, g_final_response: str) -> str:
+        """查询 vault 中与 GP 本轮工作相关的已有知识，供矛盾/扩展检测。"""
+        if not g_final_response or not self.vault.vector_engine.is_ready:
             return ""
 
-        # 附加上下文（简短）
-        header = f"TASK: {self.user_input[:200]}"
-        env_ratio = self._compute_env_success()
-        if env_ratio is not None:
-            header += f" | success_rate={env_ratio:.0%}"
-        header += f" | tool_calls={len(self._op_tool_outcomes)}"
+        try:
+            query = g_final_response[:500]
+            results = self.vault.vector_engine.search(query, top_k=5, threshold=0.5)
+            if not results:
+                return ""
 
-        return header + "\n" + "\n".join(signals)
+            node_ids = [nid for nid, _ in results]
+            briefs = self.vault.get_node_briefs(node_ids) if hasattr(self.vault, 'get_node_briefs') else {}
 
-    async def _run_discovery_recording(self, g_final_response: str) -> Dict[str, Any]:
-        """阶段2：LLM 通过 tool calling 记录 DISCOVERY（受限语言）。
+            lines = []
+            for nid, score in results:
+                brief = briefs.get(nid, {})
+                ntype = brief.get('type', '?')
+                title = brief.get('title', '?')[:80]
+                lines.append(f"  [{ntype}] {nid}: {title} (sim={score:.2f})")
 
-        与旧 _run_knowledge_extraction 的本质区别：
-          - 输入是结构化信号（非自由文本流水账）
-          - 输出受 tool schema 约束（非自由 JSON）
-          - LLM 做分类+压缩（非因果推理）
-          - 无信号时跳过（不强迫 LLM 产出）
+            return "\n".join(lines[:5])
+        except Exception as e:
+            logger.debug(f"Vault related query failed (non-fatal): {e}")
+            return ""
+
+    async def _run_reflection(self, g_final_response: str) -> Dict[str, Any]:
+        """C 的核心：内容级反思。
+
+        与 GP 等值但方向相反：
+        - GP 面向现在，执行 + 记录（错题本）
+        - C 面向过去，回顾 + 提炼（自我反思）
+
+        C 看到 GP 的完整执行上下文（推理链、工具输出、写入的知识），
+        审视内容本身而非工具使用效率。
         """
-        signals_text = self._extract_execution_signals(g_final_response)
-        if not signals_text:
-            return {"discoveries_recorded": 0, "c_tokens": 0, "reason": "no_signals"}
+        reflection_input = self._build_reflection_input(g_final_response)
+        if not reflection_input or len(reflection_input) < 200:
+            return {"lessons_recorded": 0, "c_tokens": 0, "reason": "insufficient_input"}
 
-        # 构建 vault 上下文（让 C 知道已有什么，避免重复）
-        discovery_context = self._build_discovery_context()
+        # 使用 record_lesson_node 作为输出工具（与 GP 共享同一工具，C 的产出是一等公民）
+        from genesis.tools.node_tools import RecordLessonNodeTool
+        lesson_tool = RecordLessonNodeTool()
+        tool_schema = [lesson_tool.to_schema()]
 
-        # 构建 record_discovery 工具的 schema（约束 LLM 输出空间）
-        from genesis.tools.node_tools import RecordDiscoveryTool
-        discovery_tool = RecordDiscoveryTool()
-        tool_schema = [discovery_tool.to_schema()]
+        system_prompt = (
+            "你是回顾者。你刚才观察了 GP 的完整执行过程。\n\n"
+            "你的任务不是评判 GP 的工具使用效率（那不重要），"
+            "而是审视 GP 工作的内容本身：\n"
+            "1. GP 的核心结论是否成立？推理链有没有逻辑跳跃或未验证的假设？\n"
+            "2. GP 的发现跟 Vault 已有知识是矛盾、重复、还是扩展？"
+            "如果矛盾，用 contradicts 字段指向旧节点。\n"
+            "3. 从 GP 的具体发现中，能提炼出什么更一般化的、可跨场景复用的原则？\n"
+            "4. GP 的视野之外还有什么相关但未触及的重要方向？\n\n"
+            "规则：\n"
+            "- 如果 GP 已经通过 record_lesson_node 记录了某个发现，不要重复记录同样的内容\n"
+            "- 只记录 GP 遗漏的、更深层的、或跨领域的洞察\n"
+            "- 每条 LESSON 必须是原子的（一个核心步骤），可独立复用\n"
+            "- 如果 GP 的工作已经足够完整，没有遗漏的深层洞察，不调用任何工具\n"
+            "- 最多记录 2 条 LESSON\n"
+            "- node_id 前缀用 LESSON_C_ 以区分来源"
+        )
 
-        context_block = f"\n\nVault context:\n{discovery_context}" if discovery_context else ""
         messages = [
-            {"role": "system", "content": (
-                "You are a signal classifier. You receive structured execution signals.\n"
-                "For each signal worth recording, call record_discovery ONCE.\n"
-                "Rules:\n"
-                "- Only record genuinely NEW observations, not common knowledge\n"
-                "- Do NOT record observations whose subject overlaps with RECENT_SUBJECTS below\n"
-                "- subject: dot notation, max 3 levels (e.g. nginx.port.conflict)\n"
-                "- description: max 30 tokens, use → | + symbols for compression\n"
-                "- If no signal is worth recording, do NOT call any tool\n"
-                "- Max 5 discoveries per session"
-                f"{context_block}"
-            )},
-            {"role": "user", "content": f"Classify these execution signals:\n\n{signals_text}"},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": reflection_input},
         ]
 
         try:
@@ -414,33 +365,37 @@ class CPhaseMixin:
             c_tokens = getattr(response, 'total_tokens', 0)
 
             if not response.tool_calls:
-                logger.info(f"Discovery recording: LLM chose not to record (no tool calls). c_tokens={c_tokens}")
-                return {"discoveries_recorded": 0, "c_tokens": c_tokens, "reason": "llm_no_calls"}
+                return {"lessons_recorded": 0, "c_tokens": c_tokens, "reason": "pass"}
 
-            # 执行每个 tool call（最多 5 个）
             recorded = []
-            for tc in response.tool_calls[:5]:
-                if tc.name != "record_discovery":
+            for tc in response.tool_calls[:2]:  # 最多 2 条
+                if tc.name != "record_lesson_node":
                     continue
                 try:
-                    result = await discovery_tool.execute(**tc.arguments)
+                    args = dict(tc.arguments)
+                    # 强制 node_id 前缀为 LESSON_C_
+                    nid = args.get("node_id", "")
+                    if not nid.startswith("LESSON_C_"):
+                        nid_hash = hashlib.md5(nid.encode()).hexdigest()[:8].upper()
+                        args["node_id"] = f"LESSON_C_{nid_hash}"
+                    result = await lesson_tool.execute(**args)
                     recorded.append({
-                        "subject": tc.arguments.get("subject", "?"),
-                        "category": tc.arguments.get("category", "?"),
+                        "node_id": args["node_id"],
+                        "title": args.get("title", "?"),
                         "result": str(result)[:100],
                     })
                 except Exception as e:
-                    logger.warning(f"Discovery recording failed for {tc.arguments}: {e}")
+                    logger.warning(f"Reflection lesson recording failed: {e}")
 
             return {
-                "discoveries_recorded": len(recorded),
+                "lessons_recorded": len(recorded),
                 "c_tokens": c_tokens,
-                "discoveries": recorded,
+                "lessons": recorded,
             }
 
         except Exception as e:
-            logger.warning(f"Discovery recording LLM call failed (non-fatal): {e}")
-            return {"discoveries_recorded": 0, "c_tokens": 0, "error": str(e)}
+            logger.warning(f"Reflection LLM call failed (non-fatal): {e}")
+            return {"lessons_recorded": 0, "c_tokens": 0, "error": str(e)}
 
     # ─── 阶段3: PATTERN 自动提升 ───
 
