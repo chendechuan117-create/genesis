@@ -1152,9 +1152,44 @@ class ActionHistory:
     """
 
     REPEAT_THRESHOLD = 2
+    ARG_PRIORITY = ("file_path", "path", "command", "query", "pattern", "name", "symbol", "directory", "url")
+    ARG_IGNORE = {"cwd", "job_id", "is_daemon"}
 
     def __init__(self):
         self.actions: dict = {}  # key → {count, last_round}
+
+    def _action_key(self, name: str, event: dict) -> str:
+        args = event.get("args") or {}
+        arg_desc = self._summarize_args(name, args)
+        if arg_desc:
+            return f"{name}:{arg_desc}"
+        preview = (event.get("result_preview") or "").strip()
+        return f"{name}:{preview[:80]}" if preview else name
+
+    def _summarize_args(self, tool_name: str, args: dict) -> str:
+        if not isinstance(args, dict):
+            return ""
+        parts = []
+        for key in self.ARG_PRIORITY:
+            value = args.get(key)
+            if value in (None, "", [], {}):
+                continue
+            parts.append(f"{key}={_trim_frontier_item(str(value), 120)}")
+        if tool_name == "read_file" and (args.get("offset") is not None or args.get("limit") is not None):
+            parts.append(f"slice={args.get('offset')}:{args.get('limit')}")
+        if not parts:
+            for key, value in args.items():
+                if key in self.ARG_IGNORE or value in (None, "", [], {}):
+                    continue
+                if isinstance(value, str):
+                    parts.append(f"{key}={_trim_frontier_item(value, 80)}")
+                elif isinstance(value, (int, float, bool)):
+                    parts.append(f"{key}={value}")
+                else:
+                    parts.append(f"{key}={type(value).__name__}")
+                if len(parts) >= 3:
+                    break
+        return " | ".join(parts[:3])
 
     def record_round(self, round_num: int, round_events: list):
         for event in round_events:
@@ -1163,8 +1198,7 @@ class ActionHistory:
             name = (event.get("name") or "").strip()
             if not name or name in ("search_knowledge_nodes", "record_lesson_node"):
                 continue
-            preview = (event.get("result_preview") or "").strip()
-            key = f"{name}:{preview[:80]}" if preview else name
+            key = self._action_key(name, event)
             if key in self.actions:
                 self.actions[key]["count"] += 1
                 self.actions[key]["last_round"] = round_num
