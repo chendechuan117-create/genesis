@@ -347,13 +347,16 @@ def _get_auto_signals(round_num: int = 1, session_shown_voids: set | None = None
                         session_shown_voids.add(vid)
                 sections.append("\n".join(lines))
 
-            # ── 3. 未经测试的新节点：从未使用过但最近创建，需要拝入实践 ──
+            # ── 3. 未经测试的新节点：从未使用过且至少 1 小时前创建 ──
+            # 加 age 过滤：防止 auto 模式下 GP 本轮/本 session 刚产出的 LESSON
+            # 立刻作为"未经实践"回注到下一轮信号，形成自引用回声循环
             untested_rows = conn.execute(
                 "SELECT node_id, title, type "
                 "FROM knowledge_nodes "
                 "WHERE usage_count = 0 AND node_id NOT LIKE 'MEM_CONV_%' "
                 "AND type IN ('LESSON', 'PATTERN', 'ASSET') "
                 "AND node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS') "
+                "AND created_at < datetime('now', '-1 hour') "
                 "ORDER BY created_at DESC LIMIT 3"
             ).fetchall()
             if untested_rows:
@@ -590,36 +593,27 @@ def _collect_round_result_events(events: list) -> list:
 
 
 def _detect_reanchor_signal(response: str, round_events: list, frontier_state: dict | None = None) -> tuple[bool, str]:
+    """Detect genuine workspace drift — only trigger on explicit sync-mismatch phrases.
+
+    Previous implementation used broad keyword combos (e.g. "doctor" + "snapshot")
+    which were always-true when GP works inside the Doctor sandbox, causing every
+    round to trigger reanchor and forcing GP into repetitive environment verification.
+    Now only fires on very specific phrases that indicate actual host↔container drift.
+    """
     response_text = str(response or "")
-    result_previews = []
-    for event in _collect_round_result_events(round_events):
-        preview = _compact_whitespace(event.get("result_preview") or "")
-        if preview:
-            result_previews.append(preview[:400])
-        if len(result_previews) >= 8:
-            break
-    frontier_parts = []
-    if frontier_state:
-        frontier_parts.append(str(frontier_state.get("candidate_issue") or ""))
-        frontier_parts.append(str(frontier_state.get("local_goal") or ""))
-    combined = "\n".join(part for part in [response_text, *frontier_parts, *result_previews] if part).strip()
+    combined = response_text.strip()
     if not combined:
         return False, ""
-    lowered = combined.lower()
-    env_hit = any(marker in lowered for marker in ("doctor", "/workspace", "workspace", "sandbox", "沙箱", "容器", "宿主"))
-    drift_hit = any(marker in lowered for marker in ("不同步", "未同步", "不会自动反映", "不会自动同步", "快照", "副本", "snapshot", "baseline", "基线"))
-    target_hit = any(marker in lowered for marker in ("导入", "import", "测试契约", "测试入口", "实际导入", "实际测试", "入口", "target"))
-    explicit_workspace_drift = any(marker in combined for marker in (
-        "不会自动反映到 Doctor", "不会自动反映到 Doctor 容器", "不会自动反映到 Doctor 容器内",
-        "不会自动反映到 /workspace", "宿主仓库里的", "实际导入",
-    ))
-    has_external_anchor = bool(result_previews)
-    if explicit_workspace_drift or (env_hit and drift_hit and has_external_anchor):
-        return True, "Doctor /workspace 快照与宿主修改目标可能错位；先确认实际生效副本"
-    if target_hit and drift_hit and (has_external_anchor or env_hit):
-        return True, "当前修改目标与实际测试/导入目标可能不一致；先确认 import 入口与测试目标"
-    if env_hit and target_hit and has_external_anchor:
-        return True, "Doctor 沙箱、测试入口或修改目标出现错位信号；先重新锚定环境再继续"
+    # Only trigger on phrases that unambiguously indicate host↔sandbox mismatch
+    explicit_drift_phrases = (
+        "不会自动反映到 Doctor",
+        "不会自动反映到 /workspace",
+        "宿主仓库里的修改不会同步",
+        "宿主和容器的代码不一致",
+        "修改了宿主但容器里没变",
+    )
+    if any(phrase in combined for phrase in explicit_drift_phrases):
+        return True, "检测到宿主↔沙箱同步漂移的明确描述"
     return False, ""
 
 
@@ -785,12 +779,20 @@ def _classify_auto_round_progress(response, round_events, kb_changed, frontier_s
             tool_names.append(name)
         if len(tool_names) >= 4:
             break
+    # Collect both result previews AND tool_start command args to detect doctor.sh usage
     preview_text = "\n".join(_compact_whitespace(entry.get("result_preview") or "") for entry in result_events[:10]).lower()
-    ran_tests = "doctor.sh test" in preview_text or "pytest" in preview_text
-    inspected_diff = "doctor.sh diff" in preview_text or "git diff" in preview_text or "diff --git" in preview_text
+    # Also scan tool_start events for shell command content (GP uses shell to run doctor.sh)
+    shell_cmd_text = ""
+    for evt in round_events:
+        if evt.get("type") == "tool_start" and evt.get("name") == "shell":
+            shell_cmd_text += " " + (evt.get("result_preview") or evt.get("content") or "").lower()
+    combined_text = preview_text + " " + shell_cmd_text
+    ran_tests = "doctor.sh test" in combined_text or "pytest" in combined_text
+    inspected_diff = "doctor.sh diff" in combined_text or "git diff" in combined_text or "diff --git" in combined_text
     touched_files = (
         any(name in ("write_file", "edit_file", "replace_in_file", "append_file") for name in tool_names)
-        or "sed -i" in preview_text or "write_text(" in preview_text or "text = text.replace(" in preview_text
+        or "sed -i" in combined_text or "write_text(" in combined_text or "text = text.replace(" in combined_text
+        or "doctor.sh exec" in combined_text
     )
     response_text = (response or "").strip()
     stable_issue = bool(frontier_state and frontier_state.get("candidate_issue")
