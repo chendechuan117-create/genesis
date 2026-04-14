@@ -496,6 +496,37 @@ def _trim_frontier_item(text: str, limit: int = 220) -> str:
     return text[: limit - 3].rstrip() + "..."
 
 
+def _summarize_event_args(args: dict | None) -> dict:
+    if not isinstance(args, dict):
+        return {}
+    summarized = {}
+    for idx, (key, value) in enumerate(args.items()):
+        if idx >= 8:
+            break
+        if isinstance(value, str):
+            limit = 300 if key in ("command", "query", "path", "file_path", "cwd") else 120
+            summarized[key] = _trim_frontier_item(value, limit)
+        elif isinstance(value, (int, float, bool)) or value is None:
+            summarized[key] = value
+        elif isinstance(value, (list, tuple)):
+            summarized[key] = [_trim_frontier_item(str(v), 80) for v in list(value)[:5]]
+        elif isinstance(value, dict):
+            nested = {}
+            for nested_idx, (nested_key, nested_value) in enumerate(value.items()):
+                if nested_idx >= 5:
+                    break
+                if isinstance(nested_value, str):
+                    nested[nested_key] = _trim_frontier_item(nested_value, 80)
+                elif isinstance(nested_value, (int, float, bool)) or nested_value is None:
+                    nested[nested_key] = nested_value
+                else:
+                    nested[nested_key] = type(nested_value).__name__
+            summarized[key] = nested
+        else:
+            summarized[key] = type(value).__name__
+    return summarized
+
+
 def _extract_blueprint_goal(events: list) -> str:
     for event in events:
         if event.get("type") != "blueprint":
@@ -785,7 +816,14 @@ def _classify_auto_round_progress(response, round_events, kb_changed, frontier_s
     shell_cmd_text = ""
     for evt in round_events:
         if evt.get("type") == "tool_start" and evt.get("name") == "shell":
-            shell_cmd_text += " " + (evt.get("result_preview") or evt.get("content") or "").lower()
+            args = evt.get("args") or {}
+            if isinstance(args, dict):
+                action = str(args.get("action") or "")
+                command = str(args.get("command") or "")
+                cwd = str(args.get("cwd") or "")
+                shell_cmd_text += " " + _compact_whitespace(f"{action} {command} {cwd}").lower()
+            elif args:
+                shell_cmd_text += " " + _compact_whitespace(str(args)).lower()
     combined_text = preview_text + " " + shell_cmd_text
     ran_tests = "doctor.sh test" in combined_text or "pytest" in combined_text
     inspected_diff = "doctor.sh diff" in combined_text or "git diff" in combined_text or "diff --git" in combined_text
@@ -2259,6 +2297,10 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                     entry = {"t": rel_t, "type": evt.event_type}
                     if evt.phase:
                         entry["phase"] = evt.phase
+                    if evt.args:
+                        summarized_args = _summarize_event_args(evt.args)
+                        if summarized_args:
+                            entry["args"] = summarized_args
                     if isinstance(data, dict):
                         if data.get("llm_call_id"):
                             entry["llm_call_id"] = data.get("llm_call_id")
@@ -2266,6 +2308,8 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                             entry["iteration"] = data.get("iteration")
                         if data.get("label"):
                             entry["label"] = data.get("label")
+                        if "duration_ms" in data:
+                            entry["duration_ms"] = data.get("duration_ms")
                     if evt.event_type == "tool_start":
                         entry["name"] = evt.name
                         if evt.name == "search_knowledge_nodes":

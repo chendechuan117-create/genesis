@@ -525,41 +525,51 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                     # ── 重复调用断路器：同工具同参数 ≥3 次 → 拦截 ──
                     _call_key = f"{tc.name}|{json.dumps(tc.arguments, sort_keys=True, ensure_ascii=False)[:200]}"
                     self._recent_tool_calls[_call_key] = self._recent_tool_calls.get(_call_key, 0) + 1
-                    if self._recent_tool_calls[_call_key] >= 3:
+                    breaker_tripped = self._recent_tool_calls[_call_key] >= 3
+                    if breaker_tripped:
                         res = f"[断路器] 你已经用相同参数调用 {tc.name} 达 {self._recent_tool_calls[_call_key]} 次。请换一种方法或不同参数。"
                         logger.warning(f"Circuit breaker: {tc.name} called {self._recent_tool_calls[_call_key]}x with same args")
-                        self.g_messages.append(Message(role=MessageRole.TOOL, content=res, tool_call_id=tc.id, name=tc.name))
-                        continue
-                    
-                    _unblock = set(self.loop_config.get("gp_unblock_tools") or [])
-                    if tc.name in GP_BLOCKED_TOOLS and tc.name not in _unblock:
-                        res = f"Error: GP 禁止使用工具 {tc.name}（该工具仅限反思进程使用）"
-                    else:
+
+                    if not breaker_tripped:
+                        _unblock = set(self.loop_config.get("gp_unblock_tools") or [])
+                        if tc.name in GP_BLOCKED_TOOLS and tc.name not in _unblock:
+                            res = f"Error: GP 禁止使用工具 {tc.name}（该工具仅限反思进程使用）"
+                        else:
                         # ── 普通执行工具（shell, read_file, write_file 等）──
-                        try:
-                            res = await asyncio.wait_for(
-                                self.tools.execute(tc.name, tc.arguments),
-                                timeout=self.TOOL_EXEC_TIMEOUT
-                            )
-                        except asyncio.TimeoutError:
-                            res = f"Error: 工具 {tc.name} 执行超时（{self.TOOL_EXEC_TIMEOUT}秒），已强制终止。"
-                            logger.warning(f"GP tool timeout: {tc.name} exceeded {self.TOOL_EXEC_TIMEOUT}s")
-                            PipelineDiagnostics.op_timeout.record(True)
-                        # 环境信号采集：记录工具调用的客观成功/失败
-                        self._op_tool_outcomes.append({
-                            "tool": tc.name,
-                            "success": self._classify_tool_result(tc.name, str(res)),
-                        })
-                        # 从执行结果中学习签名
-                        self._merge_signature_from_texts(str(res)[:500])
+                            try:
+                                res = await asyncio.wait_for(
+                                    self.tools.execute(tc.name, tc.arguments),
+                                    timeout=self.TOOL_EXEC_TIMEOUT
+                                )
+                            except asyncio.TimeoutError:
+                                res = f"Error: 工具 {tc.name} 执行超时（{self.TOOL_EXEC_TIMEOUT}秒），已强制终止。"
+                                logger.warning(f"GP tool timeout: {tc.name} exceeded {self.TOOL_EXEC_TIMEOUT}s")
+                                PipelineDiagnostics.op_timeout.record(True)
+                            # 环境信号采集：记录工具调用的客观成功/失败
+                            self._op_tool_outcomes.append({
+                                "tool": tc.name,
+                                "success": self._classify_tool_result(tc.name, str(res)),
+                            })
+                            # 从执行结果中学习签名
+                            self._merge_signature_from_texts(str(res)[:500])
                     
+                    res_text = str(res)
+                    duration_ms = (time.time() - t0) * 1000
+                    await self._safe_callback(step_callback, "tool_result", {
+                        "phase": "GP_PHASE",
+                        "name": tc.name,
+                        "args": tc.arguments,
+                        "result": res_text,
+                        "iteration": i,
+                        "duration_ms": round(duration_ms, 1),
+                    })
                     self.tracer.log_tool_call(
                         self.trace_id, parent=self._g_span, phase="GP",
                         tool_name=tc.name, tool_args=tc.arguments,
-                        tool_result=str(res), duration_ms=(time.time() - t0) * 1000
+                        tool_result=res_text, duration_ms=duration_ms
                     )
                     self.metrics.tools_used.append(tc.name)
-                    self.g_messages.append(Message(role=MessageRole.TOOL, content=res, tool_call_id=tc.id, name=tc.name))
+                    self.g_messages.append(Message(role=MessageRole.TOOL, content=res_text, tool_call_id=tc.id, name=tc.name))
                 
                 continue
                 
