@@ -17,6 +17,7 @@ Yogg — Genesis 放生模式
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -142,6 +143,83 @@ class LogChannel:
             pass
 
 
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(f"Invalid {name}={raw!r}; fallback to {default}")
+        return default
+    return max(minimum, value)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    normalized = raw.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    logger.warning(f"Invalid {name}={raw!r}; fallback to {default}")
+    return default
+
+
+def _resolve_cgroup_file(name: str):
+    try:
+        lines = Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return None
+    for line in lines:
+        parts = line.strip().split(":", 2)
+        if len(parts) != 3:
+            continue
+        hierarchy, controllers, rel_path = parts
+        if hierarchy == "0" or controllers == "memory" or "memory" in controllers.split(","):
+            rel_path = rel_path.lstrip("/")
+            base = Path("/sys/fs/cgroup")
+            return (base / rel_path / name) if rel_path else (base / name)
+    return None
+
+
+def _read_cgroup_int(name: str):
+    path = _resolve_cgroup_file(name)
+    if not path or not path.exists():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+    if not raw or raw == "max":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _format_bytes(value):
+    if value is None:
+        return "unknown"
+    size = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            if unit == "B":
+                return f"{int(size)}{unit}"
+            return f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{int(value)}B"
+
+
+YOGG_EXIT_ON_SESSION_END = _env_bool("YOGG_EXIT_ON_SESSION_END", True)
+YOGG_MEMORY_EXIT_THRESHOLD_MB = _env_int("YOGG_MEMORY_EXIT_THRESHOLD_MB", 0, minimum=0)
+YOGG_MEMORY_HIGH_HEADROOM_MB = _env_int("YOGG_MEMORY_HIGH_HEADROOM_MB", 256, minimum=0)
+YOGG_MEMORY_POLL_SECS = _env_int("YOGG_MEMORY_POLL_SECS", 15, minimum=5)
+
+
 async def _run_session(agent, directive: str, session_num: int):
     """单次 auto session。"""
     session_ts = time.strftime("%Y%m%d_%H%M%S")
@@ -150,9 +228,33 @@ async def _run_session(agent, directive: str, session_num: int):
     auto_state = {channel.id: {"active": True}}
 
     logger.info(f"=== Yogg session #{session_num} start ({session_id}) ===")
+    session_task = asyncio.create_task(run_auto(channel, agent, auto_state, directive=directive))
+    memory_watch_task = None
+    if YOGG_MEMORY_EXIT_THRESHOLD_MB > 0 or _read_cgroup_int("memory.high") is not None:
+        memory_watch_task = asyncio.create_task(_watch_memory_pressure(channel, session_task))
     try:
-        await run_auto(channel, agent, auto_state, directive=directive)
+        if memory_watch_task:
+            done, _ = await asyncio.wait({session_task, memory_watch_task}, return_when=asyncio.FIRST_COMPLETED)
+            if memory_watch_task in done:
+                memory_exit_state = await memory_watch_task
+                if memory_exit_state and not session_task.done():
+                    session_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await session_task
+                else:
+                    await session_task
+                return memory_exit_state
+        await session_task
+        return None
     finally:
+        if memory_watch_task:
+            memory_watch_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await memory_watch_task
+        if not session_task.done():
+            session_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await session_task
         channel.close()
         logger.info(f"=== Yogg session #{session_num} end ===")
 
@@ -165,16 +267,84 @@ def _clear_crash_counter():
         pass
 
 
+def _get_provider_override_kwargs():
+    api_key = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+    if not api_key:
+        return {}
+    return {
+        "api_key": api_key,
+        "base_url": (os.environ.get("DEEPSEEK_BASE_URL") or "https://api.deepseek.com/v1").strip(),
+        "model": (os.environ.get("GENESIS_MODEL") or "deepseek/deepseek-reasoner").strip(),
+    }
+
+
+def _get_memory_exit_state():
+    current = _read_cgroup_int("memory.current")
+    if current is None:
+        return None
+    if YOGG_MEMORY_EXIT_THRESHOLD_MB > 0:
+        threshold = YOGG_MEMORY_EXIT_THRESHOLD_MB * 1024 * 1024
+    else:
+        memory_high = _read_cgroup_int("memory.high")
+        if memory_high is None:
+            return None
+        headroom = YOGG_MEMORY_HIGH_HEADROOM_MB * 1024 * 1024
+        if memory_high <= headroom:
+            return None
+        threshold = memory_high - headroom
+    if current < threshold:
+        return None
+    return {
+        "current": current,
+        "threshold": threshold,
+        "memory_high": _read_cgroup_int("memory.high"),
+        "memory_max": _read_cgroup_int("memory.max"),
+    }
+
+
+async def _watch_memory_pressure(channel: LogChannel, session_task: asyncio.Task):
+    while not session_task.done():
+        await asyncio.sleep(YOGG_MEMORY_POLL_SECS)
+        if session_task.done():
+            break
+        memory_state = _get_memory_exit_state()
+        if not memory_state:
+            continue
+        logger.warning(
+            "Yogg memory guard triggered | current=%s threshold=%s high=%s max=%s",
+            _format_bytes(memory_state["current"]),
+            _format_bytes(memory_state["threshold"]),
+            _format_bytes(memory_state["memory_high"]),
+            _format_bytes(memory_state["memory_max"]),
+        )
+        await channel.send("♻️ 内存水位接近阈值，当前 session 将结束并交给 systemd 拉起新进程。")
+        return memory_state
+    return None
+
+
 async def main():
     directive = " ".join(sys.argv[1:]).strip() if len(sys.argv) > 1 else ""
+    provider_kwargs = _get_provider_override_kwargs()
 
     # 正常启动成功，清除崩溃计数器
     _clear_crash_counter()
     SelfEvolution.check_and_rollback_if_needed()
 
     logger.info("Yogg initializing agent...")
-    agent = create_agent()
+    if provider_kwargs:
+        logger.info(
+            f"Yogg provider override enabled: model={provider_kwargs['model']!r}, base_url={provider_kwargs['base_url']!r}"
+        )
+    agent = create_agent(**provider_kwargs)
     logger.info(f"Yogg ready. directive={directive[:100]!r}")
+    if YOGG_MEMORY_EXIT_THRESHOLD_MB > 0:
+        logger.info(
+            f"Yogg memory guard enabled: threshold={YOGG_MEMORY_EXIT_THRESHOLD_MB}MiB poll={YOGG_MEMORY_POLL_SECS}s"
+        )
+    elif _read_cgroup_int("memory.high") is not None:
+        logger.info(
+            f"Yogg memory guard enabled: headroom={YOGG_MEMORY_HIGH_HEADROOM_MB}MiB poll={YOGG_MEMORY_POLL_SECS}s"
+        )
 
     session_num = 0
     consecutive_crash = 0
@@ -183,9 +353,19 @@ async def main():
     while True:
         session_num += 1
         try:
-            await _run_session(agent, directive, session_num)
+            memory_exit_state = await _run_session(agent, directive, session_num)
             # 正常结束 (planner 建议停止等)
             consecutive_crash = 0
+            if memory_exit_state:
+                logger.warning(
+                    "Yogg exiting for clean restart after memory pressure | current=%s threshold=%s",
+                    _format_bytes(memory_exit_state["current"]),
+                    _format_bytes(memory_exit_state["threshold"]),
+                )
+                return
+            if YOGG_EXIT_ON_SESSION_END:
+                logger.info("Session ended normally. Exiting for clean systemd restart.")
+                return
             logger.info("Session ended normally. Restarting in 30s...")
             await asyncio.sleep(30)
 
@@ -208,7 +388,7 @@ async def main():
             if consecutive_crash % 5 == 0:
                 logger.warning("Yogg: rebuilding agent after 5 consecutive crashes")
                 try:
-                    agent = create_agent()
+                    agent = create_agent(**provider_kwargs)
                 except Exception as rebuild_e:
                     logger.error(f"Yogg: agent rebuild failed: {rebuild_e}")
                     await asyncio.sleep(60)

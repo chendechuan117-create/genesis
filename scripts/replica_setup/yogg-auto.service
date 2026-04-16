@@ -8,15 +8,18 @@ Type=simple
 User=yoga
 WorkingDirectory=/home/yoga/Genesis
 Environment=HF_HUB_OFFLINE=1
-ExecStart=/usr/bin/proxychains4 -q /home/yoga/Genesis/venv/bin/python -u yogg_auto.py
+Environment=YOGG_EXIT_ON_SESSION_END=1
+Environment=YOGG_MEMORY_EXIT_THRESHOLD_MB=2560
+Environment=YOGG_MEMORY_POLL_SECS=15
+ExecStart=/home/yoga/Genesis/venv/bin/python -u yogg_auto.py
 Restart=always
-RestartSec=30
+RestartSec=10
 StandardOutput=journal
 StandardError=journal
 
 # 内存保护：Yoga S730 只有 8GB
-MemoryMax=3G
-MemoryHigh=2G
+MemoryMax=3400M
+MemoryHigh=2800M
 
 [Install]
 WantedBy=multi-user.target
