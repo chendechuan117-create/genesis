@@ -193,7 +193,7 @@ class RecordLessonNodeTool(BaseNodeTool):
             logger.error(f"Lesson node creation failed: {e}")
             return f"Error: {e}"
 
-    def _resolve_text_to_node_ids(self, text: str, top_k: int = 3, threshold: float = 0.65) -> List[str]:
+    def _resolve_text_to_node_ids(self, text: str, top_k: int = 3, threshold: float = 0.75) -> List[str]:
         """将 resolves 文本描述匹配到已有节点 ID（向量搜索）。
         resolves 字段是自然语言描述（如 "file not found 探测"），
         需要通过语义搜索找到对应的节点 ID 来创建边。
