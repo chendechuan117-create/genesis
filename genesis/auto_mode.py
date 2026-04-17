@@ -2015,6 +2015,7 @@ class SelfEvolution:
                 f"🧬 ⚠️ stable_count={max_stable} 超过阈值{self.cooldown}的3倍，重置冷却（沙箱测试基础设施不匹配）"
             )
             self.file_cooldowns.clear()
+            cooled_files.clear()  # prevent stale cooled entries from triggering apply
 
         self._save()
 
