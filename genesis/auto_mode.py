@@ -1962,6 +1962,31 @@ class SelfEvolution:
         except Exception as e:
             logger.warning(f"SelfEvolution state save failed: {e}")
 
+    async def pre_check_round(self):
+        """Lightweight pre-check: detect if GP modified source files in sandbox THIS round.
+        Sets new_source_this_round flag. Called BEFORE _classify_auto_round_progress
+        so outcome_detected reads the correct value for the current round.
+        """
+        self.new_source_this_round = False
+        if self.applied_this_session:
+            return
+        current_files = await self._get_file_status()
+        if not current_files:
+            return
+        for path, info in current_files.items():
+            ftype = info["type"]
+            if ftype != "T":
+                continue
+            if path not in self.file_cooldowns:
+                # New T-type file in sandbox → GP created source file
+                self.new_source_this_round = True
+                break
+            old = self.file_cooldowns[path]
+            if old["hash"] != info["hash"]:
+                # Existing T-type file hash changed → GP modified source file
+                self.new_source_this_round = True
+                break
+
     async def check_round(self, round_num: int, channel):
         """Called each round after GP execution. Manages file-level cooling + auto-apply.
 
@@ -2350,6 +2375,10 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
         if AUTO_MAX_ROUNDS > 0 and round_num > AUTO_MAX_ROUNDS:
             stop_reason = f"reached {AUTO_MAX_ROUNDS} round cap"
             break
+
+        # Reset SelfEvolution per-round flag before any classification reads it
+        if self_evolution:
+            self_evolution.new_source_this_round = False
 
         _reset_provider(agent)
         node_status_before = _get_node_count_status()
@@ -2808,6 +2837,13 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 if round_num == 1 and SELF_EVOLUTION_ENABLED:
                     SelfEvolution.clear_restart_marker()
             knowledge_state_text = _format_knowledge_state(knowledge_state)
+            # Pre-check sandbox source changes BEFORE classification
+            # so new_source_this_round is accurate for this round
+            if self_evolution:
+                try:
+                    await self_evolution.pre_check_round()
+                except Exception:
+                    pass
             progress_profile = _classify_auto_round_progress(
                 response=response, round_events=round_events,
                 kb_changed=kb_changed if not round_is_error else False,
