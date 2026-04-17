@@ -335,6 +335,8 @@ class CPhaseMixin:
     def _build_cross_round_observations(self) -> str:
         """Format cross-round behavioral observations from loop_config.
         These are objective patterns GP cannot see about its own behavior.
+        Only uses OUTCOME signals — activity signals like progress_class
+        are inflated by probe writing and mislead C.
         """
         obs = getattr(self, 'loop_config', {}).get("cross_round_observations")
         if not obs:
@@ -345,46 +347,55 @@ class CPhaseMixin:
         if total:
             lines.append(f"  总轮次: {total}")
 
-        # Write target distribution
+        # Write target distribution + source write ratio (outcome signal)
         wt = obs.get("write_targets")
         if wt:
             total_writes = sum(wt.values())
             parts = [f"{k}={v}" for k, v in sorted(wt.items(), key=lambda x: -x[1])]
             lines.append(f"  GP 写入目标分布 ({total_writes}次): {', '.join(parts)}")
-            if wt.get("source", 0) == 0 and total_writes > 5:
-                lines.append(f"  ⚠ GP 从未修改过 genesis/ 源文件")
+        sr = obs.get("source_write_ratio", 0)
+        if sr is not None:
+            lines.append(f"  源文件写入占比: {sr:.0%}")
+            if sr < 0.1 and total_writes > 5:
+                lines.append(f"  ⚠ GP 几乎不修改 genesis/ 源文件，只写 tests/ 和 scratch/")
 
-        # Auto-apply
+        # Auto-apply outcome (now records both success and failure)
         attempts = obs.get("auto_apply_attempts", 0)
         successes = obs.get("auto_apply_successes", 0)
+        blocked = obs.get("auto_apply_blocked_reasons", [])
         if attempts > 0:
-            lines.append(f"  auto-apply: {successes}/{attempts} 成功")
-            if successes == 0 and attempts >= 3:
-                lines.append(f"  ⚠ auto-apply 连续 {attempts} 次失败")
+            lines.append(f"  auto-apply 历史: {successes}/{attempts} 成功")
+            if blocked:
+                lines.append(f"  ⚠ auto-apply 失败原因: {'; '.join(blocked[-3:])}")
+        elif total >= 5:
+            lines.append(f"  auto-apply: 尚未触发（冷却未满）")
 
-        # Progress distribution
-        pd = obs.get("progress_distribution")
-        if pd:
-            parts = [f"{k}={v}" for k, v in sorted(pd.items(), key=lambda x: -x[1])]
-            lines.append(f"  进展分布 (近{obs.get('window_size', '?')}轮): {', '.join(parts)}")
+        # KB change rate (outcome signal — actual vault mutations)
+        kcr = obs.get("kb_change_rate")
+        if kcr:
+            lines.append(f"  知识库变更率 (近{obs.get('window_size', '?')}轮): {kcr}")
 
-        # LESSON thematic repetition
-        lt = obs.get("lesson_titles_recent")
-        if lt and len(lt) >= 3:
-            lines.append(f"  近期 LESSON 标题 (最后{len(lt)}条):")
-            for t in lt[-5:]:
-                lines.append(f"    - {t}")
+        # LESSON count (NOT titles — titles create echo chamber)
+        lt = obs.get("lesson_total_in_window", 0)
+        lr = obs.get("lesson_rounds_in_window", 0)
+        ws = obs.get("window_size", 0)
+        if ws > 0:
+            lines.append(f"  LESSON 产出: {lt}条 / {lr}轮有产出 / {ws}轮窗口")
 
-        # Consecutive dry
-        cd = obs.get("consecutive_dry", 0)
-        if cd >= 3:
-            lines.append(f"  连续无实质进展轮次: {cd}")
+        # Sandbox file stability (outcome signal — are GP's changes converging?)
+        ss = obs.get("sandbox_stability")
+        if ss:
+            total_files = sum(ss.values())
+            if total_files > 0:
+                stable_pct = (ss.get("stable_3_plus", 0)) / total_files
+                lines.append(f"  沙箱文件稳定性: stable_0={ss.get('stable_0',0)} | stable_1-2={ss.get('stable_1_2',0)} | stable_3+={ss.get('stable_3_plus',0)} / {total_files}文件")
+                if stable_pct < 0.05 and total_files > 10:
+                    lines.append(f"  ⚠ 沙箱文件几乎无稳定（stable_3+≈0%），GP 每轮都在改文件")
 
         # Error rounds
         er = obs.get("error_rounds_in_window", 0)
-        ws = obs.get("window_size", 1)
         if er > 0:
-            lines.append(f"  错误轮次: {er}/{ws}")
+            lines.append(f"  错误轮次: {er}/{obs.get('window_size', '?')}")
 
         return "\n".join(lines) if lines else ""
 

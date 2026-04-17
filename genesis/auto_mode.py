@@ -967,6 +967,11 @@ def _compute_cross_round_observations(round_log: list, self_evolution=None) -> d
     """Compute cross-round behavioral observations for C-Phase.
     These are patterns GP cannot see about its own behavior —
     not corrections, but objective observations of behavioral blind spots.
+
+    Design principle: only use OUTCOME signals (what actually happened),
+    not ACTIVITY signals (what GP appeared to do). Activity signals like
+    progress_class are inflated by probe writing and mislead C into
+    thinking GP is productive when it's spinning in place.
     """
     if not round_log:
         return {}
@@ -975,6 +980,7 @@ def _compute_cross_round_observations(round_log: list, self_evolution=None) -> d
     total_rounds = len(round_log)
 
     # 1. GP write targets: what file categories GP writes to
+    #    This is reliable — it's based on actual write_file tool calls with paths.
     write_categories = {"tests": 0, "scratch": 0, "source": 0, "other": 0}
     for r in recent:
         events = r.get("events") or []
@@ -991,40 +997,64 @@ def _compute_cross_round_observations(round_log: list, self_evolution=None) -> d
                 elif path:
                     write_categories["other"] += 1
 
-    # 2. Auto-apply success rate
+    # 1b. Source write ratio: the key outcome signal.
+    #     If GP writes 0% to genesis/, it's only producing probes/scratch,
+    #     never touching production code. This is the real "productivity" metric.
+    total_writes = sum(write_categories.values())
+    source_write_ratio = write_categories["source"] / total_writes if total_writes > 0 else 0
+
+    # 2. Auto-apply outcome (grounded in apply_history which records both success and failure)
     apply_attempts = 0
     apply_successes = 0
+    apply_blocked_reasons = []
     if self_evolution:
         apply_attempts = len(self_evolution.apply_history)
         apply_successes = sum(1 for h in self_evolution.apply_history if h.get("status") == "success")
+        apply_blocked_reasons = [h.get("reason", "?") for h in self_evolution.apply_history if h.get("status") != "success"]
 
-    # 3. Progress class distribution
-    progress_classes = {}
-    for r in recent:
-        pc = r.get("progress_class", "?")
-        progress_classes[pc] = progress_classes.get(pc, 0) + 1
+    # 3. KB change rate: how many rounds actually changed the knowledge base
+    #    This is an outcome signal — kb_changed is set by actual vault mutations.
+    kb_changed_rounds = sum(1 for r in recent if r.get("kb_changed"))
 
-    # 4. LESSON thematic repetition (from c_phase_summary)
-    lesson_titles = []
+    # 4. LESSON count per round (NOT titles — titles create echo chamber)
+    #    Just the number tells C whether it's producing or passing.
+    lesson_counts = []
     for r in recent:
         c_sum = r.get("c_phase_summary") or {}
-        for t in (c_sum.get("lesson_titles") or []):
-            lesson_titles.append(t[:60])
+        n = c_sum.get("lessons_recorded", 0)
+        if n > 0:
+            lesson_counts.append(n)
+    lesson_total = sum(lesson_counts)
+    lesson_rounds = len(lesson_counts)
 
-    # 5. Consecutive dry rounds
-    consecutive_dry = recent[-1].get("consecutive_dry", 0) if recent else 0
+    # 5. Sandbox file stability: from cooldown state
+    #    How many files are at what stable_count — this tells C whether
+    #    GP's changes are converging or churning.
+    sandbox_stability = {"stable_0": 0, "stable_1_2": 0, "stable_3_plus": 0}
+    if self_evolution and self_evolution.file_cooldowns:
+        for v in self_evolution.file_cooldowns.values():
+            sc = v.get("stable_count", 0)
+            if sc == 0:
+                sandbox_stability["stable_0"] += 1
+            elif sc <= 2:
+                sandbox_stability["stable_1_2"] += 1
+            else:
+                sandbox_stability["stable_3_plus"] += 1
 
-    # 6. Error rate
+    # 6. Error rounds (reliable — only set on actual exceptions)
     error_count = sum(1 for r in recent if r.get("progress_class") == "error")
 
     obs = {
         "total_rounds": total_rounds,
         "write_targets": {k: v for k, v in write_categories.items() if v > 0},
+        "source_write_ratio": round(source_write_ratio, 2),
         "auto_apply_attempts": apply_attempts,
         "auto_apply_successes": apply_successes,
-        "progress_distribution": progress_classes,
-        "lesson_titles_recent": lesson_titles[-10:],
-        "consecutive_dry": consecutive_dry,
+        "auto_apply_blocked_reasons": apply_blocked_reasons[-5:],
+        "kb_change_rate": f"{kb_changed_rounds}/{len(recent)}",
+        "lesson_total_in_window": lesson_total,
+        "lesson_rounds_in_window": lesson_rounds,
+        "sandbox_stability": sandbox_stability,
         "error_rounds_in_window": error_count,
         "window_size": len(recent),
     }
@@ -1991,6 +2021,11 @@ class SelfEvolution:
             await channel.send(
                 f"🧬 ❌ 沙箱测试失败，放弃本次应用\n```\n{test_output[-500:]}\n```"
             )
+            self.apply_history.append({
+                "round": round_num,
+                "status": "test_failed",
+                "reason": test_output[-200:].replace("\n", " ").strip(),
+            })
             # Reset cooling — GP might fix the issue
             self.file_cooldowns.clear()
             self._save()
@@ -2015,6 +2050,11 @@ class SelfEvolution:
             await channel.send(
                 f"🧬 ❌ 应用失败\n```\n{apply_output[-500:]}\n```"
             )
+            self.apply_history.append({
+                "round": round_num,
+                "status": "apply_failed",
+                "reason": apply_output[-200:].replace("\n", " ").strip(),
+            })
             self.file_cooldowns.clear()
             self._save()
             return
@@ -2033,6 +2073,7 @@ class SelfEvolution:
         self.applied_this_session = True
         self.apply_history.append({
             "round": round_num,
+            "status": "success",
             "timestamp": _time_module.strftime("%Y-%m-%d %H:%M:%S"),
             "rollback_commit": rollback_commit,
             "applied_commit": applied_commit,
