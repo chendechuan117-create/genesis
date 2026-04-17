@@ -2709,7 +2709,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             progress_profile = _classify_auto_round_progress(
                 response=round_record.get("response_full") or round_record.get("response_preview") or "",
                 round_events=round_events, kb_changed=kb_changed, frontier_state=frontier_state,
-                self_evolution=SelfEvolution if SELF_EVOLUTION_ENABLED else None,
+                self_evolution=self_evolution,
             )
             consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             reanchor_stop_reason = _derive_reanchor_stop_reason(
@@ -2788,7 +2788,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 response=response, round_events=round_events,
                 kb_changed=kb_changed if not round_is_error else False,
                 frontier_state=frontier_state, is_error=round_is_error,
-                self_evolution=SelfEvolution if SELF_EVOLUTION_ENABLED else None,
+                self_evolution=self_evolution,
             )
             consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             last_knowledge_state = knowledge_state
@@ -2860,7 +2860,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             progress_profile = _classify_auto_round_progress(
                 response="", round_events=round_events,
                 kb_changed=kb_changed, frontier_state=frontier_state,
-                self_evolution=SelfEvolution if SELF_EVOLUTION_ENABLED else None,
+                self_evolution=self_evolution,
             )
             consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             reanchor_stop_reason = _derive_reanchor_stop_reason(
@@ -2912,7 +2912,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             progress_profile = _classify_auto_round_progress(
                 response="", round_events=round_events,
                 kb_changed=kb_changed, frontier_state=frontier_state,
-                self_evolution=SelfEvolution if SELF_EVOLUTION_ENABLED else None,
+                self_evolution=self_evolution,
             )
             consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             reanchor_stop_reason = _derive_reanchor_stop_reason(
