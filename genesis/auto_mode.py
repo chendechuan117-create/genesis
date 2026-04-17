@@ -690,7 +690,7 @@ def _derive_reanchor_stop_reason(reanchor_required: bool, reanchor_streak: int, 
     return ""
 
 
-def _build_frontier_state(round_index, response, kb_delta_summary, kb_changed, node_telemetry, round_events, prior_reanchor_streak=0):
+def _build_frontier_state(round_index, response, kb_delta_summary, kb_changed, node_telemetry, round_events, prior_reanchor_streak=0, consecutive_dry=0, progress_class="", kb_delta=None):
     local_goal = _extract_blueprint_goal(round_events)
     candidate_issue = _extract_candidate_issue(response)
     next_checks = _extract_next_checks(response)
@@ -698,6 +698,15 @@ def _build_frontier_state(round_index, response, kb_delta_summary, kb_changed, n
     reanchor_required, reanchor_reason = _detect_reanchor_signal(response, round_events)
     reanchor_streak = prior_reanchor_streak + 1 if reanchor_required else 0
     observations = [f"KB {kb_delta_summary}", node_telemetry]
+    # Inject actual node titles so GP knows what it already verified
+    # (not just meta counts like "+3新/8更新" which tell GP nothing about content)
+    if kb_delta:
+        new_titles = [n.get("title", "?")[:60] for n in (kb_delta.get("new_nodes") or [])[:3]]
+        upd_titles = [n.get("title", "?")[:60] for n in (kb_delta.get("updated_nodes") or [])[:3]]
+        if new_titles:
+            observations.append("本轮新增: " + " | ".join(new_titles))
+        if upd_titles:
+            observations.append("本轮更新: " + " | ".join(upd_titles))
     if candidate_issue and candidate_issue not in ("未提取", "未从上轮回复中提取到稳定问题定义"):
         observations.insert(0, f"已确认: {candidate_issue[:150]}")
     if tool_names:
@@ -706,6 +715,11 @@ def _build_frontier_state(round_index, response, kb_delta_summary, kb_changed, n
         observations.append(f"锚定状态: 已连续 {reanchor_streak} 轮需要重新锚定" if reanchor_streak >= 2 else "锚定状态: 需要重新锚定")
     observations.append("文本回复: 有" if response and str(response).strip() else "文本回复: 无")
     carry_warnings = []
+    # ── Strong-but-dry: GP is active but producing no durable outcome ──
+    # This is the key signal that breaks the verification loop.
+    # kb_changed=True + tools used → old logic never warned → GP kept re-verifying.
+    if progress_class in ("strong", "soft") and consecutive_dry >= 2:
+        carry_warnings.insert(0, f"已连续{consecutive_dry}轮有活动但无持久产出(progress={progress_class})——停止重复验证，转向新问题")
     if response and not kb_changed:
         carry_warnings.append("上轮无新知识写入，该方向可能已探索充分——优先切换到新方向")
     if not tool_names:
@@ -715,7 +729,9 @@ def _build_frontier_state(round_index, response, kb_delta_summary, kb_changed, n
     if reanchor_streak >= 2:
         carry_warnings.insert(0, f"信息错位已连续 {reanchor_streak} 轮出现；如重锚后仍无新的外部证据，应停止当前路径")
     if not next_checks:
-        if kb_changed:
+        if consecutive_dry >= 3:
+            next_checks = ["当前方向已连续空转，必须切换到完全不同的新问题", "不要再次验证已有结论"]
+        elif kb_changed:
             next_checks = ["在已确认事实基础上探索新的相邻问题", "避免重复验证已知事实"]
         else:
             next_checks = ["当前方向已无新信息，切换到新问题方向", "不要重复验证已有结论"]
@@ -2758,10 +2774,19 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 return
             kb_delta, kb_changed, kb_delta_summary, node_telemetry = _observe_round_state()
             final_node_telemetry = node_telemetry
+            # Classify first (interrupted = no outcome)
+            progress_profile = _classify_auto_round_progress(
+                response=round_record.get("response_full") or round_record.get("response_preview") or "",
+                round_events=round_events, kb_changed=kb_changed, frontier_state=None,
+                outcome_detected=False,  # interrupted round — GP didn't complete
+            )
+            consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             frontier_state = _build_frontier_state(
                 round_index=round_num, response=round_record.get("response_full") or round_record.get("response_preview") or "",
                 kb_delta_summary=kb_delta_summary, kb_changed=kb_changed, node_telemetry=node_telemetry,
                 round_events=round_events, prior_reanchor_streak=last_reanchor_streak,
+                consecutive_dry=consecutive_dry, progress_class=progress_profile.get("progress_class", ""),
+                kb_delta=kb_delta,
             )
             frontier_text = _format_frontier_state(frontier_state)
             frontier_preview = f"goal={frontier_state['local_goal']} | issue={frontier_state['candidate_issue']}" + (f" | reanchor#{frontier_state.get('reanchor_streak', 0)}" if frontier_state.get("reanchor_required") else "")
@@ -2770,12 +2795,6 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 raw_state=round_record.get("knowledge_state") or last_knowledge_state or None,
             )
             knowledge_state_text = _format_knowledge_state(knowledge_state)
-            progress_profile = _classify_auto_round_progress(
-                response=round_record.get("response_full") or round_record.get("response_preview") or "",
-                round_events=round_events, kb_changed=kb_changed, frontier_state=frontier_state,
-                outcome_detected=False,  # interrupted round — GP didn't complete
-            )
-            consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             reanchor_stop_reason = _derive_reanchor_stop_reason(
                 frontier_state.get("reanchor_required", False),
                 int(frontier_state.get("reanchor_streak", 0) or 0),
@@ -2823,11 +2842,34 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             kb_delta, kb_changed, kb_delta_summary, node_telemetry = _observe_round_state()
             final_node_telemetry = node_telemetry
 
+            # Ground truth: did sandbox diff change since round start?
+            _outcome = False
+            if self_evolution and not round_is_error:
+                try:
+                    _outcome = await self_evolution.outcome_changed_since_snapshot()
+                except Exception:
+                    pass
+            # Classify FIRST — needs only candidate_issue + reanchor_required from frontier
+            _partial_frontier = {
+                "candidate_issue": _extract_candidate_issue("" if round_is_error else response),
+                "reanchor_required": _detect_reanchor_signal("" if round_is_error else response, round_events)[0],
+            }
+            progress_profile = _classify_auto_round_progress(
+                response=response, round_events=round_events,
+                kb_changed=kb_changed if not round_is_error else False,
+                frontier_state=_partial_frontier, is_error=round_is_error,
+                outcome_detected=_outcome,
+            )
+            consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
+
+            # Build full frontier_state NOW with progress_class available
             frontier_state = _build_frontier_state(
                 round_index=round_num, response="" if round_is_error else response,
                 kb_delta_summary=kb_delta_summary, kb_changed=kb_changed if not round_is_error else False,
                 node_telemetry=node_telemetry, round_events=round_events,
                 prior_reanchor_streak=last_reanchor_streak,
+                consecutive_dry=consecutive_dry, progress_class=progress_profile.get("progress_class", ""),
+                kb_delta=kb_delta,
             )
             frontier_text = _format_frontier_state(frontier_state)
             if not round_is_error:
@@ -2848,20 +2890,6 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 if round_num == 1 and SELF_EVOLUTION_ENABLED:
                     SelfEvolution.clear_restart_marker()
             knowledge_state_text = _format_knowledge_state(knowledge_state)
-            # Ground truth: did sandbox diff change since round start?
-            _outcome = False
-            if self_evolution and not round_is_error:
-                try:
-                    _outcome = await self_evolution.outcome_changed_since_snapshot()
-                except Exception:
-                    pass
-            progress_profile = _classify_auto_round_progress(
-                response=response, round_events=round_events,
-                kb_changed=kb_changed if not round_is_error else False,
-                frontier_state=frontier_state, is_error=round_is_error,
-                outcome_detected=_outcome,
-            )
-            consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             last_knowledge_state = knowledge_state
             reanchor_stop_reason = _derive_reanchor_stop_reason(
                 frontier_state.get("reanchor_required", False),
@@ -2920,20 +2948,23 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             _append_md(f"### Response (timeout)\n\n{err_str}\n\n")
             kb_delta, kb_changed, kb_delta_summary, node_telemetry = _observe_round_state()
             final_node_telemetry = node_telemetry
+            # Classify first (timeout = no outcome)
+            progress_profile = _classify_auto_round_progress(
+                response="", round_events=round_events,
+                kb_changed=kb_changed, frontier_state=None,
+                outcome_detected=False,  # timeout — GP didn't complete
+            )
+            consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             frontier_state = _build_frontier_state(
                 round_index=round_num, response="",
                 kb_delta_summary=kb_delta_summary, kb_changed=kb_changed,
                 node_telemetry=node_telemetry, round_events=round_events,
                 prior_reanchor_streak=last_reanchor_streak,
+                consecutive_dry=consecutive_dry, progress_class=progress_profile.get("progress_class", ""),
+                kb_delta=kb_delta,
             )
             frontier_text = _format_frontier_state(frontier_state)
             frontier_preview = "timeout" + (f" | reanchor#{frontier_state.get('reanchor_streak', 0)}" if frontier_state.get("reanchor_required") else "")
-            progress_profile = _classify_auto_round_progress(
-                response="", round_events=round_events,
-                kb_changed=kb_changed, frontier_state=frontier_state,
-                outcome_detected=False,  # timeout — GP didn't complete
-            )
-            consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             reanchor_stop_reason = _derive_reanchor_stop_reason(
                 frontier_state.get("reanchor_required", False),
                 int(frontier_state.get("reanchor_streak", 0) or 0),
@@ -2972,20 +3003,23 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             _append_md(f"### Response (exception)\n\n{err_str}\n\n")
             kb_delta, kb_changed, kb_delta_summary, node_telemetry = _observe_round_state()
             final_node_telemetry = node_telemetry
+            # Classify first (exception = no outcome)
+            progress_profile = _classify_auto_round_progress(
+                response="", round_events=round_events,
+                kb_changed=kb_changed, frontier_state=None,
+                outcome_detected=False,  # exception — GP didn't complete
+            )
+            consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             frontier_state = _build_frontier_state(
                 round_index=round_num, response="",
                 kb_delta_summary=kb_delta_summary, kb_changed=kb_changed,
                 node_telemetry=node_telemetry, round_events=round_events,
                 prior_reanchor_streak=last_reanchor_streak,
+                consecutive_dry=consecutive_dry, progress_class=progress_profile.get("progress_class", ""),
+                kb_delta=kb_delta,
             )
             frontier_text = _format_frontier_state(frontier_state)
             frontier_preview = "exception" + (f" | reanchor#{frontier_state.get('reanchor_streak', 0)}" if frontier_state.get("reanchor_required") else "")
-            progress_profile = _classify_auto_round_progress(
-                response="", round_events=round_events,
-                kb_changed=kb_changed, frontier_state=frontier_state,
-                outcome_detected=False,  # exception — GP didn't complete
-            )
-            consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             reanchor_stop_reason = _derive_reanchor_stop_reason(
                 frontier_state.get("reanchor_required", False),
                 int(frontier_state.get("reanchor_streak", 0) or 0),
