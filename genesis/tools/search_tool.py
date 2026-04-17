@@ -7,6 +7,7 @@ Search Knowledge Nodes Tool — 全局知识搜索工具。
 
 import logging
 import json
+import hashlib
 import math
 import re
 from typing import Dict, Any, List
@@ -48,6 +49,21 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 f"[搜索仪表盘] total={cls._search_total} hit_rate={hit_rate:.1%} "
                 f"avg_fusion={avg_fusion:.3f} misses={cls._search_misses}"
             )
+
+    def _record_search_void(self, keywords, ntype=None):
+        """搜索未命中时记录 VOID（知识缺口），引导未来探索方向。
+        auto mode 禁用 Multi-G，导致 lens_phase 的 void 记录不触发，
+        此处补齐搜索层的 void 记录。
+        """
+        if not keywords:
+            return
+        try:
+            query_text = " ".join(keywords) if isinstance(keywords, (list, tuple)) else str(keywords)
+            void_id = f"VOID_SEARCH_{hashlib.md5(query_text.encode()).hexdigest()[:8].upper()}"
+            source = f"search_miss:{ntype or 'any'}"
+            self.vault.add_void_task(void_id=void_id, query=query_text, source=source)
+        except Exception as e:
+            logger.debug(f"search void recording failed: {e}")
 
     @classmethod
     def get_fusion_scores(cls, node_ids: list = None) -> Dict[str, float]:
@@ -387,6 +403,8 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
 
                 if not rows:
                     self._record_search_stats(hit=False)
+                    # 记录搜索空洞 → VOID 任务队列（引导未来探索方向）
+                    self._record_search_void(keywords, ntype)
                     return f"⚠️ [未命中] 未找到与 {keywords} 相关的 {ntype} 节点（字面+语义均无匹配）。当前处于未知区域，请基于通用能力处理。"
 
                 # 读时衰减：软淘汰 effective_confidence < 0.2 的节点
@@ -450,7 +468,7 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 
                 # === Graph Walk (圆锥模型：连根拔起) ===
                 # 强边(REQUIRES/TRIGGERS)做 2 跳拉出深度，弱边(RELATED_TO)保持 1 跳拉出宽度
-                DEEP_EDGES = {"REQUIRES", "TRIGGERS", "RESOLVES"}
+                DEEP_EDGES = {"REQUIRES", "TRIGGERS", "RESOLVES", "PREREQUISITE"}
                 graph_context = {}
                 graph_related_ids = {}
                 cone_edge_count = 0

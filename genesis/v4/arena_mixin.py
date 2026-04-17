@@ -38,15 +38,53 @@ class ArenaConfidenceMixin:
         except Exception:
             return None
 
+    # verification_source → 信任梯度权重（关键词模糊匹配）
+    # 实际 verification_source 值多样（doctor_pytest, probe_and_pytest 等），
+    # 用关键词检测而非精确匹配
+    _VERIFICATION_KEYWORDS = [
+        # (关键词集合, boost) — 按优先级降序，首个匹配即返回
+        ({"doctor"}, {"test", "pytest", "sandbox"}, 0.15),   # Doctor 沙箱实验验证
+        ({"doctor"}, {"probe"}, 0.10),                       # Doctor 沙箱探测验证
+        ({"doctor"}, set(), 0.08),                           # Doctor 其他验证
+        ({"probe"}, {"pytest", "test"}, 0.10),               # 探测+测试验证
+        ({"probe"}, set(), 0.05),                            # 单独探测验证
+        ({"command_output"}, set(), 0.05),                   # 宿主命令输出验证
+        ({"test", "pytest"}, set(), 0.05),                   # 测试验证（非 Doctor）
+        ({"read_file"}, set(), 0.02),                        # 代码阅读验证
+        ({"reflection"}, set(), 0.0),                        # 纯推理，不加权
+        ({"cross_round"}, set(), 0.0),                       # 跨轮观测，不加权
+    ]
+    # 无 verification_source 的节点降权（可能是自动写入的低质量节点）
+    _NO_VERIFICATION_PENALTY = -0.05
+
+    @staticmethod
+    def _resolve_verification_boost(ver_src: str) -> float:
+        """关键词模糊匹配 verification_source → boost 值。
+        实际 DB 中 verification_source 有 50+ 变体（doctor_pytest, probe_and_pytest 等），
+        精确匹配会漏掉大部分。按优先级检测关键词，首个匹配即返回。
+        """
+        if not ver_src:
+            return ArenaConfidenceMixin._NO_VERIFICATION_PENALTY
+        src_lower = ver_src.lower()
+        for required, secondary, boost in ArenaConfidenceMixin._VERIFICATION_KEYWORDS:
+            # required 关键词必须全部出现
+            if all(kw in src_lower for kw in required):
+                # secondary 关键词：空集合=不需要，非空=至少一个出现
+                if not secondary or any(kw in src_lower for kw in secondary):
+                    return boost
+        # 未匹配任何规则：轻微降权
+        return 0.0
+
     @staticmethod
     def effective_confidence(node_row: Dict[str, Any]) -> float:
-        """基于使用战绩的质量评分。无时间衰减。
+        """基于使用战绩 + 验证来源的质量评分。无时间衰减。
 
         知识不会因时间流逝失效——只会因事件失效（环境变化、矛盾、使用失败）。
-        评分反映经验性战绩：
+        评分反映两个维度：
+          1. 经验性战绩：有使用记录 → 0.5 + 0.4 × success_rate（范围 0.5~0.9）
+          2. 验证来源梯度：doctor_test > command_output > reflection > 无验证
           - HUMAN 节点 → 1.0
-          - 有使用记录 → 0.5 + 0.4 × success_rate（范围 0.5~0.9）
-          - 未使用 → tier 默认值（REFLECTION=0.6）
+          - 未使用节点 → tier 默认值 + verification_source 加权
         节点淘汰由 CONTRADICTS 边 / epoch_stale 驱动，不由此分数驱动。
         """
         trust_tier = node_row.get("trust_tier", "REFLECTION")
@@ -57,12 +95,19 @@ class ArenaConfidenceMixin:
         fail = node_row.get("usage_fail_count", 0) or 0
         total = success + fail
 
-        if total > 0:
-            return 0.5 + 0.4 * (success / total)
+        # 解析 verification_source → boost（关键词模糊匹配）
+        ver_src = (node_row.get("verification_source") or "").lower()
+        boost = ArenaConfidenceMixin._resolve_verification_boost(ver_src)
 
+        if total > 0:
+            base = 0.5 + 0.4 * (success / total)
+            return min(0.95, base + boost)
+
+        # 无使用战绩：tier 默认值 + verification_source 加权
         TIER_BASE = {"HUMAN": 1.0, "REFLECTION": 0.6, "SCAVENGED": 0.4,
                      "CONVERSATION": 0.55, "FERMENTED": 0.45, "OBSERVATION": 0.6}
-        return TIER_BASE.get(trust_tier, 0.55)
+        base = TIER_BASE.get(trust_tier, 0.55)
+        return min(0.95, max(0.2, base + boost))
 
     # ─── KB 熵 ───
 

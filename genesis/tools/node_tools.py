@@ -157,6 +157,26 @@ class RecordLessonNodeTool(BaseNodeTool):
             if dedup_action == "relate" and merged_node_id:
                 self.vault.add_edge(node_id, merged_node_id, "RELATED_TO", weight=0.7)
 
+            # RESOLVES 边：此经验解决了某个问题/异常 → 强边（2-hop 深度遍历）
+            resolves_msg = ""
+            if resolves:
+                # resolves 是文本描述，尝试匹配已有节点 ID
+                resolved_ids = self._resolve_text_to_node_ids(resolves)
+                for rid in resolved_ids:
+                    if rid != node_id:
+                        self.vault.add_edge(node_id, rid, "RESOLVES", weight=0.8)
+                if resolved_ids:
+                    resolves_msg = f" 🔗 RESOLVES→{resolved_ids}"
+
+            # PREREQUISITE 边：此经验依赖的前置知识 → 强边（2-hop 深度遍历）
+            prereq_msg = ""
+            if prerequisites:
+                for pid in prerequisites:
+                    pid = pid.strip()
+                    if pid and pid != node_id:
+                        self.vault.add_edge(node_id, pid, "PREREQUISITE", weight=0.7)
+                prereq_msg = f" 🔗 PREREQUISITE←{prerequisites}"
+
             # CONTRADICTS 边：标记旧节点已被新知识反驳
             contradicts_msg = ""
             if contradicts:
@@ -166,12 +186,26 @@ class RecordLessonNodeTool(BaseNodeTool):
                 logger.info(f"CONTRADICTS: [{node_id}] --[CONTRADICTS]--> [{target_id}]")
 
             if dedup_action == "relate" and merged_node_id:
-                return f"✅ LESSON节点 [{node_id}] '{title}' 写入成功。检测到相似节点 [{merged_node_id}]，已建立 RELATED_TO 边。{contradicts_msg}"
+                return f"✅ LESSON节点 [{node_id}] '{title}' 写入成功。检测到相似节点 [{merged_node_id}]，已建立 RELATED_TO 边。{resolves_msg}{prereq_msg}{contradicts_msg}"
 
-            return f"✅ LESSON节点 [{node_id}] '{title}' 写入成功。{contradicts_msg}"
+            return f"✅ LESSON节点 [{node_id}] '{title}' 写入成功。{resolves_msg}{prereq_msg}{contradicts_msg}"
         except Exception as e:
             logger.error(f"Lesson node creation failed: {e}")
             return f"Error: {e}"
+
+    def _resolve_text_to_node_ids(self, text: str, top_k: int = 3, threshold: float = 0.65) -> List[str]:
+        """将 resolves 文本描述匹配到已有节点 ID（向量搜索）。
+        resolves 字段是自然语言描述（如 "file not found 探测"），
+        需要通过语义搜索找到对应的节点 ID 来创建边。
+        """
+        if not text or not self.vault.vector_engine.is_ready:
+            return []
+        try:
+            results = self.vault.vector_engine.search(text, top_k=top_k, threshold=threshold)
+            return [rid for rid, score in results if rid]
+        except Exception as e:
+            logger.debug(f"resolve_text_to_node_ids failed: {e}")
+            return []
 
 
 class CreateMetaNodeTool(BaseNodeTool):
