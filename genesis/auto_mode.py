@@ -818,7 +818,7 @@ def _is_source_path(path: str) -> bool:
     return ("/genesis/" in p and "/tests/" not in p and "/runtime/" not in p and "/scratch/" not in p)
 
 
-def _classify_auto_round_progress(response, round_events, kb_changed, frontier_state=None, is_error=False):
+def _classify_auto_round_progress(response, round_events, kb_changed, frontier_state=None, is_error=False, self_evolution=None):
     if is_error:
         signals = ["progress=error"]
         response_text = (response or "").strip()
@@ -878,7 +878,10 @@ def _classify_auto_round_progress(response, round_events, kb_changed, frontier_s
     # Outcome-based detection: did GP produce durable value this round?
     # activity_detected is inflated by probe writing (GP always appears active).
     # gp_wrote_kb is ALSO activity — GP decides to write LESSON, it's not an outcome signal.
-    # Real outcome: GP modified source code (in sandbox) that could be auto-applied.
+    # Real outcome: GP modified source code in sandbox (detectable via SelfEvolution cooldowns).
+    # GP uses `shell doctor.sh exec` to modify files, NOT write_file — so we can't check
+    # tool call paths. Instead, check if SelfEvolution has tracked source files (type=T)
+    # in its cooldowns — those only appear when GP modified genesis/ source files in sandbox.
     source_written = any(
         name in ("write_file", "edit_file", "replace_in_file") and _is_source_path(
             str((entry.get("data") or {}).get("path") or (entry.get("args") or {}).get("path") or "")
@@ -886,7 +889,12 @@ def _classify_auto_round_progress(response, round_events, kb_changed, frontier_s
         for entry in result_events
         for name in [entry.get("name", "")]
     )
-    outcome_detected = bool(source_written)
+    sandbox_source_modified = bool(
+        self_evolution and any(
+            v.get("type") == "T" for v in self_evolution.file_cooldowns.values()
+        )
+    ) if self_evolution else False
+    outcome_detected = bool(source_written or sandbox_source_modified)
 
     signals = [f"progress={progress_class}"]
     if kb_changed: signals.append("kb")
@@ -2701,6 +2709,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             progress_profile = _classify_auto_round_progress(
                 response=round_record.get("response_full") or round_record.get("response_preview") or "",
                 round_events=round_events, kb_changed=kb_changed, frontier_state=frontier_state,
+                self_evolution=SelfEvolution if SELF_EVOLUTION_ENABLED else None,
             )
             consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             reanchor_stop_reason = _derive_reanchor_stop_reason(
@@ -2779,6 +2788,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 response=response, round_events=round_events,
                 kb_changed=kb_changed if not round_is_error else False,
                 frontier_state=frontier_state, is_error=round_is_error,
+                self_evolution=SelfEvolution if SELF_EVOLUTION_ENABLED else None,
             )
             consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             last_knowledge_state = knowledge_state
@@ -2850,6 +2860,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             progress_profile = _classify_auto_round_progress(
                 response="", round_events=round_events,
                 kb_changed=kb_changed, frontier_state=frontier_state,
+                self_evolution=SelfEvolution if SELF_EVOLUTION_ENABLED else None,
             )
             consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             reanchor_stop_reason = _derive_reanchor_stop_reason(
@@ -2901,6 +2912,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             progress_profile = _classify_auto_round_progress(
                 response="", round_events=round_events,
                 kb_changed=kb_changed, frontier_state=frontier_state,
+                self_evolution=SelfEvolution if SELF_EVOLUTION_ENABLED else None,
             )
             consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             reanchor_stop_reason = _derive_reanchor_stop_reason(
