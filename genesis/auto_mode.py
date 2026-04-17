@@ -366,7 +366,23 @@ def _get_auto_signals(round_num: int = 1, session_shown_voids: set | None = None
                     lines.append(f"  {r['node_id']}: {r['title']} <{r['type']}>")
                 sections.append("\n".join(lines))
 
-            # ── 4. C-Phase 产出：DISCOVERY 和 PATTERN 节点可见性 ──
+            # ── 4. C-Phase 跨轮洞察：LESSON_C_ 节点（C 观察到 GP 自身看不到的行为规律）──
+            lesson_c_rows = conn.execute(
+                "SELECT node_id, title, content FROM knowledge_nodes "
+                "WHERE node_id LIKE 'LESSON_C_%' AND type = 'LESSON' "
+                "AND node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS') "
+                "ORDER BY created_at DESC LIMIT 5"
+            ).fetchall()
+            if lesson_c_rows:
+                lines = ["[C-Phase 跨轮洞察 — GP 自身无法察觉的行为规律，请认真对待]"]
+                for r in lesson_c_rows:
+                    content_preview = (r['content'] or '')[:120]
+                    lines.append(f"  {r['node_id']}: {r['title']}")
+                    if content_preview:
+                        lines.append(f"    {content_preview}")
+                sections.append("\n".join(lines))
+
+            # ── 5. C-Phase 产出：DISCOVERY 和 PATTERN 节点可见性 ──
             disc_rows = conn.execute(
                 "SELECT node_id, title FROM knowledge_nodes "
                 "WHERE type = 'DISCOVERY' ORDER BY created_at DESC LIMIT 5"
@@ -794,6 +810,12 @@ def _format_knowledge_state(knowledge_state: dict) -> str:
     return "\n".join(lines)
 
 
+def _is_source_path(path: str) -> bool:
+    """Check if a file path is a genesis source file (not test/scratch/runtime)."""
+    p = path.lower()
+    return ("/genesis/" in p and "/tests/" not in p and "/runtime/" not in p and "/scratch/" not in p)
+
+
 def _classify_auto_round_progress(response, round_events, kb_changed, frontier_state=None, is_error=False):
     if is_error:
         signals = ["progress=error"]
@@ -801,7 +823,7 @@ def _classify_auto_round_progress(response, round_events, kb_changed, frontier_s
         if response_text:
             signals.append(f"reply={len(response_text)}c")
         signals.append("error_response")
-        return {"activity_detected": False, "activity_summary": " | ".join(signals), "progress_class": "error"}
+        return {"activity_detected": False, "activity_summary": " | ".join(signals), "progress_class": "error", "outcome_detected": False}
 
     result_events = _collect_round_result_events(round_events)
     tool_names = []
@@ -850,9 +872,23 @@ def _classify_auto_round_progress(response, round_events, kb_changed, frontier_s
     else:
         progress_class = "idle"
     activity_detected = progress_class in ("strong", "evidence")
+
+    # Outcome-based detection: did GP produce durable value this round?
+    # activity_detected is inflated by probe/test writing (GP always appears active).
+    # outcome_detected requires actual knowledge creation or source code modification.
+    source_written = any(
+        name in ("write_file", "edit_file", "replace_in_file") and _is_source_path(
+            str((entry.get("data") or {}).get("path") or (entry.get("args") or {}).get("path") or "")
+        )
+        for entry in result_events
+        for name in [entry.get("name", "")]
+    )
+    outcome_detected = bool(gp_wrote_kb or source_written)
+
     signals = [f"progress={progress_class}"]
     if kb_changed: signals.append("kb")
     if touched_files: signals.append("write")
+    if source_written: signals.append("source")
     if ran_tests: signals.append("test")
     if inspected_diff: signals.append("diff")
     if tool_names: signals.append(f"tools={','.join(tool_names[:3])}")
@@ -860,7 +896,7 @@ def _classify_auto_round_progress(response, round_events, kb_changed, frontier_s
     if reanchor_required: signals.append("reanchor")
     if response_text: signals.append(f"reply={len(response_text)}c")
     if progress_class == "idle": signals.append("no_external_progress")
-    return {"activity_detected": activity_detected, "activity_summary": " | ".join(signals), "progress_class": progress_class}
+    return {"activity_detected": activity_detected, "activity_summary": " | ".join(signals), "progress_class": progress_class, "outcome_detected": outcome_detected}
 
 
 # ─── Session Planner ─────────────────────────────────────────────
@@ -980,22 +1016,26 @@ def _compute_cross_round_observations(round_log: list, self_evolution=None) -> d
     total_rounds = len(round_log)
 
     # 1. GP write targets: what file categories GP writes to
-    #    This is reliable — it's based on actual write_file tool calls with paths.
-    write_categories = {"tests": 0, "scratch": 0, "source": 0, "other": 0}
+    #    Count UNIQUE files, not tool call count — GP writes same file 3x (probe+test+impl)
+    #    which inflates tests/scratch counts and deflates source_write_ratio.
+    write_file_sets = {"tests": set(), "scratch": set(), "source": set(), "other": set()}
     for r in recent:
         events = r.get("events") or []
         for evt in events:
             if evt.get("type") == "tool_result" and evt.get("name") == "write_file":
                 data = evt.get("data") or {}
                 path = str(data.get("path") or data.get("args", {}).get("path") or "")
+                if not path:
+                    continue
                 if "/tests/" in path or path.startswith("tests/"):
-                    write_categories["tests"] += 1
+                    write_file_sets["tests"].add(path)
                 elif "/scratch/" in path or "/runtime/" in path:
-                    write_categories["scratch"] += 1
+                    write_file_sets["scratch"].add(path)
                 elif "/genesis/" in path:
-                    write_categories["source"] += 1
-                elif path:
-                    write_categories["other"] += 1
+                    write_file_sets["source"].add(path)
+                else:
+                    write_file_sets["other"].add(path)
+    write_categories = {k: len(v) for k, v in write_file_sets.items() if v}
 
     # 1b. Source write ratio: the key outcome signal.
     #     If GP writes 0% to genesis/, it's only producing probes/scratch,
@@ -2026,8 +2066,22 @@ class SelfEvolution:
                 "status": "test_failed",
                 "reason": test_output[-200:].replace("\n", " ").strip(),
             })
-            # Reset cooling — GP might fix the issue
-            self.file_cooldowns.clear()
+            # Selective reset: only reset files whose hash changed (they may be the cause),
+            # preserve stable files that weren't involved in the failure.
+            current_files = await self._get_file_status()
+            if current_files:
+                changed = [p for p, v in self.file_cooldowns.items()
+                           if p in current_files and v["hash"] != current_files[p]["hash"]]
+                for p in changed:
+                    self.file_cooldowns[p]["hash"] = current_files[p]["hash"]
+                    self.file_cooldowns[p]["stable_count"] = 0
+                # Remove files no longer in sandbox
+                stale = [p for p in self.file_cooldowns if p not in current_files]
+                for p in stale:
+                    del self.file_cooldowns[p]
+            else:
+                # Fallback: can't determine which files changed, reset all
+                self.file_cooldowns.clear()
             self._save()
             return
 
@@ -2055,7 +2109,19 @@ class SelfEvolution:
                 "status": "apply_failed",
                 "reason": apply_output[-200:].replace("\n", " ").strip(),
             })
-            self.file_cooldowns.clear()
+            # Selective reset on apply failure too
+            current_files = await self._get_file_status()
+            if current_files:
+                changed = [p for p, v in self.file_cooldowns.items()
+                           if p in current_files and v["hash"] != current_files[p]["hash"]]
+                for p in changed:
+                    self.file_cooldowns[p]["hash"] = current_files[p]["hash"]
+                    self.file_cooldowns[p]["stable_count"] = 0
+                stale = [p for p in self.file_cooldowns if p not in current_files]
+                for p in stale:
+                    del self.file_cooldowns[p]
+            else:
+                self.file_cooldowns.clear()
             self._save()
             return
 
@@ -2633,7 +2699,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 response=round_record.get("response_full") or round_record.get("response_preview") or "",
                 round_events=round_events, kb_changed=kb_changed, frontier_state=frontier_state,
             )
-            consecutive_dry = 0 if progress_profile["activity_detected"] else consecutive_dry + 1
+            consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             reanchor_stop_reason = _derive_reanchor_stop_reason(
                 frontier_state.get("reanchor_required", False),
                 int(frontier_state.get("reanchor_streak", 0) or 0),
@@ -2711,7 +2777,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 kb_changed=kb_changed if not round_is_error else False,
                 frontier_state=frontier_state, is_error=round_is_error,
             )
-            consecutive_dry = 0 if progress_profile["activity_detected"] else consecutive_dry + 1
+            consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             last_knowledge_state = knowledge_state
             reanchor_stop_reason = _derive_reanchor_stop_reason(
                 frontier_state.get("reanchor_required", False),
@@ -2782,7 +2848,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 response="", round_events=round_events,
                 kb_changed=kb_changed, frontier_state=frontier_state,
             )
-            consecutive_dry = 0 if progress_profile["activity_detected"] else consecutive_dry + 1
+            consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             reanchor_stop_reason = _derive_reanchor_stop_reason(
                 frontier_state.get("reanchor_required", False),
                 int(frontier_state.get("reanchor_streak", 0) or 0),
@@ -2833,7 +2899,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 response="", round_events=round_events,
                 kb_changed=kb_changed, frontier_state=frontier_state,
             )
-            consecutive_dry = 0 if progress_profile["activity_detected"] else consecutive_dry + 1
+            consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             reanchor_stop_reason = _derive_reanchor_stop_reason(
                 frontier_state.get("reanchor_required", False),
                 int(frontier_state.get("reanchor_streak", 0) or 0),
