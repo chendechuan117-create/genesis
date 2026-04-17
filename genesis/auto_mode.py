@@ -2061,6 +2061,23 @@ class SelfEvolution:
         u_files = {p: v for p, v in self.file_cooldowns.items() if v["type"] == "U"}
         max_t = max((v["stable_count"] for v in t_files.values()), default=0)
         max_u = max((v["stable_count"] for v in u_files.values()), default=0)
+
+        # Death loop guard: if recent apply_history shows repeated test_failed with
+        # same reason, skip apply for a cooldown period instead of retrying forever.
+        recent = self.apply_history[-3:] if len(self.apply_history) >= 3 else []
+        if recent and all(e.get("status") == "test_failed" for e in recent):
+            # Check if reasons are similar (share a common error substring)
+            reasons = [e.get("reason", "")[:60] for e in recent]
+            # Simple similarity: if first 30 chars of reason are identical → same root cause
+            if len(set(r[:30] for r in reasons)) == 1:
+                last_fail_round = recent[-1].get("round", 0)
+                skip_remaining = 5 - (round_num - last_fail_round)
+                if skip_remaining > 0:
+                    await channel.send(
+                        f"🧬 ⏭ 跳过自进化（连续测试失败同原因，冷却 {skip_remaining} 轮）| T:{len(t_files)}f max{max_t}/{self.cooldown}"
+                    )
+                    return
+
         await channel.send(
             f"🧬 冷却完成 | T:{len(t_files)}f max{max_t}/{self.cooldown} U:{len(u_files)}f max{max_u}/{self.untracked_cooldown} | 开始自进化应用流程..."
         )
