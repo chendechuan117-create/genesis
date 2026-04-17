@@ -374,12 +374,14 @@ def _get_auto_signals(round_num: int = 1, session_shown_voids: set | None = None
                 "ORDER BY created_at DESC LIMIT 5"
             ).fetchall()
             if lesson_c_rows:
-                lines = ["[C-Phase 跨轮洞察 — GP 自身无法察觉的行为规律，请认真对待]"]
+                lines = ["[⚠ C-Phase 跨轮洞察 — 优先级最高 — GP 自身无法察觉的行为盲区]",
+                         "这些洞察来自跨轮行为统计，不是单轮观察。如果这里说你在某模式中卡住，",
+                         "你必须改变行为，不能继续同方向。"]
                 for r in lesson_c_rows:
-                    content_preview = (r['content'] or '')[:120]
+                    content_preview = (r['content'] or '')[:150]
                     lines.append(f"  {r['node_id']}: {r['title']}")
                     if content_preview:
-                        lines.append(f"    {content_preview}")
+                        lines.append(f"    → {content_preview}")
                 sections.append("\n".join(lines))
 
             # ── 5. C-Phase 产出：DISCOVERY 和 PATTERN 节点可见性 ──
@@ -874,8 +876,9 @@ def _classify_auto_round_progress(response, round_events, kb_changed, frontier_s
     activity_detected = progress_class in ("strong", "evidence")
 
     # Outcome-based detection: did GP produce durable value this round?
-    # activity_detected is inflated by probe/test writing (GP always appears active).
-    # outcome_detected requires actual knowledge creation or source code modification.
+    # activity_detected is inflated by probe writing (GP always appears active).
+    # gp_wrote_kb is ALSO activity — GP decides to write LESSON, it's not an outcome signal.
+    # Real outcome: GP modified source code (in sandbox) that could be auto-applied.
     source_written = any(
         name in ("write_file", "edit_file", "replace_in_file") and _is_source_path(
             str((entry.get("data") or {}).get("path") or (entry.get("args") or {}).get("path") or "")
@@ -883,7 +886,7 @@ def _classify_auto_round_progress(response, round_events, kb_changed, frontier_s
         for entry in result_events
         for name in [entry.get("name", "")]
     )
-    outcome_detected = bool(gp_wrote_kb or source_written)
+    outcome_detected = bool(source_written)
 
     signals = [f"progress={progress_class}"]
     if kb_changed: signals.append("kb")

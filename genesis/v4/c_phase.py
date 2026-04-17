@@ -349,14 +349,14 @@ class CPhaseMixin:
 
         # Write target distribution + source write ratio (outcome signal)
         wt = obs.get("write_targets")
+        total_writes = sum(wt.values()) if wt else 0
         if wt:
-            total_writes = sum(wt.values())
             parts = [f"{k}={v}" for k, v in sorted(wt.items(), key=lambda x: -x[1])]
-            lines.append(f"  GP 写入目标分布 ({total_writes}次): {', '.join(parts)}")
+            lines.append(f"  GP 写入目标分布 ({total_writes}个文件): {', '.join(parts)}")
         sr = obs.get("source_write_ratio", 0)
         if sr is not None:
             lines.append(f"  源文件写入占比: {sr:.0%}")
-            if sr < 0.1 and total_writes > 5:
+            if sr < 0.2 and total_writes > 5:
                 lines.append(f"  ⚠ GP 几乎不修改 genesis/ 源文件，只写 tests/ 和 scratch/")
 
         # Auto-apply outcome (now records both success and failure)
