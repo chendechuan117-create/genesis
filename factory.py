@@ -6,12 +6,31 @@ Genesis V4 — 极简工厂
 import logging
 from typing import Optional
 
+from genesis.core.provider import NativeHTTPProvider
 from genesis.core.registry import ToolRegistry
 from genesis.core.provider_manager import ProviderRouter
 from genesis.core.config import config
 from genesis.v4.agent import GenesisV4
 
 logger = logging.getLogger(__name__)
+
+
+def _build_explicit_provider(
+    api_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    model: Optional[str] = None,
+):
+    if not api_key:
+        return None
+    resolved_model = (model or "deepseek/deepseek-chat").strip()
+    resolved_base_url = (base_url or "https://api.deepseek.com/v1").strip()
+    provider_name = "deepseek" if "api.deepseek.com" in resolved_base_url.lower() else "override"
+    return NativeHTTPProvider(
+        api_key=api_key,
+        base_url=resolved_base_url,
+        default_model=resolved_model,
+        provider_name=provider_name,
+    )
 
 
 def create_agent(
@@ -21,9 +40,15 @@ def create_agent(
 ) -> GenesisV4:
     """创建 V4 Agent 实例"""
     logger.info(">>> V4 Factory: Init Provider")
-    provider_router = ProviderRouter(
-        config=config, api_key=api_key, base_url=base_url, model=model
+    provider = _build_explicit_provider(
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
     )
+    if provider is None:
+        provider = ProviderRouter(
+            config=config, api_key=api_key, base_url=base_url, model=model
+        )
 
     logger.info(">>> V4 Factory: Register Tools")
     tools = ToolRegistry()
@@ -85,8 +110,11 @@ def create_agent(
     activate_vault_tools(tools)
 
     # 核心改动：把带有 Failover 能力的 Router 直接传给 Agent
-    agent = GenesisV4(tools=tools, provider=provider_router)
-    logger.info(f"✓ Genesis V4 ready ({len(tools)} tools, Failover Enabled)")
+    agent = GenesisV4(tools=tools, provider=provider)
+    logger.info(
+        f"✓ Genesis V4 ready ({len(tools)} tools, "
+        f"{'Direct Provider Override' if isinstance(provider, NativeHTTPProvider) else 'Failover Enabled'})"
+    )
     return agent
 
 

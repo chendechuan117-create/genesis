@@ -33,11 +33,21 @@ _is_running() {
     docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true
 }
 
+_ensure_git_safe() {
+    # Git 2.35.2+ refuses operations when repo owner != process uid.
+    # Container runs as root (uid=0) but /workspace is owned by uid=1000.
+    docker exec "$CONTAINER" git config --global --add safe.directory /workspace 2>/dev/null || true
+    # Git identity required for commits; lost on container restart.
+    docker exec "$CONTAINER" git config --global user.email "doctor@genesis.local" 2>/dev/null || true
+    docker exec "$CONTAINER" git config --global user.name "Genesis Doctor" 2>/dev/null || true
+}
+
 _ensure_running() {
     if ! _is_running; then
         echo -e "${YELLOW}Doctor container not running. Starting...${NC}"
         cmd_start
     fi
+    _ensure_git_safe
 }
 
 cmd_start() {
@@ -131,15 +141,150 @@ cmd_test() {
         "$PYTHON" -m pytest "$target" -v --tb=short 2>&1
 }
 
+# Test only files related to sandbox diff (used by SelfEvolution auto-apply)
+# Finds test files that correspond to changed/new files in the sandbox
+cmd_test_diff() {
+    _ensure_running
+    local test_files=()
+
+    # Collect changed and untracked files from sandbox
+    local changed
+    changed=$(docker exec -w /workspace "$CONTAINER" bash -c '
+        git diff --name-only HEAD 2>/dev/null
+        git ls-files --others --exclude-standard 2>/dev/null | grep -vE "(__pycache__|\.pyc|\.pyo|\.pytest_cache|^runtime/|^\.)"
+    ' 2>/dev/null)
+
+    # Map source files to corresponding test files
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        # If it's a test file itself, include directly
+        if [[ "$f" == test_*.py ]] || [[ "$f" == tests/test_*.py ]]; then
+            test_files+=("$f")
+            continue
+        fi
+        # If it's a probe impl in runtime/scratch, find its test
+        local base
+        base=$(basename "$f" _impl.py 2>/dev/null || basename "$f" .py 2>/dev/null)
+        local t
+        for t in "tests/test_${base}.py" "tests/${base}.py"; do
+            if docker exec -w /workspace "$CONTAINER" test -f "$t" 2>/dev/null; then
+                test_files+=("$t")
+                break
+            fi
+        done
+        # If it's a genesis source file, find tests that import it
+        if [[ "$f" == genesis/*.py ]]; then
+            local modbase
+            modbase=$(basename "$f" .py)
+            while IFS= read -r tf; do
+                test_files+=("$tf")
+            done < <(docker exec -w /workspace "$CONTAINER" bash -c "
+                grep -rl 'import.*${modbase}\|from.*${modbase}' tests/ 2>/dev/null | head -5
+            " 2>/dev/null)
+        fi
+    done <<< "$changed"
+
+    # Deduplicate
+    local unique_tests
+    unique_tests=$(printf '%s\n' "${test_files[@]}" 2>/dev/null | sort -u | grep -v '^$')
+
+    if [ -z "$unique_tests" ]; then
+        echo "🧪 No test files found for diff changes — passing by default"
+        return 0
+    fi
+
+    echo "🧪 Running diff-scoped tests:"
+    echo "$unique_tests" | while IFS= read -r t; do echo "  $t"; done
+
+    # Run pytest only on the discovered test files
+    local test_args
+    test_args=$(echo "$unique_tests" | tr '\n' ' ')
+    docker exec -w /workspace -e PYTHONPATH=/workspace "$CONTAINER" \
+        "$PYTHON" -m pytest $test_args -v --tb=short 2>&1
+}
+
+_doctor_workspace_patch() {
+    _ensure_running
+    docker exec -i -w /workspace "$CONTAINER" bash <<'EOF'
+set -euo pipefail
+
+git diff HEAD
+while IFS= read -r -d '' path; do
+    case "$path" in
+        .doctor-initialized|runtime/*|__pycache__/*|.pytest_cache/*|*.pyc|*.pyo|*.orig|*.rej|*.log)
+            continue
+            ;;
+    esac
+
+    git diff --no-index --binary -- /dev/null "$path" || true
+done < <(git ls-files --others --exclude-standard -z)
+EOF
+}
+
+cmd_diff_status() {
+    _ensure_running
+    docker exec -i -w /workspace "$CONTAINER" bash <<'EOF'
+set -euo pipefail
+
+# Tracked diff hash
+tracked_diff=$(git diff HEAD 2>/dev/null || echo "")
+if [ -n "$tracked_diff" ]; then
+    tracked_hash=$(echo "$tracked_diff" | md5sum | cut -d' ' -f1 | cut -c1-12)
+    tracked_lines=$(echo "$tracked_diff" | wc -l)
+else
+    tracked_hash=""
+    tracked_lines=0
+fi
+
+# Untracked file set hash (path list only, sorted for stability)
+untracked_list=$(git ls-files --others --exclude-standard 2>/dev/null | grep -vE '(__pycache__|\.pyc|\.pyo|\.orig|\.rej|\.log|\.pytest_cache|^runtime/|^\.)' || true)
+if [ -n "$untracked_list" ]; then
+    untracked_hash=$(echo "$untracked_list" | sort | md5sum | cut -d' ' -f1 | cut -c1-12)
+    untracked_count=$(echo "$untracked_list" | wc -l)
+else
+    untracked_hash=""
+    untracked_count=0
+fi
+
+echo "TRACKED_HASH:${tracked_hash}"
+echo "TRACKED_LINES:${tracked_lines}"
+echo "UNTRACKED_HASH:${untracked_hash}"
+echo "UNTRACKED_COUNT:${untracked_count}"
+EOF
+}
+
+cmd_file_status() {
+    _ensure_running
+    docker exec -i -w /workspace "$CONTAINER" bash <<'EOF'
+set -euo pipefail
+
+# Tracked files: per-file diff hash
+git diff HEAD --name-only 2>/dev/null | while IFS= read -r f; do
+    h=$(git diff HEAD -- "$f" 2>/dev/null | md5sum | cut -d' ' -f1 | cut -c1-12)
+    echo "T:${f}:${h}"
+done
+
+# Untracked files: per-file content hash
+git ls-files --others --exclude-standard 2>/dev/null | grep -vE '(__pycache__|\.pyc|\.pyo|\.orig|\.rej|\.log|\.pytest_cache|^runtime/|^\.)' | while IFS= read -r f; do
+    h=$(cat "$f" 2>/dev/null | md5sum | cut -d' ' -f1 | cut -c1-12)
+    echo "U:${f}:${h}"
+done
+EOF
+}
+
 cmd_diff() {
     _ensure_running
-    docker exec -w /workspace "$CONTAINER" git diff HEAD
+    _doctor_workspace_patch
 }
 
 cmd_patch() {
     _ensure_running
     local patch_file="$PROJECT_DIR/doctor-patch-$(date +%Y%m%d-%H%M%S).patch"
-    docker exec -w /workspace "$CONTAINER" git diff HEAD > "$patch_file"
+    if ! _doctor_workspace_patch > "$patch_file"; then
+        rm -f "$patch_file"
+        echo -e "${RED}Failed to export Doctor workspace changes.${NC}"
+        return 1
+    fi
     if [ -s "$patch_file" ]; then
         echo -e "${GREEN}Patch exported to: $patch_file${NC}"
         echo "Lines changed: $(wc -l < "$patch_file")"
@@ -151,35 +296,45 @@ cmd_patch() {
 
 cmd_apply() {
     _ensure_running
-    
-    # 先生成 diff
-    local diff
-    diff=$(docker exec -w /workspace "$CONTAINER" git diff HEAD)
-    
-    if [ -z "$diff" ]; then
+
+    local patch_file
+    patch_file=$(mktemp "$PROJECT_DIR/doctor-apply-XXXXXX.patch")
+    if ! _doctor_workspace_patch > "$patch_file"; then
+        rm -f "$patch_file"
+        echo -e "${RED}Failed to read Doctor workspace changes.${NC}"
+        return 1
+    fi
+
+    if [ ! -s "$patch_file" ]; then
+        rm -f "$patch_file"
         echo -e "${YELLOW}No changes to apply.${NC}"
         return 0
     fi
-    
+
     echo "📋 Changes to apply to production:"
     echo "─────────────────────────────────"
-    echo "$diff" | head -50
+    sed -n '1,50p' "$patch_file"
     local total_lines
-    total_lines=$(echo "$diff" | wc -l)
+    total_lines=$(wc -l < "$patch_file")
     if [ "$total_lines" -gt 50 ]; then
         echo "... ($total_lines total lines, showing first 50)"
     fi
     echo "─────────────────────────────────"
     echo -e "${RED}⚠️  This will modify PRODUCTION code!${NC}"
     read -p "Apply these changes? [y/N] " confirm
-    
+
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        echo "$diff" | git -C "$PROJECT_DIR" apply -
-        echo -e "${GREEN}✅ Changes applied to production.${NC}"
-        echo -e "${YELLOW}⚠️  Remember to restart Genesis: systemctl --user restart genesis-v4${NC}"
+        if git -C "$PROJECT_DIR" apply --binary "$patch_file"; then
+            echo -e "${GREEN}✅ Changes applied to production.${NC}"
+            echo -e "${YELLOW}⚠️  Remember to restart Genesis: systemctl --user restart genesis-v4${NC}"
+        else
+            rm -f "$patch_file"
+            return 1
+        fi
     else
         echo "Cancelled."
     fi
+    rm -f "$patch_file"
 }
 
 cmd_status() {
@@ -189,7 +344,7 @@ cmd_status() {
             echo \"  Python: \$($PYTHON --version 2>&1)\"
             echo \"  Workspace files: \$(find /workspace -name '*.py' | wc -l) .py files\"
             echo \"  Git status:\"
-            git diff --stat HEAD 2>/dev/null | head -10
+            git status --short 2>/dev/null | head -10
         "
     else
         echo -e "${RED}● Doctor container: stopped${NC}"
@@ -245,16 +400,22 @@ cmd_auto_apply() {
     # 非交互式应用：自进化专用，带 git 安全网
     _ensure_running
 
-    local diff
-    diff=$(docker exec -w /workspace "$CONTAINER" git diff HEAD)
+    local patch_file
+    patch_file=$(mktemp "$PROJECT_DIR/doctor-auto-apply-XXXXXX.patch")
+    if ! _doctor_workspace_patch > "$patch_file"; then
+        rm -f "$patch_file"
+        echo "READ_PATCH_FAILED"
+        return 1
+    fi
 
-    if [ -z "$diff" ]; then
+    if [ ! -s "$patch_file" ]; then
+        rm -f "$patch_file"
         echo "NO_CHANGES"
         return 0
     fi
 
     local lines_changed
-    lines_changed=$(echo "$diff" | wc -l)
+    lines_changed=$(wc -l < "$patch_file")
     echo "PENDING_CHANGES: $lines_changed lines"
 
     # 1. Git commit current state as rollback point
@@ -266,11 +427,13 @@ cmd_auto_apply() {
     echo "ROLLBACK_POINT: $pre_commit"
 
     # 2. Apply the diff
-    if echo "$diff" | git apply - 2>&1; then
+    if git apply --binary "$patch_file" 2>&1; then
         echo "APPLY_OK"
     else
         echo "APPLY_FAILED"
-        git checkout -- . 2>/dev/null
+        git reset --hard HEAD >/dev/null 2>&1
+        git clean -fd >/dev/null 2>&1
+        rm -f "$patch_file"
         return 1
     fi
 
@@ -282,6 +445,7 @@ cmd_auto_apply() {
     new_commit=$(git rev-parse HEAD 2>/dev/null)
     echo "APPLIED_COMMIT: $new_commit"
     echo "APPLY_SUCCESS"
+    rm -f "$patch_file"
 }
 
 cmd_rollback() {
@@ -305,7 +469,10 @@ case "${1:-help}" in
     exec)   shift; cmd_exec "$@" ;;
     python) shift; cmd_python "$@" ;;
     test)   shift; cmd_test "$@" ;;
+    test-diff) cmd_test_diff ;;
     diff)   cmd_diff ;;
+    diff-status) cmd_diff_status ;;
+    file-status) cmd_file_status ;;
     patch)  cmd_patch ;;
     apply)  cmd_apply ;;
     auto-apply) cmd_auto_apply ;;

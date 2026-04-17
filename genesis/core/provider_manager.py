@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 # provider_name -> config attribute that must be truthy for it to be valid
 PROVIDER_KEY_MAP = {
     "xcode": "xcode_api_key",
+    "xcode_backup": "xcode_api_key",
+    "deepseek": "deepseek_api_key",
     "xcode_responses": "xcode_api_key",
 }
 
@@ -43,7 +45,7 @@ class ProviderRouter(LLMProvider):
         self.active_provider = self.providers.get(self.active_provider_name)
         self._preferred_provider_name = self.active_provider_name
         
-        # Fallback if xcode not available
+        # Fallback if no configured provider is available
         if not self.active_provider:
             self.providers['mock'] = MockLLMProvider()
             self._switch_provider('mock')
@@ -68,8 +70,10 @@ class ProviderRouter(LLMProvider):
             except Exception as e:
                 logger.warning(f"Failed to build provider plugin '{name}': {e}")
         
-        self.failover_order = ['xcode']
-        self.active_provider_name = 'xcode'
+        self.failover_order = [
+            name for name in ['xcode', 'xcode_backup', 'deepseek'] if name in self.providers
+        ]
+        self.active_provider_name = self.failover_order[0] if self.failover_order else 'xcode'
                 
     def _switch_provider(self, target: str):
         """Switch active provider"""

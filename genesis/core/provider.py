@@ -5,6 +5,7 @@ LLM 提供商实现
 from typing import List, Dict, Any, Optional
 import logging
 import json
+import os
 import re
 import asyncio
 import time
@@ -83,7 +84,9 @@ class NativeHTTPProvider(BaseLLMProvider):
         stop_sequences: Optional[List[str]] = None,
         provider_name: str = "default",
         use_proxy: bool = False,
-        skip_content_type: bool = False
+        skip_content_type: bool = False,
+        default_headers: Optional[Dict[str, str]] = None,
+        ssl_verify: bool = True,
     ):
         self.api_key = api_key
         self.base_url = base_url.rstrip('/') if base_url else "https://api.deepseek.com/v1"
@@ -95,6 +98,8 @@ class NativeHTTPProvider(BaseLLMProvider):
         self.provider_name = provider_name
         self.use_proxy = use_proxy
         self.skip_content_type = skip_content_type
+        self.default_headers = dict(default_headers or {})
+        self.ssl_verify = ssl_verify
         self._http_client: Optional[httpx.AsyncClient] = None
     
     @staticmethod
@@ -112,8 +117,18 @@ class NativeHTTPProvider(BaseLLMProvider):
     def _get_http_client(self) -> httpx.AsyncClient:
         """延迟初始化的持久 httpx 客户端（复用 TCP 连接池）"""
         if self._http_client is None or self._http_client.is_closed:
+            # Auto-detect proxy from env if use_proxy not explicitly set
+            trust_env = self.use_proxy or bool(
+                os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+                or os.environ.get("https_proxy") or os.environ.get("http_proxy")
+                or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
+            )
             timeout = httpx.Timeout(self.request_timeout, connect=self.connect_timeout)
-            self._http_client = httpx.AsyncClient(timeout=timeout, trust_env=self.use_proxy)
+            self._http_client = httpx.AsyncClient(
+                timeout=timeout,
+                trust_env=trust_env,
+                verify=self.ssl_verify,
+            )
         return self._http_client
 
     def get_default_model(self) -> str:
@@ -174,7 +189,7 @@ class NativeHTTPProvider(BaseLLMProvider):
         """发送聊天请求 (httpx)"""
         messages = self._sanitize_messages(messages)
         model = model or self.default_model
-        if model.startswith("deepseek/"):
+        if model.startswith("deepseek/") and "api.deepseek.com" in (self.base_url or "").lower():
             model = model.replace("deepseek/", "")
             
         url = f"{self.base_url}/chat/completions"
@@ -203,6 +218,8 @@ class NativeHTTPProvider(BaseLLMProvider):
             "Authorization": f"Bearer {self.api_key}",
             "User-Agent": "NanoGenesis/1.0"
         }
+        if self.default_headers:
+            headers.update(self.default_headers)
         if not self.skip_content_type:
             headers["Content-Type"] = "application/json"
         
@@ -345,7 +362,7 @@ class NativeHTTPProvider(BaseLLMProvider):
                     ))
         
         content = message.get('content') or ""
-        reasoning = message.get('reasoning_content') or ""
+        reasoning = message.get('reasoning_content') or message.get('reasoning') or ""
         
         if "<reflection>" in content:
             content = re.sub(r"<reflection>.*?</reflection>", "", content, flags=re.DOTALL)
@@ -425,13 +442,12 @@ class NativeHTTPProvider(BaseLLMProvider):
                             delta = choices[0].get('delta', {})
                             
                             # Reasoning
-                            if 'reasoning_content' in delta:
-                                rc = delta['reasoning_content']
-                                if rc:
-                                    reasoning_content.append(rc)
-                                    if callback:
-                                        res = callback("reasoning", rc)
-                                        if asyncio.iscoroutine(res): await res
+                            rc = delta.get('reasoning_content') or delta.get('reasoning')
+                            if rc:
+                                reasoning_content.append(rc)
+                                if callback:
+                                    res = callback("reasoning", rc)
+                                    if asyncio.iscoroutine(res): await res
                                         
                             # Content
                             if 'content' in delta:

@@ -74,6 +74,7 @@ AUTO_DOCTOR_SYNC_TIMEOUT_SECS = _env_int("GENESIS_AUTO_DOCTOR_SYNC_TIMEOUT_SECS"
 SPIRAL_CONCURRENCY = _env_int("GENESIS_SPIRAL_CONCURRENCY", 3, minimum=1)
 SELF_EVOLUTION_ENABLED = _env_bool("GENESIS_SELF_EVOLUTION", False)
 SELF_EVOLUTION_COOLDOWN = _env_int("GENESIS_SELF_EVOLUTION_COOLDOWN", 10, minimum=3)
+SELF_EVOLUTION_UNTRACKED_COOLDOWN = _env_int("GENESIS_SELF_EVOLUTION_UNTRACKED_COOLDOWN", 5, minimum=2)
 
 AUTO_PROMPT_FIRST = """你是 Genesis 的自主探索者。你的目标不是修 bug 或填空洞——而是基于已有知识，发现 Genesis 还没想到的新可能性。
 
@@ -962,6 +963,74 @@ def _pick_focused_fallback(signals: str, round_num: int = 1) -> str:
     return "继续探索 Genesis 系统，寻找可改进之处并在沙箱中实践"
 
 
+def _compute_cross_round_observations(round_log: list, self_evolution=None) -> dict:
+    """Compute cross-round behavioral observations for C-Phase.
+    These are patterns GP cannot see about its own behavior —
+    not corrections, but objective observations of behavioral blind spots.
+    """
+    if not round_log:
+        return {}
+
+    recent = round_log[-20:]
+    total_rounds = len(round_log)
+
+    # 1. GP write targets: what file categories GP writes to
+    write_categories = {"tests": 0, "scratch": 0, "source": 0, "other": 0}
+    for r in recent:
+        events = r.get("events") or []
+        for evt in events:
+            if evt.get("type") == "tool_result" and evt.get("name") == "write_file":
+                data = evt.get("data") or {}
+                path = str(data.get("path") or data.get("args", {}).get("path") or "")
+                if "/tests/" in path or path.startswith("tests/"):
+                    write_categories["tests"] += 1
+                elif "/scratch/" in path or "/runtime/" in path:
+                    write_categories["scratch"] += 1
+                elif "/genesis/" in path:
+                    write_categories["source"] += 1
+                elif path:
+                    write_categories["other"] += 1
+
+    # 2. Auto-apply success rate
+    apply_attempts = 0
+    apply_successes = 0
+    if self_evolution:
+        apply_attempts = len(self_evolution.apply_history)
+        apply_successes = sum(1 for h in self_evolution.apply_history if h.get("status") == "success")
+
+    # 3. Progress class distribution
+    progress_classes = {}
+    for r in recent:
+        pc = r.get("progress_class", "?")
+        progress_classes[pc] = progress_classes.get(pc, 0) + 1
+
+    # 4. LESSON thematic repetition (from c_phase_summary)
+    lesson_titles = []
+    for r in recent:
+        c_sum = r.get("c_phase_summary") or {}
+        for t in (c_sum.get("lesson_titles") or []):
+            lesson_titles.append(t[:60])
+
+    # 5. Consecutive dry rounds
+    consecutive_dry = recent[-1].get("consecutive_dry", 0) if recent else 0
+
+    # 6. Error rate
+    error_count = sum(1 for r in recent if r.get("progress_class") == "error")
+
+    obs = {
+        "total_rounds": total_rounds,
+        "write_targets": {k: v for k, v in write_categories.items() if v > 0},
+        "auto_apply_attempts": apply_attempts,
+        "auto_apply_successes": apply_successes,
+        "progress_distribution": progress_classes,
+        "lesson_titles_recent": lesson_titles[-10:],
+        "consecutive_dry": consecutive_dry,
+        "error_rounds_in_window": error_count,
+        "window_size": len(recent),
+    }
+    return obs
+
+
 def _compact_round_history(round_log: list, last_n: int = 10) -> str:
     """压缩最近 N 轮历史为紧凑文本，供 planner 审查。"""
     entries = []
@@ -1765,11 +1834,13 @@ class CrossModuleExplorer:
 class SelfEvolution:
     """Tracks Doctor sandbox modifications and auto-applies after cooling period.
 
-    Flow:
-    1. Each round, check `doctor.sh diff` for pending sandbox changes
-    2. If diff content changed → reset cooling counter (GP still actively modifying)
-    3. If diff unchanged for COOLDOWN rounds → GP moved on → safe to apply
-    4. Run `doctor.sh test` → if pass → `doctor.sh auto-apply` → restart service
+    File-level cooldown:
+    - Each file in sandbox is tracked independently with its own stable_count
+    - Tracked files (modified): cooldown = SELF_EVOLUTION_COOLDOWN (default 10)
+    - Untracked files (new): cooldown = SELF_EVOLUTION_UNTRACKED_COOLDOWN (default 5)
+    - Any single file reaching its cooldown triggers apply of ALL changes
+    - This solves the "Yogg never stops" problem: old files cool independently
+      even while Yogg keeps adding new ones
 
     Safety:
     - Git commit before apply (rollback point stored in state)
@@ -1780,10 +1851,13 @@ class SelfEvolution:
     _STATE_PATH = Path("runtime/self_evolution_state.json")
     _RESTART_MARKER = Path("runtime/.self_evolution_restart")
 
-    def __init__(self, cooldown: int = SELF_EVOLUTION_COOLDOWN):
+    def __init__(self, cooldown: int = SELF_EVOLUTION_COOLDOWN,
+                 untracked_cooldown: int = SELF_EVOLUTION_UNTRACKED_COOLDOWN):
         self.cooldown = cooldown
-        self.last_diff_hash: str = ""
-        self.stable_count: int = 0  # 持久化：diff 连续未变的轮数（跨 session）
+        self.untracked_cooldown = untracked_cooldown
+        # File-level cooldown state: {path: {"hash": str, "stable_count": int, "type": "T"|"U"}}
+        self.file_cooldowns: dict = {}
+        # Session state
         self.applied_this_session: bool = False
         self.apply_history: list = []
         self._load()
@@ -1793,8 +1867,7 @@ class SelfEvolution:
             if self._STATE_PATH.exists():
                 data = json.loads(self._STATE_PATH.read_text(encoding="utf-8"))
                 self.apply_history = data.get("apply_history", [])
-                self.last_diff_hash = data.get("last_diff_hash", "")
-                self.stable_count = data.get("stable_count", 0)
+                self.file_cooldowns = data.get("file_cooldowns", {})
         except Exception:
             pass
 
@@ -1802,85 +1875,124 @@ class SelfEvolution:
         try:
             self._STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
             self._STATE_PATH.write_text(json.dumps({
-                "last_diff_hash": self.last_diff_hash,
-                "stable_count": self.stable_count,
+                "file_cooldowns": self.file_cooldowns,
                 "apply_history": self.apply_history[-10:],
             }, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as e:
             logger.warning(f"SelfEvolution state save failed: {e}")
 
     async def check_round(self, round_num: int, channel):
-        """Called each round after GP execution. Manages cooling + auto-apply.
+        """Called each round after GP execution. Manages file-level cooling + auto-apply.
 
-        Uses a persistent stable_count (survives session restarts) instead of
-        session-local round_num to avoid dead-loops when MAX_ROUNDS < cooldown.
+        Each file's cooldown is independent: adding new files doesn't reset
+        the cooldown of existing files that haven't changed.
         """
         if self.applied_this_session:
             return
 
-        # Check sandbox diff
-        has_diff, diff_hash = await self._get_diff_hash()
-        if not has_diff:
+        # Get per-file status from sandbox
+        current_files = await self._get_file_status()
+        if not current_files:
             return  # no pending changes in sandbox
 
-        if diff_hash != self.last_diff_hash:
-            # New/changed modifications — reset cooling
-            self.last_diff_hash = diff_hash
-            self.stable_count = 0
-            self._save()
-            await channel.send(
-                f"🧬 沙箱有新修改 | 冷却计数器重置 → 0/{self.cooldown}"
-            )
-            return
+        # ── Update per-file cooldown state ──
+        cooled_files = []
+        for path, info in current_files.items():
+            ftype = info["type"]  # "T" or "U"
+            fhash = info["hash"]
+            threshold = self.untracked_cooldown if ftype == "U" else self.cooldown
 
-        # Same diff as before — increment persistent counter
-        self.stable_count += 1
+            if path in self.file_cooldowns:
+                old = self.file_cooldowns[path]
+                if old["hash"] == fhash:
+                    # File unchanged → increment stable count
+                    old["stable_count"] = old.get("stable_count", 0) + 1
+                    if old["stable_count"] >= threshold:
+                        cooled_files.append((path, ftype, old["stable_count"]))
+                else:
+                    # File changed → reset
+                    old["hash"] = fhash
+                    old["stable_count"] = 0
+                    old["type"] = ftype
+            else:
+                # New file in sandbox
+                self.file_cooldowns[path] = {
+                    "hash": fhash, "stable_count": 0, "type": ftype
+                }
+
+        # Remove files that are no longer in sandbox (applied/deleted)
+        stale = [p for p in self.file_cooldowns if p not in current_files]
+        for p in stale:
+            del self.file_cooldowns[p]
+
         self._save()
-        if self.stable_count < self.cooldown:
-            if self.stable_count % 3 == 0:  # periodic reminder
-                await channel.send(
-                    f"🧬 冷却中 {self.stable_count}/{self.cooldown}"
-                )
-            return
 
-        # Cooling period complete — try apply
-        await self._try_apply(round_num, channel)
+        # ── Status reporting ──
+        t_files = {p: v for p, v in self.file_cooldowns.items() if v["type"] == "T"}
+        u_files = {p: v for p, v in self.file_cooldowns.items() if v["type"] == "U"}
+        parts = []
+        if t_files:
+            max_t = max(v["stable_count"] for v in t_files.values())
+            parts.append(f"T:{len(t_files)}f max{max_t}/{self.cooldown}")
+        if u_files:
+            max_u = max(v["stable_count"] for v in u_files.values())
+            parts.append(f"U:{len(u_files)}f max{max_u}/{self.untracked_cooldown}")
+        status_text = " | ".join(parts) if parts else ""
 
-    async def _get_diff_hash(self) -> tuple:
-        """Check Doctor sandbox for pending diff. Returns (has_diff, hash)."""
-        import hashlib
+        # Any file cooled → trigger apply
+        if cooled_files:
+            sample = cooled_files[0]
+            await channel.send(
+                f"🧬 冷却完成 | {sample[0]} ({sample[1]}) {sample[2]}轮未变 | {status_text} | 开始自进化应用流程..."
+            )
+            await self._try_apply(round_num, channel)
+        elif status_text:
+            # Periodic reminder every 3 rounds
+            total = sum(v["stable_count"] for v in self.file_cooldowns.values())
+            if total % 3 == 0:
+                await channel.send(f"🧬 冷却中 | {status_text}")
+
+    async def _get_file_status(self) -> dict:
+        """Check Doctor sandbox for per-file status.
+        Returns dict: {path: {"hash": str, "type": "T"|"U"}}
+        """
         try:
-            ok, output = await _run_doctor_sync_command("diff", timeout_secs=30)
+            ok, output = await _run_doctor_sync_command("file-status", timeout_secs=30)
             if not ok:
-                return False, ""
-            # _run_doctor_sync_command prepends "$ ./scripts/doctor.sh diff\n"
-            # Strip that header line; also ignore "(exit=N)" placeholder for empty output
-            lines = output.strip().split("\n", 1)
-            diff_content = lines[1].strip() if len(lines) > 1 else ""
-            # Filter out non-diff content (e.g. "(exit=0)" placeholder)
-            if not diff_content or not diff_content.startswith(("diff ", "---", "+++")):
-                return False, ""
-            return True, hashlib.md5(diff_content.encode()).hexdigest()[:12]
+                return {}
+            result = {}
+            for line in output.strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                # Format: T:path:hash or U:path:hash
+                parts = line.split(":", 2)
+                if len(parts) == 3 and parts[0] in ("T", "U"):
+                    result[parts[1]] = {"hash": parts[2], "type": parts[0]}
+            return result
         except Exception as e:
-            logger.warning(f"SelfEvolution diff check failed: {e}")
-            return False, ""
+            logger.warning(f"SelfEvolution file-status check failed: {e}")
+            return {}
 
     async def _try_apply(self, round_num: int, channel):
         """Test → apply → write restart marker."""
+        t_files = {p: v for p, v in self.file_cooldowns.items() if v["type"] == "T"}
+        u_files = {p: v for p, v in self.file_cooldowns.items() if v["type"] == "U"}
+        max_t = max((v["stable_count"] for v in t_files.values()), default=0)
+        max_u = max((v["stable_count"] for v in u_files.values()), default=0)
         await channel.send(
-            f"🧬 冷却完成 ({self.stable_count} 轮) | 开始自进化应用流程..."
+            f"🧬 冷却完成 | T:{len(t_files)}f max{max_t}/{self.cooldown} U:{len(u_files)}f max{max_u}/{self.untracked_cooldown} | 开始自进化应用流程..."
         )
 
-        # 1. Run tests in sandbox
-        await channel.send("🧬 [1/3] 沙箱测试中...")
-        test_ok, test_output = await _run_doctor_sync_command("test", timeout_secs=180)
+        # 1. Run diff-scoped tests in sandbox (only test files related to current changes)
+        await channel.send("🧬 [1/3] 沙箱测试中（差分范围）...")
+        test_ok, test_output = await _run_doctor_sync_command("test-diff", timeout_secs=180)
         if not test_ok:
             await channel.send(
                 f"🧬 ❌ 沙箱测试失败，放弃本次应用\n```\n{test_output[-500:]}\n```"
             )
             # Reset cooling — GP might fix the issue
-            self.last_diff_hash = ""
-            self.stable_count = 0
+            self.file_cooldowns.clear()
             self._save()
             return
 
@@ -1903,7 +2015,7 @@ class SelfEvolution:
             await channel.send(
                 f"🧬 ❌ 应用失败\n```\n{apply_output[-500:]}\n```"
             )
-            self.last_diff_hash = ""
+            self.file_cooldowns.clear()
             self._save()
             return
 
@@ -1925,8 +2037,7 @@ class SelfEvolution:
             "rollback_commit": rollback_commit,
             "applied_commit": applied_commit,
         })
-        self.last_diff_hash = ""  # 沙箱已 reset，diff 应为空
-        self.stable_count = 0
+        self.file_cooldowns.clear()  # 沙箱已 reset，diff 应为空
         self._save()
 
         # Write restart marker for yogg_auto.py crash-loop detection
@@ -2514,6 +2625,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 loop_config={
                     "disable_multi_g": True,
                     "gp_unblock_tools": ["record_lesson_node", "record_context_node"],
+                    "cross_round_observations": _compute_cross_round_observations(round_log, self_evolution),
                 },
                 initial_knowledge_state=last_knowledge_state or None,
             )

@@ -18,6 +18,14 @@ class GlobalConfig:
     # API Keys
     xcode_api_key: Optional[str] = None
     xcode_api_keys: List[str] = None
+    xcode_base_url: Optional[str] = None
+    xcode_backup_base_url: Optional[str] = None
+    xcode_host_header: Optional[str] = None
+    xcode_backup_host_header: Optional[str] = None
+    xcode_ssl_verify: bool = True
+    xcode_backup_ssl_verify: bool = True
+    xcode_model: str = "gpt-5.4"
+    deepseek_api_key: Optional[str] = None
     
     tavily_api_key: Optional[str] = None
     
@@ -112,8 +120,19 @@ class ConfigManager:
     _KEY_MAP = {
         "XCODE_API_KEY": "xcode_api_key",
         "XCODE_API_KEYS": "xcode_api_keys",
+        "XCODE_BASE_URL": "xcode_base_url",
+        "XCODE_BACKUP_BASE_URL": "xcode_backup_base_url",
+        "XCODE_HOST_HEADER": "xcode_host_header",
+        "XCODE_BACKUP_HOST_HEADER": "xcode_backup_host_header",
+        "XCODE_SSL_VERIFY": "xcode_ssl_verify",
+        "XCODE_BACKUP_SSL_VERIFY": "xcode_backup_ssl_verify",
+        "XCODE_MODEL": "xcode_model",
         "AIXJ_API_KEY": "xcode_api_key",
         "AIXJ_API_KEYS": "xcode_api_keys",
+        "AIXJ_BASE_URL": "xcode_base_url",
+        "AIXJ_BACKUP_BASE_URL": "xcode_backup_base_url",
+        "AIXJ_MODEL": "xcode_model",
+        "DEEPSEEK_API_KEY": "deepseek_api_key",
         "TAVILY_API_KEY": "tavily_api_key",
         "LANGFUSE_PUBLIC_KEY": "langfuse_public_key",
         "LANGFUSE_SECRET_KEY": "langfuse_secret_key",
@@ -156,6 +175,8 @@ class ConfigManager:
                 setattr(self._config, "xcode_api_keys", keys)
                 if keys and not self._config.xcode_api_key:
                     self._config.xcode_api_key = keys[0]
+            elif upper_key in ("XCODE_SSL_VERIFY", "XCODE_BACKUP_SSL_VERIFY"):
+                setattr(self._config, attr, val.strip().lower() not in ("0", "false", "no", "off", ""))
             else:
                 setattr(self._config, attr, val)
             return
@@ -192,8 +213,8 @@ class ConfigManager:
 
     def _validate(self):
         """验证必要配置"""
-        if not self._config.xcode_api_key:
-            logger.warning("⚠️ 未检测到 xcode API Key")
+        if not self._config.xcode_api_key and not self._config.deepseek_api_key:
+            logger.warning("⚠️ 未检测到 xcode / deepseek API Key")
         
         if not self._config.http_proxy and not self._config.https_proxy:
             # 检查是否有 curl

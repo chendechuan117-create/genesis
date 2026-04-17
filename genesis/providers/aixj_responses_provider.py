@@ -32,7 +32,9 @@ class AIXJResponsesProvider(NativeHTTPProvider):
         stop_sequences: Optional[List[str]] = None,
         provider_name: str = "aixj_responses",
         use_proxy: bool = False,
-        skip_content_type: bool = False
+        skip_content_type: bool = False,
+        default_headers: Optional[Dict[str, str]] = None,
+        ssl_verify: bool = True,
     ):
         super().__init__(
             api_key=api_key,
@@ -44,7 +46,9 @@ class AIXJResponsesProvider(NativeHTTPProvider):
             stop_sequences=stop_sequences,
             provider_name=provider_name,
             use_proxy=use_proxy,
-            skip_content_type=skip_content_type
+            skip_content_type=skip_content_type,
+            default_headers=default_headers,
+            ssl_verify=ssl_verify,
         )
     
     async def chat(

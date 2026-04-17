@@ -290,6 +290,11 @@ class CPhaseMixin:
             if sig_text:
                 parts.append(f"[任务签名]\n{sig_text}")
 
+        # 9. 跨轮行为观测（GP 自身无法察觉的行为模式）
+        cross_obs = self._build_cross_round_observations()
+        if cross_obs:
+            parts.append(f"[跨轮行为观测 — GP 自身无法察觉的模式]\n{cross_obs}")
+
         return "\n\n".join(parts)
 
     def _query_vault_related_knowledge(self, g_final_response: str) -> str:
@@ -327,6 +332,62 @@ class CPhaseMixin:
             logger.debug(f"Vault related query failed (non-fatal): {e}")
             return ""
 
+    def _build_cross_round_observations(self) -> str:
+        """Format cross-round behavioral observations from loop_config.
+        These are objective patterns GP cannot see about its own behavior.
+        """
+        obs = getattr(self, 'loop_config', {}).get("cross_round_observations")
+        if not obs:
+            return ""
+
+        lines = []
+        total = obs.get("total_rounds", 0)
+        if total:
+            lines.append(f"  总轮次: {total}")
+
+        # Write target distribution
+        wt = obs.get("write_targets")
+        if wt:
+            total_writes = sum(wt.values())
+            parts = [f"{k}={v}" for k, v in sorted(wt.items(), key=lambda x: -x[1])]
+            lines.append(f"  GP 写入目标分布 ({total_writes}次): {', '.join(parts)}")
+            if wt.get("source", 0) == 0 and total_writes > 5:
+                lines.append(f"  ⚠ GP 从未修改过 genesis/ 源文件")
+
+        # Auto-apply
+        attempts = obs.get("auto_apply_attempts", 0)
+        successes = obs.get("auto_apply_successes", 0)
+        if attempts > 0:
+            lines.append(f"  auto-apply: {successes}/{attempts} 成功")
+            if successes == 0 and attempts >= 3:
+                lines.append(f"  ⚠ auto-apply 连续 {attempts} 次失败")
+
+        # Progress distribution
+        pd = obs.get("progress_distribution")
+        if pd:
+            parts = [f"{k}={v}" for k, v in sorted(pd.items(), key=lambda x: -x[1])]
+            lines.append(f"  进展分布 (近{obs.get('window_size', '?')}轮): {', '.join(parts)}")
+
+        # LESSON thematic repetition
+        lt = obs.get("lesson_titles_recent")
+        if lt and len(lt) >= 3:
+            lines.append(f"  近期 LESSON 标题 (最后{len(lt)}条):")
+            for t in lt[-5:]:
+                lines.append(f"    - {t}")
+
+        # Consecutive dry
+        cd = obs.get("consecutive_dry", 0)
+        if cd >= 3:
+            lines.append(f"  连续无实质进展轮次: {cd}")
+
+        # Error rounds
+        er = obs.get("error_rounds_in_window", 0)
+        ws = obs.get("window_size", 1)
+        if er > 0:
+            lines.append(f"  错误轮次: {er}/{ws}")
+
+        return "\n".join(lines) if lines else ""
+
     async def _run_reflection(self, g_final_response: str) -> Dict[str, Any]:
         """C 的核心：内容级反思。
 
@@ -354,7 +415,10 @@ class CPhaseMixin:
             "2. GP 的发现跟 Vault 已有知识是矛盾、重复、还是扩展？"
             "如果矛盾，用 contradicts 字段指向旧节点。\n"
             "3. 从 GP 的具体发现中，能提炼出什么更一般化的、可跨场景复用的原则？\n"
-            "4. GP 的视野之外还有什么相关但未触及的重要方向？\n\n"
+            "4. GP 的视野之外还有什么相关但未触及的重要方向？\n"
+            "5. 从跨轮行为观测中，你观察到什么 GP 自身无法察觉的行为规律？"
+            "GP 在流里看不到自己重复了什么、遗漏了什么类别、卡在了什么模式——"
+            "这些盲区本身就是值得记录的发现。\n\n"
             "规则：\n"
             "- 如果 GP 已经通过 record_lesson_node 记录了某个发现，不要重复记录同样的内容\n"
             "- 只记录 GP 遗漏的、更深层的、或跨领域的洞察\n"
