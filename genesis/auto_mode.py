@@ -2045,22 +2045,19 @@ class SelfEvolution:
                 await channel.send(f"🧬 冷却中 | {status_text}")
 
     async def _get_diff_status_hash(self) -> str:
-        """Get combined diff-status hash from sandbox (ground truth).
-        Returns TRACKED_HASH+UNTRACKED_HASH string, or '' on failure.
+        """Get tracked diff hash from sandbox (ground truth for outcome detection).
+        Only uses TRACKED_HASH — untracked files are GP's probe/scratch files
+        that change every round and would make outcome_detected always True.
         """
         try:
             ok, output = await _run_doctor_sync_command("diff-status", timeout_secs=30)
             if not ok:
                 return ""
-            tracked = ""
-            untracked = ""
             for line in output.strip().split("\n"):
                 line = line.strip()
                 if line.startswith("TRACKED_HASH:"):
-                    tracked = line.split(":", 1)[1]
-                elif line.startswith("UNTRACKED_HASH:"):
-                    untracked = line.split(":", 1)[1]
-            return f"{tracked}|{untracked}"
+                    return line.split(":", 1)[1]
+            return ""
         except Exception as e:
             logger.warning(f"SelfEvolution diff-status check failed: {e}")
             return ""
