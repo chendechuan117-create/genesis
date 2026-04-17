@@ -890,9 +890,7 @@ def _classify_auto_round_progress(response, round_events, kb_changed, frontier_s
         for name in [entry.get("name", "")]
     )
     sandbox_source_modified = bool(
-        self_evolution and any(
-            v.get("type") == "T" for v in self_evolution.file_cooldowns.values()
-        )
+        self_evolution and self_evolution.new_source_this_round
     ) if self_evolution else False
     outcome_detected = bool(source_written or sandbox_source_modified)
 
@@ -1941,6 +1939,8 @@ class SelfEvolution:
         # Session state
         self.applied_this_session: bool = False
         self.apply_history: list = []
+        # Whether GP modified source files in sandbox THIS round (for outcome_detected)
+        self.new_source_this_round: bool = False
         self._load()
 
     def _load(self):
@@ -1978,6 +1978,7 @@ class SelfEvolution:
 
         # ── Update per-file cooldown state ──
         cooled_files = []
+        new_source = False  # Track if GP modified source files this round
         for path, info in current_files.items():
             ftype = info["type"]  # "T" or "U"
             fhash = info["hash"]
@@ -1991,15 +1992,21 @@ class SelfEvolution:
                     if old["stable_count"] >= threshold:
                         cooled_files.append((path, ftype, old["stable_count"]))
                 else:
-                    # File changed → reset
+                    # File changed → reset (GP modified this file this round)
                     old["hash"] = fhash
                     old["stable_count"] = 0
                     old["type"] = ftype
+                    if ftype == "T":
+                        new_source = True
             else:
                 # New file in sandbox
                 self.file_cooldowns[path] = {
                     "hash": fhash, "stable_count": 0, "type": ftype
                 }
+                if ftype == "T":
+                    new_source = True
+
+        self.new_source_this_round = new_source
 
         # Remove files that are no longer in sandbox (applied/deleted)
         stale = [p for p in self.file_cooldowns if p not in current_files]
