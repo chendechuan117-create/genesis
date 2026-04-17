@@ -179,14 +179,14 @@ cmd_test_diff() {
             while IFS= read -r tf; do
                 test_files+=("$tf")
             done < <(docker exec -w /workspace "$CONTAINER" bash -c "
-                grep -rl 'import.*${modbase}\|from.*${modbase}' tests/ 2>/dev/null | head -5
+                grep -rl 'import.*${modbase}\|from.*${modbase}' tests/ 2>/dev/null | grep -vE '__pycache__|\.pyc' | head -5
             " 2>/dev/null)
         fi
     done <<< "$changed"
 
     # Deduplicate
     local unique_tests
-    unique_tests=$(printf '%s\n' "${test_files[@]}" 2>/dev/null | sort -u | grep -v '^$')
+    unique_tests=$(printf '%s\n' "${test_files[@]}" 2>/dev/null | sort -u | grep -vE '^$|__pycache__|\.pyc' | grep '\.py$')
 
     if [ -z "$unique_tests" ]; then
         echo "🧪 No test files found for diff changes — passing by default"
