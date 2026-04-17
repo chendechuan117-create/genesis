@@ -818,7 +818,7 @@ def _is_source_path(path: str) -> bool:
     return ("/genesis/" in p and "/tests/" not in p and "/runtime/" not in p and "/scratch/" not in p)
 
 
-def _classify_auto_round_progress(response, round_events, kb_changed, frontier_state=None, is_error=False, self_evolution=None):
+def _classify_auto_round_progress(response, round_events, kb_changed, frontier_state=None, is_error=False, outcome_detected=False):
     if is_error:
         signals = ["progress=error"]
         response_text = (response or "").strip()
@@ -861,27 +861,22 @@ def _classify_auto_round_progress(response, round_events, kb_changed, frontier_s
     stable_issue = bool(frontier_state and frontier_state.get("candidate_issue")
                         and frontier_state.get("candidate_issue") not in ("未提取", "未从上轮回复中提取到稳定问题定义"))
     reanchor_required = bool(frontier_state and frontier_state.get("reanchor_required"))
-    gp_wrote_kb = kb_changed and any(name == "record_lesson_node" for name in tool_names)
-    strong_progress = bool(gp_wrote_kb or touched_files or ran_tests or inspected_diff)
-    evidence_progress = bool(not strong_progress and result_events)
-    soft_progress = bool(not strong_progress and not evidence_progress and (response_text or stable_issue))
-    if strong_progress:
-        progress_class = "strong"
-    elif evidence_progress:
-        progress_class = "evidence"
-    elif soft_progress:
+    # ── Progress classification ──
+    # outcome_detected = ground truth from diff-status snapshot comparison (passed in)
+    # This replaces all indirect signal synthesis (new_source_this_round, cooldowns, etc.)
+    if outcome_detected:
+        progress_class = "evidence"  # sandbox diff changed → real durable outcome
+    elif touched_files or ran_tests or inspected_diff:
+        progress_class = "strong"   # GP was active but sandbox diff unchanged
+    elif result_events:
+        progress_class = "evidence" if not (touched_files or ran_tests) else "strong"
+    elif response_text or stable_issue:
         progress_class = "soft"
     else:
         progress_class = "idle"
     activity_detected = progress_class in ("strong", "evidence")
 
-    # Outcome-based detection: did GP produce durable value this round?
-    # activity_detected is inflated by probe writing (GP always appears active).
-    # gp_wrote_kb is ALSO activity — GP decides to write LESSON, it's not an outcome signal.
-    # Real outcome: GP modified source code in sandbox (detectable via SelfEvolution cooldowns).
-    # GP uses `shell doctor.sh exec` to modify files, NOT write_file — so we can't check
-    # tool call paths. Instead, check if SelfEvolution has tracked source files (type=T)
-    # in its cooldowns — those only appear when GP modified genesis/ source files in sandbox.
+    # Source-written signal (for display only, not for outcome_detected)
     source_written = any(
         name in ("write_file", "edit_file", "replace_in_file") and _is_source_path(
             str((entry.get("data") or {}).get("path") or (entry.get("args") or {}).get("path") or "")
@@ -889,10 +884,6 @@ def _classify_auto_round_progress(response, round_events, kb_changed, frontier_s
         for entry in result_events
         for name in [entry.get("name", "")]
     )
-    sandbox_source_modified = bool(
-        self_evolution and self_evolution.new_source_this_round
-    ) if self_evolution else False
-    outcome_detected = bool(source_written or sandbox_source_modified)
 
     signals = [f"progress={progress_class}"]
     if kb_changed: signals.append("kb")
@@ -905,6 +896,7 @@ def _classify_auto_round_progress(response, round_events, kb_changed, frontier_s
     if reanchor_required: signals.append("reanchor")
     if response_text: signals.append(f"reply={len(response_text)}c")
     if progress_class == "idle": signals.append("no_external_progress")
+    if outcome_detected: signals.append("outcome✓")
     return {"activity_detected": activity_detected, "activity_summary": " | ".join(signals), "progress_class": progress_class, "outcome_detected": outcome_detected}
 
 
@@ -1939,8 +1931,8 @@ class SelfEvolution:
         # Session state
         self.applied_this_session: bool = False
         self.apply_history: list = []
-        # Whether GP modified source files in sandbox THIS round (for outcome_detected)
-        self.new_source_this_round: bool = False
+        # Diff-status snapshot for outcome detection (ground truth)
+        self._pre_round_snapshot: str = ""
         self._load()
 
     def _load(self):
@@ -1962,30 +1954,12 @@ class SelfEvolution:
         except Exception as e:
             logger.warning(f"SelfEvolution state save failed: {e}")
 
-    async def pre_check_round(self):
-        """Lightweight pre-check: detect if GP modified source files in sandbox THIS round.
-        Sets new_source_this_round flag. Called BEFORE _classify_auto_round_progress
-        so outcome_detected reads the correct value for the current round.
+    async def snapshot_before_round(self):
+        """Take diff-status snapshot BEFORE GP runs. Compared with post-round
+        snapshot in outcome_changed_since_snapshot() to detect real changes.
+        Uses doctor.sh diff-status (ground truth) instead of indirect signals.
         """
-        self.new_source_this_round = False
-        if self.applied_this_session:
-            return
-        current_files = await self._get_file_status()
-        if not current_files:
-            return
-        for path, info in current_files.items():
-            ftype = info["type"]
-            if ftype != "T":
-                continue
-            if path not in self.file_cooldowns:
-                # New T-type file in sandbox → GP created source file
-                self.new_source_this_round = True
-                break
-            old = self.file_cooldowns[path]
-            if old["hash"] != info["hash"]:
-                # Existing T-type file hash changed → GP modified source file
-                self.new_source_this_round = True
-                break
+        self._pre_round_snapshot = await self._get_diff_status_hash()
 
     async def check_round(self, round_num: int, channel):
         """Called each round after GP execution. Manages file-level cooling + auto-apply.
@@ -2003,7 +1977,6 @@ class SelfEvolution:
 
         # ── Update per-file cooldown state ──
         cooled_files = []
-        new_source = False  # Track if GP modified source files this round
         for path, info in current_files.items():
             ftype = info["type"]  # "T" or "U"
             fhash = info["hash"]
@@ -2021,22 +1994,27 @@ class SelfEvolution:
                     old["hash"] = fhash
                     old["stable_count"] = 0
                     old["type"] = ftype
-                    if ftype == "T":
-                        new_source = True
             else:
                 # New file in sandbox
                 self.file_cooldowns[path] = {
                     "hash": fhash, "stable_count": 0, "type": ftype
                 }
-                if ftype == "T":
-                    new_source = True
-
-        self.new_source_this_round = new_source
 
         # Remove files that are no longer in sandbox (applied/deleted)
         stale = [p for p in self.file_cooldowns if p not in current_files]
         for p in stale:
             del self.file_cooldowns[p]
+
+        # ── Stable count cap: prevent permanent stall ──
+        # If any file's stable_count exceeds 3x its threshold, apply will never
+        # succeed (test infrastructure broken). Reset all cooldowns to unblock.
+        max_stable = max((v.get("stable_count", 0) for v in self.file_cooldowns.values()), default=0)
+        if max_stable >= self.cooldown * 3:
+            logger.warning(f"SelfEvolution: stable_count={max_stable} exceeds 3x threshold ({self.cooldown}), resetting cooldowns")
+            await channel.send(
+                f"🧬 ⚠️ stable_count={max_stable} 超过阈值{self.cooldown}的3倍，重置冷却（沙箱测试基础设施不匹配）"
+            )
+            self.file_cooldowns.clear()
 
         self._save()
 
@@ -2064,6 +2042,38 @@ class SelfEvolution:
             total = sum(v["stable_count"] for v in self.file_cooldowns.values())
             if total % 3 == 0:
                 await channel.send(f"🧬 冷却中 | {status_text}")
+
+    async def _get_diff_status_hash(self) -> str:
+        """Get combined diff-status hash from sandbox (ground truth).
+        Returns TRACKED_HASH+UNTRACKED_HASH string, or '' on failure.
+        """
+        try:
+            ok, output = await _run_doctor_sync_command("diff-status", timeout_secs=30)
+            if not ok:
+                return ""
+            tracked = ""
+            untracked = ""
+            for line in output.strip().split("\n"):
+                line = line.strip()
+                if line.startswith("TRACKED_HASH:"):
+                    tracked = line.split(":", 1)[1]
+                elif line.startswith("UNTRACKED_HASH:"):
+                    untracked = line.split(":", 1)[1]
+            return f"{tracked}|{untracked}"
+        except Exception as e:
+            logger.warning(f"SelfEvolution diff-status check failed: {e}")
+            return ""
+
+    async def outcome_changed_since_snapshot(self) -> bool:
+        """Compare current diff-status with pre-round snapshot.
+        Returns True if sandbox state changed since round start (ground truth).
+        """
+        if self.applied_this_session:
+            return False
+        current = await self._get_diff_status_hash()
+        if not current and not self._pre_round_snapshot:
+            return False  # both empty = no sandbox or no changes
+        return current != self._pre_round_snapshot
 
     async def _get_file_status(self) -> dict:
         """Check Doctor sandbox for per-file status.
@@ -2376,9 +2386,12 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             stop_reason = f"reached {AUTO_MAX_ROUNDS} round cap"
             break
 
-        # Reset SelfEvolution per-round flag before any classification reads it
+        # Take diff-status snapshot BEFORE GP runs (ground truth for outcome detection)
         if self_evolution:
-            self_evolution.new_source_this_round = False
+            try:
+                await self_evolution.snapshot_before_round()
+            except Exception:
+                pass
 
         _reset_provider(agent)
         node_status_before = _get_node_count_status()
@@ -2762,7 +2775,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             progress_profile = _classify_auto_round_progress(
                 response=round_record.get("response_full") or round_record.get("response_preview") or "",
                 round_events=round_events, kb_changed=kb_changed, frontier_state=frontier_state,
-                self_evolution=self_evolution,
+                outcome_detected=False,  # interrupted round — GP didn't complete
             )
             consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             reanchor_stop_reason = _derive_reanchor_stop_reason(
@@ -2837,18 +2850,18 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 if round_num == 1 and SELF_EVOLUTION_ENABLED:
                     SelfEvolution.clear_restart_marker()
             knowledge_state_text = _format_knowledge_state(knowledge_state)
-            # Pre-check sandbox source changes BEFORE classification
-            # so new_source_this_round is accurate for this round
-            if self_evolution:
+            # Ground truth: did sandbox diff change since round start?
+            _outcome = False
+            if self_evolution and not round_is_error:
                 try:
-                    await self_evolution.pre_check_round()
+                    _outcome = await self_evolution.outcome_changed_since_snapshot()
                 except Exception:
                     pass
             progress_profile = _classify_auto_round_progress(
                 response=response, round_events=round_events,
                 kb_changed=kb_changed if not round_is_error else False,
                 frontier_state=frontier_state, is_error=round_is_error,
-                self_evolution=self_evolution,
+                outcome_detected=_outcome,
             )
             consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             last_knowledge_state = knowledge_state
@@ -2920,7 +2933,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             progress_profile = _classify_auto_round_progress(
                 response="", round_events=round_events,
                 kb_changed=kb_changed, frontier_state=frontier_state,
-                self_evolution=self_evolution,
+                outcome_detected=False,  # timeout — GP didn't complete
             )
             consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             reanchor_stop_reason = _derive_reanchor_stop_reason(
@@ -2972,7 +2985,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             progress_profile = _classify_auto_round_progress(
                 response="", round_events=round_events,
                 kb_changed=kb_changed, frontier_state=frontier_state,
-                self_evolution=self_evolution,
+                outcome_detected=False,  # exception — GP didn't complete
             )
             consecutive_dry = 0 if progress_profile.get("outcome_detected") else consecutive_dry + 1
             reanchor_stop_reason = _derive_reanchor_stop_reason(
