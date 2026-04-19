@@ -316,7 +316,7 @@ def _get_auto_signals(round_num: int = 1, session_shown_voids: set | None = None
                 "ORDER BY usage_fail_count DESC LIMIT 5"
             ).fetchall()
             if failing_rows:
-                lines = ["[实践中反复失败的知识 — 失败>成功，需要修正或重写]"]
+                lines = ["[实践中反复失败的知识 — 失败次数>成功次数]"]
                 for r in failing_rows:
                     nid = r['node_id']
                     if session_shown_nodes and nid in session_shown_nodes:
@@ -369,7 +369,7 @@ def _get_auto_signals(round_num: int = 1, session_shown_voids: set | None = None
                 "ORDER BY created_at DESC LIMIT 3"
             ).fetchall()
             if untested_rows:
-                lines = ["[未经实践的新知识 — 优先尝试挂载]"]
+                lines = ["[未经实践的新知识 — 从未在实际任务中使用过]"]
                 for r in untested_rows:
                     lines.append(f"  {r['node_id']}: {r['title']} <{r['type']}>")
                 sections.append("\n".join(lines))
@@ -383,9 +383,8 @@ def _get_auto_signals(round_num: int = 1, session_shown_voids: set | None = None
                 "ORDER BY kn.created_at DESC LIMIT 5"
             ).fetchall()
             if lesson_c_rows:
-                lines = ["[⚠ C-Phase 跨轮洞察 — 优先级最高 — GP 自身无法察觉的行为盲区]",
-                         "这些洞察来自跨轮行为统计，不是单轮观察。如果这里说你在某模式中卡住，",
-                         "你必须改变行为，不能继续同方向。"]
+                lines = ["[C-Phase 跨轮洞察 — GP 自身无法察觉的行为盲区]",
+                         "这些洞察来自跨轮行为统计，不是单轮观察。如果这里说你在某模式中卡住。"]
                 for r in lesson_c_rows:
                     content_preview = (r['full_content'] or '')[:500]
                     lines.append(f"  {r['node_id']}: {r['title']}")
@@ -1002,7 +1001,7 @@ def _pick_focused_fallback(signals: str, round_num: int = 1) -> str:
             current_section = "void"
         elif "待验证" in line or "置信度" in line:
             current_section = "low_conf"
-        elif "C-Phase" in line or "DISCOVERY" in line or "未经实践的新知识" in line or "优先尝试挂载" in line:
+        elif "C-Phase" in line or "DISCOVERY" in line or "未经实践的新知识" in line or "从未在实际任务中使用过" in line:
             current_section = "c_phase"
         elif line.startswith("  ") and ":" in line:
             # 缩进行 = 某 section 下的具体条目
@@ -2512,7 +2511,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
         signals = _get_auto_signals(round_num=round_num, session_shown_voids=session_shown_voids, session_shown_nodes=session_shown_nodes)
         # Inject apply-failure feedback from previous round into signals
         if _pending_apply_feedback:
-            _aw = "\n\n[⚠️ 上一轮自进化apply被拒(沙箱测试失败)] " + _pending_apply_feedback[:200] + " 不要继续写同类型探针,转向修复测试或换方向"
+            _aw = "\n\n[⚠️ 上一轮自进化apply被拒(沙箱测试失败)] " + _pending_apply_feedback[:200] + ""
             signals += _aw
             _pending_apply_feedback = None
         _struct = [topic_tracker.format_for_prompt(), action_history.format_for_prompt()]
