@@ -96,6 +96,7 @@ AUTO_PROMPT_FIRST = """你是 Genesis 的自主探索者。你的目标不是修
 ## 沙箱规则（严格遵守）
 - **禁止直接修改 genesis/ 目录下的任何 .py 源文件**——那是正在运行的本体
 - 所有代码修改必须通过 Doctor 沙箱执行：`shell doctor.sh exec <command>`
+- **多行脚本用 `doctor.sh run`**：`shell doctor.sh run <<'SCRIPT' ... SCRIPT` — 绕过宿主 shell 变量展开，$VAR 只在容器内解析
 - 修改后在沙箱中测试：`shell doctor.sh test`
 - 查看修改差异：`shell doctor.sh diff`
 - 你可以自由读取本体代码（read_file）用于诊断，但写入只能进沙箱
@@ -125,6 +126,7 @@ AUTO_PROMPT_CONTINUE = """继续自主探索。上一轮的结论是这一轮的
 ## 沙箱规则（严格遵守）
 - **禁止直接修改 genesis/ 目录下的任何 .py 源文件**——那是正在运行的本体
 - 所有代码修改必须通过 Doctor 沙箱执行：`shell doctor.sh exec <command>`
+- **多行脚本用 `doctor.sh run`**：`shell doctor.sh run <<'SCRIPT' ... SCRIPT` — 绕过宿主 shell 变量展开，$VAR 只在容器内解析
 - 修改后在沙箱中测试：`shell doctor.sh test`
 - 查看修改差异：`shell doctor.sh diff`
 - 你可以自由读取本体代码（read_file）用于诊断，但写入只能进沙箱
@@ -137,7 +139,7 @@ AUTO_DEFAULT_DIRECTIVE = (
     "基于 Genesis 的元信息系统（知识库、经验图谱、Arena），探索 Genesis 系统的新可能性。"
     "方法：读已有知识 → 提出假设 → 在 Doctor 沙箱中实验 → 记录发现。"
     "方向：不局限于修 bug——可以探索架构改进、新机制、性能优化、知识利用的新方式。"
-    "所有代码修改必须在 Doctor 沙箱中进行（doctor.sh exec），严禁直接改本体源码。"
+    "所有代码修改必须在 Doctor 沙箱中进行（单行用 doctor.sh exec，多行脚本用 doctor.sh run），严禁直接改本体源码。"
     "每轮只做一件事，做到位。追求让人意想不到的发现。"
 )
 
@@ -229,7 +231,14 @@ async def _run_doctor_sync_command(*args: str, timeout_secs: int = AUTO_DOCTOR_S
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
     except asyncio.TimeoutError:
         proc.kill()
-        await proc.communicate()
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=10)
+        except asyncio.TimeoutError:
+            # 子进程可能进入 D 状态（不可杀），communicate 永远等不到
+            # 强制关闭 stdout transport 防止 FD 泄漏，放弃回收子进程
+            logger.warning(f"doctor.sh {' '.join(args)} unkillable after SIGKILL (D state?), abandoning process")
+            if proc.stdout:
+                proc.stdout.close()
         return False, f"$ ./scripts/doctor.sh {' '.join(args)}\n[timeout after {timeout_secs}s]"
     output = stdout.decode("utf-8", errors="replace").strip()
     header = f"$ ./scripts/doctor.sh {' '.join(args)}"
@@ -368,17 +377,18 @@ def _get_auto_signals(round_num: int = 1, session_shown_voids: set | None = None
 
             # ── 4. C-Phase 跨轮洞察：LESSON_C_ 节点（C 观察到 GP 自身看不到的行为规律）──
             lesson_c_rows = conn.execute(
-                "SELECT node_id, title, content FROM knowledge_nodes "
-                "WHERE node_id LIKE 'LESSON_C_%' AND type = 'LESSON' "
-                "AND node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS') "
-                "ORDER BY created_at DESC LIMIT 5"
+                "SELECT kn.node_id, kn.title, nc.full_content FROM knowledge_nodes kn "
+                "LEFT JOIN node_contents nc ON kn.node_id = nc.node_id "
+                "WHERE kn.node_id LIKE 'LESSON_C_%' AND kn.type = 'LESSON' "
+                "AND kn.node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS') "
+                "ORDER BY kn.created_at DESC LIMIT 5"
             ).fetchall()
             if lesson_c_rows:
                 lines = ["[⚠ C-Phase 跨轮洞察 — 优先级最高 — GP 自身无法察觉的行为盲区]",
                          "这些洞察来自跨轮行为统计，不是单轮观察。如果这里说你在某模式中卡住，",
                          "你必须改变行为，不能继续同方向。"]
                 for r in lesson_c_rows:
-                    content_preview = (r['content'] or '')[:150]
+                    content_preview = (r['full_content'] or '')[:500]
                     lines.append(f"  {r['node_id']}: {r['title']}")
                     if content_preview:
                         lines.append(f"    → {content_preview}")
@@ -993,9 +1003,9 @@ def _pick_focused_fallback(signals: str, round_num: int = 1) -> str:
             current_section = "void"
         elif "待验证" in line or "置信度" in line:
             current_section = "low_conf"
-        elif "C-Phase" in line or "DISCOVERY" in line:
+        elif "C-Phase" in line or "DISCOVERY" in line or "未经实践的新知识" in line or "优先尝试挂载" in line:
             current_section = "c_phase"
-        elif line.strip()[:2] == "  " and ":" in line:
+        elif line.startswith("  ") and ":" in line:
             # 缩进行 = 某 section 下的具体条目
             item = line.strip()
             if current_section == "arena":
@@ -1006,13 +1016,16 @@ def _pick_focused_fallback(signals: str, round_num: int = 1) -> str:
                 void_items.append(item)
             elif current_section == "c_phase":
                 low_conf_items.append(item)  # C-Phase 产出也可作为验证方向
-    # 优先级：Arena 翻车 > VOID 空洞 > 通用探索（不再轮换低置信）
+    # 优先级：Arena 翻车 > VOID 空洞 > 低置信/C-Phase > 通用探索
     if arena_items:
         pick = arena_items[0]
         return f"聚焦验证这条翻车知识并改进: {pick[:120]}"
     if void_items:
         pick = void_items[round_num % max(len(void_items), 1)]
         return f"调查这个知识空洞并尝试填充: {pick[:120]}"
+    if low_conf_items:
+        pick = low_conf_items[round_num % max(len(low_conf_items), 1)]
+        return f"优先验证并利用这条 C-Phase 新知识: {pick[:120]}"
     return "继续探索 Genesis 系统，寻找可改进之处并在沙箱中实践"
 
 
@@ -2092,11 +2105,13 @@ class SelfEvolution:
     async def _get_file_status(self) -> dict:
         """Check Doctor sandbox for per-file status.
         Returns dict: {path: {"hash": str, "type": "T"|"U"}}
+
+        NOTE: doctor.sh file-status uses pipefail + while-read pipe, which can
+        exit with code=1 even when output is perfectly valid (read returns non-zero
+        when input is exhausted). We parse output content regardless of returncode.
         """
         try:
-            ok, output = await _run_doctor_sync_command("file-status", timeout_secs=30)
-            if not ok:
-                return {}
+            _, output = await _run_doctor_sync_command("file-status", timeout_secs=30)
             result = {}
             for line in output.strip().split("\n"):
                 line = line.strip()
@@ -2106,6 +2121,8 @@ class SelfEvolution:
                 parts = line.split(":", 2)
                 if len(parts) == 3 and parts[0] in ("T", "U"):
                     result[parts[1]] = {"hash": parts[2], "type": parts[0]}
+            if not result and output.strip():
+                logger.warning(f"SelfEvolution file-status: got output but no valid T:/U: lines parsed: {output[:200]}")
             return result
         except Exception as e:
             logger.warning(f"SelfEvolution file-status check failed: {e}")
@@ -2357,6 +2374,69 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
     _md_path.write_text(f"# /auto Report — session={_session_id}\n\n", encoding="utf-8")
     _session_json_path = _report_dir / f"auto_{_session_id}.json"
 
+    # ── Session working memory persistence (crash recovery) ──
+    _memory_path = Path("runtime/.auto_session_memory.json")
+
+    def _save_session_memory():
+        """每轮结束后持久化关键工作记忆，crash 后新 session 可恢复。"""
+        try:
+            data = {
+                "round_num": round_num,
+                "consecutive_dry": consecutive_dry,
+                "last_frontier": last_frontier,
+                "last_knowledge_state": last_knowledge_state,
+                "last_good_knowledge_state": last_good_knowledge_state,
+                "last_reanchor_streak": last_reanchor_streak,
+                "session_shown_voids": list(session_shown_voids),
+                "session_shown_nodes": list(session_shown_nodes),
+                "planner_agenda": planner_agenda,
+                "planner_result": planner_result,
+                "last_planner_round": last_planner_round,
+                "planner_call_count": planner_call_count,
+                "saved_at": _time_module.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            _memory_path.parent.mkdir(parents=True, exist_ok=True)
+            _memory_path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        except Exception as _e:
+            logger.debug(f"session memory save failed: {_e}")
+
+    def _load_session_memory():
+        """加载上轮持久化的工作记忆。超过 2 小时的记忆视为过期。"""
+        try:
+            if not _memory_path.exists():
+                return None
+            data = json.loads(_memory_path.read_text(encoding="utf-8"))
+            # 过期检查：超过 2 小时的记忆不恢复
+            saved_at = data.get("saved_at", "")
+            if saved_at:
+                from datetime import datetime, timedelta
+                saved_dt = datetime.strptime(saved_at, "%Y-%m-%d %H:%M:%S")
+                if datetime.now() - saved_dt > timedelta(hours=2):
+                    logger.info("session memory expired (>2h), starting fresh")
+                    return None
+            logger.info(f"session memory recovered from round {data.get('round_num', 0)}")
+            return data
+        except Exception as _e:
+            logger.debug(f"session memory load failed: {_e}")
+            return None
+
+    _recovered = _load_session_memory()
+    if _recovered:
+        # round_num 不恢复——它是 session 内计数器，新 session 必须从 0 开始
+        # 否则恢复后 round_num >= AUTO_MAX_ROUNDS 会立即退出
+        consecutive_dry = _recovered.get("consecutive_dry", 0)
+        last_frontier = _recovered.get("last_frontier", "")
+        last_knowledge_state = _recovered.get("last_knowledge_state", {})
+        last_good_knowledge_state = _recovered.get("last_good_knowledge_state", {})
+        last_reanchor_streak = _recovered.get("last_reanchor_streak", 0)
+        session_shown_voids = set(_recovered.get("session_shown_voids", []))
+        session_shown_nodes = set(_recovered.get("session_shown_nodes", []))
+        planner_agenda = _recovered.get("planner_agenda", [])
+        planner_result = _recovered.get("planner_result", {})
+        last_planner_round = _recovered.get("last_planner_round", 0)
+        planner_call_count = _recovered.get("planner_call_count", 0)
+        await channel.send(f"♻️ 恢复上轮工作记忆 (R{round_num}, dry={consecutive_dry})")
+
     def _append_md(text: str):
         try:
             with _md_path.open("a", encoding="utf-8") as f:
@@ -2403,9 +2483,11 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
         # Take diff-status snapshot BEFORE GP runs (ground truth for outcome detection)
         if self_evolution:
             try:
+                logger.debug(f"auto R{round_num} snapshot_before_round start")
                 await self_evolution.snapshot_before_round()
-            except Exception:
-                pass
+                logger.debug(f"auto R{round_num} snapshot_before_round done")
+            except Exception as _snap_e:
+                logger.warning(f"auto R{round_num} snapshot_before_round error: {_snap_e}")
 
         _reset_provider(agent)
         node_status_before = _get_node_count_status()
@@ -2846,9 +2928,11 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             _outcome = False
             if self_evolution and not round_is_error:
                 try:
+                    logger.debug(f"auto R{round_num} outcome_changed_since_snapshot start")
                     _outcome = await self_evolution.outcome_changed_since_snapshot()
-                except Exception:
-                    pass
+                    logger.debug(f"auto R{round_num} outcome_changed_since_snapshot done: {_outcome}")
+                except Exception as _oc_e:
+                    logger.warning(f"auto R{round_num} outcome_changed_since_snapshot error: {_oc_e}")
             # Classify FIRST — needs only candidate_issue + reanchor_required from frontier
             _partial_frontier = {
                 "candidate_issue": _extract_candidate_issue("" if round_is_error else response),
@@ -3093,6 +3177,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 for _heavy_key in ("events", "response_full", "signals", "prompt_preview",
                                    "frontier_text", "knowledge_state_text", "phase_trace"):
                     _old_rec.pop(_heavy_key, None)
+        _save_session_memory()
         _release_memory()
 
         # TOOL 节点热加载：C 后台写的 TOOL 节点在此激活，下一轮 GP 可用
@@ -3107,7 +3192,9 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
         # ── Self-Evolution: 沙箱冷却追踪 + 自动应用 ──
         if self_evolution and consecutive_error == 0:
             try:
+                logger.debug(f"auto R{round_num} self_evolution.check_round start")
                 await self_evolution.check_round(round_num, channel)
+                logger.debug(f"auto R{round_num} self_evolution.check_round done")
             except Exception as _se_e:
                 logger.warning(f"SelfEvolution check_round failed: {_se_e}")
 

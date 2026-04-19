@@ -542,7 +542,96 @@ class RecordDiscoveryTool(BaseNodeTool):
                 trust_tier="REFLECTION",
             )
             logger.info(f"DISCOVERY recorded: [{node_id}] {category}/{subject}")
+
+            # ── Auto-promote DISCOVERY → PATTERN ──
+            # If same subject has ≥3 DISCOVERY nodes, create a PATTERN node.
+            pattern_id = self._try_promote_to_pattern(subject, category)
+            if pattern_id:
+                return f"✅ DISCOVERY [{node_id}] {subject}: {description[:60]} → 🎯 auto-promoted to PATTERN [{pattern_id}]"
             return f"✅ DISCOVERY [{node_id}] {subject}: {description[:60]}"
         except Exception as e:
             logger.error(f"Discovery recording failed: {e}")
             return f"Error: {e}"
+
+    def _try_promote_to_pattern(self, subject: str, category: str) -> str:
+        """Check if same subject has ≥3 DISCOVERY nodes → auto-promote to PATTERN.
+
+        Returns the new PATTERN node_id if promoted, empty string otherwise.
+        Idempotent: if a PATTERN for this subject already exists, skip.
+        """
+        import hashlib
+        try:
+            # Check if PATTERN already exists for this subject
+            pattern_prefix = f"PAT_{hashlib.md5(subject.encode()).hexdigest()[:8].upper()}"
+            existing = self.vault._conn.execute(
+                "SELECT node_id FROM knowledge_nodes WHERE node_id = ? AND type = 'PATTERN'",
+                (pattern_prefix,)
+            ).fetchone()
+            if existing:
+                return ""
+
+            # Count DISCOVERY nodes with same subject (from metadata_signature)
+            rows = self.vault._conn.execute(
+                "SELECT node_id, title, full_content, metadata_signature FROM knowledge_nodes "
+                "WHERE type = 'DISCOVERY' AND metadata_signature LIKE ?",
+                (f'%{subject}%',)
+            ).fetchall()
+            # Precise filter: only count where subject matches exactly in signature
+            matching = []
+            for r in rows:
+                try:
+                    sig = json.loads(r["metadata_signature"]) if r["metadata_signature"] else {}
+                    if sig.get("subject") == subject:
+                        matching.append(r)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+
+            if len(matching) < 3:
+                return ""
+
+            # Build PATTERN from aggregated DISCOVERY descriptions
+            descriptions = []
+            for r in matching:
+                try:
+                    content = json.loads(r["full_content"]) if r["full_content"] else {}
+                    desc = content.get("description", "")
+                    if desc:
+                        descriptions.append(desc)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+
+            # Deduplicate descriptions (keep unique ones)
+            unique_descriptions = list(dict.fromkeys(descriptions))[:5]
+            pattern_content = f"Recurring observation ({len(matching)}x): " + " | ".join(unique_descriptions)
+
+            self.vault.create_node(
+                node_id=pattern_prefix,
+                ntype="PATTERN",
+                title=f"[PATTERN] {subject}: {pattern_content[:60]}",
+                human_translation=f"{subject}: {pattern_content[:60]}",
+                tags=f"pattern,{category.lower()},auto_promoted",
+                full_content=json.dumps({
+                    "subject": subject,
+                    "category": category,
+                    "discovery_count": len(matching),
+                    "descriptions": unique_descriptions,
+                    "source_node_ids": [r["node_id"] for r in matching],
+                }, ensure_ascii=False),
+                source="auto_promotion",
+                resolves=subject,
+                metadata_signature={
+                    "category": category,
+                    "subject": subject,
+                    "promotion_threshold": 3,
+                    "discovery_count": len(matching),
+                    "validation_status": "validated",
+                    "knowledge_state": "current",
+                },
+                trust_tier="REFLECTION",
+                verification_source="auto_promotion",
+            )
+            logger.info(f"PATTERN auto-promoted: [{pattern_prefix}] {subject} ({len(matching)} DISCOVERY nodes)")
+            return pattern_prefix
+        except Exception as e:
+            logger.warning(f"PATTERN auto-promotion check failed for {subject}: {e}")
+            return ""

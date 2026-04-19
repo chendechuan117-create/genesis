@@ -50,10 +50,11 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 f"avg_fusion={avg_fusion:.3f} misses={cls._search_misses}"
             )
 
-    def _record_search_void(self, keywords, ntype=None):
-        """搜索未命中时记录 VOID（知识缺口），引导未来探索方向。
+    def _record_search_void(self, keywords, ntype=None, extra=None):
+        """搜索未命中或锥体薄时记录 VOID（知识缺口），引导未来探索方向。
         auto mode 禁用 Multi-G，导致 lens_phase 的 void 记录不触发，
         此处补齐搜索层的 void 记录。
+        extra: 可选附加信息（如锥体密度指标），会追加到 source 中。
         """
         if not keywords:
             return
@@ -61,6 +62,8 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
             query_text = " ".join(keywords) if isinstance(keywords, (list, tuple)) else str(keywords)
             void_id = f"VOID_SEARCH_{hashlib.md5(query_text.encode()).hexdigest()[:8].upper()}"
             source = f"search_miss:{ntype or 'any'}"
+            if extra:
+                source += f" | {extra}"
             self.vault.add_void_task(void_id=void_id, query=query_text, source=source)
         except Exception as e:
             logger.debug(f"search void recording failed: {e}")
@@ -702,6 +705,13 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 if void_hints:
                     lines.append("[知识空洞]")
                     lines.extend(void_hints)
+
+                # ── 低凝实锥体 → VOID 记录（知识缺口，引导未来探索） ──
+                # 原逻辑只在 len==0 时记录，但 1735 节点的 vault 几乎不会搜不到。
+                # 真正的知识缺口是"搜到了但锥体很薄"：命中少、无验证、无强边。
+                if density_label.startswith("低凝实") or density_label.startswith("近乎未知"):
+                    self._record_search_void(keywords, ntype,
+                                             extra=f"cone_density={cone_node_count},avg_conf={avg_conf:.2f},edges={cone_edge_count}")
 
                 # ── 搜索仪表盘统计 ──
                 top_scores = [r.get('fusion_score', 0.0) for r in row_dicts[:5]]

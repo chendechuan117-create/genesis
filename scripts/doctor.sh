@@ -16,6 +16,7 @@
 #   doctor.sh status         查看容器状态
 #   doctor.sh cat <file>     查看容器内文件
 #   doctor.sh edit <file>    用 sed/heredoc 修改容器内文件（配合 exec）
+#   doctor.sh run            从 stdin 读取脚本并在容器内执行（绕过宿主 shell 展开）
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -124,6 +125,17 @@ cmd_exec() {
     docker exec -w /workspace "$CONTAINER" "$@"
 }
 
+# run: 从 stdin 读取脚本，写入容器后执行。
+# 绕过宿主 shell → doctor.sh → 容器 bash 的三层变量展开问题。
+# 用法: doctor.sh run <<'SCRIPT'
+#          echo ${1:-default}   # 在容器内展开，不在宿主展开
+#        SCRIPT
+cmd_run() {
+    _ensure_running
+    docker exec -i -w /workspace -e PYTHONPATH=/workspace "$CONTAINER" \
+        bash -c 'cat > /tmp/_doctor_run.sh && bash /tmp/_doctor_run.sh; rm -f /tmp/_doctor_run.sh'
+}
+
 cmd_python() {
     _ensure_running
     if [ $# -eq 0 ]; then
@@ -148,16 +160,18 @@ cmd_test_diff() {
     local test_files=()
 
     # Collect changed and untracked files from sandbox
+    # Only include files that ACTUALLY EXIST in the container —
+    # git diff --name-only includes deletions, which causes pytest "file not found"
+    # and blocks all self-evolution apply attempts.
     local changed
     changed=$(docker exec -w /workspace "$CONTAINER" bash -c '
-        git diff --name-only HEAD 2>/dev/null
-        git ls-files --others --exclude-standard 2>/dev/null | grep -vE "(__pycache__|\.pyc|\.pyo|\.pytest_cache|^runtime/|^\.)"
+        (git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null | grep -vE "(__pycache__|\.pyc|\.pyo|\.pytest_cache|^runtime/|^\.)") | sort -u | while IFS= read -r f; do [ -f "$f" ] && echo "$f"; done
     ' 2>/dev/null)
 
     # Map source files to corresponding test files
     while IFS= read -r f; do
         [ -z "$f" ] && continue
-        # If it's a test file itself, include directly
+        # If it's a test file itself, include directly (existence already verified above)
         if [[ "$f" == test_*.py ]] || [[ "$f" == tests/test_*.py ]]; then
             test_files+=("$f")
             continue
@@ -177,7 +191,10 @@ cmd_test_diff() {
             local modbase
             modbase=$(basename "$f" .py)
             while IFS= read -r tf; do
-                test_files+=("$tf")
+                # Verify discovered test file actually exists in container
+                if docker exec -w /workspace "$CONTAINER" test -f "$tf" 2>/dev/null; then
+                    test_files+=("$tf")
+                fi
             done < <(docker exec -w /workspace "$CONTAINER" bash -c "
                 grep -rl 'import.*${modbase}\|from.*${modbase}' tests/ 2>/dev/null | grep -vE '__pycache__|\.pyc' | head -5
             " 2>/dev/null)
@@ -480,6 +497,7 @@ case "${1:-help}" in
     stop)   cmd_stop ;;
     reset)  cmd_reset ;;
     exec)   shift; cmd_exec "$@" ;;
+    run)    cmd_run ;;
     python) shift; cmd_python "$@" ;;
     test)   shift; cmd_test "$@" ;;
     test-diff) cmd_test_diff ;;
