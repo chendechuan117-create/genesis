@@ -131,16 +131,23 @@ AUTO_PROMPT_CONTINUE = """继续自主探索。上一轮的结论是这一轮的
 - 查看修改差异：`shell doctor.sh diff`
 - 你可以自由读取本体代码（read_file）用于诊断，但写入只能进沙箱
 
+## 自进化目标（优先于探索）
+- **你的核心任务是修改 genesis/*.py 源码让系统变好**，不是写探针观察系统行为
+- 探针测试（test_*.py）只用于验证修改是否正确，不是最终产出
+- 每轮产出应该是：沙箱中有 genesis/*.py 的实际修改（通过 doctor.sh exec/write），而不是只有 tests/ 下的新文件
+- 如果连续多轮只产出探针而没有源码修改，说明你在观察而不是改进——必须转向修改源码
+
 当前信号（仅供参考）：
 {signals}"""
 
 
 AUTO_DEFAULT_DIRECTIVE = (
-    "基于 Genesis 的元信息系统（知识库、经验图谱、Arena），探索 Genesis 系统的新可能性。"
-    "方法：读已有知识 → 提出假设 → 在 Doctor 沙箱中实验 → 记录发现。"
-    "方向：不局限于修 bug——可以探索架构改进、新机制、性能优化、知识利用的新方式。"
+    "基于 Genesis 的元信息系统（知识库、经验图谱、Arena），改进 Genesis 系统本身。"
+    "方法：读已有知识 → 提出假设 → 在 Doctor 沙箱中修改 genesis/*.py 源码 → 测试验证 → 记录发现。"
+    "方向：修改源码让系统变好——修 bug、架构改进、新机制、性能优化、知识利用的新方式。"
     "所有代码修改必须在 Doctor 沙箱中进行（单行用 doctor.sh exec，多行脚本用 doctor.sh run），严禁直接改本体源码。"
-    "每轮只做一件事，做到位。追求让人意想不到的发现。"
+    "核心产出是 genesis/*.py 的源码改进，不是探针测试。探针只用于验证假设，不是最终产出。"
+    "每轮只做一件事，做到位。"
 )
 
 SPIRAL_PROMPT = """你的任务：为 Genesis 代码库中的一个文件创建 **结构性理解锚点**。
@@ -1990,19 +1997,22 @@ class SelfEvolution:
         """
         self._pre_round_snapshot = await self._get_diff_status_hash()
 
-    async def check_round(self, round_num: int, channel):
+    async def check_round(self, round_num: int, channel) -> dict:
         """Called each round after GP execution. Manages file-level cooling + auto-apply.
 
         Each file's cooldown is independent: adding new files doesn't reset
         the cooldown of existing files that haven't changed.
+
+        Returns dict: {"apply_attempted": bool, "apply_succeeded": bool, "apply_reason": str}
         """
+        result = {"apply_attempted": False, "apply_succeeded": False, "apply_reason": ""}
         if self.applied_this_session:
-            return
+            return result
 
         # Get per-file status from sandbox
         current_files = await self._get_file_status()
         if not current_files:
-            return  # no pending changes in sandbox
+            return result  # no pending changes in sandbox
 
         # ── Update per-file cooldown state ──
         cooled_files = []
@@ -2066,12 +2076,16 @@ class SelfEvolution:
             await channel.send(
                 f"🧬 冷却完成 | {sample[0]} ({sample[1]}) {sample[2]}轮未变 | {status_text} | 开始自进化应用流程..."
             )
-            await self._try_apply(round_num, channel)
+            apply_result = await self._try_apply(round_num, channel)
+            if apply_result:
+                result.update(apply_result)
         elif status_text:
             # Periodic reminder every 3 rounds
             total = sum(v["stable_count"] for v in self.file_cooldowns.values())
             if total % 3 == 0:
                 await channel.send(f"🧬 冷却中 | {status_text}")
+
+        return result
 
     async def _get_diff_status_hash(self) -> str:
         """Get tracked diff hash from sandbox (ground truth for outcome detection).
@@ -2128,8 +2142,12 @@ class SelfEvolution:
             logger.warning(f"SelfEvolution file-status check failed: {e}")
             return {}
 
-    async def _try_apply(self, round_num: int, channel):
-        """Test → apply → write restart marker."""
+    async def _try_apply(self, round_num: int, channel) -> dict:
+        """Test → apply → write restart marker.
+
+        Returns dict: {"apply_attempted": True, "apply_succeeded": bool, "apply_reason": str}
+        """
+        apply_result = {"apply_attempted": True, "apply_succeeded": False, "apply_reason": ""}
         t_files = {p: v for p, v in self.file_cooldowns.items() if v["type"] == "T"}
         u_files = {p: v for p, v in self.file_cooldowns.items() if v["type"] == "U"}
         max_t = max((v["stable_count"] for v in t_files.values()), default=0)
@@ -2162,10 +2180,11 @@ class SelfEvolution:
             await channel.send(
                 f"🧬 ❌ 沙箱测试失败，放弃本次应用\n```\n{test_output[-500:]}\n```"
             )
+            apply_result["apply_reason"] = test_output[-200:].replace("\n", " ").strip()
             self.apply_history.append({
                 "round": round_num,
                 "status": "test_failed",
-                "reason": test_output[-200:].replace("\n", " ").strip(),
+                "reason": apply_result["apply_reason"],
             })
             # Selective reset: only reset files whose hash changed (they may be the cause),
             # preserve stable files that weren't involved in the failure.
@@ -2184,7 +2203,7 @@ class SelfEvolution:
                 # Fallback: can't determine which files changed, reset all
                 self.file_cooldowns.clear()
             self._save()
-            return
+            return apply_result
 
         await channel.send("🧬 ✅ 测试通过")
 
@@ -2205,10 +2224,11 @@ class SelfEvolution:
             await channel.send(
                 f"🧬 ❌ 应用失败\n```\n{apply_output[-500:]}\n```"
             )
+            apply_result["apply_reason"] = apply_output[-200:].replace("\n", " ").strip()
             self.apply_history.append({
                 "round": round_num,
                 "status": "apply_failed",
-                "reason": apply_output[-200:].replace("\n", " ").strip(),
+                "reason": apply_result["apply_reason"],
             })
             # Selective reset on apply failure too
             current_files = await self._get_file_status()
@@ -2224,7 +2244,7 @@ class SelfEvolution:
             else:
                 self.file_cooldowns.clear()
             self._save()
-            return
+            return apply_result
 
         await channel.send(f"🧬 ✅ 代码已应用 | commit={applied_commit[:8]}")
 
@@ -2237,6 +2257,7 @@ class SelfEvolution:
             await channel.send(f"🧬 ⚠️ 沙箱重置失败（不影响本体）: {reset_output[-200:]}")
 
         # 4. Write restart marker + record history + clear cooling state
+        apply_result["apply_succeeded"] = True
         self.applied_this_session = True
         self.apply_history.append({
             "round": round_num,
@@ -2341,6 +2362,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
     round_num = 0
     consecutive_dry = 0
     consecutive_error = 0
+    _pending_apply_feedback = None  # carry apply-failure reason to next round signals
     stop_reason = "manual"
     round_log = []
     last_frontier = ""
@@ -2496,6 +2518,11 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
         round_start_utc_iso = _time_module.strftime("%Y-%m-%d %H:%M:%S", _time_module.gmtime(round_start_ts))
 
         signals = _get_auto_signals(round_num=round_num, session_shown_voids=session_shown_voids, session_shown_nodes=session_shown_nodes)
+        # Inject apply-failure feedback from previous round into signals
+        if _pending_apply_feedback:
+            _aw = "\n\n[⚠️ 上一轮自进化apply被拒(沙箱测试失败)] " + _pending_apply_feedback[:200] + " 不要继续写同类型探针,转向修复测试或换方向"
+            signals += _aw
+            _pending_apply_feedback = None
         _struct = [topic_tracker.format_for_prompt(), action_history.format_for_prompt()]
         _struct_text = "\n\n".join(p for p in _struct if p)
         if _struct_text:
