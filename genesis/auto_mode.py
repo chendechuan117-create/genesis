@@ -2167,7 +2167,7 @@ class SelfEvolution:
                     await channel.send(
                         f"🧬 ⏭ 跳过自进化（连续测试失败同原因，冷却 {skip_remaining} 轮）| T:{len(t_files)}f max{max_t}/{self.cooldown}"
                     )
-                    return
+                    return apply_result
 
         await channel.send(
             f"🧬 冷却完成 | T:{len(t_files)}f max{max_t}/{self.cooldown} U:{len(u_files)}f max{max_u}/{self.untracked_cooldown} | 开始自进化应用流程..."
@@ -3217,13 +3217,20 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             logger.debug(f"/auto tool_hotload skip: {_e}")
 
         # ── Self-Evolution: 沙箱冷却追踪 + 自动应用 ──
+        _apply_feedback = None
         if self_evolution and consecutive_error == 0:
             try:
                 logger.debug(f"auto R{round_num} self_evolution.check_round start")
-                await self_evolution.check_round(round_num, channel)
+                _se_result = await self_evolution.check_round(round_num, channel)
                 logger.debug(f"auto R{round_num} self_evolution.check_round done")
+                if _se_result and _se_result.get("apply_attempted") and not _se_result.get("apply_succeeded"):
+                    _apply_feedback = _se_result.get("apply_reason", "unknown")
             except Exception as _se_e:
                 logger.warning(f"SelfEvolution check_round failed: {_se_e}")
+
+        # Apply-failure feedback -> next round signals
+        if _apply_feedback:
+            _pending_apply_feedback = _apply_feedback
 
         # 轮间休息（错误轮指数退避 + provider reset）
         if state.get("active", False):
