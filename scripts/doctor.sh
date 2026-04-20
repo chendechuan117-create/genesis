@@ -186,19 +186,6 @@ cmd_test_diff() {
                 break
             fi
         done
-        # If it's a genesis source file, find tests that import it
-        if [[ "$f" == genesis/*.py ]]; then
-            local modbase
-            modbase=$(basename "$f" .py)
-            while IFS= read -r tf; do
-                # Verify discovered test file actually exists in container
-                if docker exec -w /workspace "$CONTAINER" test -f "$tf" 2>/dev/null; then
-                    test_files+=("$tf")
-                fi
-            done < <(docker exec -w /workspace "$CONTAINER" bash -c "
-                grep -rl 'import.*${modbase}\|from.*${modbase}' tests/ 2>/dev/null | grep -vE '__pycache__|\.pyc' | head -5
-            " 2>/dev/null)
-        fi
     done <<< "$changed"
 
     # Deduplicate
