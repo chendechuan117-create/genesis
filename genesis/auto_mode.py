@@ -2496,6 +2496,25 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
         round_start_utc_iso = _time_module.strftime("%Y-%m-%d %H:%M:%S", _time_module.gmtime(round_start_ts))
 
         signals = _get_auto_signals(round_num=round_num, session_shown_voids=session_shown_voids, session_shown_nodes=session_shown_nodes)
+
+        # ── 行为观测信号：连续N轮未产生沙箱代码修改 ──
+        # 纯事实注入，不是指令。GP 看到后自行决策。
+        # source_write_ratio 只传给 C-Phase，GP 自身看不到这个盲区。
+        if round_log and round_num > 1:
+            _consecutive_no_write = 0
+            for _r in reversed(round_log):
+                _evts = _r.get("events") or []
+                _has_source_write = any(
+                    e.get("type") == "tool_result" and e.get("name") == "write_file"
+                    and "/genesis/" in str(e.get("data", {}).get("path") or e.get("args", {}).get("path") or "")
+                    for e in _evts
+                )
+                if _has_source_write:
+                    break
+                _consecutive_no_write += 1
+            if _consecutive_no_write >= 3:
+                signals += f"\n\n[行为观测] 连续{_consecutive_no_write}轮未产生沙箱代码修改 (source_write_ratio=0)"
+
         _struct = [topic_tracker.format_for_prompt(), action_history.format_for_prompt()]
         _struct_text = "\n\n".join(p for p in _struct if p)
         if _struct_text:
