@@ -239,6 +239,11 @@ class NativeHTTPProvider(BaseLLMProvider):
         except asyncio.TimeoutError:
             NativeHTTPProvider._stats_wall_clock_timeouts += 1
             NativeHTTPProvider._record_stat("wall_timeout")
+            # 销毁可能处于半读状态的连接，防止复用污染连接池
+            if self._http_client:
+                try: await self._http_client.aclose()
+                except Exception: pass
+                self._http_client = None
             raise WallClockTimeoutError(
                 f"LLM 调用总超时 ({self.wall_clock_timeout}s)。"
                 f"推理模型可能思考过久，请简化问题或缩短上下文。"

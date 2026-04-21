@@ -347,17 +347,14 @@ class CPhaseMixin:
         if total:
             lines.append(f"  总轮次: {total}")
 
-        # Write target distribution + source write ratio (outcome signal)
-        wt = obs.get("write_targets")
-        total_writes = sum(wt.values()) if wt else 0
-        if wt:
-            parts = [f"{k}={v}" for k, v in sorted(wt.items(), key=lambda x: -x[1])]
-            lines.append(f"  GP 写入目标分布 ({total_writes}个文件): {', '.join(parts)}")
-        sr = obs.get("source_write_ratio", 0)
-        if sr is not None:
-            lines.append(f"  源文件写入占比: {sr:.0%}")
-            if sr < 0.2 and total_writes > 5:
-                lines.append(f"  ⚠ GP 几乎不修改 genesis/ 源文件，只写 tests/ 和 scratch/")
+        # Sandbox outcome rate (ground truth from diff-status snapshots)
+        or_ratio = obs.get("outcome_ratio", 0)
+        or_rounds = obs.get("outcome_rounds_in_window", 0)
+        window = obs.get("window_size", 0)
+        if window > 0:
+            lines.append(f"  沙箱产出率: {or_rounds}/{window} 轮产生diff变化 ({or_ratio:.0%})")
+            if or_ratio < 0.2 and window >= 5:
+                lines.append(f"  ⚠ GP 连续多轮未产生沙箱代码变化 — 可能在纯分析循环")
 
         # Auto-apply outcome (now records both success and failure)
         attempts = obs.get("auto_apply_attempts", 0)
