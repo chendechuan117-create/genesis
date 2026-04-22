@@ -13,7 +13,7 @@ import time
 import os
 from datetime import datetime, timedelta
 
-DB_PATH = os.path.expanduser("~/.nanogenesis/workshop_v4.sqlite")
+DB_PATH = os.path.expanduser("~/.genesis/workshop_v4.sqlite")
 
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
