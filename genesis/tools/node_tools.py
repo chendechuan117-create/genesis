@@ -94,6 +94,15 @@ class RecordLessonNodeTool(BaseNodeTool):
         }
 
     async def execute(self, node_id: str, title: str, trigger_verb: str, trigger_noun: str, trigger_context: str, action_steps: List[str], because_reason: str, prerequisites: List[str] = None, resolves: str = None, contradicts: str = None, reasoning_basis: List[Dict[str, str]] = None, metadata_signature: Dict[str, Any] = None, last_verified_at: str = None, verification_source: str = None) -> str:
+        # validateInput（借鉴Claude Code）：reasoning_basis为空时拒绝执行，要求模型连线
+        if not reasoning_basis:
+            return (
+                "⚠️ record_lesson_node 拒绝执行：reasoning_basis 不能为空。"
+                "你必须在 reasoning_basis 中声明此经验基于哪些已有知识产生、判断依据是什么。"
+                "格式：[{\"basis_node_id\": \"LESSON_XXX\", \"reasoning\": \"为什么觉得那个节点有用/如何推导出此经验\"}]。"
+                "如果你搜索了知识库并基于搜索结果产生了新洞察，必须填写此字段连线。"
+                "请重新调用 record_lesson_node 并填写 reasoning_basis 参数。"
+            )
         try:
             lesson_struct = {
                 "IF_trigger": {
