@@ -770,6 +770,11 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                 except Exception:
                     sig = {}
             comp = (sig or {}).get("component") if isinstance(sig, dict) else None
+            # component 可能是 list（某些节点），转为可 hash 的字符串
+            if isinstance(comp, list):
+                comp = comp[0] if comp else None
+            if isinstance(comp, (list, tuple, set)):
+                comp = str(comp)
             
             if comp:
                 component_groups.setdefault(comp, []).append((nid, brief))
