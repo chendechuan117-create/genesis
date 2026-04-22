@@ -18,6 +18,8 @@ PROVIDER_KEY_MAP = {
     "xcode_backup": "xcode_api_key",
     "deepseek": "deepseek_api_key",
     "xcode_responses": "xcode_api_key",
+    "newshrimp": "newshrimp_api_key",
+    "newshrimp_backup": "newshrimp_api_key",
 }
 
 class ProviderRouter(LLMProvider):
@@ -40,6 +42,7 @@ class ProviderRouter(LLMProvider):
         self._failover_time: float = 0  # 上次 failover 时间戳
         self._last_recovery_attempt: float = 0  # 上次探活时间戳
         self._last_refresh_time: float = time.time()  # 上次刷新时间
+        self._last_schedule_check: float = 0  # 上次时段调度检查
         
         self._initialize_providers(api_key, base_url, model)
         self.active_provider = self.providers.get(self.active_provider_name)
@@ -71,10 +74,38 @@ class ProviderRouter(LLMProvider):
                 logger.warning(f"Failed to build provider plugin '{name}': {e}")
         
         self.failover_order = [
-            name for name in ['xcode', 'xcode_backup', 'deepseek'] if name in self.providers
+            name for name in ['newshrimp', 'newshrimp_backup', 'xcode', 'xcode_backup', 'deepseek'] if name in self.providers
         ]
-        self.active_provider_name = self.failover_order[0] if self.failover_order else 'xcode'
+        self.active_provider_name = self._get_scheduled_provider()
                 
+    # ── 时段调度：7-24 newshrimp, 0-7 xcode ──
+    _DAYTIME_PROVIDER = "newshrimp"    # 7:00-24:00 首选
+    _NIGHTTIME_PROVIDER = "xcode"      # 0:00-7:00 首选
+    _SCHEDULE_CHECK_INTERVAL = 300     # 每5分钟检查一次时段切换
+
+    def _get_scheduled_provider(self) -> str:
+        """根据当前小时返回首选 provider"""
+        from datetime import datetime
+        hour = datetime.now().hour
+        if 7 <= hour < 24:
+            preferred = self._DAYTIME_PROVIDER
+        else:
+            preferred = self._NIGHTTIME_PROVIDER
+        # 如果首选不可用，回退到 failover_order 第一个
+        if preferred in self.providers:
+            return preferred
+        return self.failover_order[0] if self.failover_order else 'xcode'
+
+    def _check_schedule_switch(self):
+        """时段切换检查：如果当前首选与调度不符，切换"""
+        scheduled = self._get_scheduled_provider()
+        if scheduled != self._preferred_provider_name:
+            logger.info(f"🕐 时段切换: {self._preferred_provider_name} -> {scheduled}")
+            self._preferred_provider_name = scheduled
+            if scheduled in self.providers:
+                self._switch_provider(scheduled)
+                self._failover_time = 0
+
     def _switch_provider(self, target: str):
         """Switch active provider"""
         if target not in self.providers:
@@ -101,6 +132,11 @@ class ProviderRouter(LLMProvider):
         model = kwargs.get("model") or self.get_default_model()
 
         t0 = time.time()
+
+        # 时段调度检查：每5分钟检查是否需要切换首选 provider
+        if (time.time() - self._last_schedule_check) > self._SCHEDULE_CHECK_INTERVAL:
+            self._last_schedule_check = time.time()
+            self._check_schedule_switch()
 
         # 每小时刷新连接：关闭旧 httpx client，下次请求自动重建
         if (time.time() - self._last_refresh_time) > self.REFRESH_INTERVAL_SECS:

@@ -27,6 +27,14 @@ class GlobalConfig:
     xcode_model: str = "gpt-5.4"
     deepseek_api_key: Optional[str] = None
     
+    # NewShrimp provider
+    newshrimp_api_key: Optional[str] = None
+    newshrimp_base_url: Optional[str] = None
+    newshrimp_backup_base_url: Optional[str] = None
+    newshrimp_model: Optional[str] = None
+    newshrimp_ssl_verify: bool = True
+    newshrimp_backup_ssl_verify: bool = True
+    
     tavily_api_key: Optional[str] = None
     
     # Observability (optional)
@@ -133,6 +141,12 @@ class ConfigManager:
         "AIXJ_BACKUP_BASE_URL": "xcode_backup_base_url",
         "AIXJ_MODEL": "xcode_model",
         "DEEPSEEK_API_KEY": "deepseek_api_key",
+        "NEWSHRIMP_API_KEY": "newshrimp_api_key",
+        "NEWSHRIMP_BASE_URL": "newshrimp_base_url",
+        "NEWSHRIMP_BACKUP_BASE_URL": "newshrimp_backup_base_url",
+        "NEWSHRIMP_MODEL": "newshrimp_model",
+        "NEWSHRIMP_SSL_VERIFY": "newshrimp_ssl_verify",
+        "NEWSHRIMP_BACKUP_SSL_VERIFY": "newshrimp_backup_ssl_verify",
         "TAVILY_API_KEY": "tavily_api_key",
         "LANGFUSE_PUBLIC_KEY": "langfuse_public_key",
         "LANGFUSE_SECRET_KEY": "langfuse_secret_key",
@@ -175,7 +189,7 @@ class ConfigManager:
                 setattr(self._config, "xcode_api_keys", keys)
                 if keys and not self._config.xcode_api_key:
                     self._config.xcode_api_key = keys[0]
-            elif upper_key in ("XCODE_SSL_VERIFY", "XCODE_BACKUP_SSL_VERIFY"):
+            elif upper_key in ("XCODE_SSL_VERIFY", "XCODE_BACKUP_SSL_VERIFY", "NEWSHRIMP_SSL_VERIFY", "NEWSHRIMP_BACKUP_SSL_VERIFY"):
                 setattr(self._config, attr, val.strip().lower() not in ("0", "false", "no", "off", ""))
             else:
                 setattr(self._config, attr, val)
@@ -213,8 +227,8 @@ class ConfigManager:
 
     def _validate(self):
         """验证必要配置"""
-        if not self._config.xcode_api_key and not self._config.deepseek_api_key:
-            logger.warning("⚠️ 未检测到 xcode / deepseek API Key")
+        if not self._config.xcode_api_key and not self._config.deepseek_api_key and not self._config.newshrimp_api_key:
+            logger.warning("⚠️ 未检测到 xcode / deepseek / newshrimp API Key")
         
         if not self._config.http_proxy and not self._config.https_proxy:
             # 检查是否有 curl
