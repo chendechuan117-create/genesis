@@ -379,6 +379,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         # GP 工具列表提前计算，同时传入 prompt 生成（消除 prompt-registry 脱节）
         gp_tools = self._get_gp_tools()
         gp_tool_names = [t.name for t in gp_tools]
+        logger.info(f"GP tools available ({len(gp_tool_names)}): {gp_tool_names}")
 
         gp_prompt = self.factory.build_gp_prompt(
             recent_memory=self.vault.get_recent_memory(),
