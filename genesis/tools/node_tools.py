@@ -17,7 +17,7 @@ class RecordContextNodeTool(BaseNodeTool):
 
     @property
     def description(self) -> str:
-        return "沉淀静态参数类节点 (CONTEXT)，用于记录纯粹的 Key-Value 状态变量或环境信息。(仅超级管理员 C 进程 有权限使用)"
+        return "沉淀静态参数类节点 (CONTEXT)，用于记录纯粹的 Key-Value 状态变量或环境信息。发现需要记录的环境参数或配置信息时，可调用此工具写入知识库。"
 
     @property
     def parameters(self) -> Dict[str, Any]:
@@ -62,7 +62,7 @@ class RecordLessonNodeTool(BaseNodeTool):
 
     @property
     def description(self) -> str:
-        return "沉淀经验流程类节点 (LESSON)，用于记录具体的排错手段或操作流。(仅超级管理员 C 进程 有权限使用)"
+        return "沉淀经验流程类节点 (LESSON)，用于记录具体的排错手段或操作流。搜索知识库后产生新洞察时，必须调用此工具写回知识库，并用 reasoning_basis 连线到搜索命中的节点。"
 
     @property
     def parameters(self) -> Dict[str, Any]:
@@ -87,13 +87,22 @@ class RecordLessonNodeTool(BaseNodeTool):
                 },
                 "resolves": {"type": "string", "description": "此经验主要解决的具体报错信息或异常现象简述（用于丰富图谱寻找）"},
                 "contradicts": {"type": "string", "description": "可选。如果这条新知识反驳/替代了某个旧节点，填写被反驳的节点 ID。旧节点将被标记为已过时，不再出现在搜索结果中。"},
-                "reasoning_basis": {"type": "array", "items": {"type": "object", "properties": {"basis_node_id": {"type": "string", "description": "基于哪个已有节点产生此经验"}, "reasoning": {"type": "string", "description": "为什么觉得那个节点有用/如何推导出此经验"}}, "required": ["basis_node_id", "reasoning"]}, "description": "可选。推理线：记录此经验是基于哪些已有知识产生的，以及判断依据。"},
+                "reasoning_basis": {"type": "array", "items": {"type": "object", "properties": {"basis_node_id": {"type": "string", "description": "基于哪个已有节点产生此经验"}, "reasoning": {"type": "string", "description": "为什么觉得那个节点有用/如何推导出此经验"}}, "required": ["basis_node_id", "reasoning"]}, "description": "推理线（强烈建议填写）：记录此经验基于哪些已有知识产生、判断依据是什么。如果你搜索了知识库并基于搜索结果产生了新洞察，必须填写此字段连线。示例：[{\"basis_node_id\": \"LESSON_XXX\", \"reasoning\": \"该节点描述了X模式，我观察到当前场景也符合此模式\"}]"},
                 **TRUST_SCHEMA_PROPERTIES
             },
             "required": ["node_id", "title", "trigger_verb", "trigger_noun", "trigger_context", "action_steps", "because_reason", "resolves"]
         }
 
     async def execute(self, node_id: str, title: str, trigger_verb: str, trigger_noun: str, trigger_context: str, action_steps: List[str], because_reason: str, prerequisites: List[str] = None, resolves: str = None, contradicts: str = None, reasoning_basis: List[Dict[str, str]] = None, metadata_signature: Dict[str, Any] = None, last_verified_at: str = None, verification_source: str = None) -> str:
+        # validateInput（借鉴Claude Code）：reasoning_basis为空时拒绝执行，要求模型连线
+        if not reasoning_basis:
+            return (
+                "⚠️ record_lesson_node 拒绝执行：reasoning_basis 不能为空。"
+                "你必须在 reasoning_basis 中声明此经验基于哪些已有知识产生、判断依据是什么。"
+                "格式：[{\"basis_node_id\": \"LESSON_XXX\", \"reasoning\": \"为什么觉得那个节点有用/如何推导出此经验\"}]。"
+                "如果你搜索了知识库并基于搜索结果产生了新洞察，必须填写此字段连线。"
+                "请重新调用 record_lesson_node 并填写 reasoning_basis 参数。"
+            )
         try:
             lesson_struct = {
                 "IF_trigger": {

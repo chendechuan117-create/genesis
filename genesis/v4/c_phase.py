@@ -288,6 +288,11 @@ class CPhaseMixin:
             if sig_text:
                 parts.append(f"[任务签名]\n{sig_text}")
 
+        # 8.5 基础盘感知：当前领域的锚点和救生索拓扑
+        density_info = self._query_component_density()
+        if density_info:
+            parts.append(f"[基础盘 — 当前领域的锚点和救生索]\n{density_info}")
+
         # 9. 跨轮行为观测（GP 自身无法察觉的行为模式）
         cross_obs = self._build_cross_round_observations()
         if cross_obs:
@@ -330,6 +335,40 @@ class CPhaseMixin:
             logger.debug(f"Vault related query failed (non-fatal): {e}")
             return ""
 
+    def _query_component_density(self) -> str:
+        """查询当前任务相关的基础盘（面），供 C-Phase 密度感知。
+        面是拓扑描述——枢纽点、覆盖情况、重合点，不是评分。
+        防原地踏步：让 C 知道当前领域已有哪些锚点。"""
+        try:
+            # 从当前任务的 component 找种子节点
+            current_comp = (self.inferred_signature or {}).get("component")
+            if not current_comp:
+                return ""
+            
+            # 找该 component 最近的 LESSON 作为种子
+            seed_rows = self.vault._conn.execute("""
+                SELECT kn.node_id FROM knowledge_nodes kn
+                WHERE json_extract(kn.metadata_signature, '$.component') = ?
+                AND kn.type = 'LESSON'
+                ORDER BY kn.updated_at DESC LIMIT 5
+            """, (current_comp,)).fetchall()
+            
+            if not seed_rows:
+                return f"  {current_comp}: 0个锚点，未探索领域"
+            
+            seed_ids = [r[0] for r in seed_rows]
+            landscape = self.vault.build_landscape(seed_node_ids=seed_ids)
+            
+            if not landscape:
+                # 没有ANCHORED边时的降级输出
+                count = len(seed_rows)
+                return f"  {current_comp}: {count}个锚点（无救生索连线）"
+            
+            return f"  当前领域: {current_comp}\n{landscape}"
+        except Exception as e:
+            logger.debug(f"Landscape query failed (non-fatal): {e}")
+            return ""
+
     def _build_cross_round_observations(self) -> str:
         """Format cross-round behavioral observations from loop_config.
         These are objective patterns GP cannot see about its own behavior.
@@ -345,17 +384,14 @@ class CPhaseMixin:
         if total:
             lines.append(f"  总轮次: {total}")
 
-        # Write target distribution + source write ratio (outcome signal)
-        wt = obs.get("write_targets")
-        total_writes = sum(wt.values()) if wt else 0
-        if wt:
-            parts = [f"{k}={v}" for k, v in sorted(wt.items(), key=lambda x: -x[1])]
-            lines.append(f"  GP 写入目标分布 ({total_writes}个文件): {', '.join(parts)}")
-        sr = obs.get("source_write_ratio", 0)
-        if sr is not None:
-            lines.append(f"  源文件写入占比: {sr:.0%}")
-            if sr < 0.2 and total_writes > 5:
-                lines.append(f"  ⚠ GP 几乎不修改 genesis/ 源文件，只写 tests/ 和 scratch/")
+        # Sandbox outcome rate (ground truth from diff-status snapshots)
+        or_ratio = obs.get("outcome_ratio", 0)
+        or_rounds = obs.get("outcome_rounds_in_window", 0)
+        window = obs.get("window_size", 0)
+        if window > 0:
+            lines.append(f"  沙箱产出率: {or_rounds}/{window} 轮产生diff变化 ({or_ratio:.0%})")
+            if or_ratio < 0.2 and window >= 5:
+                lines.append(f"  ⚠ GP 连续多轮未产生沙箱代码变化 — 可能在纯分析循环")
 
         # Auto-apply outcome (now records both success and failure)
         attempts = obs.get("auto_apply_attempts", 0)

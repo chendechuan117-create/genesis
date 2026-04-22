@@ -68,7 +68,7 @@ AUTO_DRY_LIMIT = _env_int("GENESIS_AUTO_DRY_LIMIT", 0, minimum=0)
 AUTO_SLEEP_BASE = _env_int("GENESIS_AUTO_SLEEP_BASE", 8, minimum=0)
 AUTO_DRY_SLEEP_BASE = _env_int("GENESIS_AUTO_DRY_SLEEP_BASE", 15, minimum=0)
 AUTO_DRY_SLEEP_STEP = _env_int("GENESIS_AUTO_DRY_SLEEP_STEP", 5, minimum=0)
-AUTO_ROUND_TIMEOUT_SECS = _env_int("GENESIS_AUTO_ROUND_TIMEOUT_SECS", 0, minimum=0)
+AUTO_ROUND_TIMEOUT_SECS = _env_int("GENESIS_AUTO_ROUND_TIMEOUT_SECS", 600, minimum=0)
 AUTO_SYNC_DOCTOR_SANDBOX = _env_bool("GENESIS_AUTO_SYNC_DOCTOR_SANDBOX", True)
 AUTO_DOCTOR_SYNC_TIMEOUT_SECS = _env_int("GENESIS_AUTO_DOCTOR_SYNC_TIMEOUT_SECS", 420, minimum=30)
 SPIRAL_CONCURRENCY = _env_int("GENESIS_SPIRAL_CONCURRENCY", 3, minimum=1)
@@ -873,10 +873,18 @@ def _classify_auto_round_progress(response, round_events, kb_changed, frontier_s
     combined_text = preview_text + " " + shell_cmd_text
     ran_tests = "doctor.sh test" in combined_text or "pytest" in combined_text
     inspected_diff = "doctor.sh diff" in combined_text or "git diff" in combined_text or "diff --git" in combined_text
+    # doctor.sh exec is used for ALL sandbox interactions (cat, ls, sed -n = read-only).
+    # Only count as touched_files when combined with write indicators inside the exec.
+    _doctor_write_patterns = (
+        "doctor.sh exec" in combined_text
+        and any(p in combined_text for p in ("sed -i", "write_text(", "text = text.replace(",
+                                              "cat >", "cat >>", "tee ", "python3 -c", "python -c",
+                                              " > ", " >> ", "patch ", "cp ", "mv "))
+    )
     touched_files = (
         any(name in ("write_file", "edit_file", "replace_in_file", "append_file") for name in tool_names)
         or "sed -i" in combined_text or "write_text(" in combined_text or "text = text.replace(" in combined_text
-        or "doctor.sh exec" in combined_text
+        or _doctor_write_patterns
     )
     response_text = (response or "").strip()
     stable_issue = bool(frontier_state and frontier_state.get("candidate_issue")
@@ -890,7 +898,7 @@ def _classify_auto_round_progress(response, round_events, kb_changed, frontier_s
     elif touched_files or ran_tests or inspected_diff:
         progress_class = "strong"   # GP was active but sandbox diff unchanged
     elif result_events:
-        progress_class = "evidence" if not (touched_files or ran_tests) else "strong"
+        progress_class = "soft"   # GP produced tool results but no write/test/diff activity
     elif response_text or stable_issue:
         progress_class = "soft"
     else:
@@ -1040,33 +1048,12 @@ def _compute_cross_round_observations(round_log: list, self_evolution=None) -> d
     recent = round_log[-20:]
     total_rounds = len(round_log)
 
-    # 1. GP write targets: what file categories GP writes to
-    #    Count UNIQUE files, not tool call count — GP writes same file 3x (probe+test+impl)
-    #    which inflates tests/scratch counts and deflates source_write_ratio.
-    write_file_sets = {"tests": set(), "scratch": set(), "source": set(), "other": set()}
-    for r in recent:
-        events = r.get("events") or []
-        for evt in events:
-            if evt.get("type") == "tool_result" and evt.get("name") == "write_file":
-                data = evt.get("data") or {}
-                path = str(data.get("path") or data.get("args", {}).get("path") or "")
-                if not path:
-                    continue
-                if "/tests/" in path or path.startswith("tests/"):
-                    write_file_sets["tests"].add(path)
-                elif "/scratch/" in path or "/runtime/" in path:
-                    write_file_sets["scratch"].add(path)
-                elif "/genesis/" in path:
-                    write_file_sets["source"].add(path)
-                else:
-                    write_file_sets["other"].add(path)
-    write_categories = {k: len(v) for k, v in write_file_sets.items() if v}
-
-    # 1b. Source write ratio: the key outcome signal.
-    #     If GP writes 0% to genesis/, it's only producing probes/scratch,
-    #     never touching production code. This is the real "productivity" metric.
-    total_writes = sum(write_categories.values())
-    source_write_ratio = write_categories["source"] / total_writes if total_writes > 0 else 0
+    # 1. Sandbox outcome rate: how many rounds actually changed sandbox diff.
+    #    In auto mode, GP writes via shell (doctor.sh exec), not write_file tool,
+    #    so write_file events are always empty — source_write_ratio was always 0.
+    #    outcome_detected is the ground truth from diff-status snapshot comparison.
+    outcome_rounds = sum(1 for r in recent if r.get("outcome_detected"))
+    outcome_ratio = outcome_rounds / len(recent) if recent else 0
 
     # 2. Auto-apply outcome (grounded in apply_history which records both success and failure)
     apply_attempts = 0
@@ -1111,8 +1098,8 @@ def _compute_cross_round_observations(round_log: list, self_evolution=None) -> d
 
     obs = {
         "total_rounds": total_rounds,
-        "write_targets": {k: v for k, v in write_categories.items() if v > 0},
-        "source_write_ratio": round(source_write_ratio, 2),
+        "outcome_ratio": round(outcome_ratio, 2),
+        "outcome_rounds_in_window": outcome_rounds,
         "auto_apply_attempts": apply_attempts,
         "auto_apply_successes": apply_successes,
         "auto_apply_blocked_reasons": apply_blocked_reasons[-5:],
@@ -2511,6 +2498,20 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             _aw = "\n\n[⚠️ 上一轮自进化apply被拒(沙箱测试失败)] " + _pending_apply_feedback[:200] + ""
             signals += _aw
             _pending_apply_feedback = None
+
+        # ── 行为观测信号：连续N轮沙箱无变化 ──
+        # 纯事实注入，不是指令。GP 看到后自行决策。
+        # 使用 outcome_detected（沙箱 diff ground truth）而非 write_file 事件，
+        # 因为 GP 通过 shell 写沙箱，不经过 write_file 工具。
+        if round_log and round_num > 1:
+            _consecutive_no_outcome = 0
+            for _r in reversed(round_log):
+                if _r.get("outcome_detected"):
+                    break
+                _consecutive_no_outcome += 1
+            if _consecutive_no_outcome >= 3:
+                signals += f"\n\n[行为观测] 连续{_consecutive_no_outcome}轮沙箱无代码变化 (outcome_detected=False)"
+
         _struct = [topic_tracker.format_for_prompt(), action_history.format_for_prompt()]
         _struct_text = "\n\n".join(p for p in _struct if p)
         if _struct_text:
@@ -2547,14 +2548,20 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                     progress=pioneer.get_progress(),
                 )
                 try:
-                    _r = await agent.process(
+                    _coro = agent.process(
                         f"[GENESIS_USER_REQUEST_START]\n{_p}",
                         c_phase_blocking=True,
                         loop_config={"disable_multi_g": True, "gp_unblock_tools": ["record_point", "record_line", "record_context_point"]},
                     )
+                    if AUTO_ROUND_TIMEOUT_SECS > 0:
+                        _r = await asyncio.wait_for(_coro, timeout=AUTO_ROUND_TIMEOUT_SECS)
+                    else:
+                        _r = await _coro
                     _resp = _r.response if hasattr(_r, 'response') else ""
                     _tok = _r.total_tokens if hasattr(_r, 'total_tokens') else 0
                     return {"task": _task_item, "ok": not _is_error_response(_resp, _tok), "tokens": _tok, "response": _resp}
+                except asyncio.TimeoutError:
+                    return {"task": _task_item, "ok": False, "tokens": 0, "response": f"spiral_timeout>{AUTO_ROUND_TIMEOUT_SECS}s"}
                 except Exception as _e:
                     return {"task": _task_item, "ok": False, "tokens": 0, "response": str(_e)}
 
@@ -2619,14 +2626,20 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                     progress=explorer.get_progress(),
                 )
                 try:
-                    _r = await agent.process(
+                    _coro = agent.process(
                         f"[GENESIS_USER_REQUEST_START]\n{_p}",
                         c_phase_blocking=True,
                         loop_config={"disable_multi_g": True, "gp_unblock_tools": ["record_point", "record_line", "record_context_point"]},
                     )
+                    if AUTO_ROUND_TIMEOUT_SECS > 0:
+                        _r = await asyncio.wait_for(_coro, timeout=AUTO_ROUND_TIMEOUT_SECS)
+                    else:
+                        _r = await _coro
                     _resp = _r.response if hasattr(_r, 'response') else ""
                     _tok = _r.total_tokens if hasattr(_r, 'total_tokens') else 0
                     return {"pair": _pair, "ok": not _is_error_response(_resp, _tok), "tokens": _tok, "response": _resp}
+                except asyncio.TimeoutError:
+                    return {"pair": _pair, "ok": False, "tokens": 0, "response": f"cross_module_timeout>{AUTO_ROUND_TIMEOUT_SECS}s"}
                 except Exception as _e:
                     return {"pair": _pair, "ok": False, "tokens": 0, "response": str(_e)}
 
@@ -2827,6 +2840,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             "kb_delta": {"new_nodes": [], "updated_nodes": [], "error": "pending"},
             "kb_delta_summary": "pending", "kb_changed": False,
             "activity_detected": False, "activity_summary": "pending", "progress_class": "pending",
+            "outcome_detected": False,
             "consecutive_dry": consecutive_dry,
             "node_telemetry": "节点计数观测: 进行中",
             "phase_trace": None, "knowledge_state": None, "knowledge_state_text": "",
@@ -2906,6 +2920,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 "activity_detected": progress_profile["activity_detected"],
                 "activity_summary": progress_profile["activity_summary"],
                 "progress_class": progress_profile["progress_class"],
+                "outcome_detected": progress_profile.get("outcome_detected", False),
                 "consecutive_dry": consecutive_dry, "node_telemetry": node_telemetry,
                 "knowledge_state": knowledge_state, "knowledge_state_text": knowledge_state_text,
                 "frontier_state": frontier_state, "frontier_text": frontier_text, "frontier_preview": frontier_preview,
@@ -3004,6 +3019,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 "activity_detected": progress_profile["activity_detected"],
                 "activity_summary": progress_profile["activity_summary"],
                 "progress_class": progress_profile["progress_class"],
+                "outcome_detected": progress_profile.get("outcome_detected", False),
                 "consecutive_dry": consecutive_dry, "node_telemetry": node_telemetry,
                 "phase_trace": result.phase_trace if hasattr(result, 'phase_trace') else None,
                 "knowledge_state": knowledge_state, "knowledge_state_text": knowledge_state_text,
@@ -3076,6 +3092,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 "activity_detected": progress_profile["activity_detected"],
                 "activity_summary": progress_profile["activity_summary"],
                 "progress_class": progress_profile["progress_class"],
+                "outcome_detected": progress_profile.get("outcome_detected", False),
                 "consecutive_dry": consecutive_dry, "node_telemetry": node_telemetry,
                 "frontier_state": frontier_state, "frontier_text": frontier_text, "frontier_preview": frontier_preview,
                 "reanchor_required": frontier_state.get("reanchor_required", False),
@@ -3131,6 +3148,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 "activity_detected": progress_profile["activity_detected"],
                 "activity_summary": progress_profile["activity_summary"],
                 "progress_class": progress_profile["progress_class"],
+                "outcome_detected": progress_profile.get("outcome_detected", False),
                 "consecutive_dry": consecutive_dry, "node_telemetry": node_telemetry,
                 "frontier_state": frontier_state, "frontier_text": frontier_text, "frontier_preview": frontier_preview,
                 "reanchor_required": frontier_state.get("reanchor_required", False),
