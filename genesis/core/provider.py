@@ -444,7 +444,9 @@ class NativeHTTPProvider(BaseLLMProvider):
                             choices = chunk.get('choices')
                             if not choices: continue
                             
-                            delta = choices[0].get('delta') or {}
+                            choice0 = choices[0] if choices else None
+                            if not choice0: continue
+                            delta = choice0.get('delta') or {}
                             
                             # Reasoning
                             rc = delta.get('reasoning_content') or delta.get('reasoning')
