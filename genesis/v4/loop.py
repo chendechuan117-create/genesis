@@ -472,10 +472,10 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
             
             # ── 知识路径持续提醒（仅 auto 模式，对抗 Instruction Attenuation）──
             _unblocked = set(self.loop_config.get("gp_unblock_tools") or [])
-            if "record_lesson_node" in _unblocked and i >= 8 and i % 5 == 3:
+            if "record_lesson_node" in _unblocked and i >= 3 and i % 3 == 0:
                 self.g_messages.append(Message(
                     role=MessageRole.SYSTEM,
-                    content="[知识路径] 回顾你到目前为止的发现——有什么新认知值得写入知识库？"
+                    content="[知识路径] 你搜索了知识库并有了发现——现在用 record_lesson_node 把新洞察写回知识库，reasoning_basis 必须连线到搜索命中的节点。"
                 ))
             
             self._llm_call_count += 1
@@ -742,20 +742,41 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
 
     def _render_preloaded_nodes(self, node_ids: List[str], header: str,
                                  similarity_scores: Optional[Dict[str, float]] = None) -> Optional[str]:
-        """渲染预加载节点 + 1-hop 邻居为 GP 可读文本"""
+        """渲染预加载节点 + 1-hop 邻居为 GP 可读文本，按 component 分组"""
         briefs = self.vault.get_node_briefs(node_ids)
         if not briefs:
             return None
         
         lines = [header]
         loaded_ids = []
-        DEEP_EDGES = {"REQUIRES", "TRIGGERS", "RESOLVES"}
+        DEEP_EDGES = {"REQUIRES", "TRIGGERS", "RESOLVES", "PREREQUISITE", "ANCHORED"}
         
         from genesis.v4.arena_mixin import ArenaConfidenceMixin
+        
+        # 按 component 分组（替代旧的 CONCEPT 锥体分组）
+        component_groups: Dict[str, List[tuple]] = {}  # component → [(nid, brief)]
+        ungrouped = []
+        
         for nid in node_ids:
             brief = briefs.get(nid)
             if not brief:
                 continue
+            # 从 metadata_signature.component 推断归属
+            sig = brief.get("metadata_signature")
+            if isinstance(sig, str):
+                try:
+                    import json as _json
+                    sig = _json.loads(sig)
+                except Exception:
+                    sig = {}
+            comp = (sig or {}).get("component") if isinstance(sig, dict) else None
+            
+            if comp:
+                component_groups.setdefault(comp, []).append((nid, brief))
+            else:
+                ungrouped.append((nid, brief))
+        
+        def _render_node(nid, brief, indent="  "):
             title = brief.get("title", nid)
             ntype = brief.get("type", "?")
             conf = ArenaConfidenceMixin.effective_confidence(brief)
@@ -766,7 +787,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
             losses = brief.get("usage_fail_count", 0) or 0
             if wins or losses:
                 meta_parts.append(f"{wins}W/{losses}L")
-            lines.append(f"  ● <{ntype}> {title} [{nid}] ({', '.join(meta_parts)})")
+            lines.append(f"{indent}● <{ntype}> {title} [{nid}] ({', '.join(meta_parts)})")
             loaded_ids.append(nid)
             
             # 1-hop 邻居 + 强边 2-hop
@@ -775,7 +796,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                 neighbors = self.vault.get_related_nodes(nid, direction=direction)
                 for nb in neighbors[:4]:
                     arrow = "→" if direction == "out" else "←"
-                    lines.append(f"    {arrow} [{nb['relation']}] <{nb['type']}> {nb['title']} ({nb['node_id']})")
+                    lines.append(f"{indent}  {arrow} [{nb['relation']}] <{nb['type']}> {nb['title']} ({nb['node_id']})")
                     if nb['relation'] in DEEP_EDGES:
                         hop1_deep.append(nb['node_id'])
             # 强边 2-hop（限制 3 条）
@@ -787,10 +808,23 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                     for h2 in self.vault.get_related_nodes(h1id, direction=direction)[:2]:
                         if h2['node_id'] == nid or h2['relation'] not in DEEP_EDGES:
                             continue
-                        lines.append(f"      (2-hop via {h1id}) → [{h2['relation']}] <{h2['type']}> {h2['title']} ({h2['node_id']})")
+                        lines.append(f"{indent}    (2-hop via {h1id}) → [{h2['relation']}] <{h2['type']}> {h2['title']} ({h2['node_id']})")
                         hop2_count += 1
                         if hop2_count >= 3:
                             break
+        
+        # 渲染 component 分组
+        for comp, items in component_groups.items():
+            lines.append(f"  ◆ [{comp}] ({len(items)}个锚点)")
+            for nid, brief in items:
+                _render_node(nid, brief, indent="    ")
+        
+        # 渲染无 component 归属的节点
+        if ungrouped:
+            if component_groups:
+                lines.append(f"  [未归属] ({len(ungrouped)}个锚点)")
+            for nid, brief in ungrouped:
+                _render_node(nid, brief, indent="  " if not component_groups else "    ")
         
         if not loaded_ids:
             return None
