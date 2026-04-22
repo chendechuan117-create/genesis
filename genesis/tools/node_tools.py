@@ -87,7 +87,7 @@ class RecordLessonNodeTool(BaseNodeTool):
                 },
                 "resolves": {"type": "string", "description": "此经验主要解决的具体报错信息或异常现象简述（用于丰富图谱寻找）"},
                 "contradicts": {"type": "string", "description": "可选。如果这条新知识反驳/替代了某个旧节点，填写被反驳的节点 ID。旧节点将被标记为已过时，不再出现在搜索结果中。"},
-                "reasoning_basis": {"type": "array", "items": {"type": "object", "properties": {"basis_node_id": {"type": "string", "description": "基于哪个已有节点产生此经验"}, "reasoning": {"type": "string", "description": "为什么觉得那个节点有用/如何推导出此经验"}}, "required": ["basis_node_id", "reasoning"]}, "description": "可选。推理线：记录此经验是基于哪些已有知识产生的，以及判断依据。"},
+                "reasoning_basis": {"type": "array", "items": {"type": "object", "properties": {"basis_node_id": {"type": "string", "description": "基于哪个已有节点产生此经验"}, "reasoning": {"type": "string", "description": "为什么觉得那个节点有用/如何推导出此经验"}}, "required": ["basis_node_id", "reasoning"]}, "description": "推理线（强烈建议填写）：记录此经验基于哪些已有知识产生、判断依据是什么。如果你搜索了知识库并基于搜索结果产生了新洞察，必须填写此字段连线。示例：[{\"basis_node_id\": \"LESSON_XXX\", \"reasoning\": \"该节点描述了X模式，我观察到当前场景也符合此模式\"}]"},
                 **TRUST_SCHEMA_PROPERTIES
             },
             "required": ["node_id", "title", "trigger_verb", "trigger_noun", "trigger_context", "action_steps", "because_reason", "resolves"]
