@@ -589,15 +589,16 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
 
                 # === 知识邻域视图（连根拔起） ===
                 total_neighbors = sum(len(v) for v in graph_related_ids.values())
-                lines = [f"🔍 [知识邻域] 查询: {keywords} | 命中 {len(row_dicts)} 节点，关联 {total_neighbors} 邻居"]
 
-                # 面拓扑呈现（放头部，防Discord截断；无数字评分，GP从拓扑自己感受价值）
+                # 面拓扑呈现（合并到首行，防Discord截断；无数字评分，GP从拓扑自己感受价值）
                 depth_counts = {}
                 for p in surface_points:
                     d = p.get("depth", 0)
                     depth_counts[d] = depth_counts.get(d, 0) + 1
-                depth_str = " | ".join(f"深度{d}:{c}点" for d, c in sorted(depth_counts.items()))
-                lines.append(f"[知识地形] {len(surface_points)} 点 | {depth_str} | {len(surface_frontiers)} 前沿 | {len(surface_voids)} 空洞")
+                depth_str = " | ".join(f"d{d}:{c}" for d, c in sorted(depth_counts.items()))
+                terrain_str = f"地形:{len(surface_points)}点({depth_str}) {len(surface_frontiers)}前沿 {len(surface_voids)}空洞"
+                lines = [f"🔍 [知识邻域] 查询: {keywords} | 命中 {len(row_dicts)} 节点，关联 {total_neighbors} 邻居 | {terrain_str}"]
+
                 if surface_frontiers:
                     frontier_names = [f["title"][:30] for f in surface_frontiers[:5]]
                     lines.append(f"[前沿] {', '.join(frontier_names)}")
