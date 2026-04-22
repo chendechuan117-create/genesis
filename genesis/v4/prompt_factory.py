@@ -170,8 +170,8 @@ class FactoryManager:
 
         map_block = ""
         if knowledge_map:
-            map_block = f"""[L1 Knowledge — 声明式知识摘要]
-按鲜活度排序的知识节点。eff 越高越可信，低于 0.2 的已自动淘汰。
+            map_block = f"""[知识地形 — 拓扑视图]
+知识节点的拓扑分布。前沿是知识最外层，空洞是未探索方向。
 需要详情用 search_knowledge_nodes(keywords=[...]) 或 get_knowledge_node_content(node_id=...)。
 {knowledge_map}
 """

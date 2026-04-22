@@ -51,10 +51,10 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
             )
 
     def _record_search_void(self, keywords, ntype=None, extra=None):
-        """搜索未命中或基础盘薄弱时记录 VOID（知识缺口），引导未来探索方向。
+        """搜索未命中或锥体薄时记录 VOID（知识缺口），引导未来探索方向。
         auto mode 禁用 Multi-G，导致 lens_phase 的 void 记录不触发，
         此处补齐搜索层的 void 记录。
-        extra: 可选附加信息（如基础盘锚点/线数量），会追加到 source 中。
+        extra: 可选附加信息（如锥体密度指标），会追加到 source 中。
         """
         if not keywords:
             return
@@ -469,13 +469,11 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     if nid and score > self.__class__._last_fusion_scores.get(nid, 0.0):
                         self.__class__._last_fusion_scores[nid] = score
                 
-                # === Graph Walk (圆锥模型：连根拔起) ===
+                # === Graph Walk (点线面：连根拔起) ===
                 # 强边(REQUIRES/TRIGGERS)做 2 跳拉出深度，弱边(RELATED_TO)保持 1 跳拉出宽度
-                DEEP_EDGES = {"REQUIRES", "TRIGGERS", "RESOLVES", "PREREQUISITE", "ANCHORED"}
+                DEEP_EDGES = {"REQUIRES", "TRIGGERS", "RESOLVES", "PREREQUISITE"}
                 graph_context = {}
                 graph_related_ids = {}
-                cone_edge_count = 0
-                cone_all_neighbor_ids = set()
                 
                 for r in row_dicts:
                     nid = r['node_id']
@@ -494,8 +492,6 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                             graph_context[nid].append(line)
                             if n2id not in graph_related_ids[nid]:
                                 graph_related_ids[nid].append(n2id)
-                            cone_all_neighbor_ids.add(n2id)
-                            cone_edge_count += 1
                             # 记录强边邻居，用于 2-hop
                             if rel in DEEP_EDGES:
                                 hop1_deep_ids.append(n2id)
@@ -520,8 +516,6 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                                 graph_context[nid].append(hop2_line)
                                 if h2id not in graph_related_ids[nid]:
                                     graph_related_ids[nid].append(h2id)
-                                cone_all_neighbor_ids.add(h2id)
-                                cone_edge_count += 1
                                 hop2_count += 1
                                 if hop2_count >= 6:
                                     break
@@ -581,8 +575,6 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     nid = r['node_id']
                     # 紧凑元数据
                     meta = []
-                    if r.get('fusion_score'):
-                        meta.append(f"f:{r['fusion_score']:.2f}")
                     wins = r.get('usage_success_count', 0) or 0
                     losses = r.get('usage_fail_count', 0) or 0
                     if wins or losses:
@@ -634,22 +626,8 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                         detail_parts.append(f"invalid:{invalidation_reason}")
                     if r.get('resolves'):
                         detail_parts.append(f"resolves:{r['resolves'][:80]}")
-                    # component 归属（概念级锚定）
-                    sig_dict = r.get('metadata_signature')
-                    if isinstance(sig_dict, str):
-                        try:
-                            sig_dict = json.loads(sig_dict)
-                        except Exception:
-                            sig_dict = {}
-                    if isinstance(sig_dict, dict) and sig_dict.get('component'):
-                        detail_parts.append(f"component:{sig_dict['component']}")
                     if detail_parts:
                         lines.append(f"  {' | '.join(detail_parts)}")
-                    # ANCHORED 救生索：命中节点时展示锚定连线
-                    if nid in graph_context:
-                        for rel_line in graph_context[nid]:
-                            if 'ANCHORED' in rel_line:
-                                lines.append(f"  ⚓ {rel_line}")
                     # 内联边：展示知识邻域连接（含 2-hop 深度）
                     if nid in graph_context:
                         for rel_line in graph_context[nid][:6]:
@@ -677,9 +655,12 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 if hot_neighbors:
                     lines.append(f"[高频邻居] {', '.join(hot_neighbors)}（被多个命中节点引用，建议一起挂载）")
 
-                # === 基础盘摘要 ===
-                cone_node_count = len(row_dicts) + len(cone_all_neighbor_ids)
-                proven_count = sum(1 for r in row_dicts if (r.get('usage_success_count') or 0) >= 2)
+                # === 点线面：面扩散（替代圆锥凝实度摘要） ===
+                seed_ids = [r['node_id'] for r in row_dicts[:8]]
+                surface = self.vault.expand_surface(seed_ids, context_budget=25000)
+                surface_points = surface.get("points", [])
+                surface_frontiers = surface.get("frontiers", [])
+                surface_voids = surface.get("voids", [])
 
                 # 交叉查询 void_tasks：找出与本次搜索相关的知识空洞
                 void_count = 0
@@ -698,18 +679,29 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 except Exception:
                     pass
 
-                landscape_parts = [f"{cone_node_count} 锚点", f"{cone_edge_count} 条线", f"{proven_count} PROVEN"]
-                if void_count:
-                    landscape_parts.append(f"{void_count} VOID")
-                lines.append(f"[基础盘] {' | '.join(landscape_parts)}")
+                # 面拓扑呈现（无数字评分，GP从拓扑自己感受价值）
+                depth_counts = {}
+                for p in surface_points:
+                    d = p.get("depth", 0)
+                    depth_counts[d] = depth_counts.get(d, 0) + 1
+                depth_str = " | ".join(f"深度{d}:{c}点" for d, c in sorted(depth_counts.items()))
+
+                lines.append(f"[知识地形] {len(surface_points)} 点 | {depth_str} | {len(surface_frontiers)} 前沿 | {len(surface_voids)} 空洞")
+                if surface_frontiers:
+                    frontier_names = [f["title"][:30] for f in surface_frontiers[:5]]
+                    lines.append(f"[前沿] {', '.join(frontier_names)}")
+                if surface_voids:
+                    void_briefs = self.vault.get_node_briefs(surface_voids[:5])
+                    void_names = [void_briefs.get(vid, {}).get("title", vid)[:30] for vid in surface_voids[:5]]
+                    lines.append(f"[空洞边界] {', '.join(void_names)} — 这些方向无后续推导")
                 if void_hints:
                     lines.append("[知识空洞]")
                     lines.extend(void_hints)
 
-                # ── 基础盘薄弱 → VOID 记录（知识缺口，引导未来探索） ──
-                if cone_node_count <= 2 and cone_edge_count == 0:
+                # ── 稀疏面 → VOID 记录（知识缺口，引导未来探索） ──
+                if len(surface_points) < 3:
                     self._record_search_void(keywords, ntype,
-                                             extra=f"anchors={cone_node_count},lines={cone_edge_count}")
+                                             extra=f"surface_points={len(surface_points)},frontiers={len(surface_frontiers)}")
 
                 # ── 搜索仪表盘统计 ──
                 top_scores = [r.get('fusion_score', 0.0) for r in row_dicts[:5]]
