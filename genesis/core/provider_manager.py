@@ -84,10 +84,13 @@ class ProviderRouter(LLMProvider):
     _SCHEDULE_CHECK_INTERVAL = 300     # 每5分钟检查一次时段切换
 
     def _get_scheduled_provider(self) -> str:
-        """根据当前小时返回首选 provider"""
-        from datetime import datetime
-        hour = datetime.now().hour
-        if 7 <= hour < 24:
+        """根据当前小时返回首选 provider (北京时间 UTC+8)
+        7:00-24:00 北京时间 = newshrimp → UTC 23:00-16:00 (跨日)
+        0:00-7:00  北京时间 = xcode     → UTC 16:00-23:00
+        """
+        from datetime import datetime, timezone, timedelta
+        bj_hour = (datetime.now(timezone(timedelta(hours=8)))).hour
+        if 7 <= bj_hour < 24:
             preferred = self._DAYTIME_PROVIDER
         else:
             preferred = self._NIGHTTIME_PROVIDER
