@@ -17,7 +17,7 @@ class RecordContextNodeTool(BaseNodeTool):
 
     @property
     def description(self) -> str:
-        return "沉淀静态参数类节点 (CONTEXT)，用于记录纯粹的 Key-Value 状态变量或环境信息。(仅超级管理员 C 进程 有权限使用)"
+        return "沉淀静态参数类节点 (CONTEXT)，用于记录纯粹的 Key-Value 状态变量或环境信息。发现需要记录的环境参数或配置信息时，可调用此工具写入知识库。"
 
     @property
     def parameters(self) -> Dict[str, Any]:
@@ -62,7 +62,7 @@ class RecordLessonNodeTool(BaseNodeTool):
 
     @property
     def description(self) -> str:
-        return "沉淀经验流程类节点 (LESSON)，用于记录具体的排错手段或操作流。(仅超级管理员 C 进程 有权限使用)"
+        return "沉淀经验流程类节点 (LESSON)，用于记录具体的排错手段或操作流。搜索知识库后产生新洞察时，必须调用此工具写回知识库，并用 reasoning_basis 连线到搜索命中的节点。"
 
     @property
     def parameters(self) -> Dict[str, Any]:
