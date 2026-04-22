@@ -88,7 +88,7 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         self._initialized = True
         self.signature = SignatureEngine(self._conn, vault=self)
         self.signature.initialize()
-        self.query = KnowledgeQuery(self._conn)
+        self.query = KnowledgeQuery(self._conn, vault=self)
 
     def _get_db_now(self) -> str:
         """SQLite CURRENT_TIMESTAMP 的 Python 等价"""
@@ -559,6 +559,124 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         except Exception as e:
             logger.warning(f"touch_node failed for {node_id}: {e}")
 
+    def build_landscape(self, seed_node_ids: List[str] = None, max_depth: int = 3, max_nodes: int = 30) -> str:
+        """面生成器：从种子节点出发，沿 ANCHORED 边 BFS，生成拓扑描述。
+        
+        面不是评分，是拓扑列举——关键点（连线多的枢纽）、覆盖情况、重合点。
+        占 GP 上下文 ~20%，让 GP 对当前探索领域有大局观。
+        """
+        try:
+            if not seed_node_ids:
+                return ""
+            
+            # BFS 遍历 ANCHORED 边
+            visited = set()
+            frontier = set(seed_node_ids)
+            node_anchors = {}  # node_id -> [被哪些节点 ANCHORED 到]
+            all_nodes = {}     # node_id -> {title, type}
+            
+            # 获取种子节点信息
+            seed_rows = self._conn.execute(
+                f"SELECT node_id, title, type FROM knowledge_nodes WHERE node_id IN ({','.join('?' * len(seed_node_ids))})",
+                tuple(seed_node_ids)
+            ).fetchall()
+            for r in seed_rows:
+                all_nodes[r[0]] = {"title": r[1] or r[0], "type": r[2]}
+            
+            depth = 0
+            while frontier and depth < max_depth and len(visited) < max_nodes:
+                next_frontier = set()
+                # 查询当前层所有节点的 ANCHORED 边（双向）
+                frontier_ids = list(frontier - visited)
+                if not frontier_ids:
+                    break
+                
+                placeholders = ','.join('?' * len(frontier_ids))
+                # 出边：node → ANCHORED → old_node
+                out_edges = self._conn.execute(f"""
+                    SELECT e.source_id, e.target_id, kn.title, kn.type
+                    FROM node_edges e
+                    JOIN knowledge_nodes kn ON e.target_id = kn.node_id
+                    WHERE e.source_id IN ({placeholders}) AND e.relation = 'ANCHORED'
+                """, tuple(frontier_ids)).fetchall()
+                # 入边：other_node → ANCHORED → node
+                in_edges = self._conn.execute(f"""
+                    SELECT e.source_id, e.target_id, kn.title, kn.type
+                    FROM node_edges e
+                    JOIN knowledge_nodes kn ON e.source_id = kn.node_id
+                    WHERE e.target_id IN ({placeholders}) AND e.relation = 'ANCHORED'
+                """, tuple(frontier_ids)).fetchall()
+                
+                for src, tgt, title, ntype in out_edges:
+                    node_anchors.setdefault(tgt, []).append(src)
+                    all_nodes[tgt] = {"title": title or tgt, "type": ntype}
+                    if tgt not in visited:
+                        next_frontier.add(tgt)
+                
+                for src, tgt, title, ntype in in_edges:
+                    node_anchors.setdefault(tgt, []).append(src)
+                    all_nodes.setdefault(src, {"title": title or src, "type": ntype})
+                    if src not in visited:
+                        next_frontier.add(src)
+                
+                visited.update(frontier)
+                frontier = next_frontier
+                depth += 1
+            
+            if not all_nodes:
+                return ""
+            
+            # 生成拓扑描述
+            lines = []
+            
+            # 枢纽点：被 ≥3 条 ANCHORED 线连接的点
+            hubs = {nid: anchors for nid, anchors in node_anchors.items() if len(anchors) >= 3}
+            if hubs:
+                lines.append("枢纽:")
+                for nid, anchors in sorted(hubs.items(), key=lambda x: -len(x[1]))[:5]:
+                    info = all_nodes.get(nid, {"title": nid, "type": "?"})
+                    lines.append(f"  {info['title']} ({len(anchors)}条线)")
+            
+            # 覆盖列举：按 component 分组（如果有的话）
+            component_groups = {}
+            for nid, info in all_nodes.items():
+                # 尝试从 metadata_signature 获取 component
+                sig_row = self._conn.execute(
+                    "SELECT json_extract(metadata_signature, '$.component') FROM knowledge_nodes WHERE node_id = ?",
+                    (nid,)
+                ).fetchone()
+                comp = sig_row[0] if sig_row and sig_row[0] else "其他"
+                component_groups.setdefault(comp, []).append(nid)
+            
+            if component_groups:
+                lines.append("覆盖:")
+                for comp, nids in sorted(component_groups.items(), key=lambda x: -len(x[1])):
+                    anchor_count = sum(len(node_anchors.get(n, [])) for n in nids)
+                    lines.append(f"  {comp}: {len(nids)}个锚点, {anchor_count}条线")
+            
+            # 重合检测：两个不同节点被同一组 ANCHORED 线连接 → 可能在说同一件事
+            seen_anchor_sets = {}
+            overlaps = []
+            for nid, anchors in node_anchors.items():
+                if len(anchors) < 2:
+                    continue
+                key = tuple(sorted(anchors))
+                if key in seen_anchor_sets:
+                    overlaps.append((seen_anchor_sets[key], nid))
+                else:
+                    seen_anchor_sets[key] = nid
+            if overlaps:
+                lines.append("重合:")
+                for a, b in overlaps[:3]:
+                    a_info = all_nodes.get(a, {"title": a})
+                    b_info = all_nodes.get(b, {"title": b})
+                    lines.append(f"  {a_info['title']} ≈ {b_info['title']}")
+            
+            return "\n".join(lines) if lines else ""
+        except Exception as e:
+            logger.debug(f"build_landscape failed (non-fatal): {e}")
+            return ""
+
     def add_edge(self, source_id: str, target_id: str, relation: str, weight: float = 1.0):
         """添加一条图谱边 (Idempotent)"""
         try:
@@ -828,7 +946,7 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             normalized_last_verified = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         normalized_verification_source = verification_source or (source if normalized_last_verified else None)
         # V4.3: 支持 ENTITY/EVENT/ACTION 进行向量化
-        embeddable_types = ["LESSON", "CONTEXT", "ASSET", "EPISODE", "ENTITY", "EVENT", "ACTION", "TOOL", "DISCOVERY", "PATTERN"]
+        embeddable_types = ["LESSON", "CONTEXT", "ASSET", "EPISODE", "ENTITY", "EVENT", "ACTION", "TOOL", "DISCOVERY", "PATTERN", "CONCEPT"]
         if ntype in embeddable_types and self.vector_engine.is_ready:
             text_to_encode = f"{title} {tags} {resolves or ''} {signature_text}".strip()
             vec = self.vector_engine.encode(text_to_encode)
@@ -877,7 +995,7 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             logger.warning("VectorEngine not ready, cannot backfill embeddings.")
             return {"total_missing": 0, "success": 0, "failed": 0, "skipped": 0}
 
-        embeddable_types = ["LESSON", "CONTEXT", "ASSET", "EPISODE", "ENTITY", "EVENT", "ACTION", "TOOL", "DISCOVERY", "PATTERN"]
+        embeddable_types = ["LESSON", "CONTEXT", "ASSET", "EPISODE", "ENTITY", "EVENT", "ACTION", "TOOL", "DISCOVERY", "PATTERN", "CONCEPT"]
         placeholders = ','.join('?' * len(embeddable_types))
         rows = self._conn.execute(
             f"SELECT node_id, type, title, tags, resolves, metadata_signature "

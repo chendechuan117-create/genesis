@@ -2,6 +2,7 @@ import logging
 import json
 from typing import Dict, Any, List
 from genesis.v4.manager import NodeVault, TRUST_TIERS
+from genesis.v4.signature_constants import COMPONENT_MARKERS
 from genesis.tools._base import BaseNodeTool, TRUST_SCHEMA_PROPERTIES  # noqa: F401
 
 logger = logging.getLogger(__name__)
@@ -87,12 +88,17 @@ class RecordLessonNodeTool(BaseNodeTool):
                 },
                 "resolves": {"type": "string", "description": "此经验主要解决的具体报错信息或异常现象简述（用于丰富图谱寻找）"},
                 "contradicts": {"type": "string", "description": "可选。如果这条新知识反驳/替代了某个旧节点，填写被反驳的节点 ID。旧节点将被标记为已过时，不再出现在搜索结果中。"},
+                "anchored_to": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "可选。此新知识锚定到的旧节点ID列表——你认为哪些旧知识对此次行动有帮助。这些连线构成探索路径的救生索。"
+                },
                 **TRUST_SCHEMA_PROPERTIES
             },
             "required": ["node_id", "title", "trigger_verb", "trigger_noun", "trigger_context", "action_steps", "because_reason", "resolves"]
         }
 
-    async def execute(self, node_id: str, title: str, trigger_verb: str, trigger_noun: str, trigger_context: str, action_steps: List[str], because_reason: str, prerequisites: List[str] = None, resolves: str = None, contradicts: str = None, metadata_signature: Dict[str, Any] = None, last_verified_at: str = None, verification_source: str = None) -> str:
+    async def execute(self, node_id: str, title: str, trigger_verb: str, trigger_noun: str, trigger_context: str, action_steps: List[str], because_reason: str, prerequisites: List[str] = None, resolves: str = None, contradicts: str = None, metadata_signature: Dict[str, Any] = None, last_verified_at: str = None, verification_source: str = None, anchored_to: List[str] = None) -> str:
         try:
             lesson_struct = {
                 "IF_trigger": {
@@ -105,6 +111,17 @@ class RecordLessonNodeTool(BaseNodeTool):
             }
             content = json.dumps(lesson_struct, ensure_ascii=False, indent=2)
             prereq_str = ",".join(prerequisites) if prerequisites else None
+
+            # 自动推断 component：如果 metadata_signature 没有 component，从内容推断
+            if metadata_signature is None:
+                metadata_signature = {}
+            if not metadata_signature.get("component"):
+                text = f"{title} {trigger_noun} {trigger_context} {resolves or ''} {because_reason or ''}".lower()
+                for comp, markers in COMPONENT_MARKERS.items():
+                    if any(m.lower() in text for m in markers):
+                        metadata_signature["component"] = comp
+                        logger.info(f"LESSON [{node_id}] auto-inferred component={comp}")
+                        break
 
             # === 语义去重：写入前搜索相似 LESSON ===
             dedup_action = None
@@ -157,6 +174,15 @@ class RecordLessonNodeTool(BaseNodeTool):
             if dedup_action == "relate" and merged_node_id:
                 self.vault.add_edge(node_id, merged_node_id, "RELATED_TO", weight=0.7)
 
+            # ANCHORED 边：新点 → 旧点的救生索连线（LLM 判断哪些旧知识对此次有帮助）
+            anchored_msg = ""
+            if anchored_to:
+                for old_id in anchored_to:
+                    old_id = old_id.strip()
+                    if old_id and old_id != node_id:
+                        self.vault.add_edge(node_id, old_id, "ANCHORED", weight=0.8)
+                anchored_msg = f" ⚓ ANCHORED→{anchored_to}"
+
             # RESOLVES 边：此经验解决了某个问题/异常 → 强边（2-hop 深度遍历）
             resolves_msg = ""
             if resolves:
@@ -186,9 +212,9 @@ class RecordLessonNodeTool(BaseNodeTool):
                 logger.info(f"CONTRADICTS: [{node_id}] --[CONTRADICTS]--> [{target_id}]")
 
             if dedup_action == "relate" and merged_node_id:
-                return f"✅ LESSON节点 [{node_id}] '{title}' 写入成功。检测到相似节点 [{merged_node_id}]，已建立 RELATED_TO 边。{resolves_msg}{prereq_msg}{contradicts_msg}"
+                return f"✅ LESSON节点 [{node_id}] '{title}' 写入成功。检测到相似节点 [{merged_node_id}]，已建立 RELATED_TO 边。{resolves_msg}{prereq_msg}{anchored_msg}{contradicts_msg}"
 
-            return f"✅ LESSON节点 [{node_id}] '{title}' 写入成功。{resolves_msg}{prereq_msg}{contradicts_msg}"
+            return f"✅ LESSON节点 [{node_id}] '{title}' 写入成功。{resolves_msg}{prereq_msg}{anchored_msg}{contradicts_msg}"
         except Exception as e:
             logger.error(f"Lesson node creation failed: {e}")
             return f"Error: {e}"

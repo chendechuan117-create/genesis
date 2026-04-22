@@ -51,10 +51,10 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
             )
 
     def _record_search_void(self, keywords, ntype=None, extra=None):
-        """搜索未命中或锥体薄时记录 VOID（知识缺口），引导未来探索方向。
+        """搜索未命中或基础盘薄弱时记录 VOID（知识缺口），引导未来探索方向。
         auto mode 禁用 Multi-G，导致 lens_phase 的 void 记录不触发，
         此处补齐搜索层的 void 记录。
-        extra: 可选附加信息（如锥体密度指标），会追加到 source 中。
+        extra: 可选附加信息（如基础盘锚点/线数量），会追加到 source 中。
         """
         if not keywords:
             return
@@ -471,7 +471,7 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 
                 # === Graph Walk (圆锥模型：连根拔起) ===
                 # 强边(REQUIRES/TRIGGERS)做 2 跳拉出深度，弱边(RELATED_TO)保持 1 跳拉出宽度
-                DEEP_EDGES = {"REQUIRES", "TRIGGERS", "RESOLVES", "PREREQUISITE"}
+                DEEP_EDGES = {"REQUIRES", "TRIGGERS", "RESOLVES", "PREREQUISITE", "ANCHORED"}
                 graph_context = {}
                 graph_related_ids = {}
                 cone_edge_count = 0
@@ -634,8 +634,22 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                         detail_parts.append(f"invalid:{invalidation_reason}")
                     if r.get('resolves'):
                         detail_parts.append(f"resolves:{r['resolves'][:80]}")
+                    # component 归属（概念级锚定）
+                    sig_dict = r.get('metadata_signature')
+                    if isinstance(sig_dict, str):
+                        try:
+                            sig_dict = json.loads(sig_dict)
+                        except Exception:
+                            sig_dict = {}
+                    if isinstance(sig_dict, dict) and sig_dict.get('component'):
+                        detail_parts.append(f"component:{sig_dict['component']}")
                     if detail_parts:
                         lines.append(f"  {' | '.join(detail_parts)}")
+                    # ANCHORED 救生索：命中节点时展示锚定连线
+                    if nid in graph_context:
+                        for rel_line in graph_context[nid]:
+                            if 'ANCHORED' in rel_line:
+                                lines.append(f"  ⚓ {rel_line}")
                     # 内联边：展示知识邻域连接（含 2-hop 深度）
                     if nid in graph_context:
                         for rel_line in graph_context[nid][:6]:
@@ -663,13 +677,9 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 if hot_neighbors:
                     lines.append(f"[高频邻居] {', '.join(hot_neighbors)}（被多个命中节点引用，建议一起挂载）")
 
-                # === 圆锥凝实度摘要（含空洞检测） ===
+                # === 基础盘摘要 ===
                 cone_node_count = len(row_dicts) + len(cone_all_neighbor_ids)
-                conf_values = [self.vault.effective_confidence(r) for r in row_dicts]
-                avg_conf = sum(conf_values) / len(conf_values) if conf_values else 0
                 proven_count = sum(1 for r in row_dicts if (r.get('usage_success_count') or 0) >= 2)
-                untested_count = sum(1 for r in row_dicts if (r.get('usage_count') or 0) == 0)
-                untested_pct = round(untested_count / len(row_dicts) * 100) if row_dicts else 0
 
                 # 交叉查询 void_tasks：找出与本次搜索相关的知识空洞
                 void_count = 0
@@ -688,30 +698,18 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 except Exception:
                     pass
 
-                # 凝实度判定（综合 PROVEN + UNTESTED 比例 + VOID 空洞）
-                if proven_count >= 3 and avg_conf >= 0.7 and cone_edge_count >= 5 and untested_pct < 40:
-                    density_label = "高凝实 — 已有成熟解法，可直接组装"
-                elif cone_node_count >= 5 and avg_conf >= 0.5:
-                    density_label = "中凝实 — 有基础知识，部分区域需验证"
-                elif cone_node_count >= 2:
-                    density_label = "低凝实 — 知识稀疏，建议先探索再执行"
-                else:
-                    density_label = "近乎未知 — 无成熟积木，需要全面探索"
-
-                density_parts = [f"{cone_node_count} 节点({untested_count} 未验证)", f"置信 {avg_conf:.2f}", f"{cone_edge_count} 条边", f"{proven_count} PROVEN"]
+                landscape_parts = [f"{cone_node_count} 锚点", f"{cone_edge_count} 条线", f"{proven_count} PROVEN"]
                 if void_count:
-                    density_parts.append(f"{void_count} VOID")
-                lines.append(f"[知识密度] {' | '.join(density_parts)} → {density_label}")
+                    landscape_parts.append(f"{void_count} VOID")
+                lines.append(f"[基础盘] {' | '.join(landscape_parts)}")
                 if void_hints:
                     lines.append("[知识空洞]")
                     lines.extend(void_hints)
 
-                # ── 低凝实锥体 → VOID 记录（知识缺口，引导未来探索） ──
-                # 原逻辑只在 len==0 时记录，但 1735 节点的 vault 几乎不会搜不到。
-                # 真正的知识缺口是"搜到了但锥体很薄"：命中少、无验证、无强边。
-                if density_label.startswith("低凝实") or density_label.startswith("近乎未知"):
+                # ── 基础盘薄弱 → VOID 记录（知识缺口，引导未来探索） ──
+                if cone_node_count <= 2 and cone_edge_count == 0:
                     self._record_search_void(keywords, ntype,
-                                             extra=f"cone_density={cone_node_count},avg_conf={avg_conf:.2f},edges={cone_edge_count}")
+                                             extra=f"anchors={cone_node_count},lines={cone_edge_count}")
 
                 # ── 搜索仪表盘统计 ──
                 top_scores = [r.get('fusion_score', 0.0) for r in row_dicts[:5]]
