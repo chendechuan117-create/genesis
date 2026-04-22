@@ -290,6 +290,11 @@ class CPhaseMixin:
             if sig_text:
                 parts.append(f"[任务签名]\n{sig_text}")
 
+        # 8.5 基础盘感知：当前领域的锚点和救生索拓扑
+        density_info = self._query_component_density()
+        if density_info:
+            parts.append(f"[基础盘 — 当前领域的锚点和救生索]\n{density_info}")
+
         # 9. 跨轮行为观测（GP 自身无法察觉的行为模式）
         cross_obs = self._build_cross_round_observations()
         if cross_obs:
@@ -330,6 +335,40 @@ class CPhaseMixin:
             return "\n".join(lines)
         except Exception as e:
             logger.debug(f"Vault related query failed (non-fatal): {e}")
+            return ""
+
+    def _query_component_density(self) -> str:
+        """查询当前任务相关的基础盘（面），供 C-Phase 密度感知。
+        面是拓扑描述——枢纽点、覆盖情况、重合点，不是评分。
+        防原地踏步：让 C 知道当前领域已有哪些锚点。"""
+        try:
+            # 从当前任务的 component 找种子节点
+            current_comp = (self.inferred_signature or {}).get("component")
+            if not current_comp:
+                return ""
+            
+            # 找该 component 最近的 LESSON 作为种子
+            seed_rows = self.vault._conn.execute("""
+                SELECT kn.node_id FROM knowledge_nodes kn
+                WHERE json_extract(kn.metadata_signature, '$.component') = ?
+                AND kn.type = 'LESSON'
+                ORDER BY kn.updated_at DESC LIMIT 5
+            """, (current_comp,)).fetchall()
+            
+            if not seed_rows:
+                return f"  {current_comp}: 0个锚点，未探索领域"
+            
+            seed_ids = [r[0] for r in seed_rows]
+            landscape = self.vault.build_landscape(seed_node_ids=seed_ids)
+            
+            if not landscape:
+                # 没有ANCHORED边时的降级输出
+                count = len(seed_rows)
+                return f"  {current_comp}: {count}个锚点（无救生索连线）"
+            
+            return f"  当前领域: {current_comp}\n{landscape}"
+        except Exception as e:
+            logger.debug(f"Landscape query failed (non-fatal): {e}")
             return ""
 
     def _build_cross_round_observations(self) -> str:
@@ -433,7 +472,11 @@ class CPhaseMixin:
             "- 每条 LESSON 必须是原子的（一个核心步骤），可独立复用\n"
             "- 如果 GP 的工作已经足够完整，没有遗漏的深层洞察，不调用任何工具\n"
             "- 最多记录 2 条 LESSON\n"
-            "- node_id 前缀用 LESSON_C_ 以区分来源"
+            "- node_id 前缀用 LESSON_C_ 以区分来源\n"
+            "- 注意基础盘：如果当前领域已有大量锚点和枢纽，"
+            "新知识必须比已有知识有实质增量，否则不写\n"
+            "- 用 reasoning_basis 连线：声明此洞察基于哪些已有节点产生、为什么。"
+            "线是推理链的因果记录，帮助后续搜索理解知识之间的推导关系"
         )
 
         messages = [
@@ -466,6 +509,18 @@ class CPhaseMixin:
                     if not nid.startswith("LESSON_C_"):
                         nid_hash = hashlib.md5(nid.encode()).hexdigest()[:8].upper()
                         args["node_id"] = f"LESSON_C_{nid_hash}"
+                    # 自动注入 component：从执行上下文的 inferred_signature 继承
+                    # 确保 LESSON 有概念级锚定，不再悬浮
+                    if self.inferred_signature and "component" in self.inferred_signature:
+                        existing_sig = args.get("metadata_signature") or {}
+                        if isinstance(existing_sig, str):
+                            try:
+                                existing_sig = json.loads(existing_sig)
+                            except (json.JSONDecodeError, TypeError):
+                                existing_sig = {}
+                        if "component" not in existing_sig:
+                            existing_sig["component"] = self.inferred_signature["component"]
+                            args["metadata_signature"] = existing_sig
                     result = await lesson_tool.execute(**args)
                     recorded.append({
                         "node_id": args["node_id"],

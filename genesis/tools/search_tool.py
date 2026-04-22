@@ -563,9 +563,52 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     )
                 )
 
+                # === 点线面：面扩散（替代圆锥凝实度摘要） ===
+                seed_ids = [r['node_id'] for r in row_dicts[:8]]
+                surface = self.vault.expand_surface(seed_ids, context_budget=25000)
+                surface_points = surface.get("points", [])
+                surface_frontiers = surface.get("frontiers", [])
+                surface_voids = surface.get("voids", [])
+
+                # 交叉查询 void_tasks：找出与本次搜索相关的知识空洞
+                void_count = 0
+                void_hints = []
+                try:
+                    void_conditions = []
+                    void_params = []
+                    for kw in (expanded_keywords or keywords or []):
+                        void_conditions.append("query LIKE ?")
+                        void_params.append(f"%{kw}%")
+                    if void_conditions:
+                        void_sql = f"SELECT void_id, query FROM void_tasks WHERE status = 'open' AND ({' OR '.join(void_conditions)}) LIMIT 5"
+                        void_rows = conn.execute(void_sql, tuple(void_params)).fetchall()
+                        void_count = len(void_rows)
+                        void_hints = [f"  [?] {vr['query'][:60]} ({vr['void_id']})" for vr in void_rows]
+                except Exception:
+                    pass
+
                 # === 知识邻域视图（连根拔起） ===
                 total_neighbors = sum(len(v) for v in graph_related_ids.values())
                 lines = [f"🔍 [知识邻域] 查询: {keywords} | 命中 {len(row_dicts)} 节点，关联 {total_neighbors} 邻居"]
+
+                # 面拓扑呈现（放头部，防Discord截断；无数字评分，GP从拓扑自己感受价值）
+                depth_counts = {}
+                for p in surface_points:
+                    d = p.get("depth", 0)
+                    depth_counts[d] = depth_counts.get(d, 0) + 1
+                depth_str = " | ".join(f"深度{d}:{c}点" for d, c in sorted(depth_counts.items()))
+                lines.append(f"[知识地形] {len(surface_points)} 点 | {depth_str} | {len(surface_frontiers)} 前沿 | {len(surface_voids)} 空洞")
+                if surface_frontiers:
+                    frontier_names = [f["title"][:30] for f in surface_frontiers[:5]]
+                    lines.append(f"[前沿] {', '.join(frontier_names)}")
+                if surface_voids:
+                    void_briefs = self.vault.get_node_briefs(surface_voids[:5])
+                    void_names = [void_briefs.get(vid, {}).get("title", vid)[:30] for vid in surface_voids[:5]]
+                    lines.append(f"[空洞边界] {', '.join(void_names)} — 这些方向无后续推导")
+                if void_hints:
+                    lines.append("[知识空洞]")
+                    lines.extend(void_hints)
+
                 if normalized_signature:
                     lines.append(f"签名: {self.vault.signature.render(normalized_signature)}")
                 lines.append("")
@@ -654,49 +697,6 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     lines.append(f"[支撑背景] {self._bucket_summary(support_rows)}")
                 if hot_neighbors:
                     lines.append(f"[高频邻居] {', '.join(hot_neighbors)}（被多个命中节点引用，建议一起挂载）")
-
-                # === 点线面：面扩散（替代圆锥凝实度摘要） ===
-                seed_ids = [r['node_id'] for r in row_dicts[:8]]
-                surface = self.vault.expand_surface(seed_ids, context_budget=25000)
-                surface_points = surface.get("points", [])
-                surface_frontiers = surface.get("frontiers", [])
-                surface_voids = surface.get("voids", [])
-
-                # 交叉查询 void_tasks：找出与本次搜索相关的知识空洞
-                void_count = 0
-                void_hints = []
-                try:
-                    void_conditions = []
-                    void_params = []
-                    for kw in (expanded_keywords or keywords or []):
-                        void_conditions.append("query LIKE ?")
-                        void_params.append(f"%{kw}%")
-                    if void_conditions:
-                        void_sql = f"SELECT void_id, query FROM void_tasks WHERE status = 'open' AND ({' OR '.join(void_conditions)}) LIMIT 5"
-                        void_rows = conn.execute(void_sql, tuple(void_params)).fetchall()
-                        void_count = len(void_rows)
-                        void_hints = [f"  [?] {vr['query'][:60]} ({vr['void_id']})" for vr in void_rows]
-                except Exception:
-                    pass
-
-                # 面拓扑呈现（无数字评分，GP从拓扑自己感受价值）
-                depth_counts = {}
-                for p in surface_points:
-                    d = p.get("depth", 0)
-                    depth_counts[d] = depth_counts.get(d, 0) + 1
-                depth_str = " | ".join(f"深度{d}:{c}点" for d, c in sorted(depth_counts.items()))
-
-                lines.append(f"[知识地形] {len(surface_points)} 点 | {depth_str} | {len(surface_frontiers)} 前沿 | {len(surface_voids)} 空洞")
-                if surface_frontiers:
-                    frontier_names = [f["title"][:30] for f in surface_frontiers[:5]]
-                    lines.append(f"[前沿] {', '.join(frontier_names)}")
-                if surface_voids:
-                    void_briefs = self.vault.get_node_briefs(surface_voids[:5])
-                    void_names = [void_briefs.get(vid, {}).get("title", vid)[:30] for vid in surface_voids[:5]]
-                    lines.append(f"[空洞边界] {', '.join(void_names)} — 这些方向无后续推导")
-                if void_hints:
-                    lines.append("[知识空洞]")
-                    lines.extend(void_hints)
 
                 # ── 稀疏面 → VOID 记录（知识缺口，引导未来探索） ──
                 if len(surface_points) < 3:
