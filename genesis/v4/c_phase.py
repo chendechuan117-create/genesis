@@ -19,6 +19,7 @@ LLM 组件：
 V4Loop 通过 Mixin 继承获得这些方法，无需改变调用方式。
 """
 
+import os
 import re
 import json
 import hashlib
@@ -29,6 +30,52 @@ from typing import Any, Dict, Optional
 from genesis.core.base import MessageRole
 
 logger = logging.getLogger(__name__)
+
+
+def _check_cgroup_memory_pressure(headroom_mb: int = 384) -> bool:
+    """同步检查 cgroup 内存压力。不依赖 asyncio，在事件循环冻结前可调用。
+
+    当 memory.current 接近 memory.high 时返回 True。
+    headroom_mb: 距离 high 阈值的安全余量（MB），默认 384MB（约 12% of 2.8GB high）。
+    """
+    try:
+        cgroup_path = f"/proc/self/cgroup"
+        with open(cgroup_path) as f:
+            for line in f:
+                parts = line.strip().split(":")
+                if len(parts) >= 3 and "yogg" in parts[2]:
+                    slice_name = parts[2].lstrip("/")
+                    base = f"/sys/fs/cgroup/{slice_name}"
+                    current_s = (base + "/memory.current")
+                    high_s = (base + "/memory.high")
+                    try:
+                        with open(current_s) as cf:
+                            current = int(cf.read().strip())
+                        with open(high_s) as hf:
+                            high_val = int(hf.read().strip())
+                    except (FileNotFoundError, ValueError):
+                        return False
+                    threshold = high_val - headroom_mb * 1024 * 1024
+                    if current >= threshold:
+                        logger.warning(
+                            f"C-Phase memory pressure: current={current // 1048576}MB, "
+                            f"high={high_val // 1048576}MB, headroom={(high_val - current) // 1048576}MB < {headroom_mb}MB"
+                        )
+                        return True
+                    return False
+        # No yogg cgroup found — check /proc/self/status VmRSS as fallback
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    rss_kb = int(line.split()[1])
+                    rss_mb = rss_kb // 1024
+                    # Hard limit: if RSS > 2.4GB on 8GB system, skip
+                    if rss_mb > 2400:
+                        logger.warning(f"C-Phase memory pressure (RSS fallback): {rss_mb}MB > 2400MB")
+                        return True
+        return False
+    except Exception:
+        return False
 
 
 class CPhaseMixin:
@@ -175,10 +222,17 @@ class CPhaseMixin:
         # V2: C 不再创建点，改为审核+补全（补建边 + 补深层线）
         reflection_result = {"supplements": 0, "c_tokens": 0}
         if mode != "SKIP":
-            try:
-                reflection_result = await self._run_reflection(g_final_response)
-            except Exception as e:
-                logger.warning(f"Reflection failed (non-fatal): {e}", exc_info=True)
+            # 同步内存检查：cgroup memory.high 节流会冻结 asyncio 事件循环，
+            # 导致 wall_clock_timeout 和 memory guard 全部失效（根因：D 状态卡死）
+            if _check_cgroup_memory_pressure():
+                logger.warning("C-Phase Reflection SKIPPED: cgroup memory near throttle threshold. "
+                               "Skipping LLM call to prevent event loop freeze.")
+                reflection_result = {"supplements": 0, "c_tokens": 0, "reason": "memory_pressure_skip"}
+            else:
+                try:
+                    reflection_result = await self._run_reflection(g_final_response)
+                except Exception as e:
+                    logger.warning(f"Reflection failed (non-fatal): {e}", exc_info=True)
 
             r_n = reflection_result.get("supplements", 0)
             r_tokens = reflection_result.get("c_tokens", 0)
