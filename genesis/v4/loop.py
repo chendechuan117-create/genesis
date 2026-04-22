@@ -44,6 +44,7 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
     return max(minimum, value)
 
 # GP 禁用工具名（仅 C-Phase 可用的节点管理工具）
+# V2 点线面工具（record_point, record_line, record_context_point）不在禁用列表，GP 可用
 GP_BLOCKED_TOOLS = frozenset([
     "record_context_node", "record_lesson_node", "create_meta_node",
     "delete_node", "create_graph_node", "create_node_edge",
@@ -460,6 +461,10 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         _MAX_CONSECUTIVE_ERRORS = 3
         gp_max_iterations = _env_int("GENESIS_GP_MAX_ITERATIONS_OVERRIDE", self.max_iterations, minimum=1)
         for i in range(gp_max_iterations):
+            # V2: 重置跨实例共享状态，防止 last_point_id 跨轮泄漏
+            from genesis.tools._base import BaseNodeTool
+            BaseNodeTool._round_state = {}
+
             # === 跨进程向量同步：拉取后台进程新增的节点向量 ===
             self.vault.sync_vector_matrix_incremental()
             
@@ -472,10 +477,10 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
             
             # ── 知识路径持续提醒（仅 auto 模式，对抗 Instruction Attenuation）──
             _unblocked = set(self.loop_config.get("gp_unblock_tools") or [])
-            if "record_lesson_node" in _unblocked and i >= 8 and i % 5 == 3:
+            if ("record_point" in _unblocked or "record_line" in _unblocked) and i >= 8 and i % 5 == 3:
                 self.g_messages.append(Message(
                     role=MessageRole.SYSTEM,
-                    content="[知识路径] 回顾你到目前为止的发现——有什么新认知值得写入知识库？"
+                    content="[知识路径] 回顾你到目前为止的发现——用 record_line 连线到搜索命中的节点，再用 record_point 记录新洞察。"
                 ))
             
             self._llm_call_count += 1
@@ -651,7 +656,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         """获取 GP 可用的所有工具（排除 C-Phase 专属工具）
         
         loop_config.gp_unblock_tools: 允许选择性解禁部分 GP_BLOCKED_TOOLS，
-        例如 auto 模式下解禁 record_lesson_node 让 GP 直接写知识。
+        例如 auto 模式下解禁 record_point/record_line 让 GP 直接写知识。
         """
         unblock = set(self.loop_config.get("gp_unblock_tools") or [])
         blocked = GP_BLOCKED_TOOLS - unblock

@@ -290,6 +290,32 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             "CREATE INDEX IF NOT EXISTS idx_environment_epochs_scope_status "
             "ON environment_epochs(scope, status, created_at)"
         )
+        # ── 推理线表（点线面架构）：独立于 edges，存储因果推理链 ──
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS reasoning_lines (
+            line_id TEXT PRIMARY KEY,
+            new_point_id TEXT NOT NULL,
+            basis_point_id TEXT NOT NULL,
+            reasoning TEXT NOT NULL,
+            source TEXT DEFAULT 'C',
+            trace_id TEXT,
+            round_seq INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        ''')
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reasoning_lines_new_point "
+            "ON reasoning_lines(new_point_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reasoning_lines_basis_point "
+            "ON reasoning_lines(basis_point_id)"
+        )
+        # V2: reasoning_lines 加 source 列（存量DB兼容）
+        try:
+            conn.execute("ALTER TABLE reasoning_lines ADD COLUMN source TEXT DEFAULT 'C'")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
         conn.commit()
 
     def _migrate_old_data(self):
@@ -571,12 +597,164 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         except Exception as e:
             logger.error(f"Failed to add edge: {e}")
 
+    # ── 推理线（点线面架构）────────────────────────────────────────
+
+    def add_reasoning_line(self, new_point_id: str, basis_point_id: str,
+                           reasoning: str, source: str = 'C',
+                           trace_id: str = None,
+                           round_seq: int = 0) -> str:
+        """写入一条推理线：new_point 基于 basis_point 产生，reasoning 是判断依据。
+        source: 'GP' 或 'C'，标记线的产出者。
+        返回 line_id。"""
+        import hashlib as _hl
+        raw = f"{new_point_id}|{basis_point_id}|{reasoning[:80]}"
+        line_id = f"LINE_{_hl.md5(raw.encode()).hexdigest()[:10].upper()}"
+        try:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO reasoning_lines "
+                "(line_id, new_point_id, basis_point_id, reasoning, source, trace_id, round_seq) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (line_id, new_point_id, basis_point_id, reasoning, source, trace_id, round_seq)
+            )
+            self._conn.commit()
+            logger.debug(f"Line: {new_point_id} ← {basis_point_id} ({reasoning[:60]}) [source={source}]")
+        except Exception as e:
+            logger.error(f"Failed to add reasoning line: {e}")
+        return line_id
+
+    def get_incoming_line_count(self, point_id: str) -> int:
+        """获取一个点的入线数（被多少新点基于它产生）。后台价值信号，GP不可见。"""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM reasoning_lines WHERE basis_point_id = ?",
+            (point_id,)
+        ).fetchone()
+        return row[0] if row else 0
+
+    def get_outgoing_lines(self, point_id: str) -> List[Dict[str, Any]]:
+        """获取一个点产生的所有出线（它基于哪些旧点产生）。因果部分，GP可见。"""
+        rows = self._conn.execute(
+            "SELECT line_id, basis_point_id, reasoning, trace_id, round_seq, created_at "
+            "FROM reasoning_lines WHERE new_point_id = ? ORDER BY created_at",
+            (point_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_incoming_lines(self, point_id: str) -> List[Dict[str, Any]]:
+        """获取一个点的所有入线（哪些新点基于它产生）。因果部分，GP可见。"""
+        rows = self._conn.execute(
+            "SELECT line_id, new_point_id, reasoning, trace_id, round_seq, created_at "
+            "FROM reasoning_lines WHERE basis_point_id = ? ORDER BY created_at",
+            (point_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def expand_surface(self, seed_ids: List[str], context_budget: int = 25000) -> Dict[str, Any]:
+        """面扩散：从种子点沿推导链BFS扩散，到context_budget时摸石头过河替换。
+
+        返回:
+          - points: 面中的点列表 [{node_id, title, type, depth, is_frontier}]
+          - frontiers: 边缘点（面最外层，下一步可替换入面的候选）
+          - voids: 扩散过程中遇到的空洞（无出线的方向）
+        """
+        from collections import deque
+
+        # BFS 扩散
+        visited = {}  # node_id → depth
+        frontier = deque()  # (node_id, depth)
+        voids = []
+
+        # 初始化种子点
+        for sid in seed_ids:
+            visited[sid] = 0
+            frontier.append((sid, 0))
+
+        # 估算每个点占用的token数（标题+类型≈50, 内容≈500）
+        TOKENS_PER_BRIEF = 50
+        TOKENS_PER_CONTENT = 500
+        used_tokens = 0
+        phase = "expand"  # expand → replace
+
+        while frontier and used_tokens < context_budget:
+            current_id, depth = frontier.popleft()
+
+            # 获取节点简要信息
+            brief = self.get_node_briefs([current_id]).get(current_id)
+            if not brief:
+                continue
+
+            if phase == "expand":
+                used_tokens += TOKENS_PER_BRIEF
+            else:
+                # 替换阶段：用内容替换标题
+                used_tokens += TOKENS_PER_CONTENT
+
+            # 沿推导链扩散：找出 current_id 作为 basis 的出线
+            # 即：哪些新点是基于 current_id 产生的
+            # V2: 过滤 INSIGHT_ 虚拟标记（不在 knowledge_nodes 中的死胡同）
+            outgoing = self._conn.execute(
+                "SELECT rl.new_point_id FROM reasoning_lines rl "
+                "WHERE rl.basis_point_id = ? "
+                "AND (rl.new_point_id NOT LIKE 'INSIGHT_%' OR rl.new_point_id IN (SELECT node_id FROM knowledge_nodes))",
+                (current_id,)
+            ).fetchall()
+
+            # 也沿现有边扩散（REQUIRES/TRIGGERS/RESOLVES 为强边）
+            edge_neighbors = self._conn.execute(
+                "SELECT target_id FROM node_edges WHERE source_id = ? "
+                "AND relation IN ('REQUIRES', 'TRIGGERS', 'RESOLVES')",
+                (current_id,)
+            ).fetchall()
+
+            neighbors = set(r[0] for r in outgoing) | set(r[0] for r in edge_neighbors)
+
+            if not neighbors and depth > 0:
+                voids.append(current_id)
+
+            for nid in neighbors:
+                if nid not in visited:
+                    visited[nid] = depth + 1
+                    frontier.append((nid, depth + 1))
+
+            # 到达预算 60% 时切换到替换阶段
+            if phase == "expand" and used_tokens > context_budget * 0.6:
+                phase = "replace"
+                # 摸石头过河：把深度0的种子点标记为可替换
+                break
+
+        # 构建结果
+        briefs = self.get_node_briefs(list(visited.keys()))
+        points = []
+        frontiers = []
+        for nid, depth in visited.items():
+            b = briefs.get(nid, {})
+            entry = {
+                "node_id": nid,
+                "title": b.get("title", nid),
+                "type": b.get("type", "?"),
+                "depth": depth,
+                "is_frontier": False,
+            }
+            points.append(entry)
+            # 边缘点：深度最大且有未访问邻居的
+            if depth == max(visited.values()) if visited else 0:
+                entry["is_frontier"] = True
+                frontiers.append(entry)
+
+        return {
+            "points": points,
+            "frontiers": frontiers,
+            "voids": voids,
+            "used_tokens": used_tokens,
+            "phase": phase,
+        }
+
     def delete_node(self, node_id: str) -> bool:
         """物理删除一个节点及其所有关联数据（统一删除入口）"""
         try:
             self._conn.execute("DELETE FROM node_edges WHERE source_id = ? OR target_id = ?", (node_id, node_id))
             self._conn.execute("DELETE FROM node_versions WHERE node_id = ?", (node_id,))
             self._conn.execute("DELETE FROM node_contents WHERE node_id = ?", (node_id,))
+            self._conn.execute("DELETE FROM reasoning_lines WHERE new_point_id = ? OR basis_point_id = ?", (node_id, node_id))
             self._conn.execute("DELETE FROM knowledge_nodes WHERE node_id = ?", (node_id,))
             self._conn.commit()
             if self.vector_engine and node_id in getattr(self.vector_engine, 'node_ids', []):
@@ -828,7 +1006,7 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             normalized_last_verified = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         normalized_verification_source = verification_source or (source if normalized_last_verified else None)
         # V4.3: 支持 ENTITY/EVENT/ACTION 进行向量化
-        embeddable_types = ["LESSON", "CONTEXT", "ASSET", "EPISODE", "ENTITY", "EVENT", "ACTION", "TOOL", "DISCOVERY", "PATTERN"]
+        embeddable_types = ["LESSON", "CONTEXT", "ASSET", "EPISODE", "ENTITY", "EVENT", "ACTION", "TOOL", "DISCOVERY", "PATTERN", "POINT"]
         if ntype in embeddable_types and self.vector_engine.is_ready:
             text_to_encode = f"{title} {tags} {resolves or ''} {signature_text}".strip()
             vec = self.vector_engine.encode(text_to_encode)
@@ -877,7 +1055,7 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             logger.warning("VectorEngine not ready, cannot backfill embeddings.")
             return {"total_missing": 0, "success": 0, "failed": 0, "skipped": 0}
 
-        embeddable_types = ["LESSON", "CONTEXT", "ASSET", "EPISODE", "ENTITY", "EVENT", "ACTION", "TOOL", "DISCOVERY", "PATTERN"]
+        embeddable_types = ["LESSON", "CONTEXT", "ASSET", "EPISODE", "ENTITY", "EVENT", "ACTION", "TOOL", "DISCOVERY", "PATTERN", "POINT"]
         placeholders = ','.join('?' * len(embeddable_types))
         rows = self._conn.execute(
             f"SELECT node_id, type, title, tags, resolves, metadata_signature "

@@ -170,8 +170,8 @@ class FactoryManager:
 
         map_block = ""
         if knowledge_map:
-            map_block = f"""[L1 Knowledge — 声明式知识摘要]
-按鲜活度排序的知识节点。eff 越高越可信，低于 0.2 的已自动淘汰。
+            map_block = f"""[知识地形 — 拓扑视图]
+知识节点的拓扑分布。前沿是知识最外层，空洞是未探索方向。
 需要详情用 search_knowledge_nodes(keywords=[...]) 或 get_knowledge_node_content(node_id=...)。
 {knowledge_map}
 """
@@ -228,7 +228,8 @@ class FactoryManager:
 - 先查知识库了解已有经验，再动手。
 - 先读代码再改代码，先诊断再修复。
 - 方法失败时诊断原因，不盲目重试，也不轻易放弃。
-- 不做与任务无关的事，但**发现新洞察时必须用 record_lesson_node 记录**——这不是加戏，是核心职责。知识库是你的记忆，不记录等于遗忘。
+- 不做与任务无关的事，但**发现新洞察时必须用 record_point 记录 + record_line 连线**——这不是加戏，是核心职责。知识库是你的记忆，不记录等于遗忘。
+- record_line 连线：声明你为什么觉得某个已有节点有用（to_id + why，2参数）。record_point 记点：一句话标题+自然语言正文（2参数）。像记笔记一样，不需要结构化。
 - 临时脚本用 write_file 的 use_scratch=true。
 
 # 工具使用

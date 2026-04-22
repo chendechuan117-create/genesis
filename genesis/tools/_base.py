@@ -30,5 +30,9 @@ TRUST_SCHEMA_PROPERTIES = {
 
 class BaseNodeTool(Tool):
     """所有节点管理工具的公共基类，统一 vault 初始化。"""
+
+    # V2 点线面工具的跨实例共享状态（同一轮 GP 内）
+    _round_state: dict = {}  # {'last_point_id': str, 'insight_markers': [str]}
+
     def __init__(self):
         self.vault = NodeVault()

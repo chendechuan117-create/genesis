@@ -14,7 +14,7 @@ C 与 GP 等值但方向相反：
 LLM 组件：
 - Reflector: 内容级反思，审视 GP 工作的实际内容（非工具效率）
   输入：GP 的完整推理链 + 工具输出 + 写入的知识 + vault 已有相关知识
-  输出：GP 遗漏的深层洞察（LESSON 节点，通过 record_lesson_node）
+  输出：补建边（create_node_edge）+ 补深层线（record_line, source='C'）
 
 V4Loop 通过 Mixin 继承获得这些方法，无需改变调用方式。
 """
@@ -172,28 +172,26 @@ class CPhaseMixin:
                 logger.warning(f"Trace pipeline failed (non-fatal): {e}")
 
         # ── Reflector: 内容级反思（单次 LLM 调用）─────────────────────
-        # C 与 GP 等值但方向相反：GP 记录现在，C 回顾过去
-        # 输入：GP 的完整推理链 + 工具输出 + 写入的知识 + vault 已有相关知识
-        # 输出：GP 遗漏的深层洞察（LESSON 节点）
-        reflection_result = {"lessons_recorded": 0, "c_tokens": 0}
+        # V2: C 不再创建点，改为审核+补全（补建边 + 补深层线）
+        reflection_result = {"supplements": 0, "c_tokens": 0}
         if mode != "SKIP":
             try:
                 reflection_result = await self._run_reflection(g_final_response)
             except Exception as e:
                 logger.warning(f"Reflection failed (non-fatal): {e}", exc_info=True)
 
-            r_n = reflection_result.get("lessons_recorded", 0)
+            r_n = reflection_result.get("supplements", 0)
             r_tokens = reflection_result.get("c_tokens", 0)
             if r_n > 0:
-                logger.info(f"Reflection: {r_n} lessons (c_tokens={r_tokens})")
-                for lesson in reflection_result.get("lessons", []):
-                    logger.info(f"  → {lesson.get('node_id', '?')}: {lesson.get('title', '?')[:80]}")
+                logger.info(f"Reflection: {r_n} supplements (c_tokens={r_tokens})")
+                for sup in reflection_result.get("details", []):
+                    logger.info(f"  → {sup.get('type', '?')}: {str(sup)[:80]}")
             else:
                 logger.info(f"Reflection: PASS (c_tokens={r_tokens}, reason={reflection_result.get('reason', 'none')})")
 
         c_tokens_total = reflection_result.get("c_tokens", 0)
         self.c_messages = []
-        logger.info(f"C-Process finished (Arena + Trace + Reflection). c_tokens={c_tokens_total}, lessons={reflection_result.get('lessons_recorded', 0)}, total={self.metrics.total_tokens}")
+        logger.info(f"C-Process finished (Arena + Trace + Reflection). c_tokens={c_tokens_total}, supplements={reflection_result.get('supplements', 0)}, total={self.metrics.total_tokens}")
         await self._safe_callback(step_callback, "c_phase_done", {
             "mode": mode, "c_tokens": c_tokens_total,
             "trace_pipeline": trace_pipeline_result,
@@ -242,9 +240,9 @@ class CPhaseMixin:
                             tc_args = json.loads(tc_args)
                         except (json.JSONDecodeError, TypeError):
                             tc_args = {}
-                    if tc_name in ('record_lesson_node', 'record_context_node'):
+                    if tc_name in ('record_lesson_node', 'record_context_node', 'record_point', 'record_context_point'):
                         title = tc_args.get('title', '')
-                        reason = tc_args.get('because_reason', '')
+                        reason = tc_args.get('because_reason', '') or tc_args.get('content', '')[:150]
                         resolves = tc_args.get('resolves', '')
                         gp_knowledge_writes.append(
                             f"  [{tc_name}] {title}"
@@ -260,7 +258,7 @@ class CPhaseMixin:
             if msg.role == MessageRole.TOOL and msg.content:
                 content_str = str(msg.content)
                 # 跳过知识工具的结果（已在上面单独提取）
-                if msg.name in ('record_lesson_node', 'record_context_node', 'record_discovery'):
+                if msg.name in ('record_lesson_node', 'record_context_node', 'record_point', 'record_context_point', 'record_discovery'):
                     continue
                 if msg.name == "shell":
                     tool_interactions.append(f"  [shell] {content_str[:250]}")
@@ -411,36 +409,51 @@ class CPhaseMixin:
         """
         reflection_input = self._build_reflection_input(g_final_response)
         if not reflection_input or len(reflection_input) < 200:
-            return {"lessons_recorded": 0, "c_tokens": 0, "reason": "insufficient_input"}
+            return {"supplements": 0, "c_tokens": 0, "reason": "insufficient_input"}
 
-        # 使用 record_lesson_node 作为输出工具（与 GP 共享同一工具，C 的产出是一等公民）
-        from genesis.tools.node_tools import RecordLessonNodeTool
-        lesson_tool = RecordLessonNodeTool()
-        tool_schema = [lesson_tool.to_schema()]
+        # V2: C 不再创建点，改为审核+补全（补建边 + 补深层线）
+        from genesis.tools.node_tools import CreateNodeEdgeTool, RecordLineTool
+        edge_tool = CreateNodeEdgeTool()
+        line_tool = RecordLineTool()
+        tool_schema = [edge_tool.to_schema(), line_tool.to_schema()]
+
+        # 收集本轮 GP 创建的新点
+        gp_new_points = []
+        for msg in self.g_messages:
+            if msg.role == MessageRole.TOOL and msg.name == "record_point":
+                content_str = str(msg.content) if msg.content else ""
+                if "写入成功" in content_str:
+                    import re
+                    m = re.search(r'\[(P_\w+)\]', content_str)
+                    if m:
+                        gp_new_points.append(m.group(1))
+
+        gp_points_info = ""
+        if gp_new_points:
+            gp_points_info = f"\n\n本轮 GP 创建的新点: {gp_new_points}"
 
         system_prompt = (
             "你是回顾者。你刚才观察了 GP 的完整执行过程。\n\n"
-            "你的任务不是评判 GP 的工具使用效率（那不重要），"
-            "而是审视 GP 工作的内容本身：\n"
-            "1. GP 的核心结论是否成立？推理链有没有逻辑跳跃或未验证的假设？\n"
-            "2. GP 的发现跟 Vault 已有知识是矛盾、重复、还是扩展？"
-            "如果矛盾，用 contradicts 字段指向旧节点。\n"
-            "3. 从 GP 的具体发现中，能提炼出什么更一般化的、可跨场景复用的原则？\n"
-            "4. GP 的视野之外还有什么相关但未触及的重要方向？\n"
-            "5. 从跨轮行为观测中，你观察到什么 GP 自身无法察觉的行为规律？"
-            "GP 在流里看不到自己重复了什么、遗漏了什么类别、卡在了什么模式——"
-            "这些盲区本身就是值得记录的发现。\n\n"
+            "V2 规则：你不再创建新知识节点（GP 已经用 record_point 实时记录了），"
+            "你的任务是**补全**——补建边、补深层线、审核质量。\n\n"
+            "具体任务：\n"
+            "1. **补建边**：GP 的 record_point 可能只带了 resolves，"
+            "但从执行轨迹中你能发现更多关系（REQUIRES/TRIGGERS/CONTRADICTS）。"
+            "用 create_node_edge 补建。\n"
+            "2. **补深层线**：GP 连了浅层因果（'这个有用因为X'），"
+            "你能连深层（'为什么X成立'）。用 record_line 补线。\n"
+            "3. **审核**：如果 GP 写了两个高度相似的点，"
+            "用 create_node_edge 建立 RELATED_TO 边标记关联。\n\n"
             "规则：\n"
-            "- 如果 GP 已经通过 record_lesson_node 记录了某个发现，不要重复记录同样的内容\n"
-            "- 只记录 GP 遗漏的、更深层的、或跨领域的洞察\n"
-            "- 每条 LESSON 必须是原子的（一个核心步骤），可独立复用\n"
-            "- 如果 GP 的工作已经足够完整，没有遗漏的深层洞察，不调用任何工具\n"
-            "- 最多记录 2 条 LESSON\n"
-            "- node_id 前缀用 LESSON_C_ 以区分来源"
+            "- 如果 GP 的工作已经足够完整，不需要补全，不调用任何工具\n"
+            "- 最多 5 条补全操作\n"
+            "- record_line 的 to_id 必须是知识库中实际存在的节点ID\n"
+            "- create_node_edge 的 source_id/target_id 必须是实际存在的节点ID\n"
+            "- 注意基础盘：如果已有大量锚点和枢纽，补全必须有实质增量"
         )
 
         messages = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": system_prompt + gp_points_info},
             {"role": "user", "content": reflection_input},
         ]
 
@@ -456,35 +469,35 @@ class CPhaseMixin:
             c_tokens = getattr(response, 'total_tokens', 0)
 
             if not response.tool_calls:
-                return {"lessons_recorded": 0, "c_tokens": c_tokens, "reason": "pass"}
+                return {"supplements": 0, "c_tokens": c_tokens, "reason": "pass"}
 
-            recorded = []
-            for tc in response.tool_calls[:2]:  # 最多 2 条
-                if tc.name != "record_lesson_node":
-                    continue
+            supplements = []
+            for tc in response.tool_calls[:5]:  # 最多 5 条补全
                 try:
                     args = dict(tc.arguments)
-                    # 强制 node_id 前缀为 LESSON_C_
-                    nid = args.get("node_id", "")
-                    if not nid.startswith("LESSON_C_"):
-                        nid_hash = hashlib.md5(nid.encode()).hexdigest()[:8].upper()
-                        args["node_id"] = f"LESSON_C_{nid_hash}"
-                    result = await lesson_tool.execute(**args)
-                    recorded.append({
-                        "node_id": args["node_id"],
-                        "title": args.get("title", "?"),
-                        "result": str(result)[:100],
-                    })
+                    if tc.name == "create_node_edge":
+                        result = await edge_tool.execute(**args)
+                        supplements.append({"type": "edge", "result": str(result)[:100]})
+                    elif tc.name == "record_line":
+                        # C-Phase 的线标记 source='C'
+                        # record_line schema: to_id + why (no from_id)
+                        from_id = gp_new_points[0] if gp_new_points else ""
+                        lid = self.vault.add_reasoning_line(
+                            new_point_id=from_id,
+                            basis_point_id=args.get("to_id", ""),
+                            reasoning=args.get("why", ""),
+                            source='C',
+                        )
+                        supplements.append({"type": "line", "line_id": lid})
                 except Exception as e:
-                    logger.warning(f"Reflection lesson recording failed: {e}")
+                    logger.warning(f"C-Phase supplement failed: {e}")
 
             return {
-                "lessons_recorded": len(recorded),
+                "supplements": len(supplements),
                 "c_tokens": c_tokens,
-                "lessons": recorded,
+                "details": supplements,
             }
 
         except Exception as e:
             logger.warning(f"Reflection LLM call failed (non-fatal): {e}")
-            return {"lessons_recorded": 0, "c_tokens": 0, "error": str(e)}
-
+            return {"supplements": 0, "c_tokens": 0, "error": str(e)}
