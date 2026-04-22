@@ -95,8 +95,27 @@ class ToolRegistry:
         self._cached_definitions = sorted(definitions, key=lambda x: x["function"]["name"])
         return self._cached_definitions
     
+    def _fuzzy_resolve(self, tool_name: str) -> Optional[str]:
+        """模糊匹配工具名：处理 LLM 重复拼接幻觉（如 record_linerecord_line → record_line）"""
+        if tool_name in self._tools:
+            return tool_name
+        # 检查是否是某个注册工具名的重复拼接
+        for registered in self._tools:
+            if tool_name.startswith(registered) and tool_name[len(registered):] == registered:
+                logger.info(f"Tool name fuzzy match: '{tool_name}' → '{registered}' (LLM duplication)")
+                return registered
+        # 检查是否是某个注册工具名的前缀（截断）
+        for registered in self._tools:
+            if registered.startswith(tool_name) and len(tool_name) >= len(registered) // 2:
+                logger.info(f"Tool name fuzzy match: '{tool_name}' → '{registered}' (truncation)")
+                return registered
+        return None
+
     async def execute(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """执行工具"""
+        resolved = self._fuzzy_resolve(tool_name)
+        if resolved and resolved != tool_name:
+            tool_name = resolved
         tool = self.get(tool_name)
         
         if not tool:
