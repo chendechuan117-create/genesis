@@ -490,7 +490,7 @@ class NativeHTTPProvider(BaseLLMProvider):
                                         if 'name' in tc['function']: tool_call_chunks[idx]["name"] += tc['function']['name']
                                         if 'arguments' in tc['function']: tool_call_chunks[idx]["args"] += tc['function']['arguments']
                             
-                            if 'usage' in chunk:
+                            if 'usage' in chunk and chunk['usage']:
                                 output_tokens = chunk['usage'].get('completion_tokens', 0)
                                 input_tokens = chunk['usage'].get('prompt_tokens', 0)
                                 prompt_cache_hit_tokens = chunk['usage'].get('prompt_cache_hit_tokens', 0)
