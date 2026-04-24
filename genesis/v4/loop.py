@@ -43,7 +43,7 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
         return default
     return max(minimum, value)
 
-# GP 禁用工具名（仅 C-Phase 可用的节点管理工具）
+# GP 禁用工具名（仅 C-Phase Gardener 可用的节点管理工具）
 GP_BLOCKED_TOOLS = frozenset([
     "record_context_node", "record_lesson_node", "create_meta_node",
     "delete_node", "create_graph_node", "create_node_edge",
@@ -475,7 +475,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
             if "record_lesson_node" in _unblocked and i >= 8 and i % 5 == 3:
                 self.g_messages.append(Message(
                     role=MessageRole.SYSTEM,
-                    content="[知识路径] 回顾你到目前为止的发现——有什么新认知值得写入知识库？"
+                    content="[知识路径] 回顾你到目前为止的发现——有什么新认知值得写入知识库？记录 LESSON 时必须填写 reasoning_basis 连线到已有节点。"
                 ))
             
             self._llm_call_count += 1

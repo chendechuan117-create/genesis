@@ -68,7 +68,7 @@ AUTO_DRY_LIMIT = _env_int("GENESIS_AUTO_DRY_LIMIT", 0, minimum=0)
 AUTO_SLEEP_BASE = _env_int("GENESIS_AUTO_SLEEP_BASE", 8, minimum=0)
 AUTO_DRY_SLEEP_BASE = _env_int("GENESIS_AUTO_DRY_SLEEP_BASE", 15, minimum=0)
 AUTO_DRY_SLEEP_STEP = _env_int("GENESIS_AUTO_DRY_SLEEP_STEP", 5, minimum=0)
-AUTO_ROUND_TIMEOUT_SECS = _env_int("GENESIS_AUTO_ROUND_TIMEOUT_SECS", 0, minimum=0)
+AUTO_ROUND_TIMEOUT_SECS = _env_int("GENESIS_AUTO_ROUND_TIMEOUT_SECS", 600, minimum=0)
 AUTO_SYNC_DOCTOR_SANDBOX = _env_bool("GENESIS_AUTO_SYNC_DOCTOR_SANDBOX", True)
 AUTO_DOCTOR_SYNC_TIMEOUT_SECS = _env_int("GENESIS_AUTO_DOCTOR_SYNC_TIMEOUT_SECS", 420, minimum=30)
 SPIRAL_CONCURRENCY = _env_int("GENESIS_SPIRAL_CONCURRENCY", 3, minimum=1)
@@ -81,17 +81,19 @@ AUTO_PROMPT_FIRST = """你是 Genesis 的自主探索者。你的目标不是修
 ## 用户方向
 {directive}
 
-## 方法
+## 方法（点线面架构）
 1. 用 `search_knowledge_nodes` 了解已有知识——这是你的起点，不是终点
 2. 基于已有知识，提出一个大胆假设：Genesis 还可以怎样变得更强？
 3. 在 Doctor 沙箱中实验验证你的假设
 4. 记录发现——假设成立记录为什么成立，不成立记录为什么不成立，两者同样有价值
+5. **记录 LESSON 时必须填写 reasoning_basis**——声明此经验基于哪些已有节点产生。没有推理链的知识无法判断价值、无法去重，是噪音。
 
 ## 规则
 - 围绕用户方向行动
 - 每轮聚焦一个假设，做到位
 - 已有知识直接用，你的价值在于发现新的
 - 不要做琐碎的环境检查——只在实验需要时才检查环境
+- 面中**基础节点**可直接依赖，**探索节点**需验证后再用
 
 ## 沙箱规则（严格遵守）
 - **禁止直接修改 genesis/ 目录下的任何 .py 源文件**——那是正在运行的本体
@@ -122,6 +124,7 @@ AUTO_PROMPT_CONTINUE = """继续自主探索。上一轮的结论是这一轮的
 - 如果上一轮的假设已验证或已证伪，提出新的假设
 - 追求让人意想不到的发现，不是流水线式的节点记录
 - 每轮聚焦一个假设，做到位
+- **记录 LESSON 必须连线**：reasoning_basis 填写此经验基于哪些已有节点，没有线的知识是噪音
 
 ## 沙箱规则（严格遵守）
 - **禁止直接修改 genesis/ 目录下的任何 .py 源文件**——那是正在运行的本体
@@ -136,11 +139,10 @@ AUTO_PROMPT_CONTINUE = """继续自主探索。上一轮的结论是这一轮的
 
 
 AUTO_DEFAULT_DIRECTIVE = (
-    "基于 Genesis 的元信息系统（知识库、经验图谱、Arena），探索 Genesis 系统的新可能性。"
-    "方法：读已有知识 → 提出假设 → 在 Doctor 沙箱中实验 → 记录发现。"
-    "方向：不局限于修 bug——可以探索架构改进、新机制、性能优化、知识利用的新方式。"
+    "基于 Genesis 的元信息系统（知识库、经验图谱、Arena），改进 Genesis 系统本身。"
+    "方法：读已有知识 → 提出改进假设 → 在 Doctor 沙箱中修改 → 测试验证 → 记录发现。"
     "所有代码修改必须在 Doctor 沙箱中进行（单行用 doctor.sh exec，多行脚本用 doctor.sh run），严禁直接改本体源码。"
-    "每轮只做一件事，做到位。追求让人意想不到的发现。"
+    "每轮只做一件事，做到位。"
 )
 
 SPIRAL_PROMPT = """你的任务：为 Genesis 代码库中的一个文件创建 **结构性理解锚点**。
@@ -154,9 +156,9 @@ SPIRAL_PROMPT = """你的任务：为 Genesis 代码库中的一个文件创建 
 2. 理解这个文件在 Genesis 系统中的角色和职责
 3. 识别关键的类和函数，各一句话概括
 4. 用 `record_context_node` 创建锚点节点：
-   - node_id: `{anchor_id}`
    - title: 模块名 + 一句话职责
-   - state_description: 角色 + 关键组件列表 + 对外接口
+   - content: 角色 + 关键组件列表 + 对外接口（自然语言描述）
+5. **如果发现非平凡的执行经验**（如隐含依赖、初始化顺序、竞态条件），用 `record_lesson_node` 记录，**必须填写 reasoning_basis** 连线到相关锚点节点
 
 ## 规则
 - 只关注目标文件，一轮只做一个文件
@@ -164,10 +166,11 @@ SPIRAL_PROMPT = """你的任务：为 Genesis 代码库中的一个文件创建 
 - 不要做环境检查、不要搜索知识库、不要验证已有知识
 - 锚点是组织索引，不是重复描述碎片已有内容
 - 边连接由系统自动完成，你只需创建锚点
+- **LESSON 必须带线**：reasoning_basis 为空的 LESSON 会被拒绝执行
 
 探索进度：{progress}"""
 
-CROSS_MODULE_PROMPT = """你的任务：分析两个 Genesis 模块之间的 **因果协作关系**。
+CROSS_MODULE_PROMPT = """你的任务：分析两个 Genesis 模块之间的 **推理链关系**——一个模块的发现基于另一个模块的什么能力？
 
 ## 模块 A
 `{filepath_a}` — {anchor_title_a}
@@ -182,17 +185,17 @@ CROSS_MODULE_PROMPT = """你的任务：分析两个 Genesis 模块之间的 **�
 1. 用 `read_file` 读取两个模块的源码
 2. 找到它们之间的**具体调用链**：A 的哪个函数/类调用了 B 的什么？或反过来？
 3. 理解这个调用的**目的**：为什么 A 需要 B？去掉这个连接会怎样？
-4. 用 `record_lesson_node` 记录一条因果关系：
+4. 用 `record_lesson_node` 记录一条推理链（**reasoning_basis 必填**，连线到两个模块的锚点节点）：
    - title: "A → B: 一句话描述协作关系"
    - content: 具体调用链 + 目的 + 如果修改一方需要注意什么
-   - tags: 两个模块名
-   - resolves: "cross_module_understanding"
+   - reasoning_basis: [模块A锚点ID, 模块B锚点ID] — 声明此经验基于对两个模块的理解产生
 
 ## 规则
 - 只关注这两个模块之间的关系，不发散
 - 找**具体代码证据**（函数名、import 路径），不要泛泛而谈
 - 如果两个模块没有直接交互，记录"无直接依赖"也是有价值的发现
 - 不要做环境检查、不要搜索知识库
+- **reasoning_basis 为空会被拒绝**——连线是知识的骨架，没有线的知识是噪音
 
 进度：{progress}"""
 
@@ -317,7 +320,7 @@ def _get_auto_signals(round_num: int = 1, session_shown_voids: set | None = None
                 "ORDER BY usage_fail_count DESC LIMIT 5"
             ).fetchall()
             if failing_rows:
-                lines = ["[实践中反复失败的知识 — 失败>成功，需要修正或重写]"]
+                lines = ["[实践中反复失败的知识 — 失败次数>成功次数]"]
                 for r in failing_rows:
                     nid = r['node_id']
                     if session_shown_nodes and nid in session_shown_nodes:
@@ -364,34 +367,35 @@ def _get_auto_signals(round_num: int = 1, session_shown_voids: set | None = None
                 "SELECT node_id, title, type "
                 "FROM knowledge_nodes "
                 "WHERE usage_count = 0 AND node_id NOT LIKE 'MEM_CONV_%' "
+                "AND node_id NOT LIKE 'LESSON_C_%' "
                 "AND type IN ('LESSON', 'PATTERN', 'ASSET') "
                 "AND node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS') "
                 "AND created_at < datetime('now', '-1 hour') "
                 "ORDER BY created_at DESC LIMIT 3"
             ).fetchall()
             if untested_rows:
-                lines = ["[未经实践的新知识 — 优先尝试挂载]"]
+                lines = ["[未经实践的新知识 — 从未在实际任务中使用过]"]
                 for r in untested_rows:
                     lines.append(f"  {r['node_id']}: {r['title']} <{r['type']}>")
                 sections.append("\n".join(lines))
 
-            # ── 4. C-Phase 跨轮洞察：LESSON_C_ 节点（C 观察到 GP 自身看不到的行为规律）──
-            lesson_c_rows = conn.execute(
-                "SELECT kn.node_id, kn.title, nc.full_content FROM knowledge_nodes kn "
-                "LEFT JOIN node_contents nc ON kn.node_id = nc.node_id "
-                "WHERE kn.node_id LIKE 'LESSON_C_%' AND kn.type = 'LESSON' "
-                "AND kn.node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS') "
-                "ORDER BY kn.created_at DESC LIMIT 5"
+            # ── 4. C-Gardener 产出：CONTRADICTS/RELATED_TO 边（C 不再写 LESSON_C_ 节点）──
+            # C 园丁模式只加边不加节点，此处展示 C 加的跨锥体关联边
+            gardener_edges = conn.execute(
+                "SELECT ne.source_id, ne.target_id, ne.relation, "
+                "s.title as src_title, t.title as tgt_title "
+                "FROM node_edges ne "
+                "JOIN knowledge_nodes s ON ne.source_id = s.node_id "
+                "JOIN knowledge_nodes t ON ne.target_id = t.node_id "
+                "WHERE ne.relation IN ('CONTRADICTS', 'RELATED_TO') "
+                "AND s.node_id NOT LIKE 'MEM_CONV_%' "
+                "ORDER BY ne.created_at DESC LIMIT 5"
             ).fetchall()
-            if lesson_c_rows:
-                lines = ["[⚠ C-Phase 跨轮洞察 — 优先级最高 — GP 自身无法察觉的行为盲区]",
-                         "这些洞察来自跨轮行为统计，不是单轮观察。如果这里说你在某模式中卡住，",
-                         "你必须改变行为，不能继续同方向。"]
-                for r in lesson_c_rows:
-                    content_preview = (r['full_content'] or '')[:500]
-                    lines.append(f"  {r['node_id']}: {r['title']}")
-                    if content_preview:
-                        lines.append(f"    → {content_preview}")
+            if gardener_edges:
+                lines = ["[C-Gardener 关联发现 — 跨锥体连接和矛盾标记]",
+                         "这些边由 C 园丁发现，连接了 GP 单轮看不到的知识关系。"]
+                for r in gardener_edges:
+                    lines.append(f"  {r['source_id']}({r['src_title'][:40]}) --[{r['relation']}]--> {r['target_id']}({r['tgt_title'][:40]})")
                 sections.append("\n".join(lines))
 
             # ── 5. C-Phase 产出：DISCOVERY 和 PATTERN 节点可见性 ──
@@ -878,10 +882,18 @@ def _classify_auto_round_progress(response, round_events, kb_changed, frontier_s
     combined_text = preview_text + " " + shell_cmd_text
     ran_tests = "doctor.sh test" in combined_text or "pytest" in combined_text
     inspected_diff = "doctor.sh diff" in combined_text or "git diff" in combined_text or "diff --git" in combined_text
+    # doctor.sh exec is used for ALL sandbox interactions (cat, ls, sed -n = read-only).
+    # Only count as touched_files when combined with write indicators inside the exec.
+    _doctor_write_patterns = (
+        "doctor.sh exec" in combined_text
+        and any(p in combined_text for p in ("sed -i", "write_text(", "text = text.replace(",
+                                              "cat >", "cat >>", "tee ", "python3 -c", "python -c",
+                                              " > ", " >> ", "patch ", "cp ", "mv "))
+    )
     touched_files = (
         any(name in ("write_file", "edit_file", "replace_in_file", "append_file") for name in tool_names)
         or "sed -i" in combined_text or "write_text(" in combined_text or "text = text.replace(" in combined_text
-        or "doctor.sh exec" in combined_text
+        or _doctor_write_patterns
     )
     response_text = (response or "").strip()
     stable_issue = bool(frontier_state and frontier_state.get("candidate_issue")
@@ -895,7 +907,7 @@ def _classify_auto_round_progress(response, round_events, kb_changed, frontier_s
     elif touched_files or ran_tests or inspected_diff:
         progress_class = "strong"   # GP was active but sandbox diff unchanged
     elif result_events:
-        progress_class = "evidence" if not (touched_files or ran_tests) else "strong"
+        progress_class = "soft"   # GP produced tool results but no write/test/diff activity
     elif response_text or stable_issue:
         progress_class = "soft"
     else:
@@ -990,9 +1002,21 @@ DEFAULT_PLANNER_RESULT = {
 }
 
 
+def _extract_description(item: str) -> str:
+    """从 'NODE_ID: description' 格式中提取描述部分。
+    Directive 应描述验证任务，不嵌入 node_id 防止定向搜索锁定方向。"""
+    if ": " in item:
+        prefix, desc = item.split(": ", 1)
+        # NODE_ID 格式：全大写+下划线（如 LESSON_C_XXX, P_XXX）
+        if prefix.replace("_", "").isupper() and len(prefix) > 3:
+            return desc
+    return item
+
+
 def _pick_focused_fallback(signals: str, round_num: int = 1) -> str:
     """Planner 失败时的确定性聚焦：从 signals 中选 1 个最高优先级方向。
-    优先级：Arena 失败 > VOID > 低置信度 > 通用探索"""
+    优先级：Arena 失败 > VOID > 低置信度 > 通用探索
+    设计原则：directive 描述验证任务，不嵌入 node_id（防止定向搜索锁定方向）。"""
     lines = signals.strip().splitlines()
     arena_items, void_items, low_conf_items = [], [], []
     current_section = None
@@ -1003,10 +1027,10 @@ def _pick_focused_fallback(signals: str, round_num: int = 1) -> str:
             current_section = "void"
         elif "待验证" in line or "置信度" in line:
             current_section = "low_conf"
-        elif "C-Phase" in line or "DISCOVERY" in line or "未经实践的新知识" in line or "优先尝试挂载" in line:
+        elif "C-Phase" in line or "DISCOVERY" in line or "未经实践的新知识" in line or "从未在实际任务中使用过" in line:
             current_section = "c_phase"
-        elif line.startswith("  ") and ":" in line:
-            # 缩进行 = 某 section 下的具体条目
+        elif line.startswith("  ") and not line.startswith("    →") and ":" in line:
+            # 缩进行 = 某 section 下的具体条目（跳过 → 开头的 content_preview 续行）
             item = line.strip()
             if current_section == "arena":
                 arena_items.append(item)
@@ -1018,14 +1042,14 @@ def _pick_focused_fallback(signals: str, round_num: int = 1) -> str:
                 low_conf_items.append(item)  # C-Phase 产出也可作为验证方向
     # 优先级：Arena 翻车 > VOID 空洞 > 低置信/C-Phase > 通用探索
     if arena_items:
-        pick = arena_items[0]
+        pick = _extract_description(arena_items[0])
         return f"聚焦验证这条翻车知识并改进: {pick[:120]}"
     if void_items:
         pick = void_items[round_num % max(len(void_items), 1)]
         return f"调查这个知识空洞并尝试填充: {pick[:120]}"
     if low_conf_items:
-        pick = low_conf_items[round_num % max(len(low_conf_items), 1)]
-        return f"优先验证并利用这条 C-Phase 新知识: {pick[:120]}"
+        pick = _extract_description(low_conf_items[round_num % max(len(low_conf_items), 1)])
+        return f"验证这条待确认的知识: {pick[:120]}"
     return "继续探索 Genesis 系统，寻找可改进之处并在沙箱中实践"
 
 
@@ -1045,33 +1069,12 @@ def _compute_cross_round_observations(round_log: list, self_evolution=None) -> d
     recent = round_log[-20:]
     total_rounds = len(round_log)
 
-    # 1. GP write targets: what file categories GP writes to
-    #    Count UNIQUE files, not tool call count — GP writes same file 3x (probe+test+impl)
-    #    which inflates tests/scratch counts and deflates source_write_ratio.
-    write_file_sets = {"tests": set(), "scratch": set(), "source": set(), "other": set()}
-    for r in recent:
-        events = r.get("events") or []
-        for evt in events:
-            if evt.get("type") == "tool_result" and evt.get("name") == "write_file":
-                data = evt.get("data") or {}
-                path = str(data.get("path") or data.get("args", {}).get("path") or "")
-                if not path:
-                    continue
-                if "/tests/" in path or path.startswith("tests/"):
-                    write_file_sets["tests"].add(path)
-                elif "/scratch/" in path or "/runtime/" in path:
-                    write_file_sets["scratch"].add(path)
-                elif "/genesis/" in path:
-                    write_file_sets["source"].add(path)
-                else:
-                    write_file_sets["other"].add(path)
-    write_categories = {k: len(v) for k, v in write_file_sets.items() if v}
-
-    # 1b. Source write ratio: the key outcome signal.
-    #     If GP writes 0% to genesis/, it's only producing probes/scratch,
-    #     never touching production code. This is the real "productivity" metric.
-    total_writes = sum(write_categories.values())
-    source_write_ratio = write_categories["source"] / total_writes if total_writes > 0 else 0
+    # 1. Sandbox outcome rate: how many rounds actually changed sandbox diff.
+    #    In auto mode, GP writes via shell (doctor.sh exec), not write_file tool,
+    #    so write_file events are always empty — source_write_ratio was always 0.
+    #    outcome_detected is the ground truth from diff-status snapshot comparison.
+    outcome_rounds = sum(1 for r in recent if r.get("outcome_detected"))
+    outcome_ratio = outcome_rounds / len(recent) if recent else 0
 
     # 2. Auto-apply outcome (grounded in apply_history which records both success and failure)
     apply_attempts = 0
@@ -1091,7 +1094,7 @@ def _compute_cross_round_observations(round_log: list, self_evolution=None) -> d
     lesson_counts = []
     for r in recent:
         c_sum = r.get("c_phase_summary") or {}
-        n = c_sum.get("lessons_recorded", 0)
+        n = c_sum.get("supplements", 0)
         if n > 0:
             lesson_counts.append(n)
     lesson_total = sum(lesson_counts)
@@ -1116,8 +1119,8 @@ def _compute_cross_round_observations(round_log: list, self_evolution=None) -> d
 
     obs = {
         "total_rounds": total_rounds,
-        "write_targets": {k: v for k, v in write_categories.items() if v > 0},
-        "source_write_ratio": round(source_write_ratio, 2),
+        "outcome_ratio": round(outcome_ratio, 2),
+        "outcome_rounds_in_window": outcome_rounds,
         "auto_apply_attempts": apply_attempts,
         "auto_apply_successes": apply_successes,
         "auto_apply_blocked_reasons": apply_blocked_reasons[-5:],
@@ -1141,7 +1144,7 @@ def _compact_round_history(round_log: list, last_n: int = 10) -> str:
             parts.append(f"KB:{r['kb_delta_summary']}")
         c_sum = r.get("c_phase_summary") or {}
         if c_sum:
-            parts.append(f"C:lessons={c_sum.get('lessons_recorded', 0)}")
+            parts.append(f"C:sup={c_sum.get('supplements', 0)}")
         ks = r.get("knowledge_search_count", 0)
         if ks:
             parts.append(f"search={ks}")
@@ -1990,19 +1993,22 @@ class SelfEvolution:
         """
         self._pre_round_snapshot = await self._get_diff_status_hash()
 
-    async def check_round(self, round_num: int, channel):
+    async def check_round(self, round_num: int, channel) -> dict:
         """Called each round after GP execution. Manages file-level cooling + auto-apply.
 
         Each file's cooldown is independent: adding new files doesn't reset
         the cooldown of existing files that haven't changed.
+
+        Returns dict: {"apply_attempted": bool, "apply_succeeded": bool, "apply_reason": str}
         """
+        result = {"apply_attempted": False, "apply_succeeded": False, "apply_reason": ""}
         if self.applied_this_session:
-            return
+            return result
 
         # Get per-file status from sandbox
         current_files = await self._get_file_status()
         if not current_files:
-            return  # no pending changes in sandbox
+            return result  # no pending changes in sandbox
 
         # ── Update per-file cooldown state ──
         cooled_files = []
@@ -2066,12 +2072,16 @@ class SelfEvolution:
             await channel.send(
                 f"🧬 冷却完成 | {sample[0]} ({sample[1]}) {sample[2]}轮未变 | {status_text} | 开始自进化应用流程..."
             )
-            await self._try_apply(round_num, channel)
+            apply_result = await self._try_apply(round_num, channel)
+            if apply_result:
+                result.update(apply_result)
         elif status_text:
             # Periodic reminder every 3 rounds
             total = sum(v["stable_count"] for v in self.file_cooldowns.values())
             if total % 3 == 0:
                 await channel.send(f"🧬 冷却中 | {status_text}")
+
+        return result
 
     async def _get_diff_status_hash(self) -> str:
         """Get tracked diff hash from sandbox (ground truth for outcome detection).
@@ -2128,8 +2138,12 @@ class SelfEvolution:
             logger.warning(f"SelfEvolution file-status check failed: {e}")
             return {}
 
-    async def _try_apply(self, round_num: int, channel):
-        """Test → apply → write restart marker."""
+    async def _try_apply(self, round_num: int, channel) -> dict:
+        """Test → apply → write restart marker.
+
+        Returns dict: {"apply_attempted": True, "apply_succeeded": bool, "apply_reason": str}
+        """
+        apply_result = {"apply_attempted": True, "apply_succeeded": False, "apply_reason": ""}
         t_files = {p: v for p, v in self.file_cooldowns.items() if v["type"] == "T"}
         u_files = {p: v for p, v in self.file_cooldowns.items() if v["type"] == "U"}
         max_t = max((v["stable_count"] for v in t_files.values()), default=0)
@@ -2149,7 +2163,7 @@ class SelfEvolution:
                     await channel.send(
                         f"🧬 ⏭ 跳过自进化（连续测试失败同原因，冷却 {skip_remaining} 轮）| T:{len(t_files)}f max{max_t}/{self.cooldown}"
                     )
-                    return
+                    return apply_result
 
         await channel.send(
             f"🧬 冷却完成 | T:{len(t_files)}f max{max_t}/{self.cooldown} U:{len(u_files)}f max{max_u}/{self.untracked_cooldown} | 开始自进化应用流程..."
@@ -2162,10 +2176,11 @@ class SelfEvolution:
             await channel.send(
                 f"🧬 ❌ 沙箱测试失败，放弃本次应用\n```\n{test_output[-500:]}\n```"
             )
+            apply_result["apply_reason"] = test_output[-200:].replace("\n", " ").strip()
             self.apply_history.append({
                 "round": round_num,
                 "status": "test_failed",
-                "reason": test_output[-200:].replace("\n", " ").strip(),
+                "reason": apply_result["apply_reason"],
             })
             # Selective reset: only reset files whose hash changed (they may be the cause),
             # preserve stable files that weren't involved in the failure.
@@ -2184,7 +2199,7 @@ class SelfEvolution:
                 # Fallback: can't determine which files changed, reset all
                 self.file_cooldowns.clear()
             self._save()
-            return
+            return apply_result
 
         await channel.send("🧬 ✅ 测试通过")
 
@@ -2205,10 +2220,11 @@ class SelfEvolution:
             await channel.send(
                 f"🧬 ❌ 应用失败\n```\n{apply_output[-500:]}\n```"
             )
+            apply_result["apply_reason"] = apply_output[-200:].replace("\n", " ").strip()
             self.apply_history.append({
                 "round": round_num,
                 "status": "apply_failed",
-                "reason": apply_output[-200:].replace("\n", " ").strip(),
+                "reason": apply_result["apply_reason"],
             })
             # Selective reset on apply failure too
             current_files = await self._get_file_status()
@@ -2224,7 +2240,7 @@ class SelfEvolution:
             else:
                 self.file_cooldowns.clear()
             self._save()
-            return
+            return apply_result
 
         await channel.send(f"🧬 ✅ 代码已应用 | commit={applied_commit[:8]}")
 
@@ -2237,6 +2253,7 @@ class SelfEvolution:
             await channel.send(f"🧬 ⚠️ 沙箱重置失败（不影响本体）: {reset_output[-200:]}")
 
         # 4. Write restart marker + record history + clear cooling state
+        apply_result["apply_succeeded"] = True
         self.applied_this_session = True
         self.apply_history.append({
             "round": round_num,
@@ -2341,6 +2358,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
     round_num = 0
     consecutive_dry = 0
     consecutive_error = 0
+    _pending_apply_feedback = None  # carry apply-failure reason to next round signals
     stop_reason = "manual"
     round_log = []
     last_frontier = ""
@@ -2424,7 +2442,10 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
     if _recovered:
         # round_num 不恢复——它是 session 内计数器，新 session 必须从 0 开始
         # 否则恢复后 round_num >= AUTO_MAX_ROUNDS 会立即退出
-        consecutive_dry = _recovered.get("consecutive_dry", 0)
+        # consecutive_dry 不恢复——和 round_num/last_planner_round 同理
+        # 旧 session 的 dry streak 对新 session 无意义，恢复后 Fix5 (dry>=3) 永久触发
+        # 导致 Yogg 每轮都被强制切换方向，无法稳定探索
+        consecutive_dry = 0
         last_frontier = _recovered.get("last_frontier", "")
         last_knowledge_state = _recovered.get("last_knowledge_state", {})
         last_good_knowledge_state = _recovered.get("last_good_knowledge_state", {})
@@ -2433,7 +2454,9 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
         session_shown_nodes = set(_recovered.get("session_shown_nodes", []))
         planner_agenda = _recovered.get("planner_agenda", [])
         planner_result = _recovered.get("planner_result", {})
-        last_planner_round = _recovered.get("last_planner_round", 0)
+        # last_planner_round 不恢复——和 round_num 一样是 session 内计数器
+        # 恢复后 round_num 从 1 开始但 last_planner_round 保留旧值 → 差值永远为负 → planner 永不触发
+        last_planner_round = 0
         planner_call_count = _recovered.get("planner_call_count", 0)
         await channel.send(f"♻️ 恢复上轮工作记忆 (R{round_num}, dry={consecutive_dry})")
 
@@ -2496,24 +2519,24 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
         round_start_utc_iso = _time_module.strftime("%Y-%m-%d %H:%M:%S", _time_module.gmtime(round_start_ts))
 
         signals = _get_auto_signals(round_num=round_num, session_shown_voids=session_shown_voids, session_shown_nodes=session_shown_nodes)
+        # Inject apply-failure feedback from previous round into signals
+        if _pending_apply_feedback:
+            _aw = "\n\n[⚠️ 上一轮自进化apply被拒(沙箱测试失败)] " + _pending_apply_feedback[:200] + ""
+            signals += _aw
+            _pending_apply_feedback = None
 
-        # ── 行为观测信号：连续N轮未产生沙箱代码修改 ──
+        # ── 行为观测信号：连续N轮沙箱无变化 ──
         # 纯事实注入，不是指令。GP 看到后自行决策。
-        # source_write_ratio 只传给 C-Phase，GP 自身看不到这个盲区。
+        # 使用 outcome_detected（沙箱 diff ground truth）而非 write_file 事件，
+        # 因为 GP 通过 shell 写沙箱，不经过 write_file 工具。
         if round_log and round_num > 1:
-            _consecutive_no_write = 0
+            _consecutive_no_outcome = 0
             for _r in reversed(round_log):
-                _evts = _r.get("events") or []
-                _has_source_write = any(
-                    e.get("type") == "tool_result" and e.get("name") == "write_file"
-                    and "/genesis/" in str(e.get("data", {}).get("path") or e.get("args", {}).get("path") or "")
-                    for e in _evts
-                )
-                if _has_source_write:
+                if _r.get("outcome_detected"):
                     break
-                _consecutive_no_write += 1
-            if _consecutive_no_write >= 3:
-                signals += f"\n\n[行为观测] 连续{_consecutive_no_write}轮未产生沙箱代码修改 (source_write_ratio=0)"
+                _consecutive_no_outcome += 1
+            if _consecutive_no_outcome >= 3:
+                signals += f"\n\n[行为观测] 连续{_consecutive_no_outcome}轮沙箱无代码变化 (outcome_detected=False)"
 
         _struct = [topic_tracker.format_for_prompt(), action_history.format_for_prompt()]
         _struct_text = "\n\n".join(p for p in _struct if p)
@@ -2551,14 +2574,20 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                     progress=pioneer.get_progress(),
                 )
                 try:
-                    _r = await agent.process(
+                    _coro = agent.process(
                         f"[GENESIS_USER_REQUEST_START]\n{_p}",
                         c_phase_blocking=True,
                         loop_config={"disable_multi_g": True, "gp_unblock_tools": ["record_lesson_node", "record_context_node"]},
                     )
+                    if AUTO_ROUND_TIMEOUT_SECS > 0:
+                        _r = await asyncio.wait_for(_coro, timeout=AUTO_ROUND_TIMEOUT_SECS)
+                    else:
+                        _r = await _coro
                     _resp = _r.response if hasattr(_r, 'response') else ""
                     _tok = _r.total_tokens if hasattr(_r, 'total_tokens') else 0
                     return {"task": _task_item, "ok": not _is_error_response(_resp, _tok), "tokens": _tok, "response": _resp}
+                except asyncio.TimeoutError:
+                    return {"task": _task_item, "ok": False, "tokens": 0, "response": f"spiral_timeout>{AUTO_ROUND_TIMEOUT_SECS}s"}
                 except Exception as _e:
                     return {"task": _task_item, "ok": False, "tokens": 0, "response": str(_e)}
 
@@ -2623,14 +2652,20 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                     progress=explorer.get_progress(),
                 )
                 try:
-                    _r = await agent.process(
+                    _coro = agent.process(
                         f"[GENESIS_USER_REQUEST_START]\n{_p}",
                         c_phase_blocking=True,
                         loop_config={"disable_multi_g": True, "gp_unblock_tools": ["record_lesson_node", "record_context_node"]},
                     )
+                    if AUTO_ROUND_TIMEOUT_SECS > 0:
+                        _r = await asyncio.wait_for(_coro, timeout=AUTO_ROUND_TIMEOUT_SECS)
+                    else:
+                        _r = await _coro
                     _resp = _r.response if hasattr(_r, 'response') else ""
                     _tok = _r.total_tokens if hasattr(_r, 'total_tokens') else 0
                     return {"pair": _pair, "ok": not _is_error_response(_resp, _tok), "tokens": _tok, "response": _resp}
+                except asyncio.TimeoutError:
+                    return {"pair": _pair, "ok": False, "tokens": 0, "response": f"cross_module_timeout>{AUTO_ROUND_TIMEOUT_SECS}s"}
                 except Exception as _e:
                     return {"pair": _pair, "ok": False, "tokens": 0, "response": str(_e)}
 
@@ -2705,6 +2740,10 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 round_focus = ""
             if not round_focus:
                 round_focus = _pick_focused_fallback(signals, round_num) if signals else directive
+                # Fallback 不考虑收敛——dry streak 长时强制切换方向
+                # 只覆盖 fallback，不覆盖 planner（planner 有 round_log 上下文可自行判断）
+                if consecutive_dry >= 3:
+                    round_focus = "当前方向已连续多轮无持久产出，切换到完全不同的新问题进行探索"
 
             if round_num == 1:
                 prompt = AUTO_PROMPT_FIRST.format(directive=round_focus, signals=signals)
@@ -2776,8 +2815,8 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                             round_record["c_phase_summary"] = {
                                 "mode": data.get("mode", "?"),
                                 "c_tokens": data.get("c_tokens", 0),
-                                "lessons_recorded": refl.get("lessons_recorded", 0),
-                                "lesson_titles": [l.get("title", "?") for l in refl.get("lessons", [])][:3],
+                                "supplements": refl.get("supplements", 0),
+                                "supplement_details": [str(s)[:80] for s in refl.get("details", [])][:3],
                                 "reflection_reason": refl.get("reason", ""),
                             }
                             entry["data"] = round_record["c_phase_summary"]
@@ -2831,6 +2870,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             "kb_delta": {"new_nodes": [], "updated_nodes": [], "error": "pending"},
             "kb_delta_summary": "pending", "kb_changed": False,
             "activity_detected": False, "activity_summary": "pending", "progress_class": "pending",
+            "outcome_detected": False,
             "consecutive_dry": consecutive_dry,
             "node_telemetry": "节点计数观测: 进行中",
             "phase_trace": None, "knowledge_state": None, "knowledge_state_text": "",
@@ -2910,6 +2950,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 "activity_detected": progress_profile["activity_detected"],
                 "activity_summary": progress_profile["activity_summary"],
                 "progress_class": progress_profile["progress_class"],
+                "outcome_detected": progress_profile.get("outcome_detected", False),
                 "consecutive_dry": consecutive_dry, "node_telemetry": node_telemetry,
                 "knowledge_state": knowledge_state, "knowledge_state_text": knowledge_state_text,
                 "frontier_state": frontier_state, "frontier_text": frontier_text, "frontier_preview": frontier_preview,
@@ -3008,6 +3049,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 "activity_detected": progress_profile["activity_detected"],
                 "activity_summary": progress_profile["activity_summary"],
                 "progress_class": progress_profile["progress_class"],
+                "outcome_detected": progress_profile.get("outcome_detected", False),
                 "consecutive_dry": consecutive_dry, "node_telemetry": node_telemetry,
                 "phase_trace": result.phase_trace if hasattr(result, 'phase_trace') else None,
                 "knowledge_state": knowledge_state, "knowledge_state_text": knowledge_state_text,
@@ -3021,7 +3063,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             # C-Phase + 知识闭环诊断行
             c_sum = round_record.get("c_phase_summary") or {}
             ks_count = round_record.get("knowledge_search_count", 0)
-            c_diag = f"C[lessons={c_sum.get('lessons_recorded', 0)}]" if c_sum else "C[skip]"
+            c_diag = f"C[sup={c_sum.get('supplements', 0)}]" if c_sum else "C[skip]"
             k_diag = f"search={ks_count}" if ks_count else "search=0"
 
             _append_md(
@@ -3080,6 +3122,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 "activity_detected": progress_profile["activity_detected"],
                 "activity_summary": progress_profile["activity_summary"],
                 "progress_class": progress_profile["progress_class"],
+                "outcome_detected": progress_profile.get("outcome_detected", False),
                 "consecutive_dry": consecutive_dry, "node_telemetry": node_telemetry,
                 "frontier_state": frontier_state, "frontier_text": frontier_text, "frontier_preview": frontier_preview,
                 "reanchor_required": frontier_state.get("reanchor_required", False),
@@ -3135,6 +3178,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 "activity_detected": progress_profile["activity_detected"],
                 "activity_summary": progress_profile["activity_summary"],
                 "progress_class": progress_profile["progress_class"],
+                "outcome_detected": progress_profile.get("outcome_detected", False),
                 "consecutive_dry": consecutive_dry, "node_telemetry": node_telemetry,
                 "frontier_state": frontier_state, "frontier_text": frontier_text, "frontier_preview": frontier_preview,
                 "reanchor_required": frontier_state.get("reanchor_required", False),
@@ -3209,13 +3253,20 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             logger.debug(f"/auto tool_hotload skip: {_e}")
 
         # ── Self-Evolution: 沙箱冷却追踪 + 自动应用 ──
+        _apply_feedback = None
         if self_evolution and consecutive_error == 0:
             try:
                 logger.debug(f"auto R{round_num} self_evolution.check_round start")
-                await self_evolution.check_round(round_num, channel)
+                _se_result = await self_evolution.check_round(round_num, channel)
                 logger.debug(f"auto R{round_num} self_evolution.check_round done")
+                if _se_result and _se_result.get("apply_attempted") and not _se_result.get("apply_succeeded"):
+                    _apply_feedback = _se_result.get("apply_reason", "unknown")
             except Exception as _se_e:
                 logger.warning(f"SelfEvolution check_round failed: {_se_e}")
+
+        # Apply-failure feedback -> next round signals
+        if _apply_feedback:
+            _pending_apply_feedback = _apply_feedback
 
         # 轮间休息（错误轮指数退避 + provider reset）
         if state.get("active", False):

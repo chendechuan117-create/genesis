@@ -1,27 +1,28 @@
 """
-Genesis V4 - C-Phase Mixin (Reflector)
+Genesis V4 - C-Phase Mixin (Gardener)
 
-C 与 GP 等值但方向相反：
-- GP 面向现在：执行 + 记录（错题本）
-- C 面向过去：回顾 + 提炼（自我反思）
+点线面架构下，C 是知识图谱的园丁：
+- GP 面向现在：执行 + 记录（种树）
+- C 面向过去：回顾 + 修图（园丁，只修图不种树）
 
 确定性组件（零 LLM）：
-- Knowledge Arena 反馈
+- Knowledge Arena 反馈（W/L 互补信号）
 - Persona 在线学习
 - Trace Analysis Pipeline
-- PATTERN 自动提升
+- 消融触发（入线数≥5 → 隐藏节点）
 
-LLM 组件：
-- Reflector: 内容级反思，审视 GP 工作的实际内容（非工具效率）
-  输入：GP 的完整推理链 + 工具输出 + 写入的知识 + vault 已有相关知识
-  输出：GP 遗漏的深层洞察（LESSON 节点，通过 record_lesson_node）
+LLM 组件（园丁模式）：
+- Gardener: 审视 GP 工作，只修图不加节点
+  矛盾 → CONTRADICTS 边（GP搜索可见）
+  关联 → RELATED_TO 边（面BFS跨锥体连接）
+  不创建 LESSON_C_ 节点（拓扑死点：入线数永远=0）
 
 V4Loop 通过 Mixin 继承获得这些方法，无需改变调用方式。
 """
 
 import re
 import json
-import hashlib
+
 import asyncio
 import logging
 from typing import Any, Dict, Optional
@@ -171,29 +172,49 @@ class CPhaseMixin:
             except Exception as e:
                 logger.warning(f"Trace pipeline failed (non-fatal): {e}")
 
-        # ── Reflector: 内容级反思（单次 LLM 调用）─────────────────────
-        # C 与 GP 等值但方向相反：GP 记录现在，C 回顾过去
-        # 输入：GP 的完整推理链 + 工具输出 + 写入的知识 + vault 已有相关知识
-        # 输出：GP 遗漏的深层洞察（LESSON 节点）
-        reflection_result = {"lessons_recorded": 0, "c_tokens": 0}
+        # ── 真理区分消融触发（确定性，零 LLM）──────────────────────
+        # 检查是否有节点满足消融条件（入线数≥5），自动标记为消融观察
+        try:
+            ablation_candidates = self.vault.check_ablation_candidates(min_incoming=5)
+            if ablation_candidates:
+                for cid, incoming, title in ablation_candidates[:3]:
+                    self.vault.activate_ablation(cid, baseline_env_ratio=env_ratio)
+                    logger.info(f"Ablation triggered: [{cid}] '{title}' (incoming={incoming}, baseline_env={env_ratio})")
+        except Exception as e:
+            logger.debug(f"Ablation check skipped (non-fatal): {e}")
+
+        # ── 真理区分消融评估（确定性，零 LLM）──────────────────────
+        # 检查已处于消融观察的节点，比较当前 env_ratio 与 baseline
+        try:
+            ablation_observing = self.vault.get_ablation_observing_nodes(min_duration_seconds=300)
+            for nid, title, baseline in ablation_observing[:5]:
+                result = self.vault.deactivate_ablation(nid, current_env_ratio=env_ratio)
+                logger.info(f"Ablation evaluated: [{nid}] '{title}' → {result} (baseline={baseline}, current={env_ratio})")
+        except Exception as e:
+            logger.debug(f"Ablation evaluation skipped (non-fatal): {e}")
+
+        # ── Gardener: 园丁模式（单次 LLM 调用）─────────────────────
+        # C 只修图不种树：矛盾→CONTRADICTS边，关联→RELATED_TO边
+        # 不创建 LESSON_C_ 节点（入线数永远=0 = 拓扑死点）
+        reflection_result = {"edges_added": 0, "metadata_expanded": 0, "c_tokens": 0}
         if mode != "SKIP":
             try:
                 reflection_result = await self._run_reflection(g_final_response)
             except Exception as e:
                 logger.warning(f"Reflection failed (non-fatal): {e}", exc_info=True)
 
-            r_n = reflection_result.get("lessons_recorded", 0)
+            r_edges = reflection_result.get("edges_added", 0)
             r_tokens = reflection_result.get("c_tokens", 0)
-            if r_n > 0:
-                logger.info(f"Reflection: {r_n} lessons (c_tokens={r_tokens})")
-                for lesson in reflection_result.get("lessons", []):
-                    logger.info(f"  → {lesson.get('node_id', '?')}: {lesson.get('title', '?')[:80]}")
+            if r_edges > 0:
+                logger.info(f"Reflection: {r_edges} edges added (c_tokens={r_tokens})")
+                for edge in reflection_result.get("edges", []):
+                    logger.info(f"  → {edge.get('source_id','?')} --[{edge.get('relation','?')}]--> {edge.get('target_id','?')}")
             else:
                 logger.info(f"Reflection: PASS (c_tokens={r_tokens}, reason={reflection_result.get('reason', 'none')})")
 
         c_tokens_total = reflection_result.get("c_tokens", 0)
         self.c_messages = []
-        logger.info(f"C-Process finished (Arena + Trace + Reflection). c_tokens={c_tokens_total}, lessons={reflection_result.get('lessons_recorded', 0)}, total={self.metrics.total_tokens}")
+        logger.info(f"C-Process finished (Arena + Trace + Gardener). c_tokens={c_tokens_total}, edges={reflection_result.get('edges_added', 0)}, total={self.metrics.total_tokens}")
         await self._safe_callback(step_callback, "c_phase_done", {
             "mode": mode, "c_tokens": c_tokens_total,
             "trace_pipeline": trace_pipeline_result,
@@ -203,10 +224,10 @@ class CPhaseMixin:
     # ─── Reflector: 内容级反思 ───────────────────────────────────────
 
     def _build_reflection_input(self, g_final_response: str) -> str:
-        """构建 C 的反思输入：GP 的完整执行上下文（内容级，非工具级）。
+        """构建 C-Gardener 的输入：GP 的完整执行上下文。
 
-        设计原则：C 应该能看到 GP 看到的一切核心内容，
-        但以回顾视角审视，而非重复执行。
+        设计原则：C 应该能看到 GP 看到的一切核心内容 + 活跃节点ID，
+        以便加边（CONTRADICTS/RELATED_TO）时能引用正确的 source_id/target_id。
         """
         parts = []
 
@@ -243,11 +264,12 @@ class CPhaseMixin:
                         except (json.JSONDecodeError, TypeError):
                             tc_args = {}
                     if tc_name in ('record_lesson_node', 'record_context_node'):
+                        nid = tc_args.get('node_id', '')
                         title = tc_args.get('title', '')
                         reason = tc_args.get('because_reason', '')
                         resolves = tc_args.get('resolves', '')
                         gp_knowledge_writes.append(
-                            f"  [{tc_name}] {title}"
+                            f"  [{tc_name}] {nid}: {title}"
                             + (f" | 因为: {reason[:150]}" if reason else "")
                             + (f" | 解决: {resolves[:80]}" if resolves else "")
                         )
@@ -279,18 +301,28 @@ class CPhaseMixin:
         if vault_related:
             parts.append(f"[Vault 已有相关知识]\n{vault_related}")
 
-        # 7. Multi-G 发现的知识空洞（已知的未知）
+        # 7. GP 本轮活跃节点（C-Gardener 加边需要 node_id）
+        if self.execution_active_nodes:
+            unique_active = list(dict.fromkeys(self.execution_active_nodes))[:12]
+            active_briefs = self.vault.batch_get_titles(unique_active) if hasattr(self.vault, 'batch_get_titles') else {}
+            active_lines = []
+            for nid in unique_active:
+                title = active_briefs.get(nid, '?')
+                active_lines.append(f"  {nid}: {title}")
+            parts.append("[GP 本轮引用的活跃节点 — 可作为 create_node_edge 的 source_id/target_id]\n" + "\n".join(active_lines))
+
+        # 8. Multi-G 发现的知识空洞（已知的未知）
         if self.blackboard and self.blackboard.search_voids:
             void_lines = [f"  - {v}" for v in self.blackboard.search_voids[:5]]
             parts.append("[知识空洞 — Multi-G 搜索未命中的方向]\n" + "\n".join(void_lines))
 
-        # 8. 任务签名（领域上下文）
+        # 9. 任务签名（领域上下文）
         if self.inferred_signature:
             sig_text = self.vault.signature.render(self.inferred_signature)
             if sig_text:
                 parts.append(f"[任务签名]\n{sig_text}")
 
-        # 9. 跨轮行为观测（GP 自身无法察觉的行为模式）
+        # 10. 跨轮行为观测（GP 自身无法察觉的行为模式）
         cross_obs = self._build_cross_round_observations()
         if cross_obs:
             parts.append(f"[跨轮行为观测 — GP 自身无法察觉的模式]\n{cross_obs}")
@@ -400,43 +432,44 @@ class CPhaseMixin:
         return "\n".join(lines) if lines else ""
 
     async def _run_reflection(self, g_final_response: str) -> Dict[str, Any]:
-        """C 的核心：内容级反思。
+        """C 的核心：园丁模式——只修图，不种树。
 
-        与 GP 等值但方向相反：
-        - GP 面向现在，执行 + 记录（错题本）
-        - C 面向过去，回顾 + 提炼（自我反思）
+        点线面架构下，C 不创建新节点（LESSON_C_ 是拓扑死点：入线数永远=0）。
+        C 只做三件事：
+        1. 矛盾检测 → 加 CONTRADICTS 边（旧节点被标记，GP搜索可见）
+        2. 关联发现 → 加 RELATED_TO 边（面BFS跨锥体连接）
+        3. 适用范围扩展 → 扩展 metadata_signature（提升搜索命中率）
 
-        C 看到 GP 的完整执行上下文（推理链、工具输出、写入的知识），
-        审视内容本身而非工具使用效率。
+        全新知识的记录是 GP 的职责，C 不补作业。
         """
         reflection_input = self._build_reflection_input(g_final_response)
         if not reflection_input or len(reflection_input) < 200:
-            return {"lessons_recorded": 0, "c_tokens": 0, "reason": "insufficient_input"}
+            return {"edges_added": 0, "metadata_expanded": 0, "c_tokens": 0, "reason": "insufficient_input"}
 
-        # 使用 record_lesson_node 作为输出工具（与 GP 共享同一工具，C 的产出是一等公民）
-        from genesis.tools.node_tools import RecordLessonNodeTool
-        lesson_tool = RecordLessonNodeTool()
-        tool_schema = [lesson_tool.to_schema()]
+        # 园丁工具：add_edge（加边）——使用 C-Phase 的 vault 实例
+        from genesis.tools.node_tools import CreateNodeEdgeTool
+        edge_tool = CreateNodeEdgeTool()
+        edge_tool.vault = self.vault  # 必须用 C-Phase 的 vault，不能让工具自带新实例
+        tool_schema = [edge_tool.to_schema()]
 
         system_prompt = (
-            "你是回顾者。你刚才观察了 GP 的完整执行过程。\n\n"
-            "你的任务不是评判 GP 的工具使用效率（那不重要），"
-            "而是审视 GP 工作的内容本身：\n"
-            "1. GP 的核心结论是否成立？推理链有没有逻辑跳跃或未验证的假设？\n"
-            "2. GP 的发现跟 Vault 已有知识是矛盾、重复、还是扩展？"
-            "如果矛盾，用 contradicts 字段指向旧节点。\n"
-            "3. 从 GP 的具体发现中，能提炼出什么更一般化的、可跨场景复用的原则？\n"
-            "4. GP 的视野之外还有什么相关但未触及的重要方向？\n"
-            "5. 从跨轮行为观测中，你观察到什么 GP 自身无法察觉的行为规律？"
-            "GP 在流里看不到自己重复了什么、遗漏了什么类别、卡在了什么模式——"
-            "这些盲区本身就是值得记录的发现。\n\n"
+            "你是知识图谱的园丁。你刚才观察了 GP 的完整执行过程。\n\n"
+            "你的职责不是记录新知识（那是 GP 的事），而是维护知识图的健康：\n\n"
+            "1. **矛盾检测**：GP 的发现跟 Vault 已有知识矛盾吗？\n"
+            "   如果矛盾，用 create_node_edge 加 CONTRADICTS 边：\n"
+            "   source_id=GP新节点, target_id=被矛盾的旧节点, relation=CONTRADICTS\n\n"
+            "2. **关联发现**：两个独立节点其实是同一问题的不同侧面吗？\n"
+            "   如果是，用 create_node_edge 加 RELATED_TO 边：\n"
+            "   让面BFS能跨锥体连接，丰富图结构\n\n"
+            "3. **适用范围扩展**：某条 LESSON 的 metadata_signature 太窄了吗？\n"
+            "   例如标记了 language=go 但其实也适用于 python，\n"
+            "   暂时跳过（需要单独工具，当前MVP只做边）\n\n"
             "规则：\n"
-            "- 如果 GP 已经通过 record_lesson_node 记录了某个发现，不要重复记录同样的内容\n"
-            "- 只记录 GP 遗漏的、更深层的、或跨领域的洞察\n"
-            "- 每条 LESSON 必须是原子的（一个核心步骤），可独立复用\n"
-            "- 如果 GP 的工作已经足够完整，没有遗漏的深层洞察，不调用任何工具\n"
-            "- 最多记录 2 条 LESSON\n"
-            "- node_id 前缀用 LESSON_C_ 以区分来源"
+            "- 如果 GP 已经标记了 contradicts，不要重复加边\n"
+            "- 只加有充分证据的边，不要猜测性关联\n"
+            "- 如果没有发现矛盾或关联，不调用任何工具（PASS）\n"
+            "- 最多加 2 条边\n"
+            "- 不要创建新节点，只加边"
         )
 
         messages = [
@@ -456,35 +489,46 @@ class CPhaseMixin:
             c_tokens = getattr(response, 'total_tokens', 0)
 
             if not response.tool_calls:
-                return {"lessons_recorded": 0, "c_tokens": c_tokens, "reason": "pass"}
+                return {"edges_added": 0, "metadata_expanded": 0, "c_tokens": c_tokens, "reason": "pass"}
 
-            recorded = []
-            for tc in response.tool_calls[:2]:  # 最多 2 条
-                if tc.name != "record_lesson_node":
+            edges_added = []
+            for tc in response.tool_calls[:2]:
+                if tc.name != "create_node_edge":
                     continue
                 try:
                     args = dict(tc.arguments)
-                    # 强制 node_id 前缀为 LESSON_C_
-                    nid = args.get("node_id", "")
-                    if not nid.startswith("LESSON_C_"):
-                        nid_hash = hashlib.md5(nid.encode()).hexdigest()[:8].upper()
-                        args["node_id"] = f"LESSON_C_{nid_hash}"
-                    result = await lesson_tool.execute(**args)
-                    recorded.append({
-                        "node_id": args["node_id"],
-                        "title": args.get("title", "?"),
+                    source_id = args.get("source_id", "")
+                    target_id = args.get("target_id", "")
+                    relation = args.get("relation", "")
+                    if not all([source_id, target_id, relation]):
+                        continue
+                    # 只允许 CONTRADICTS 和 RELATED_TO
+                    if relation not in ("CONTRADICTS", "RELATED_TO"):
+                        relation = "RELATED_TO"  # 降级为关联
+                    result = await edge_tool.execute(
+                        source_id=source_id,
+                        target_id=target_id,
+                        relation=relation,
+                        weight=args.get("weight", 1.0),
+                    )
+                    edges_added.append({
+                        "source_id": source_id,
+                        "target_id": target_id,
+                        "relation": relation,
                         "result": str(result)[:100],
                     })
+                    logger.info(f"C-Gardener: {source_id} --[{relation}]--> {target_id}")
                 except Exception as e:
-                    logger.warning(f"Reflection lesson recording failed: {e}")
+                    logger.warning(f"Reflection edge creation failed: {e}")
 
             return {
-                "lessons_recorded": len(recorded),
+                "edges_added": len(edges_added),
+                "metadata_expanded": 0,
                 "c_tokens": c_tokens,
-                "lessons": recorded,
+                "edges": edges_added,
             }
 
         except Exception as e:
             logger.warning(f"Reflection LLM call failed (non-fatal): {e}")
-            return {"lessons_recorded": 0, "c_tokens": 0, "error": str(e)}
+            return {"edges_added": 0, "metadata_expanded": 0, "c_tokens": 0, "error": str(e)}
 

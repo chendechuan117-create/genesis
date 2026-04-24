@@ -80,6 +80,7 @@ class NativeHTTPProvider(BaseLLMProvider):
         default_model: str = "deepseek-chat",
         connect_timeout: int = 30,
         request_timeout: int = 180,
+        read_timeout: int = 120,  # streaming 逐 chunk 超时(秒)：防止 API 停止发数据导致永久挂起
         wall_clock_timeout: int = 300,  # 整体超时(秒)：防止推理模型思考过久
         stop_sequences: Optional[List[str]] = None,
         provider_name: str = "default",
@@ -93,6 +94,7 @@ class NativeHTTPProvider(BaseLLMProvider):
         self.default_model = default_model
         self.connect_timeout = connect_timeout
         self.request_timeout = request_timeout
+        self.read_timeout = read_timeout
         self.wall_clock_timeout = wall_clock_timeout
         self.stop_sequences = stop_sequences if stop_sequences is not None else self.DEFAULT_STOP_SEQUENCES
         self.provider_name = provider_name
@@ -123,7 +125,13 @@ class NativeHTTPProvider(BaseLLMProvider):
                 or os.environ.get("https_proxy") or os.environ.get("http_proxy")
                 or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
             )
-            timeout = httpx.Timeout(self.request_timeout, connect=self.connect_timeout)
+            timeout = httpx.Timeout(
+                timeout=self.request_timeout,
+                connect=self.connect_timeout,
+                read=self.read_timeout,
+                write=30.0,
+                pool=self.connect_timeout,
+            )
             self._http_client = httpx.AsyncClient(
                 timeout=timeout,
                 trust_env=trust_env,
@@ -135,32 +143,54 @@ class NativeHTTPProvider(BaseLLMProvider):
         """获取默认模型"""
         return self.default_model
 
+    # MiniMax 等模型在 assistant message 中注入的非标准字段，回传其他 API 会 400
+    _STRIP_MSG_FIELDS = {"audio_content", "reasoning_details", "reasoning_content",
+                         "input_sensitive", "output_sensitive", "input_sensitive_type",
+                         "output_sensitive_type", "output_sensitive_int", "base_resp"}
+
     @staticmethod
     def _sanitize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """清洗消息列表，修复会导致 API 400 的格式问题：
         - content 为 None/空 → 填充占位符
         - name 为空字符串 → 删除该字段
+        - assistant 消息中的 name 字段 → 删除（MiniMax 注入 "MiniMax AI"，其他 API 拒绝）
         - tool_calls 中 name 为空 → 填充 'unknown'
+        - 非标准字段（audio_content, reasoning_details 等）→ 删除
+        - 对话中间的 system 消息 → 转为 user（K2.6/Kimi 等模型拒绝中间 system）
         """
         cleaned = []
+        seen_non_system = False
         for msg in messages:
             m = dict(msg)  # shallow copy
             role = m.get("role", "")
-            
+
+            # K2.6/Kimi 等模型只允许开头的 system，中间的 system → 转 user
+            if role == "system":
+                if seen_non_system:
+                    m["role"] = "user"
+                    m["content"] = f"[System] {m.get('content', '')}"
+                    role = "user"
+            else:
+                seen_non_system = True
+
             # 修复空 content（xcode API 要求所有消息 content 非空非 null）
             if m.get("content") is None or m.get("content") == "":
                 if role == "tool":
                     m["content"] = "(empty)"
                 else:
                     m["content"] = " "
-            
+
             # 修复空 name（API 拒绝空字符串）
             if "name" in m and (m["name"] is None or m["name"] == ""):
                 if role == "tool":
                     m["name"] = "tool"
                 else:
                     del m["name"]
-            
+
+            # MiniMax 注入 name="MiniMax AI" 到 assistant 消息，回传其他 API 会 400
+            if role == "assistant" and "name" in m:
+                del m["name"]
+
             # 修复 tool_calls 中的空 name
             if "tool_calls" in m and m["tool_calls"]:
                 fixed_tcs = []
@@ -173,7 +203,11 @@ class NativeHTTPProvider(BaseLLMProvider):
                         tc["function"] = fn
                     fixed_tcs.append(tc)
                 m["tool_calls"] = fixed_tcs
-            
+
+            # 清除非标准字段（MiniMax 等模型注入的额外字段）
+            for field in NativeHTTPProvider._STRIP_MSG_FIELDS:
+                m.pop(field, None)
+
             cleaned.append(m)
         return cleaned
 
@@ -239,6 +273,11 @@ class NativeHTTPProvider(BaseLLMProvider):
         except asyncio.TimeoutError:
             NativeHTTPProvider._stats_wall_clock_timeouts += 1
             NativeHTTPProvider._record_stat("wall_timeout")
+            # 销毁可能处于半读状态的连接，防止复用污染连接池
+            if self._http_client:
+                try: await self._http_client.aclose()
+                except Exception: pass
+                self._http_client = None
             raise WallClockTimeoutError(
                 f"LLM 调用总超时 ({self.wall_clock_timeout}s)。"
                 f"推理模型可能思考过久，请简化问题或缩短上下文。"
@@ -273,17 +312,47 @@ class NativeHTTPProvider(BaseLLMProvider):
                     last_exception = e
                     await asyncio.sleep(1)
                     continue
-                # 5xx 瞬态错误可重试（502/503/504）
-                if status in (502, 503, 504) and attempt < retries - 1:
+                # 5xx 瞬态错误可重试（502/503/504/524）
+                # 524 = Cloudflare origin timeout, 短暂瞬态，重试通常能恢复
+                if status in (502, 503, 504, 524) and attempt < retries - 1:
                     NativeHTTPProvider._stats_retries += 1
                     NativeHTTPProvider._record_stat("retry")
                     logger.warning(f"HTTP {status} (attempt {attempt+1}/{retries}): {error_msg[:100]}")
                     last_exception = e
                     await asyncio.sleep(1 * (attempt + 1))
                     continue
+                # 400 诊断：记录请求关键信息
+                if status == 400:
+                    msgs = params.get("messages", [])
+                    msgs_summary = []
+                    tc_ids = []
+                    result_ids = []
+                    for m in msgs:
+                        role = m.get("role", "?")
+                        content = m.get("content")
+                        tc = m.get("tool_calls")
+                        if tc:
+                            msgs_summary.append(f"{role}: [tc x{len(tc)} ids={[t.get('id','?')[:8] for t in tc]}]")
+                            tc_ids.extend([t.get('id') for t in tc if t.get('id')])
+                        elif role == "tool":
+                            tid = m.get("tool_call_id", "?")
+                            result_ids.append(tid)
+                            msgs_summary.append(f"tool(res:{tid[:8]})")
+                        elif content is None:
+                            msgs_summary.append(f"{role}: [content=None]")
+                        else:
+                            msgs_summary.append(f"{role}: {str(content)[:40]}")
+                    missing = [t for t in tc_ids if t not in result_ids]
+                    orphan = [r for r in result_ids if r not in tc_ids]
+                    detail = f"model={params.get('model')} | n_msgs={len(msgs)} | msgs=[{', '.join(msgs_summary)}] | tc_ids={len(tc_ids)} res_ids={len(result_ids)} missing={len(missing)} orphan={len(orphan)} | tools={len(params.get('tools',[]))} | stream={params.get('stream')}"
+                    logger.warning(f"🔍 Stream 400 debug | {detail}")
+                    try:
+                        with open("/tmp/genesis_400_debug.log", "a") as f:
+                            f.write(f"\n=== {time.strftime('%H:%M:%S')} ===\n{detail}\n")
+                    except Exception: pass
                 NativeHTTPProvider._stats_errors += 1
                 NativeHTTPProvider._record_stat("error")
-                raise Exception(f"API Error ({status}): {self._clean_error_text(error_msg)}")
+                raise Exception(f"API Error ({status}): {self._clean_error_text(e.response.text)}")
             except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as e:
                 logger.warning(f"httpx connection error (attempt {attempt+1}/{retries}): {e}")
                 last_exception = e
@@ -423,7 +492,19 @@ class NativeHTTPProvider(BaseLLMProvider):
                         await response.aread()
                     response.raise_for_status()
                     
-                    async for line in response.aiter_lines():
+                    # Per-chunk timeout: 防止 API 停止发数据导致永久挂起
+                    # httpx read timeout 是 per-syscall，但 streaming 下可能不生效
+                    chunk_timeout = self.read_timeout + 30  # 比 httpx read 多 30s 余量
+                    aiter = response.aiter_lines()
+                    while True:
+                        try:
+                            line = await asyncio.wait_for(aiter.__anext__(), timeout=chunk_timeout)
+                        except StopAsyncIteration:
+                            break
+                        except asyncio.TimeoutError:
+                            logger.warning(f"Stream chunk timeout ({chunk_timeout}s): API 停止发送数据")
+                            raise httpx.ReadTimeout(f"Stream read timeout ({chunk_timeout}s): no data from API")
+                        
                         line = line.strip()
                         if not line:
                             continue
@@ -439,7 +520,26 @@ class NativeHTTPProvider(BaseLLMProvider):
                             choices = chunk.get('choices')
                             if not choices: continue
                             
-                            delta = choices[0].get('delta', {})
+                            choice0 = choices[0] if choices else None
+                            if not choice0: continue
+                            
+                            # finish_reason 可出现在任何 chunk（MiniMax 在中间 chunk 就带 finish_reason）
+                            if choice0.get('finish_reason'):
+                                finish_reason = choice0['finish_reason']
+                            
+                            # MiniMax 最终 chunk 用 'message' 而非 'delta'（含完整 reasoning + usage）
+                            # 优先用 delta，fallback 到 message（兼容 MiniMax 格式）
+                            delta = choice0.get('delta')
+                            if delta is None:
+                                msg = choice0.get('message')
+                                if msg is not None:
+                                    # MiniMax 最终 chunk：提取 reasoning（仅当之前未累积时），跳过已累积的 content
+                                    rc = msg.get('reasoning_content') or msg.get('reasoning')
+                                    if rc and not reasoning_content:
+                                        reasoning_content.append(rc)
+                                    delta = {}
+                            
+                            if not delta: delta = {}
                             
                             # Reasoning
                             rc = delta.get('reasoning_content') or delta.get('reasoning')
@@ -461,7 +561,7 @@ class NativeHTTPProvider(BaseLLMProvider):
                             # Tool Calls
                             if delta.get('tool_calls'):
                                 for tc in delta['tool_calls']:
-                                    idx = tc['index']
+                                    idx = tc.get('index', len(tool_call_chunks))
                                     has_id = 'id' in tc and tc['id']
                                     has_name = 'function' in tc and 'name' in tc['function'] and tc['function']['name']
                                     
@@ -483,7 +583,7 @@ class NativeHTTPProvider(BaseLLMProvider):
                                         if 'name' in tc['function']: tool_call_chunks[idx]["name"] += tc['function']['name']
                                         if 'arguments' in tc['function']: tool_call_chunks[idx]["args"] += tc['function']['arguments']
                             
-                            if 'usage' in chunk:
+                            if 'usage' in chunk and chunk['usage']:
                                 output_tokens = chunk['usage'].get('completion_tokens', 0)
                                 input_tokens = chunk['usage'].get('prompt_tokens', 0)
                                 prompt_cache_hit_tokens = chunk['usage'].get('prompt_cache_hit_tokens', 0)
@@ -522,13 +622,43 @@ class NativeHTTPProvider(BaseLLMProvider):
                     client = self._get_http_client()
                     await asyncio.sleep(1)
                     continue
-                # 5xx 瞬态错误可重试
-                if status in (502, 503, 504) and attempt < retries - 1:
+                # 5xx 瞬态错误可重试（502/503/504/524）
+                # 524 = Cloudflare origin timeout
+                if status in (502, 503, 504, 524) and attempt < retries - 1:
                     NativeHTTPProvider._stats_retries += 1
                     NativeHTTPProvider._record_stat("retry")
                     logger.warning(f"Stream HTTP {status} (attempt {attempt+1}/{retries}): {e.response.text[:100]}")
                     await asyncio.sleep(1 * (attempt + 1))
                     continue
+                # 400 诊断：记录请求关键信息
+                if status == 400:
+                    msgs = params.get("messages", [])
+                    msgs_summary = []
+                    tc_ids = []
+                    result_ids = []
+                    for m in msgs:
+                        role = m.get("role", "?")
+                        content = m.get("content")
+                        tc = m.get("tool_calls")
+                        if tc:
+                            msgs_summary.append(f"{role}: [tc x{len(tc)} ids={[t.get('id','?')[:8] for t in tc]}]")
+                            tc_ids.extend([t.get('id') for t in tc if t.get('id')])
+                        elif role == "tool":
+                            tid = m.get("tool_call_id", "?")
+                            result_ids.append(tid)
+                            msgs_summary.append(f"tool(res:{tid[:8]})")
+                        elif content is None:
+                            msgs_summary.append(f"{role}: [content=None]")
+                        else:
+                            msgs_summary.append(f"{role}: {str(content)[:40]}")
+                    missing = [t for t in tc_ids if t not in result_ids]
+                    orphan = [r for r in result_ids if r not in tc_ids]
+                    detail = f"model={params.get('model')} | n_msgs={len(msgs)} | msgs=[{', '.join(msgs_summary)}] | tc_ids={len(tc_ids)} res_ids={len(result_ids)} missing={len(missing)} orphan={len(orphan)} | tools={len(params.get('tools',[]))} | stream={params.get('stream')}"
+                    logger.warning(f"🔍 Stream 400 debug | {detail}")
+                    try:
+                        with open("/tmp/genesis_400_debug.log", "a") as f:
+                            f.write(f"\n=== {time.strftime('%H:%M:%S')} (stream) ===\n{detail}\n")
+                    except Exception: pass
                 NativeHTTPProvider._stats_errors += 1
                 NativeHTTPProvider._record_stat("error")
                 raise Exception(f"API Error ({status}): {self._clean_error_text(e.response.text)}")
@@ -537,7 +667,8 @@ class NativeHTTPProvider(BaseLLMProvider):
                 if attempt < retries - 1:
                     NativeHTTPProvider._stats_retries += 1
                     NativeHTTPProvider._record_stat("retry")
-                    await asyncio.sleep(1)
+                    logger.warning(f"Empty stream response (attempt {attempt+1}/{retries}), retrying...")
+                    await asyncio.sleep(1 * (attempt + 1))
                     continue
                 NativeHTTPProvider._stats_timeouts += 1
                 NativeHTTPProvider._record_stat("timeout")

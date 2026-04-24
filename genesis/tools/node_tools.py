@@ -87,12 +87,35 @@ class RecordLessonNodeTool(BaseNodeTool):
                 },
                 "resolves": {"type": "string", "description": "此经验主要解决的具体报错信息或异常现象简述（用于丰富图谱寻找）"},
                 "contradicts": {"type": "string", "description": "可选。如果这条新知识反驳/替代了某个旧节点，填写被反驳的节点 ID。旧节点将被标记为已过时，不再出现在搜索结果中。"},
+                "reasoning_basis": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "此经验基于哪些已有节点产生（节点ID数组）。必填。搜索知识库后记录LESSON必须声明推理依据，说明基于哪些已有知识产生此经验。"
+                },
                 **TRUST_SCHEMA_PROPERTIES
             },
-            "required": ["node_id", "title", "trigger_verb", "trigger_noun", "trigger_context", "action_steps", "because_reason", "resolves"]
+            "required": ["node_id", "title", "trigger_verb", "trigger_noun", "trigger_context", "action_steps", "because_reason", "resolves", "reasoning_basis"]
         }
 
-    async def execute(self, node_id: str, title: str, trigger_verb: str, trigger_noun: str, trigger_context: str, action_steps: List[str], because_reason: str, prerequisites: List[str] = None, resolves: str = None, contradicts: str = None, metadata_signature: Dict[str, Any] = None, last_verified_at: str = None, verification_source: str = None) -> str:
+    async def execute(self, node_id: str, title: str, trigger_verb: str, trigger_noun: str, trigger_context: str, action_steps: List[str], because_reason: str, prerequisites: List[str] = None, resolves: str = None, contradicts: str = None, reasoning_basis: List[str] = None, metadata_signature: Dict[str, Any] = None, last_verified_at: str = None, verification_source: str = None) -> str:
+        # ── validateInput: reasoning_basis 必填校验 ──
+        if not reasoning_basis:
+            return "Error: reasoning_basis 不能为空。记录 LESSON 必须声明基于哪些已有节点产生此经验。请先搜索知识库，找到相关节点后填写 reasoning_basis。没有线的创新 = 无法判断价值 = 无法去重 = 噪音。"
+
+        # ── 预处理 basis：清洗去重去自引用 ──
+        valid_basis = [bid.strip() for bid in reasoning_basis if bid.strip() and bid.strip() != node_id]
+
+        # ── 同轮检测：basis 中哪些是本轮刚创建的（不贡献入线数，防自刷） ──
+        same_round_ids = self.vault.get_same_round_ids(valid_basis) if valid_basis else set()
+
+        # ── 碰撞检测（写前去重）：basis 集合与已有节点重叠 ──
+        collision_candidates = self.vault.find_collision_candidates(valid_basis, min_overlap=2) if valid_basis else []
+        collision_hint = ""
+        if collision_candidates:
+            candidate_hints = [f"[{cid}] '{ctitle}' (重叠{overlap}个basis)" for cid, overlap, ctitle in collision_candidates[:3]]
+            collision_hint = f" ⚠️ 碰撞检测：你引用的节点已被以下节点引用：{', '.join(candidate_hints)}。确认是否重复？"
+            logger.info(f"Collision detected for [{node_id}]: {candidate_hints}")
+
         try:
             lesson_struct = {
                 "IF_trigger": {
@@ -185,10 +208,18 @@ class RecordLessonNodeTool(BaseNodeTool):
                 contradicts_msg = f" ⚠️ 已标记 [{target_id}] 为被反驳，该节点将不再出现在搜索结果中。"
                 logger.info(f"CONTRADICTS: [{node_id}] --[CONTRADICTS]--> [{target_id}]")
 
-            if dedup_action == "relate" and merged_node_id:
-                return f"✅ LESSON节点 [{node_id}] '{title}' 写入成功。检测到相似节点 [{merged_node_id}]，已建立 RELATED_TO 边。{resolves_msg}{prereq_msg}{contradicts_msg}"
+            # ── 推理线（点线面架构）：新点连线到 basis 节点 ──
+            line_msg = ""
+            if valid_basis:
+                for bid in valid_basis:
+                    sr = 1 if bid in same_round_ids else 0
+                    self.vault.create_reasoning_line(node_id, bid, reasoning=because_reason, source="GP", same_round=sr)
+                line_msg = f" 🔗 推理线→{valid_basis}"
 
-            return f"✅ LESSON节点 [{node_id}] '{title}' 写入成功。{resolves_msg}{prereq_msg}{contradicts_msg}"
+            if dedup_action == "relate" and merged_node_id:
+                return f"✅ LESSON节点 [{node_id}] '{title}' 写入成功。检测到相似节点 [{merged_node_id}]，已建立 RELATED_TO 边。{resolves_msg}{prereq_msg}{contradicts_msg}{line_msg}{collision_hint}"
+
+            return f"✅ LESSON节点 [{node_id}] '{title}' 写入成功。{resolves_msg}{prereq_msg}{contradicts_msg}{line_msg}{collision_hint}"
         except Exception as e:
             logger.error(f"Lesson node creation failed: {e}")
             return f"Error: {e}"
@@ -356,8 +387,8 @@ class CreateNodeEdgeTool(BaseNodeTool):
                 "target_id": {"type": "string", "description": "目标节点ID"},
                 "relation": {
                     "type": "string", 
-                    "enum": ["TRIGGERS", "RESOLVES", "REQUIRES", "LOCATED_AT", "RELATED_TO"],
-                    "description": "关系类型"
+                    "enum": ["TRIGGERS", "RESOLVES", "REQUIRES", "LOCATED_AT", "RELATED_TO", "CONTRADICTS"],
+                    "description": "关系类型。CONTRADICTS: 矛盾（C-Gardener标记，GP搜索可见）"
                 },
                 "weight": {"type": "number", "description": "权重 (0.0-1.0)", "default": 1.0}
             },

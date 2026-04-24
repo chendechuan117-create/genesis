@@ -1,7 +1,23 @@
 import importlib.util
 import pathlib
 
-import pytest
+# 依赖门控：在导入 pytest 之前检查可选依赖
+if importlib.util.find_spec("requests") is None:
+    # 缺少可选依赖时，跳过整个测试模块
+    import sys
+    # 创建一个虚拟的 pytest 模块来设置 pytestmark
+    pytest_stub = type(sys)('pytest_stub')
+    pytest_stub.mark = type(sys)('mark')
+    pytest_stub.mark.skipif = lambda *a, **k: lambda f: f
+    sys.modules['pytest'] = pytest_stub
+    pytest = pytest_stub
+else:
+    import pytest
+
+pytestmark = pytest.mark.skipif(
+    importlib.util.find_spec("requests") is None,
+    reason="optional dependency missing: requests"
+)
 
 MODULE_PATH = pathlib.Path('/workspace/tests/test_direct_ip.py')
 

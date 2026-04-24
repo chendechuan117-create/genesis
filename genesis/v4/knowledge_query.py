@@ -41,57 +41,53 @@ class KnowledgeQuery:
     # ─── G Prompt 数据 ───
 
     def get_digest(self, top_k: int = 4) -> str:
-        """精简认知目录：类别计数 + 战绩节点 + 待探索节点，消除马太效应"""
+        """精简认知目录：类别计数 + 入线数拓扑 + 知识缺口"""
         type_rows = self._conn.execute(
             "SELECT type, COUNT(*) AS cnt FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%' GROUP BY type ORDER BY cnt DESC"
         ).fetchall()
         type_counts = {r['type']: r['cnt'] for r in type_rows}
         total = sum(type_counts.values())
 
-        # 按战绩排序的 Top 节点（成功率高 + 使用次数多）
-        top_rows = self._conn.execute(
-            """SELECT node_id, type, title, usage_success_count, usage_fail_count
-               FROM knowledge_nodes
-               WHERE node_id NOT LIKE 'MEM_CONV%' AND (usage_success_count > 0 OR usage_count > 2)
-                 AND node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS')
-               ORDER BY CAST(usage_success_count AS REAL) / (usage_success_count + usage_fail_count + 1) DESC,
-                        usage_count DESC
+        # 入线数 TOP 节点（点线面价值信号：被多少新点基于它产生）
+        top_incoming = self._conn.execute(
+            """SELECT rl.basis_point_id, COUNT(*) as incoming, kn.type, kn.title
+               FROM reasoning_lines rl
+               JOIN knowledge_nodes kn ON rl.basis_point_id = kn.node_id
+               WHERE kn.node_id NOT LIKE 'MEM_CONV%'
+               GROUP BY rl.basis_point_id
+               ORDER BY incoming DESC
                LIMIT ?""",
             (top_k,)
         ).fetchall()
 
-        # 待探索节点：从未使用过、最近创建的高潜力节点（打破马太效应的关键）
-        untested_rows = self._conn.execute(
-            """SELECT node_id, type, title, tags, updated_at, last_verified_at, trust_tier,
-                      usage_success_count, usage_fail_count
-               FROM knowledge_nodes
-               WHERE node_id NOT LIKE 'MEM_CONV%'
-                 AND usage_count = 0
-                 AND type IN ('ASSET', 'LESSON', 'CONTEXT', 'DISCOVERY')
-                 AND node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS')
-               ORDER BY created_at DESC
+        # 前沿节点：最近创建、入线数=0（尚未被验证的新知识）
+        frontier_rows = self._conn.execute(
+            """SELECT kn.node_id, kn.type, kn.title, kn.created_at
+               FROM knowledge_nodes kn
+               WHERE kn.node_id NOT LIKE 'MEM_CONV%'
+                 AND kn.type IN ('LESSON', 'CONTEXT', 'DISCOVERY')
+                 AND kn.node_id NOT IN (SELECT basis_point_id FROM reasoning_lines)
+                 AND kn.node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS')
+               ORDER BY kn.created_at DESC
                LIMIT ?""",
             (top_k,)
         ).fetchall()
 
-        # 知识缺口：从 void_tasks 队列读取（不再污染 knowledge_nodes）
+        # 知识缺口：从 void_tasks 队列读取
         void_rows = self.get_recent_voids(limit=3)
 
         cats = " | ".join(f"{t}:{c}" for t, c in type_counts.items() if c > 0)
         lines = [f"[认知目录] {total}节点 | {cats}"]
-        if top_rows:
-            lines.append("PROVEN:")
-            for r in top_rows:
-                w, l = r['usage_success_count'] or 0, r['usage_fail_count'] or 0
-                lines.append(f"- [{r['node_id']}] <{r['type']}> {r['title']} ({w}W/{l}L)")
-        if untested_rows:
-            lines.append("UNTESTED (从未使用，优先尝试挂载):")
-            for r in untested_rows:
-                from genesis.v4.arena_mixin import ArenaConfidenceMixin
-                eff_conf = ArenaConfidenceMixin.effective_confidence(dict(r))
-                lines.append(f"- [{r['node_id']}] <{r['type']}> {r['title']} (eff:{eff_conf:.2f})")
+        if top_incoming:
+            lines.append("基础（高入线数，已被反复验证）:")
+            for r in top_incoming:
+                lines.append(f"- [{r['basis_point_id']}] <{r['type']}> {r['title']} (入线:{r['incoming']})")
+        if frontier_rows:
+            lines.append("探索（入线=0，尚未被验证的前沿）:")
+            for r in frontier_rows:
+                lines.append(f"- [{r['node_id']}] <{r['type']}> {r['title']}")
         if void_rows:
-            lines.append("VOID (已识别的知识缺口，可通过实验验证后升格为 LESSON):")
+            lines.append("VOID (知识缺口):")
             for r in void_rows:
                 lines.append(f"- [{r['void_id']}] {r['query']}")
         lines.append("需要细节时请使用 get_knowledge_node_content 读取具体节点。")
@@ -215,39 +211,35 @@ class KnowledgeQuery:
 
             lines.append("")
 
-        # PROVEN: 久经考验的节点（战绩排序）
-        top_rows = self._conn.execute(
-            """SELECT node_id, type, title, usage_success_count, usage_fail_count
-               FROM knowledge_nodes
-               WHERE node_id NOT LIKE 'MEM_CONV%' AND (usage_success_count > 0 OR usage_count > 2)
-               ORDER BY CAST(usage_success_count AS REAL) / (usage_success_count + usage_fail_count + 1) DESC,
-                        usage_count DESC
+        # 基础（高入线数，已被反复验证）
+        top_incoming = self._conn.execute(
+            """SELECT rl.basis_point_id, COUNT(*) as incoming, kn.type, kn.title
+               FROM reasoning_lines rl
+               JOIN knowledge_nodes kn ON rl.basis_point_id = kn.node_id
+               WHERE kn.node_id NOT LIKE 'MEM_CONV%'
+               GROUP BY rl.basis_point_id
+               ORDER BY incoming DESC
                LIMIT 4"""
         ).fetchall()
-        if top_rows:
-            lines.append("PROVEN:")
-            for r in top_rows:
-                w, l = r['usage_success_count'] or 0, r['usage_fail_count'] or 0
-                lines.append(f"  {r['node_id']} <{r['type']}> {r['title']} ({w}W/{l}L)")
+        if top_incoming:
+            lines.append("基础（高入线数）:")
+            for r in top_incoming:
+                lines.append(f"  {r['basis_point_id']} <{r['type']}> {r['title']} (入线:{r['incoming']})")
             lines.append("")
 
-        # UNTESTED: 从未使用过的高潜力节点（打破马太效应）
-        untested_rows = self._conn.execute(
-            """SELECT node_id, type, title, tags, updated_at, last_verified_at, trust_tier,
-                      usage_success_count, usage_fail_count
-               FROM knowledge_nodes
+        # 探索（入线=0，尚未被验证的前沿）
+        frontier_rows = self._conn.execute(
+            """SELECT node_id, type, title FROM knowledge_nodes
                WHERE node_id NOT LIKE 'MEM_CONV%'
-                 AND usage_count = 0
-                 AND type IN ('ASSET', 'LESSON', 'CONTEXT', 'DISCOVERY')
+                 AND type IN ('LESSON', 'CONTEXT', 'DISCOVERY')
+                 AND node_id NOT IN (SELECT basis_point_id FROM reasoning_lines)
                ORDER BY created_at DESC
                LIMIT 4"""
         ).fetchall()
-        if untested_rows:
-            lines.append("UNTESTED (优先尝试):")
-            for r in untested_rows:
-                from genesis.v4.arena_mixin import ArenaConfidenceMixin
-                eff_conf = ArenaConfidenceMixin.effective_confidence(dict(r))
-                lines.append(f"  {r['node_id']} <{r['type']}> {r['title']} (eff:{eff_conf:.2f})")
+        if frontier_rows:
+            lines.append("探索（入线=0，前沿）:")
+            for r in frontier_rows:
+                lines.append(f"  {r['node_id']} <{r['type']}> {r['title']}")
             lines.append("")
 
         # VOID 摘要（增强版：source 分布 + 签名标签 + 更多样本）

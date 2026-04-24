@@ -170,7 +170,9 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             ('last_verified_at', 'TIMESTAMP'),
             ('verification_source', 'TEXT'),
             ('trust_tier', 'TEXT DEFAULT \'REFLECTION\''),
-            ('epistemic_status', 'TEXT DEFAULT \'BELIEF\'')
+            ('epistemic_status', 'TEXT DEFAULT \'BELIEF\''),
+            ('is_virtual', 'INTEGER DEFAULT 0'),
+            ('ablation_active', 'INTEGER DEFAULT 0')
         ]:
             try:
                 conn.execute(f"ALTER TABLE knowledge_nodes ADD COLUMN {col[0]} {col[1]}")
@@ -239,6 +241,30 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             FOREIGN KEY (target_id) REFERENCES knowledge_nodes(node_id)
         )
         ''')
+        # 推理线表（点线面架构）：记录新点基于哪些旧点产生
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS reasoning_lines (
+            line_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            new_point_id TEXT NOT NULL,
+            basis_point_id TEXT NOT NULL,
+            reasoning TEXT,
+            source TEXT DEFAULT 'GP',
+            same_round INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (new_point_id) REFERENCES knowledge_nodes(node_id),
+            FOREIGN KEY (basis_point_id) REFERENCES knowledge_nodes(node_id)
+        )
+        ''')
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rl_basis ON reasoning_lines(basis_point_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rl_new ON reasoning_lines(new_point_id)")
+        # Schema migration: reasoning_lines 可能缺 same_round 列（IF NOT EXISTS 不加列）
+        try:
+            rl_cols = [r[1] for r in conn.execute("PRAGMA table_info(reasoning_lines)").fetchall()]
+            if 'same_round' not in rl_cols:
+                conn.execute("ALTER TABLE reasoning_lines ADD COLUMN same_round INTEGER DEFAULT 0")
+                logger.info("Schema migration: added same_round column to reasoning_lines")
+        except Exception as e:
+            logger.warning(f"Schema migration for reasoning_lines.same_round skipped: {e}")
         # 签名推断自学习表：C-Phase 偏差检测发现的新 marker
         conn.execute('''
         CREATE TABLE IF NOT EXISTS learned_signature_markers (
@@ -259,6 +285,15 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             losses INTEGER DEFAULT 0,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (persona, task_kind)
+        )
+        ''')
+        # 消融基线表：记录消融激活时的 env_ratio，用于向前/向后判定
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS ablation_baselines (
+            node_id TEXT PRIMARY KEY,
+            activated_at INTEGER NOT NULL,
+            baseline_env_ratio REAL,
+            FOREIGN KEY (node_id) REFERENCES knowledge_nodes(node_id)
         )
         ''')
         # VOID 任务队列（从 knowledge_nodes 分离，不污染知识搜索空间）
@@ -571,10 +606,350 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         except Exception as e:
             logger.error(f"Failed to add edge: {e}")
 
+    # ── 推理线接口（点线面架构）──
+
+    def create_reasoning_line(self, new_point_id: str, basis_point_id: str, reasoning: str = "", source: str = "GP", same_round: int = 0):
+        """创建一条推理线：新点基于旧点产生"""
+        try:
+            self._conn.execute(
+                "INSERT INTO reasoning_lines (new_point_id, basis_point_id, reasoning, source, same_round) VALUES (?,?,?,?,?)",
+                (new_point_id, basis_point_id, reasoning, source, same_round)
+            )
+            self._conn.commit()
+            logger.debug(f"Line: {new_point_id} --[based_on]--> {basis_point_id} (source={source})")
+        except Exception as e:
+            logger.error(f"Failed to create reasoning line: {e}")
+
+    def get_incoming_line_count(self, node_id: str) -> int:
+        """获取节点的入线数（被多少新点基于它产生）"""
+        try:
+            row = self._conn.execute(
+                "SELECT COUNT(*) FROM reasoning_lines WHERE basis_point_id = ? AND same_round = 0",
+                (node_id,)
+            ).fetchone()
+            return row[0] if row else 0
+        except Exception:
+            return 0
+
+    def get_incoming_line_counts_batch(self, node_ids: list) -> dict:
+        """批量获取入线数，避免 N+1 查询"""
+        if not node_ids:
+            return {}
+        try:
+            placeholders = ",".join("?" * len(node_ids))
+            rows = self._conn.execute(
+                f"SELECT basis_point_id, COUNT(*) as cnt FROM reasoning_lines WHERE basis_point_id IN ({placeholders}) AND same_round = 0 GROUP BY basis_point_id",
+                node_ids
+            ).fetchall()
+            result = {nid: 0 for nid in node_ids}
+            result.update({row[0]: row[1] for row in rows})
+            return result
+        except Exception:
+            return {nid: 0 for nid in node_ids}
+
+    def get_basis_set_for_node(self, new_point_id: str) -> set:
+        """获取某新点连线指向的所有 basis_point_id 集合（碰撞检测用）"""
+        try:
+            rows = self._conn.execute(
+                "SELECT basis_point_id FROM reasoning_lines WHERE new_point_id = ?",
+                (new_point_id,)
+            ).fetchall()
+            return {row[0] for row in rows}
+        except Exception:
+            return set()
+
+    def find_collision_candidates(self, basis_ids: list, min_overlap: int = 2) -> list:
+        """碰撞检测：查找与给定 basis_ids 有重叠的已有节点。
+        返回 [(new_point_id, overlap_count, title), ...] 按重叠数降序"""
+        if not basis_ids:
+            return []
+        try:
+            placeholders = ",".join("?" * len(basis_ids))
+            rows = self._conn.execute(
+                f"""SELECT new_point_id, COUNT(*) as overlap
+                FROM reasoning_lines
+                WHERE basis_point_id IN ({placeholders})
+                GROUP BY new_point_id
+                HAVING overlap >= ?
+                ORDER BY overlap DESC
+                LIMIT 5""",
+                basis_ids + [min_overlap]
+            ).fetchall()
+            # 补充标题
+            result = []
+            for row in rows:
+                nid, overlap = row[0], row[1]
+                title_row = self._conn.execute(
+                    "SELECT title FROM knowledge_nodes WHERE node_id = ?", (nid,)
+                ).fetchone()
+                title = title_row[0] if title_row else nid
+                result.append((nid, overlap, title))
+            return result
+        except Exception as e:
+            logger.error(f"find_collision_candidates failed: {e}")
+            return []
+
+    def get_virtual_saturation(self, node_ids: list) -> list:
+        """查询指定节点邻域内的虚点饱和信号。
+        返回 [(area_hint, count), ...] 按虚点数降序"""
+        if not node_ids:
+            return []
+        try:
+            # 找到 node_ids 的 1-hop 邻居中的虚点
+            placeholders = ",".join("?" * len(node_ids))
+            # 从 node_edges 找邻居
+            neighbor_rows = self._conn.execute(
+                f"""SELECT DISTINCT target_id FROM node_edges
+                WHERE source_id IN ({placeholders})
+                UNION
+                SELECT DISTINCT source_id FROM node_edges
+                WHERE target_id IN ({placeholders})""",
+                node_ids + node_ids
+            ).fetchall()
+            neighbor_ids = [r[0] for r in neighbor_rows]
+            if not neighbor_ids:
+                return []
+            # 统计虚点
+            nh_placeholders = ",".join("?" * len(neighbor_ids))
+            virtual_rows = self._conn.execute(
+                f"""SELECT node_id, title FROM knowledge_nodes
+                WHERE node_id IN ({nh_placeholders}) AND is_virtual = 1""",
+                neighbor_ids
+            ).fetchall()
+            if not virtual_rows:
+                return []
+            # 按区域聚合（取 title 前4字符作为区域标识，兼容中文）
+            from collections import Counter
+            area_counts = Counter()
+            for vid, vtitle in virtual_rows:
+                area = vtitle[:4] if len(vtitle) >= 4 else vtitle
+                area_counts[area] += 1
+            return [(area, count) for area, count in area_counts.most_common(5)]
+        except Exception as e:
+            logger.error(f"get_virtual_saturation failed: {e}")
+            return []
+
+    # ── 面组装辅助查询（供 SurfaceExpander 使用）──
+
+    def get_neighbor_map(self, node_ids: list) -> dict:
+        """获取节点的 1-hop 邻居映射（node_edges + reasoning_lines 合并）"""
+        if not node_ids:
+            return {}
+        try:
+            placeholders = ",".join("?" * len(node_ids))
+            neighbor_map = {}
+            # node_edges
+            for row in self._conn.execute(
+                f"SELECT source_id, target_id FROM node_edges WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})",
+                node_ids + node_ids
+            ).fetchall():
+                neighbor_map.setdefault(row[0], []).append(row[1])
+                neighbor_map.setdefault(row[1], []).append(row[0])
+            # reasoning_lines（排除同轮线，面BFS只走异轮验证路径）
+            for row in self._conn.execute(
+                f"SELECT new_point_id, basis_point_id FROM reasoning_lines WHERE same_round = 0 AND (new_point_id IN ({placeholders}) OR basis_point_id IN ({placeholders}))",
+                node_ids + node_ids
+            ).fetchall():
+                neighbor_map.setdefault(row[0], []).append(row[1])
+                neighbor_map.setdefault(row[1], []).append(row[0])
+            # 去重
+            for k in neighbor_map:
+                neighbor_map[k] = list(dict.fromkeys(neighbor_map[k]))
+            return neighbor_map
+        except Exception as e:
+            logger.error(f"get_neighbor_map failed: {e}")
+            return {}
+
+    def get_frontier_node_ids(self, limit: int = 50) -> list:
+        """获取最近创建的非虚拟、非消融、非反驳的前沿节点 ID"""
+        try:
+            rows = self._conn.execute(
+                """SELECT node_id FROM knowledge_nodes
+                WHERE node_id NOT LIKE 'MEM_CONV%'
+                  AND type IN ('LESSON', 'CONTEXT', 'DISCOVERY')
+                  AND is_virtual = 0
+                  AND ablation_active = 0
+                  AND node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS')
+                ORDER BY created_at DESC
+                LIMIT ?""",
+                (limit,)
+            ).fetchall()
+            return [r[0] for r in rows]
+        except Exception as e:
+            logger.error(f"get_frontier_node_ids failed: {e}")
+            return []
+
+    def get_excluded_ids(self, candidate_ids: list) -> set:
+        """获取消融中的节点 ID 集合（ablation_active > 0）"""
+        if not candidate_ids:
+            return set()
+        try:
+            placeholders = ",".join("?" * len(candidate_ids))
+            rows = self._conn.execute(
+                f"SELECT node_id FROM knowledge_nodes WHERE node_id IN ({placeholders}) AND ablation_active > 0",
+                list(candidate_ids)
+            ).fetchall()
+            return {r[0] for r in rows}
+        except Exception:
+            return set()
+
+    def batch_get_titles(self, node_ids: list) -> dict:
+        """批量获取节点标题 {node_id: title}"""
+        if not node_ids:
+            return {}
+        try:
+            placeholders = ",".join("?" * len(node_ids))
+            rows = self._conn.execute(
+                f"SELECT node_id, title FROM knowledge_nodes WHERE node_id IN ({placeholders})",
+                node_ids
+            ).fetchall()
+            return {r[0]: r[1] for r in rows}
+        except Exception:
+            return {}
+
+    def get_same_round_ids(self, node_ids: list, window_seconds: int = 600) -> set:
+        """检测哪些节点是最近 window_seconds 秒内创建的（同轮线标记用）"""
+        if not node_ids:
+            return set()
+        try:
+            import time
+            now = time.time()
+            placeholders = ",".join("?" * len(node_ids))
+            rows = self._conn.execute(
+                f"SELECT node_id, created_at FROM knowledge_nodes WHERE node_id IN ({placeholders})",
+                node_ids
+            ).fetchall()
+            same_round = set()
+            for row in rows:
+                try:
+                    ca = row[1]
+                    if isinstance(ca, (int, float)) and now - ca < window_seconds:
+                        same_round.add(row[0])
+                    elif isinstance(ca, str) and ca:
+                        from datetime import datetime
+                        dt = datetime.fromisoformat(ca.replace("Z", "+00:00"))
+                        if (now - dt.timestamp()) < window_seconds:
+                            same_round.add(row[0])
+                except Exception:
+                    pass
+            return same_round
+        except Exception:
+            return set()
+
+    # ── 真理区分（RAG消融）──
+
+    def check_ablation_candidates(self, min_incoming: int = 5, min_idle_rounds: int = 3) -> list:
+        """查找满足消融触发条件的节点：
+        1. 入线数 >= min_incoming（已被足够多新点基于它产生）
+        2. 最近 min_idle_rounds 轮无新线连向该点（知识已稳定）
+        返回 [(node_id, incoming_count, title), ...]"""
+        try:
+            rows = self._conn.execute(
+                """SELECT rl.basis_point_id, COUNT(*) as incoming, kn.title
+                FROM reasoning_lines rl
+                JOIN knowledge_nodes kn ON rl.basis_point_id = kn.node_id
+                WHERE rl.same_round = 0
+                  AND kn.ablation_active = 0
+                  AND kn.node_id NOT LIKE 'MEM_CONV%'
+                GROUP BY rl.basis_point_id
+                HAVING incoming >= ?
+                ORDER BY incoming DESC""",
+                (min_incoming,)
+            ).fetchall()
+            # TODO: 检查 idle rounds（需要 trace 数据，MVP 先跳过）
+            return [(r[0], r[1], r[2]) for r in rows]
+        except Exception as e:
+            logger.error(f"check_ablation_candidates failed: {e}")
+            return []
+
+    def get_ablation_observing_nodes(self, min_duration_seconds: int = 300) -> list:
+        """获取正在消融观察中的节点（已观察超过 min_duration_seconds 秒）。
+        返回 [(node_id, title, baseline_env_ratio), ...]"""
+        try:
+            rows = self._conn.execute(
+                """SELECT kn.node_id, kn.title, ab.baseline_env_ratio
+                FROM knowledge_nodes kn JOIN ablation_baselines ab ON kn.node_id = ab.node_id
+                WHERE kn.ablation_active = 1 AND ab.activated_at <= strftime('%s','now') - ?""",
+                (min_duration_seconds,)
+            ).fetchall()
+            return [(r[0], r[1], r[2]) for r in rows]
+        except Exception as e:
+            logger.error(f"get_ablation_observing_nodes failed: {e}")
+            return []
+
+    def activate_ablation(self, node_id: str, baseline_env_ratio: float = None) -> bool:
+        """激活消融：从面和搜索中隐藏该节点，观察 N 轮。
+        baseline_env_ratio: 消融前的环境成功率，用于后续评估向前/向后判定。"""
+        try:
+            import time
+            self._conn.execute(
+                "UPDATE knowledge_nodes SET ablation_active = 1 WHERE node_id = ?",
+                (node_id,)
+            )
+            # 记录消融基线（用于评估）
+            self._conn.execute(
+                "INSERT OR REPLACE INTO ablation_baselines (node_id, activated_at, baseline_env_ratio) VALUES (?,?,?)",
+                (node_id, int(time.time()), baseline_env_ratio)
+            )
+            self._conn.commit()
+            logger.info(f"Ablation activated for [{node_id}] (baseline_env_ratio={baseline_env_ratio})")
+            return True
+        except Exception as e:
+            logger.error(f"activate_ablation failed: {e}")
+            return False
+
+    def deactivate_ablation(self, node_id: str, current_env_ratio: float = None) -> str:
+        """结束消融观察期，自动判定向前/向后：
+        - current_env_ratio 下降 vs baseline → 向后（必要跳板）→ 恢复可见
+        - current_env_ratio 不变 vs baseline → 向前（LLM内部已有）→ 降级
+        - 无数据时默认向后（保守策略：宁可保留也不丢失跳板）
+        """
+        try:
+            # 读取消融基线
+            row = self._conn.execute(
+                "SELECT baseline_env_ratio FROM ablation_baselines WHERE node_id = ?",
+                (node_id,)
+            ).fetchone()
+            baseline = row[0] if row else None
+
+            # 自动判定
+            confirmed = True  # 默认保守：保留
+            if baseline is not None and current_env_ratio is not None:
+                # env_ratio 下降 ≥ 0.1 → 向后（必要跳板）
+                # env_ratio 不变或上升 → 向前（LLM内部已有）
+                if current_env_ratio >= baseline - 0.1:
+                    confirmed = False  # 向前：缺了它不影响
+                    logger.info(f"Ablation auto-judge: [{node_id}] 向前 (baseline={baseline:.2f}, current={current_env_ratio:.2f})")
+                else:
+                    logger.info(f"Ablation auto-judge: [{node_id}] 向后 (baseline={baseline:.2f}, current={current_env_ratio:.2f})")
+
+            if confirmed:
+                # 确认价值：恢复可见
+                self._conn.execute(
+                    "UPDATE knowledge_nodes SET ablation_active = 0 WHERE node_id = ?",
+                    (node_id,)
+                )
+                self._conn.commit()
+                logger.info(f"Ablation ended: [{node_id}] confirmed valuable (向后)")
+                return "confirmed_valuable"
+            else:
+                # 降级：保持隐藏，标记为 LLM 内部已有知识
+                self._conn.execute(
+                    "UPDATE knowledge_nodes SET ablation_active = 2 WHERE node_id = ?",
+                    (node_id,)
+                )
+                self._conn.commit()
+                logger.info(f"Ablation ended: [{node_id}] demoted (向前: LLM internal)")
+                return "demoted"
+        except Exception as e:
+            logger.error(f"deactivate_ablation failed: {e}")
+            return "error"
+
     def delete_node(self, node_id: str) -> bool:
         """物理删除一个节点及其所有关联数据（统一删除入口）"""
         try:
             self._conn.execute("DELETE FROM node_edges WHERE source_id = ? OR target_id = ?", (node_id, node_id))
+            self._conn.execute("DELETE FROM reasoning_lines WHERE new_point_id = ? OR basis_point_id = ?", (node_id, node_id))
             self._conn.execute("DELETE FROM node_versions WHERE node_id = ?", (node_id,))
             self._conn.execute("DELETE FROM node_contents WHERE node_id = ?", (node_id,))
             self._conn.execute("DELETE FROM knowledge_nodes WHERE node_id = ?", (node_id,))

@@ -65,7 +65,59 @@ def _build_xcode_responses(config) -> AIXJResponsesProvider:
     )
 
 
+def _build_newshrimp(config) -> NativeHTTPProvider:
+    api_key = getattr(config, 'newshrimp_api_key', None)
+    if not api_key: return None
+    base_url = getattr(config, 'newshrimp_base_url', None) or "https://api.new-shrimp.icu/v1"
+    default_model = getattr(config, 'newshrimp_model', None) or "MiniMax-M2.7-highspeed"
+    ssl_verify = getattr(config, 'newshrimp_ssl_verify', True)
+    return NativeHTTPProvider(
+        api_key=api_key,
+        base_url=base_url,
+        default_model=default_model,
+        ssl_verify=ssl_verify,
+        connect_timeout=8,   # 国内直连 50ms, 8s 足够判断死活
+        read_timeout=60,    # 国内 API 60s 无数据 = 挂死，必须超时
+        provider_name="newshrimp"
+    )
+
+
+def _build_newshrimp_backup(config) -> NativeHTTPProvider:
+    api_key = getattr(config, 'newshrimp_api_key', None)
+    backup_base_url = getattr(config, 'newshrimp_backup_base_url', None)
+    if not api_key or not backup_base_url: return None
+    default_model = getattr(config, 'newshrimp_model', None) or "MiniMax-M2.7-highspeed"
+    ssl_verify = getattr(config, 'newshrimp_backup_ssl_verify', True)
+    return NativeHTTPProvider(
+        api_key=api_key,
+        base_url=backup_base_url,
+        default_model=default_model,
+        ssl_verify=ssl_verify,
+        provider_name="newshrimp_backup"
+    )
+
+
+def _build_newshrimp_2(config) -> NativeHTTPProvider:
+    api_key = getattr(config, 'newshrimp_2_api_key', None)
+    if not api_key: return None
+    base_url = getattr(config, 'newshrimp_2_base_url', None) or "https://api.new-shrimp.icu/v1"
+    default_model = getattr(config, 'newshrimp_2_model', None) or getattr(config, 'newshrimp_model', None) or "MiniMax-M2.7-highspeed"
+    ssl_verify = getattr(config, 'newshrimp_2_ssl_verify', True)
+    return NativeHTTPProvider(
+        api_key=api_key,
+        base_url=base_url,
+        default_model=default_model,
+        ssl_verify=ssl_verify,
+        connect_timeout=8,   # 国内直连
+        read_timeout=60,    # 国内 API 60s 无数据 = 挂死，必须超时
+        provider_name="newshrimp_2"
+    )
+
+
 provider_registry.register("xcode", _build_xcode)
 provider_registry.register("xcode_backup", _build_xcode_backup)
 provider_registry.register("deepseek", _build_deepseek)
 provider_registry.register("xcode_responses", _build_xcode_responses)
+provider_registry.register("newshrimp", _build_newshrimp)
+provider_registry.register("newshrimp_backup", _build_newshrimp_backup)
+provider_registry.register("newshrimp_2", _build_newshrimp_2)

@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 PROVIDER_KEY_MAP = {
     "xcode": "xcode_api_key",
     "xcode_backup": "xcode_api_key",
+    "newshrimp": "newshrimp_api_key",
+    "newshrimp_backup": "newshrimp_api_key",
+    "newshrimp_2": "newshrimp_2_api_key",
     "deepseek": "deepseek_api_key",
     "xcode_responses": "xcode_api_key",
 }
@@ -40,6 +43,9 @@ class ProviderRouter(LLMProvider):
         self._failover_time: float = 0  # 上次 failover 时间戳
         self._last_recovery_attempt: float = 0  # 上次探活时间戳
         self._last_refresh_time: float = time.time()  # 上次刷新时间
+        # Provider 健康追踪：跳过已知死亡的 provider，避免 failover 浪费时间
+        # {"provider_name": {"state": "network_dead"|"rate_limited"|"quota_dead", "until": timestamp, "fail_count": int}}
+        self._provider_health: Dict[str, Dict[str, Any]] = {}
         
         self._initialize_providers(api_key, base_url, model)
         self.active_provider = self.providers.get(self.active_provider_name)
@@ -71,10 +77,63 @@ class ProviderRouter(LLMProvider):
                 logger.warning(f"Failed to build provider plugin '{name}': {e}")
         
         self.failover_order = [
-            name for name in ['xcode', 'xcode_backup', 'deepseek'] if name in self.providers
+            name for name in ['newshrimp', 'newshrimp_2', 'newshrimp_backup', 'xcode', 'xcode_backup', 'deepseek'] if name in self.providers
         ]
         self.active_provider_name = self.failover_order[0] if self.failover_order else 'xcode'
                 
+    @staticmethod
+    def _classify_error(err_str: str) -> tuple:
+        """Classify API error into health state + cooldown.
+        Returns (state, cooldown_secs, emoji).
+        """
+        err_lower = err_str.lower()
+        # Quota dead — hard limit, must wait until reset
+        for pat in ("daily_limit_exceeded", "usage_limit_exceeded", "insufficient_quota",
+                     "billing_hard_limit", "monthly_limit", "account_on_hold",
+                     "plan_limit_reached"):
+            if pat in err_lower:
+                return ("quota_dead", 3600, "💰")  # until UTC midnight ~1h max
+        # Rate limited — cooldown escalates with fail_count (handled in _mark_provider_unhealthy)
+        for pat in ("rate.limit", "too.many.requests", "slow.down", "throttl",
+                     "code.1302", "请求频率", "速率限制", "请求数限制",
+                     "request limit", "calls exceeded"):
+            if pat in err_lower:
+                return ("rate_limited", 60, "⏳")
+        # Network dead — SSL, connection refused, Cloudflare 524/5xx
+        for pat in ("ssl", "connection error", "network error", "connecterror",
+                     "524", "502", "503", "504", "timeoutexception"):
+            if pat in err_lower:
+                return ("network_dead", 300, "🔌")
+        # Default: transient, short cooldown
+        return ("transient", 30, "⚠️")
+
+    def _is_provider_healthy(self, name: str) -> bool:
+        """Check if a provider is healthy enough to try. Auto-clears expired entries."""
+        health = self._provider_health.get(name)
+        if not health:
+            return True
+        if time.time() >= health.get("until", 0):
+            # Cooldown expired, clear entry
+            del self._provider_health[name]
+            return True
+        return False
+
+    def _mark_provider_unhealthy(self, name: str, err_str: str):
+        """Mark a provider as unhealthy based on the error from its last attempt."""
+        state, cooldown, emoji = self._classify_error(err_str)
+        existing = self._provider_health.get(name, {})
+        fail_count = existing.get("fail_count", 0) + 1
+        # 自适应冷却：rate_limited 连续命中时指数升级冷却时间
+        # newshrimp 450次/300分钟限 → 30s 太短(又撞429) → 需要更长冷却
+        if state == "rate_limited" and fail_count > 1:
+            cooldown = min(cooldown * (2 ** (fail_count - 1)), 300)  # 60→120→240→300s cap
+        self._provider_health[name] = {
+            "state": state,
+            "until": time.time() + cooldown,
+            "fail_count": fail_count,
+        }
+        logger.info(f"{emoji} Provider {name} marked {state} for {cooldown}s (fail #{fail_count})")
+
     def _switch_provider(self, target: str):
         """Switch active provider"""
         if target not in self.providers:
@@ -115,15 +174,19 @@ class ProviderRouter(LLMProvider):
             logger.info("🔄 Provider connections refreshed (hourly)")
 
         # 回退探活：如果当前不是首选 provider，定期用轻量 ping 尝试恢复
+        # 但不探活已知 quota_dead 的 provider
         if (
             self._preferred_provider_name
             and self.active_provider_name != self._preferred_provider_name
             and self._preferred_provider_name in self.providers
             and (time.time() - self._last_recovery_attempt) > self.RECOVERY_COOLDOWN_SECS
+            and self._is_provider_healthy(self._preferred_provider_name)
         ):
             self._last_recovery_attempt = time.time()
             try:
                 probe_provider = self.providers[self._preferred_provider_name]
+                # 探活：轻量 chat completion (max_tokens=1)
+                # 不用 GET /models — models 可能被 CDN 缓存，而 inference 后端实际挂了
                 _probe_msgs = [{"role": "user", "content": "ping"}]
                 _probe_kwargs = {k: v for k, v in kwargs.items() if k not in ("tools", "stream", "stream_callback")}
                 _probe_kwargs["max_tokens"] = 1
@@ -131,9 +194,36 @@ class ProviderRouter(LLMProvider):
                 # 探活成功，恢复首选（不返回 probe 结果，继续走正常路径用真实消息）
                 self._switch_provider(self._preferred_provider_name)
                 self._failover_time = 0
+                # 清除健康记录
+                self._provider_health.pop(self._preferred_provider_name, None)
                 logger.info(f"✅ Provider recovered: back to {self._preferred_provider_name}")
             except Exception as probe_e:
+                self._mark_provider_unhealthy(self._preferred_provider_name, str(probe_e))
                 logger.debug(f"Recovery probe to {self._preferred_provider_name} failed: {probe_e}")
+
+        # 如果当前 active provider 不健康，立即切换到下一个健康的
+        if not self._is_provider_healthy(self.active_provider_name):
+            logger.info(f"⏭️ Active provider {self.active_provider_name} unhealthy, skipping")
+            # 找下一个健康的 provider
+            switched = False
+            for pname in self.failover_order:
+                if pname != self.active_provider_name and pname in self.providers and self._is_provider_healthy(pname):
+                    self._switch_provider(pname)
+                    switched = True
+                    break
+            if not switched:
+                # 全部不健康：清除 rate_limited 和 transient（可能已恢复），保留 quota_dead
+                cleared = []
+                for pname in list(self._provider_health.keys()):
+                    state = self._provider_health[pname].get("state")
+                    if state in ("rate_limited", "transient", "network_dead"):
+                        del self._provider_health[pname]
+                        cleared.append(pname)
+                if cleared:
+                    logger.info(f"🔓 All unhealthy, cleared {cleared} for retry")
+                else:
+                    # 只剩 quota_dead，只能等
+                    logger.warning(f"💀 All providers quota_dead, cannot proceed")
 
         # Try active first
         try:
@@ -150,6 +240,8 @@ class ProviderRouter(LLMProvider):
                     duration_ms=dur,
                     has_tool_calls=result.has_tool_calls
                 )
+            # 成功后清除健康记录
+            self._provider_health.pop(self.active_provider_name, None)
             return result
         except WallClockTimeoutError:
             raise  # 总超时不是 provider 故障，直接上抛，不触发 failover
@@ -161,6 +253,8 @@ class ProviderRouter(LLMProvider):
             if "400" in err_str or "invalid_request_error" in err_str:
                 raise
             
+            # 标记当前 provider 不健康
+            self._mark_provider_unhealthy(self.active_provider_name, err_str)
             self._failover_time = time.time()
             
             # Dynamic Failover (仅对 5xx / 网络 / 超时等服务端故障)
@@ -170,30 +264,37 @@ class ProviderRouter(LLMProvider):
             except ValueError:
                 pass
                 
-            # Try next providers in the list
+            # Try next providers in the list — 跳过不健康的
             start_index = current_index + 1
             for next_provider_name in self.failover_order[start_index:]:
-                if next_provider_name in self.providers:
-                     if self._switch_provider(next_provider_name):
-                         logger.info(f"🔄 Failover Attempt: {next_provider_name}")
-                         try:
-                             result = await self.active_provider.chat(messages=messages, **kwargs)
-                             dur = (time.time() - t0) * 1000
-                             if trace_id:
-                                 tracer.log_llm_call(
-                                     trace_id, parent=trace_parent, phase=trace_phase,
-                                     model=model + f"(failover:{next_provider_name})",
-                                     input_tokens=result.input_tokens,
-                                     output_tokens=result.output_tokens,
-                                     total_tokens=result.total_tokens,
-                                     cache_hit_tokens=getattr(result, 'prompt_cache_hit_tokens', 0),
-                                     duration_ms=dur,
-                                     has_tool_calls=result.has_tool_calls
-                                 )
-                             return result
-                         except Exception as e2:
-                             logger.error(f"Backup Provider {next_provider_name} also failed: {e2}")
-                             continue # Try next
+                if next_provider_name not in self.providers:
+                    continue
+                if not self._is_provider_healthy(next_provider_name):
+                    logger.info(f"⏭️ Skipping unhealthy provider {next_provider_name}")
+                    continue
+                if self._switch_provider(next_provider_name):
+                    logger.info(f"🔄 Failover Attempt: {next_provider_name}")
+                    try:
+                        result = await self.active_provider.chat(messages=messages, **kwargs)
+                        dur = (time.time() - t0) * 1000
+                        if trace_id:
+                            tracer.log_llm_call(
+                                trace_id, parent=trace_parent, phase=trace_phase,
+                                model=model + f"(failover:{next_provider_name})",
+                                input_tokens=result.input_tokens,
+                                output_tokens=result.output_tokens,
+                                total_tokens=result.total_tokens,
+                                cache_hit_tokens=getattr(result, 'prompt_cache_hit_tokens', 0),
+                                duration_ms=dur,
+                                has_tool_calls=result.has_tool_calls
+                            )
+                        # 成功后清除健康记录
+                        self._provider_health.pop(next_provider_name, None)
+                        return result
+                    except Exception as e2:
+                        logger.error(f"Backup Provider {next_provider_name} also failed: {e2}")
+                        self._mark_provider_unhealthy(next_provider_name, str(e2))
+                        continue # Try next
             
             dur = (time.time() - t0) * 1000
             if trace_id:
