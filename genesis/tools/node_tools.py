@@ -17,7 +17,7 @@ class RecordContextNodeTool(BaseNodeTool):
 
     @property
     def description(self) -> str:
-        return "沉淀静态参数类节点 (CONTEXT)，用于记录纯粹的 Key-Value 状态变量或环境信息。发现需要记录的环境参数或配置信息时，可调用此工具写入知识库。"
+        return "沉淀静态参数类节点 (CONTEXT)，用于记录纯粹的 Key-Value 状态变量或环境信息。(仅超级管理员 C 进程 有权限使用)"
 
     @property
     def parameters(self) -> Dict[str, Any]:
@@ -62,7 +62,7 @@ class RecordLessonNodeTool(BaseNodeTool):
 
     @property
     def description(self) -> str:
-        return "沉淀经验流程类节点 (LESSON)，用于记录具体的排错手段或操作流。搜索知识库后产生新洞察时，必须调用此工具写回知识库，并用 reasoning_basis 连线到搜索命中的节点。"
+        return "沉淀经验流程类节点 (LESSON)，用于记录具体的排错手段或操作流。(仅超级管理员 C 进程 有权限使用)"
 
     @property
     def parameters(self) -> Dict[str, Any]:
@@ -87,22 +87,57 @@ class RecordLessonNodeTool(BaseNodeTool):
                 },
                 "resolves": {"type": "string", "description": "此经验主要解决的具体报错信息或异常现象简述（用于丰富图谱寻找）"},
                 "contradicts": {"type": "string", "description": "可选。如果这条新知识反驳/替代了某个旧节点，填写被反驳的节点 ID。旧节点将被标记为已过时，不再出现在搜索结果中。"},
-                "reasoning_basis": {"type": "array", "items": {"type": "object", "properties": {"basis_node_id": {"type": "string", "description": "基于哪个已有节点产生此经验"}, "reasoning": {"type": "string", "description": "为什么觉得那个节点有用/如何推导出此经验"}}, "required": ["basis_node_id", "reasoning"]}, "description": "推理线（强烈建议填写）：记录此经验基于哪些已有知识产生、判断依据是什么。如果你搜索了知识库并基于搜索结果产生了新洞察，必须填写此字段连线。示例：[{\"basis_node_id\": \"LESSON_XXX\", \"reasoning\": \"该节点描述了X模式，我观察到当前场景也符合此模式\"}]"},
+                "reasoning_basis": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "basis_node_id": {"type": "string", "description": "基于哪个已有节点产生此经验"},
+                            "reasoning": {"type": "string", "description": "这条线回答一个具体的因果问题：为什么基于这个特定节点？不同basis的reasoning必须不同。例如：CONTEXT→'什么环境条件使此经验成立'，PATTERN→'这属于什么已知重复模式'，LESSON→'什么先验经验指导了这个做法'"}
+                        },
+                        "required": ["basis_node_id", "reasoning"]
+                    },
+                    "description": "推理线（必填）：每条线回答一个不同的因果问题——为什么此经验基于那个特定节点？不要写总理由复制到每条线，每条线的reasoning必须针对该basis节点回答不同的因果角度。至少2条线。"
+                },
                 **TRUST_SCHEMA_PROPERTIES
             },
-            "required": ["node_id", "title", "trigger_verb", "trigger_noun", "trigger_context", "action_steps", "because_reason", "resolves"]
+            "required": ["node_id", "title", "trigger_verb", "trigger_noun", "trigger_context", "action_steps", "because_reason", "resolves", "reasoning_basis"]
         }
 
     async def execute(self, node_id: str, title: str, trigger_verb: str, trigger_noun: str, trigger_context: str, action_steps: List[str], because_reason: str, prerequisites: List[str] = None, resolves: str = None, contradicts: str = None, reasoning_basis: List[Dict[str, str]] = None, metadata_signature: Dict[str, Any] = None, last_verified_at: str = None, verification_source: str = None) -> str:
-        # validateInput（借鉴Claude Code）：reasoning_basis为空时拒绝执行，要求模型连线
+        # ── validateInput: reasoning_basis 必填校验 ──
         if not reasoning_basis:
-            return (
-                "⚠️ record_lesson_node 拒绝执行：reasoning_basis 不能为空。"
-                "你必须在 reasoning_basis 中声明此经验基于哪些已有知识产生、判断依据是什么。"
-                "格式：[{\"basis_node_id\": \"LESSON_XXX\", \"reasoning\": \"为什么觉得那个节点有用/如何推导出此经验\"}]。"
-                "如果你搜索了知识库并基于搜索结果产生了新洞察，必须填写此字段连线。"
-                "请重新调用 record_lesson_node 并填写 reasoning_basis 参数。"
-            )
+            return "Error: reasoning_basis 不能为空。记录 LESSON 必须声明基于哪些已有节点产生此经验，且每条线的reasoning必须针对该basis节点回答不同的因果角度。请先搜索知识库，找到相关节点后填写 reasoning_basis。没有线的创新 = 无法判断价值 = 无法去重 = 噪音。"
+
+        # ── 预处理 basis：解析对象数组，清洗去重去自引用 ──
+        basis_entries = []
+        seen_ids = set()
+        for rb in reasoning_basis:
+            if isinstance(rb, str):
+                # 兼容旧格式：纯节点ID字符串
+                bid = rb.strip()
+                br = because_reason  # fallback
+            elif isinstance(rb, dict):
+                bid = (rb.get("basis_node_id") or "").strip()
+                br = (rb.get("reasoning") or because_reason).strip()
+            else:
+                continue
+            if bid and bid != node_id and bid not in seen_ids:
+                seen_ids.add(bid)
+                basis_entries.append({"id": bid, "reasoning": br})
+        valid_basis = [e["id"] for e in basis_entries]
+
+        # ── 同轮检测：basis 中哪些是本轮刚创建的（不贡献入线数，防自刷） ──
+        same_round_ids = self.vault.get_same_round_ids(valid_basis) if valid_basis else set()
+
+        # ── 碰撞检测（写前去重）：basis 集合与已有节点重叠 ──
+        collision_candidates = self.vault.find_collision_candidates(valid_basis, min_overlap=2) if valid_basis else []
+        collision_hint = ""
+        if collision_candidates:
+            candidate_hints = [f"[{cid}] '{ctitle}' (重叠{overlap}个basis)" for cid, overlap, ctitle in collision_candidates[:3]]
+            collision_hint = f" ⚠️ 碰撞检测：你引用的节点已被以下节点引用：{', '.join(candidate_hints)}。确认是否重复？"
+            logger.info(f"Collision detected for [{node_id}]: {candidate_hints}")
+
         try:
             lesson_struct = {
                 "IF_trigger": {
@@ -195,30 +230,20 @@ class RecordLessonNodeTool(BaseNodeTool):
                 contradicts_msg = f" ⚠️ 已标记 [{target_id}] 为被反驳，该节点将不再出现在搜索结果中。"
                 logger.info(f"CONTRADICTS: [{node_id}] --[CONTRADICTS]--> [{target_id}]")
 
-            # 推理线（点线面架构）：记录此经验基于哪些已有知识产生
-            lines_msg = ""
-            if reasoning_basis:
-                line_ids = []
-                for rb in reasoning_basis:
-                    bid = rb.get("basis_node_id", "").strip()
-                    reasoning_text = rb.get("reasoning", "").strip()
-                    if bid and reasoning_text and bid != node_id:
-                        lid = self.vault.add_reasoning_line(
-                            new_point_id=node_id,
-                            basis_point_id=bid,
-                            reasoning=reasoning_text,
-                            source='C',
-                        )
-                        if lid:
-                            line_ids.append(lid)
-                if line_ids:
-                    lines_msg = f" 🔗 {len(line_ids)}条推理线"
-                    logger.info(f"ReasoningLines: [{node_id}] ← {line_ids}")
+            # ── 推理线（点线面架构）：新点连线到 basis 节点，每条线用独立的因果推理 ──
+            line_msg = ""
+            if basis_entries:
+                for entry in basis_entries:
+                    bid = entry["id"]
+                    line_reasoning = entry["reasoning"]
+                    sr = 1 if bid in same_round_ids else 0
+                    self.vault.create_reasoning_line(node_id, bid, reasoning=line_reasoning, source="GP", same_round=sr)
+                line_msg = f" 🔗 {len(basis_entries)}条推理线→{valid_basis}"
 
             if dedup_action == "relate" and merged_node_id:
-                return f"✅ LESSON节点 [{node_id}] '{title}' 写入成功。检测到相似节点 [{merged_node_id}]，已建立 RELATED_TO 边。{resolves_msg}{prereq_msg}{contradicts_msg}{lines_msg}"
+                return f"✅ LESSON节点 [{node_id}] '{title}' 写入成功。检测到相似节点 [{merged_node_id}]，已建立 RELATED_TO 边。{resolves_msg}{prereq_msg}{contradicts_msg}{line_msg}{collision_hint}"
 
-            return f"✅ LESSON节点 [{node_id}] '{title}' 写入成功。{resolves_msg}{prereq_msg}{contradicts_msg}{lines_msg}"
+            return f"✅ LESSON节点 [{node_id}] '{title}' 写入成功。{resolves_msg}{prereq_msg}{contradicts_msg}{line_msg}{collision_hint}"
         except Exception as e:
             logger.error(f"Lesson node creation failed: {e}")
             return f"Error: {e}"
@@ -386,8 +411,8 @@ class CreateNodeEdgeTool(BaseNodeTool):
                 "target_id": {"type": "string", "description": "目标节点ID"},
                 "relation": {
                     "type": "string", 
-                    "enum": ["TRIGGERS", "RESOLVES", "REQUIRES", "LOCATED_AT", "RELATED_TO"],
-                    "description": "关系类型"
+                    "enum": ["TRIGGERS", "RESOLVES", "REQUIRES", "LOCATED_AT", "RELATED_TO", "CONTRADICTS"],
+                    "description": "关系类型。CONTRADICTS: 矛盾（C-Gardener标记，GP搜索可见）"
                 },
                 "weight": {"type": "number", "description": "权重 (0.0-1.0)", "default": 1.0}
             },
@@ -665,244 +690,3 @@ class RecordDiscoveryTool(BaseNodeTool):
         except Exception as e:
             logger.warning(f"PATTERN auto-promotion check failed for {subject}: {e}")
             return ""
-
-
-# ══════════════════════════════════════════════════════════════════
-# V2 点线面工具：低摩擦，GP 可用
-# ══════════════════════════════════════════════════════════════════
-
-class RecordPointTool(BaseNodeTool):
-    """V2 点工具：2参数极简记录，GP 主要知识产出手段。"""
-
-    @property
-    def name(self) -> str:
-        return "record_point"
-
-    @property
-    def description(self) -> str:
-        return "记录一个知识点（POINT）。一句话标题+自然语言正文，2个必填参数。发现新洞察时立即调用，像记笔记一样。"
-
-    @property
-    def parameters(self) -> Dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string", "description": "一句话描述这个知识点，如 'nginx端口占用时用fuser查PID'"},
-                "content": {"type": "string", "description": "自然语言正文，写清楚你发现了什么、怎么做。不需要结构化，自然写就行。"},
-                "resolves": {"type": "string", "description": "可选。此知识点解决的具体问题或报错，如 'Address already in use'"},
-            },
-            "required": ["title", "content"]
-        }
-
-    async def execute(self, title: str, content: str, resolves: str = None) -> str:
-        try:
-            import hashlib as _hl
-            node_id = f"P_{_hl.md5(title.encode()).hexdigest()[:5].upper()}"
-
-            # 语义去重
-            dedup_action = None
-            merged_node_id = None
-            if self.vault.vector_engine.is_ready:
-                similar = self.vault.vector_engine.search(title, top_k=3, threshold=0.75)
-                candidate_ids = [sid for sid, _ in similar]
-                candidate_briefs = self.vault.get_node_briefs(candidate_ids) if candidate_ids else {}
-                for sim_id, sim_score in similar:
-                    brief = candidate_briefs.get(sim_id)
-                    if not brief:
-                        continue
-                    if sim_score >= 0.85:
-                        dedup_action = "merge"
-                        merged_node_id = sim_id
-                        self.vault.update_node_content(sim_id, content, source="gp_merged")
-                        self.vault.touch_node(sim_id)
-                        logger.info(f"POINT dedup: merged into [{sim_id}] (sim={sim_score:.2f})")
-                        break
-                    elif sim_score >= 0.65:
-                        dedup_action = "relate"
-                        merged_node_id = sim_id
-                        break
-
-            if dedup_action == "merge":
-                return f"♻️ POINT 与已有 [{merged_node_id}] 高度相似(≥0.85)，已合并更新。"
-
-            self.vault.create_node(
-                node_id=node_id,
-                ntype="POINT",
-                title=title,
-                human_translation=title,
-                tags="auto_managed",
-                full_content=content,
-                source="gp",
-                resolves=resolves,
-                trust_tier="REFLECTION"
-            )
-
-            if dedup_action == "relate" and merged_node_id:
-                self.vault.add_edge(node_id, merged_node_id, "RELATED_TO", weight=0.7)
-
-            # RESOLVES 边
-            resolves_msg = ""
-            if resolves:
-                resolved_ids = self._resolve_text_to_node_ids(resolves)
-                for rid in resolved_ids:
-                    if rid != node_id:
-                        self.vault.add_edge(node_id, rid, "RESOLVES", weight=0.8)
-                if resolved_ids:
-                    resolves_msg = f" 🔗 RESOLVES→{resolved_ids}"
-
-            relate_msg = ""
-            if dedup_action == "relate" and merged_node_id:
-                relate_msg = f" 🔗 RELATED_TO→[{merged_node_id}]"
-
-            # V2: 记录本轮创建的 point ID，供 record_line 使用
-            BaseNodeTool._round_state['last_point_id'] = node_id
-
-            return f"✅ POINT [{node_id}] '{title}' 写入成功。{resolves_msg}{relate_msg}"
-        except Exception as e:
-            logger.error(f"Point creation failed: {e}")
-            return f"Error: {e}"
-
-    def _resolve_text_to_node_ids(self, text: str, top_k: int = 3, threshold: float = 0.75) -> List[str]:
-        if not text or not self.vault.vector_engine.is_ready:
-            return []
-        try:
-            results = self.vault.vector_engine.search(text, top_k=top_k, threshold=threshold)
-            return [rid for rid, score in results if rid]
-        except Exception as e:
-            logger.debug(f"resolve_text_to_node_ids failed: {e}")
-            return []
-
-
-class RecordLineTool(BaseNodeTool):
-    """V2 线工具：2参数连线，记录推理因果。GP 可用。"""
-
-    @property
-    def name(self) -> str:
-        return "record_line"
-
-    @property
-    def description(self) -> str:
-        return "连一条推理线：声明你为什么觉得某个已有节点有用，或新洞察基于什么产生。2个必填参数：目标节点ID + 原因。搜索知识库后产生新洞察时必须调用。"
-
-    @property
-    def parameters(self) -> Dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "to_id": {"type": "string", "description": "你参考的已有节点ID（搜索命中的或之前记录的），如 P_A3F2 或 LESSON_XXX"},
-                "why": {"type": "string", "description": "为什么觉得那个节点有用/如何推导出当前判断。一两句话就行。"},
-            },
-            "required": ["to_id", "why"]
-        }
-
-    async def execute(self, to_id: str, why: str) -> str:
-        # validateInput：to_id 必须存在于 knowledge_nodes
-        brief = self.vault.get_node_briefs([to_id])
-        if not brief or to_id not in brief:
-            if not to_id.startswith("INSIGHT_"):
-                return (
-                    f"⚠️ record_line 拒绝执行：节点 [{to_id}] 不存在于知识库。"
-                    "请确认 to_id 是搜索命中的节点ID或之前 record_point 返回的ID。"
-                )
-
-        try:
-            # from端(new_point_id)自动填充：
-            # 如果本轮已有 record_point，用其 ID；否则用虚拟标记
-            from_id = BaseNodeTool._round_state.get('last_point_id')
-            if not from_id:
-                import hashlib as _hl
-                import time
-                raw = f"insight_{time.time()}"
-                from_id = f"INSIGHT_{_hl.md5(raw.encode()).hexdigest()[:8].upper()}"
-                insight_markers = BaseNodeTool._round_state.setdefault('insight_markers', [])
-                insight_markers.append(from_id)
-
-            lid = self.vault.add_reasoning_line(
-                new_point_id=from_id,
-                basis_point_id=to_id,
-                reasoning=why,
-                source='GP',
-            )
-            if lid:
-                return f"✅ 推理线 [{lid}] 连接成功：{from_id} ← [{to_id}] ({why[:60]})"
-            else:
-                return f"⚠️ 推理线写入失败（可能重复）。"
-        except Exception as e:
-            logger.error(f"Line creation failed: {e}")
-            return f"Error: {e}"
-
-
-class RecordContextPointTool(BaseNodeTool):
-    """V2 环境上下文点工具：替代 record_context_node，2参数。"""
-
-    @property
-    def name(self) -> str:
-        return "record_context_point"
-
-    @property
-    def description(self) -> str:
-        return "记录环境上下文信息（POINT），如配置状态、目录结构、API布局等。2个必填参数。"
-
-    @property
-    def parameters(self) -> Dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string", "description": "一句话标题，如 'Genesis目录结构'"},
-                "content": {"type": "string", "description": "环境信息正文，自然语言描述"},
-            },
-            "required": ["title", "content"]
-        }
-
-    async def execute(self, title: str, content: str) -> str:
-        try:
-            import hashlib as _hl
-            node_id = f"P_{_hl.md5(title.encode()).hexdigest()[:5].upper()}"
-
-            # 语义去重
-            dedup_action = None
-            merged_node_id = None
-            if self.vault.vector_engine.is_ready:
-                similar = self.vault.vector_engine.search(title, top_k=3, threshold=0.75)
-                candidate_ids = [sid for sid, _ in similar]
-                candidate_briefs = self.vault.get_node_briefs(candidate_ids) if candidate_ids else {}
-                for sim_id, sim_score in similar:
-                    brief = candidate_briefs.get(sim_id)
-                    if not brief:
-                        continue
-                    if sim_score >= 0.85:
-                        dedup_action = "merge"
-                        merged_node_id = sim_id
-                        self.vault.update_node_content(sim_id, content, source="gp_merged")
-                        self.vault.touch_node(sim_id)
-                        break
-                    elif sim_score >= 0.65:
-                        dedup_action = "relate"
-                        merged_node_id = sim_id
-                        break
-
-            if dedup_action == "merge":
-                return f"♻️ CONTEXT POINT 与已有 [{merged_node_id}] 高度相似(≥0.85)，已合并更新。"
-
-            self.vault.create_node(
-                node_id=node_id,
-                ntype="POINT",
-                title=title,
-                human_translation=title,
-                tags="auto_managed,context",
-                full_content=content,
-                source="gp",
-                trust_tier="REFLECTION"
-            )
-
-            if dedup_action == "relate" and merged_node_id:
-                self.vault.add_edge(node_id, merged_node_id, "RELATED_TO", weight=0.7)
-
-            relate_msg = ""
-            if dedup_action == "relate" and merged_node_id:
-                relate_msg = f" 🔗 RELATED_TO→[{merged_node_id}]"
-
-            return f"✅ CONTEXT POINT [{node_id}] '{title}' 写入成功。{relate_msg}"
-        except Exception as e:
-            logger.error(f"Context point creation failed: {e}")
-            return f"Error: {e}"

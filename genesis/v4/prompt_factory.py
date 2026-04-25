@@ -170,8 +170,8 @@ class FactoryManager:
 
         map_block = ""
         if knowledge_map:
-            map_block = f"""[知识地形 — 拓扑视图]
-知识节点的拓扑分布。前沿是知识最外层，空洞是未探索方向。
+            map_block = f"""[L1 Knowledge — 声明式知识摘要]
+按鲜活度排序的知识节点。eff 越高越可信，低于 0.2 的已自动淘汰。
 需要详情用 search_knowledge_nodes(keywords=[...]) 或 get_knowledge_node_content(node_id=...)。
 {knowledge_map}
 """
@@ -228,18 +228,23 @@ class FactoryManager:
 - 先查知识库了解已有经验，再动手。
 - 先读代码再改代码，先诊断再修复。
 - 方法失败时诊断原因，不盲目重试，也不轻易放弃。
-- 不做与任务无关的事，但**发现新洞察时必须用 record_point 记录 + record_line 连线**——这不是加戏，是核心职责。知识库是你的记忆，不记录等于遗忘。
-- record_line 连线：声明你为什么觉得某个已有节点有用（to_id + why，2参数）。record_point 记点：一句话标题+自然语言正文（2参数）。像记笔记一样，不需要结构化。
+- 不做与任务无关的事，但**发现新洞察时必须用 record_lesson_node 记录并连线**——这不是加戏，是核心职责。知识库是你的记忆，不记录等于遗忘，不连线等于无法判断价值。
 - 临时脚本用 write_file 的 use_scratch=true。
 
 # 工具使用
 {tool_section}
 
-# 知识检索
+# 知识检索（点线面架构）
 接到任务后浏览 Knowledge Map，执行双规划：
 1. [任务路径] 怎么完成请求
 2. [知识路径] 执行过程能否顺便填补知识空洞（不超过2步额外操作）
-密集面→直接组装；稀疏面→先探索；空洞边界→优先调查。
+
+面的角色标签指导你的行动：
+- **基础节点**（已被反复验证）→ 直接作为推理基础使用
+- **探索节点**（新近产生）→ 需要验证后再依赖
+- **知识空洞** → 优先调查
+
+记录 LESSON 时**必须填写 reasoning_basis**——每条线回答一个不同的因果问题：为什么此经验基于那个特定节点？不同basis的reasoning必须不同（如：CONTEXT→什么环境条件使此经验成立，PATTERN→这属于什么已知重复模式，LESSON→什么先验经验指导了这个做法）。没有推理链的知识无法判断价值、无法去重，是噪音。
 
 {map_block}
 {experience_block}
