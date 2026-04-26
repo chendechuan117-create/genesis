@@ -14,6 +14,7 @@ from typing import Dict, Any, List
 
 from genesis.v4.manager import METADATA_SIGNATURE_FIELDS
 from genesis.v4.knowledge_query import normalize_node_dict
+from genesis.v4.surface import BASIS_INCOMING_FLOOR, BASIS_INCOMING_PERCENTILE
 from genesis.tools._base import BaseNodeTool
 
 logger = logging.getLogger(__name__)
@@ -329,6 +330,9 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
         row['fusion_score'] = round(fused, 4)
         return fused
 
+    def is_concurrency_safe(self, arguments: Dict[str, Any]) -> bool:
+        return True  # 只读搜索，可并行
+
     async def execute(self, keywords: List[str] = None, ntype: str = "ALL", signature: Dict[str, Any] = None, conversation_context: str = None) -> str:
         try:
             normalized_signature = self.vault.signature.normalize(signature)
@@ -584,23 +588,32 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 # 批量获取入线数（点线面价值信号）
                 all_result_ids = [r['node_id'] for r in row_dicts]
                 incoming_counts = self.vault.get_incoming_line_counts_batch(all_result_ids) if all_result_ids else {}
+                try:
+                    basis_threshold = max(
+                        self.vault.get_incoming_count_percentile(BASIS_INCOMING_PERCENTILE),
+                        BASIS_INCOMING_FLOOR,
+                    )
+                except Exception:
+                    basis_threshold = 2
 
                 for r in row_dicts[:8]:
                     nid = r['node_id']
                     # 紧凑元数据
                     meta = []
-                    if r.get('fusion_score'):
-                        meta.append(f"f:{r['fusion_score']:.2f}")
                     # 点线面角色标签（严格版：只给标签不给数字，防GP当confidence用）
                     inc = incoming_counts.get(nid, 0)
-                    if inc >= 2:
+                    if inc >= basis_threshold:
                         meta.append("基础")
-                    elif inc == 0:
+                    else:
                         meta.append("探索")
                     wins = r.get('usage_success_count', 0) or 0
                     losses = r.get('usage_fail_count', 0) or 0
-                    if wins or losses:
-                        meta.append(f"{wins}W/{losses}L")
+                    if wins and losses:
+                        meta.append("有实战记录")
+                    elif wins:
+                        meta.append("有成功记录")
+                    elif losses:
+                        meta.append("有失败记录")
                     reliability = r.get('reliability') or {}
                     if reliability.get('epoch_stale'):
                         meta.append("旧快照")
@@ -700,25 +713,28 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     pass
 
                 # 拓扑密度判定（基于入线数而非 confidence）
+                should_record_void = False
                 if basis_count >= 3 and cone_edge_count >= 5:
-                    density_label = "高密度 — 已有成熟解法，可直接组装"
+                    surface_label = "已有基础链路，可先复用再推进"
                 elif total_nodes >= 5 and basis_count >= 2:
-                    density_label = "中密度 — 有基础知识，部分区域需验证"
+                    surface_label = "有基础，也有待验证区域"
                 elif total_nodes >= 2:
-                    density_label = "低密度 — 知识稀疏，建议先探索再执行"
+                    surface_label = "知识偏探索，先验证再执行"
+                    should_record_void = True
                 else:
-                    density_label = "近乎未知 — 无成熟知识，需要全面探索"
+                    surface_label = "知识空洞明显，需要先调查"
+                    should_record_void = True
 
-                density_parts = [f"{total_nodes} 节点({basis_count}基础,{frontier_count}探索)", f"{cone_edge_count} 条边"]
+                surface_parts = [surface_label]
                 if void_count:
-                    density_parts.append(f"{void_count} VOID")
-                lines.append(f"[知识密度] {' | '.join(density_parts)} → {density_label}")
+                    surface_parts.append("存在知识空洞")
+                lines.append(f"[面状态] {' | '.join(surface_parts)}")
                 if void_hints:
                     lines.append("[知识空洞]")
                     lines.extend(void_hints)
 
                 # ── 低密度 → VOID 记录（知识缺口，引导未来探索） ──
-                if density_label.startswith("低密度") or density_label.startswith("近乎未知"):
+                if should_record_void:
                     self._record_search_void(keywords, ntype,
                                              extra=f"topo_density={total_nodes},basis={basis_count},edges={cone_edge_count}")
 

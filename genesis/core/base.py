@@ -121,6 +121,10 @@ class Tool(ABC):
         """执行工具"""
         pass
     
+    def is_concurrency_safe(self, arguments: Dict[str, Any]) -> bool:
+        """是否可与其他工具并行执行。默认 False（保守），只读工具覆写为 True。"""
+        return False
+    
     def to_schema(self) -> Dict[str, Any]:
         """转换为 OpenAI Function Schema (Safe Version)"""
         params = self.parameters

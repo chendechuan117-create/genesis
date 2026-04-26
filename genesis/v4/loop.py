@@ -11,6 +11,7 @@ import asyncio
 import logging
 import traceback
 import hashlib
+import inspect
 from typing import List, Dict, Any, Tuple, Optional
 
 from genesis.core.base import Message, MessageRole, LLMProvider, PerformanceMetrics, ToolCall
@@ -472,10 +473,10 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
             
             # ── 知识路径持续提醒（仅 auto 模式，对抗 Instruction Attenuation）──
             _unblocked = set(self.loop_config.get("gp_unblock_tools") or [])
-            if "record_lesson_node" in _unblocked and i >= 8 and i % 5 == 3:
+            if "record_context_node" in _unblocked and "record_point" in self.tools and i >= 8 and i % 5 == 3:
                 self.g_messages.append(Message(
                     role=MessageRole.SYSTEM,
-                    content="[知识路径] 回顾你到目前为止的发现——有什么新认知值得写入知识库？记录 LESSON 时必须填写 reasoning_basis 连线到已有节点。"
+                    content="[知识路径] 回顾你到目前为止的发现——有什么新认知值得写入知识库？先用 record_point 写点，再用 record_line 连到依据节点；每条线的 reasoning 回答不同的因果问题。"
                 ))
             
             self._llm_call_count += 1
@@ -517,44 +518,113 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
             ))
             
             if response.tool_calls:
+                # ═══════════════════════════════════════════════════════
+                # 三阶段并行工具执行
+                # Phase 1: 预检查（串行）— 断路器 + 权限 + 并发安全分类
+                # Phase 2: 执行（safe 并行, unsafe 串行）— 纯 IO，无副作用
+                # Phase 3: 后处理（串行）— 按原始顺序处理所有副作用
+                # ═══════════════════════════════════════════════════════
+                _unblock = set(self.loop_config.get("gp_unblock_tools") or [])
+                
+                # Phase 1: 预检查
+                exec_plan = []  # [(tc, should_execute, skip_reason, is_safe)]
                 for tc in response.tool_calls:
                     await self._safe_callback(step_callback, "tool_start", {"phase": "GP_PHASE", "name": tc.name, "args": tc.arguments, "iteration": i})
                     self._tool_call_count += 1
-                    t0 = time.time()
                     
-                    # ── 重复调用断路器：同工具同参数 ≥3 次 → 拦截 ──
+                    # 断路器检查
                     _call_key = f"{tc.name}|{json.dumps(tc.arguments, sort_keys=True, ensure_ascii=False)[:200]}"
                     self._recent_tool_calls[_call_key] = self._recent_tool_calls.get(_call_key, 0) + 1
-                    breaker_tripped = self._recent_tool_calls[_call_key] >= 3
-                    if breaker_tripped:
-                        res = f"[断路器] 你已经用相同参数调用 {tc.name} 达 {self._recent_tool_calls[_call_key]} 次。请换一种方法或不同参数。"
+                    if self._recent_tool_calls[_call_key] >= 3:
                         logger.warning(f"Circuit breaker: {tc.name} called {self._recent_tool_calls[_call_key]}x with same args")
-
-                    if not breaker_tripped:
-                        _unblock = set(self.loop_config.get("gp_unblock_tools") or [])
-                        if tc.name in GP_BLOCKED_TOOLS and tc.name not in _unblock:
-                            res = f"Error: GP 禁止使用工具 {tc.name}（该工具仅限反思进程使用）"
-                        else:
-                        # ── 普通执行工具（shell, read_file, write_file 等）──
-                            try:
-                                res = await asyncio.wait_for(
-                                    self.tools.execute(tc.name, tc.arguments),
-                                    timeout=self.TOOL_EXEC_TIMEOUT
-                                )
-                            except asyncio.TimeoutError:
-                                res = f"Error: 工具 {tc.name} 执行超时（{self.TOOL_EXEC_TIMEOUT}秒），已强制终止。"
-                                logger.warning(f"GP tool timeout: {tc.name} exceeded {self.TOOL_EXEC_TIMEOUT}s")
-                                PipelineDiagnostics.op_timeout.record(True)
-                            # 环境信号采集：记录工具调用的客观成功/失败
-                            self._op_tool_outcomes.append({
-                                "tool": tc.name,
-                                "success": self._classify_tool_result(tc.name, str(res)),
-                            })
-                            # 从执行结果中学习签名
-                            self._merge_signature_from_texts(str(res)[:500])
+                        exec_plan.append((tc, False, "breaker", False))
+                        continue
                     
-                    res_text = str(res)
+                    # GP 权限检查
+                    if tc.name in GP_BLOCKED_TOOLS and tc.name not in _unblock:
+                        exec_plan.append((tc, False, "blocked", False))
+                        continue
+                    
+                    # 并发安全分类
+                    is_safe = self.tools.is_concurrency_safe(tc.name, tc.arguments)
+                    exec_plan.append((tc, True, None, is_safe))
+                
+                # Phase 2: 执行
+                tool_results = {}  # tc.id → (res_text, duration_ms)
+                
+                async def _exec_single(tc):
+                    """执行单个工具，返回 (tc, res_text, duration_ms)"""
+                    t0 = time.time()
+                    try:
+                        tool_args = dict(tc.arguments or {})
+                        if tc.name in {"record_lesson_node", "record_point", "record_line"}:
+                            tool = self.tools.get(tc.name)
+                            try:
+                                params = inspect.signature(getattr(tool, "execute")).parameters if tool else {}
+                            except Exception:
+                                params = {}
+                            accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+                            if accepts_kwargs or "_trace_id" in params:
+                                tool_args.setdefault("_trace_id", self.trace_id)
+                            if accepts_kwargs or "_round_seq" in params:
+                                tool_args.setdefault("_round_seq", i)
+                        res = await asyncio.wait_for(
+                            self.tools.execute(tc.name, tool_args),
+                            timeout=self.TOOL_EXEC_TIMEOUT
+                        )
+                    except asyncio.TimeoutError:
+                        res = f"Error: 工具 {tc.name} 执行超时（{self.TOOL_EXEC_TIMEOUT}秒），已强制终止。"
+                        logger.warning(f"GP tool timeout: {tc.name} exceeded {self.TOOL_EXEC_TIMEOUT}s")
+                        PipelineDiagnostics.op_timeout.record(True)
+                    except Exception as e:
+                        # API 不稳定容错：单个工具失败不影响其他工具
+                        res = f"Error: 工具 {tc.name} 执行异常: {str(e)[:500]}"
+                        logger.error(f"GP tool error: {tc.name} — {e}")
                     duration_ms = (time.time() - t0) * 1000
+                    return tc, str(res), duration_ms
+                
+                # 并行执行 safe 工具
+                safe_tasks = [tc for tc, should_exec, _, is_safe in exec_plan
+                              if should_exec and is_safe]
+                if safe_tasks:
+                    gathered = await asyncio.gather(
+                        *[_exec_single(tc) for tc in safe_tasks],
+                        return_exceptions=True
+                    )
+                    for item in gathered:
+                        if isinstance(item, Exception):
+                            logger.error(f"Parallel tool execution failed: {item}")
+                            continue
+                        tc, res_text, dur = item
+                        tool_results[tc.id] = (res_text, dur)
+                    if len(safe_tasks) > 1:
+                        logger.info(f"GP parallel: {len(safe_tasks)} safe tools executed concurrently")
+                
+                # 串行执行 unsafe 工具
+                unsafe_tasks = [tc for tc, should_exec, _, is_safe in exec_plan
+                                if should_exec and not is_safe]
+                for tc in unsafe_tasks:
+                    _, res_text, dur = await _exec_single(tc)
+                    tool_results[tc.id] = (res_text, dur)
+                
+                # Phase 3: 后处理（按原始 tool_call 顺序，保证副作用一致性）
+                for tc, should_exec, skip_reason, is_safe in exec_plan:
+                    if not should_exec:
+                        if skip_reason == "breaker":
+                            res_text = f"[断路器] 你已经用相同参数调用 {tc.name} 达 {self._recent_tool_calls[f'{tc.name}|{json.dumps(tc.arguments, sort_keys=True, ensure_ascii=False)[:200]}']} 次。请换一种方法或不同参数。"
+                        elif skip_reason == "blocked":
+                            res_text = f"Error: GP 禁止使用工具 {tc.name}（该工具仅限反思进程使用）"
+                        duration_ms = 0
+                    else:
+                        res_text, duration_ms = tool_results.get(tc.id, ("Error: 工具执行结果丢失", 0))
+                        # 环境信号采集
+                        self._op_tool_outcomes.append({
+                            "tool": tc.name,
+                            "success": self._classify_tool_result(tc.name, res_text),
+                        })
+                        # 签名学习
+                        self._merge_signature_from_texts(res_text[:500])
+                    
                     await self._safe_callback(step_callback, "tool_result", {
                         "phase": "GP_PHASE",
                         "name": tc.name,
@@ -651,7 +721,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         """获取 GP 可用的所有工具（排除 C-Phase 专属工具）
         
         loop_config.gp_unblock_tools: 允许选择性解禁部分 GP_BLOCKED_TOOLS，
-        例如 auto 模式下解禁 record_lesson_node 让 GP 直接写知识。
+        例如 auto 模式下解禁 record_context_node 让 GP 创建结构锚点。
         """
         unblock = set(self.loop_config.get("gp_unblock_tools") or [])
         blocked = GP_BLOCKED_TOOLS - unblock

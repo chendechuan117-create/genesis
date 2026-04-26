@@ -213,33 +213,46 @@ class KnowledgeQuery:
 
         # 基础（高入线数，已被反复验证）
         top_incoming = self._conn.execute(
-            """SELECT rl.basis_point_id, COUNT(*) as incoming, kn.type, kn.title
+            """SELECT rl.basis_point_id, COUNT(*) as incoming, kn.type, kn.title,
+                      kn.usage_success_count, kn.usage_fail_count, kn.usage_count
                FROM reasoning_lines rl
                JOIN knowledge_nodes kn ON rl.basis_point_id = kn.node_id
                WHERE kn.node_id NOT LIKE 'MEM_CONV%'
+                 AND kn.node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS')
                GROUP BY rl.basis_point_id
                ORDER BY incoming DESC
                LIMIT 4"""
         ).fetchall()
         if top_incoming:
-            lines.append("基础（高入线数）:")
+            lines.append("基础:")
             for r in top_incoming:
-                lines.append(f"  {r['basis_point_id']} <{r['type']}> {r['title']} (入线:{r['incoming']})")
+                # 计算胜率，检测陷阱
+                wins = r['usage_success_count'] or 0
+                losses = r['usage_fail_count'] or 0
+                total = r['usage_count'] or 0
+                trap_marker = ""
+                if total >= 3 and wins / total < 0.5:  # 至少3次使用且胜率<50%
+                    trap_marker = " ⚠️陷阱"
+                lines.append(f"  {r['basis_point_id']} <{r['type']}> {r['title']}{trap_marker}")
             lines.append("")
 
         # 探索（入线=0，尚未被验证的前沿）
         frontier_rows = self._conn.execute(
-            """SELECT node_id, type, title FROM knowledge_nodes
-               WHERE node_id NOT LIKE 'MEM_CONV%'
-                 AND type IN ('LESSON', 'CONTEXT', 'DISCOVERY')
-                 AND node_id NOT IN (SELECT basis_point_id FROM reasoning_lines)
-               ORDER BY created_at DESC
+            """SELECT kn.node_id, kn.type, kn.title,
+                      CASE WHEN ne.source_id IS NOT NULL THEN 1 ELSE 0 END as has_contradiction
+               FROM knowledge_nodes kn
+               LEFT JOIN node_edges ne ON kn.node_id = ne.target_id AND ne.relation = 'CONTRADICTS'
+               WHERE kn.node_id NOT LIKE 'MEM_CONV%'
+                 AND kn.type IN ('LESSON', 'CONTEXT', 'DISCOVERY')
+                 AND kn.node_id NOT IN (SELECT basis_point_id FROM reasoning_lines)
+               ORDER BY kn.created_at DESC
                LIMIT 4"""
         ).fetchall()
         if frontier_rows:
             lines.append("探索（入线=0，前沿）:")
             for r in frontier_rows:
-                lines.append(f"  {r['node_id']} <{r['type']}> {r['title']}")
+                contradiction_marker = " ⚔️矛盾" if r['has_contradiction'] else ""
+                lines.append(f"  {r['node_id']} <{r['type']}> {r['title']}{contradiction_marker}")
             lines.append("")
 
         # VOID 摘要（增强版：source 分布 + 签名标签 + 更多样本）
@@ -252,6 +265,22 @@ class KnowledgeQuery:
             remaining_voids = void_count - len(void_details)
             if remaining_voids > 0:
                 lines.append(f"  ... +{remaining_voids} more")
+            lines.append("")
+
+        # 饱和信号（虚点密集区域）
+        saturation_rows = self._conn.execute(
+            """SELECT substr(title, 4) as area_hint, COUNT(*) as count
+               FROM knowledge_nodes
+               WHERE type = 'CONTEXT' AND title LIKE '饱和:%'
+               GROUP BY substr(title, 4)
+               HAVING count >= 3
+               ORDER BY count DESC
+               LIMIT 3"""
+        ).fetchall()
+        if saturation_rows:
+            lines.append("[饱和信号] 知识饱和区域:")
+            for r in saturation_rows:
+                lines.append(f"  🔬 {r['area_hint']} ({r['count']} 个虚点)")
             lines.append("")
 
         lines.append("→ get_knowledge_node_content(node_id=...) 获取某节点详情")
@@ -276,13 +305,14 @@ class KnowledgeQuery:
         for tr in type_names:
             t = tr['type']
             type_rows = self._conn.execute(
-                """SELECT node_id, type, title, tags,
-                          updated_at, last_verified_at, trust_tier,
-                          usage_success_count, usage_fail_count, usage_count
-                   FROM knowledge_nodes
-                   WHERE node_id NOT LIKE 'MEM_CONV%' AND type = ?
-                     AND node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS')
-                   ORDER BY updated_at DESC
+                """SELECT kn.node_id, kn.type, kn.title, kn.tags,
+                          kn.updated_at, kn.last_verified_at, kn.trust_tier,
+                          kn.usage_success_count, kn.usage_fail_count, kn.usage_count,
+                          CASE WHEN ne.source_id IS NOT NULL THEN 1 ELSE 0 END as has_contradiction
+                   FROM knowledge_nodes kn
+                   LEFT JOIN node_edges ne ON kn.node_id = ne.target_id AND ne.relation = 'CONTRADICTS'
+                   WHERE kn.node_id NOT LIKE 'MEM_CONV%' AND kn.type = ?
+                   ORDER BY kn.updated_at DESC
                    LIMIT 30""", (t,)
             ).fetchall()
             all_candidates.extend(type_rows)
@@ -347,12 +377,26 @@ class KnowledgeQuery:
         shown = nodes[:max_per_group]
         lines.append(f"{ntype} ({len(nodes)}):")
         for d in shown:
-            eff = d.get('eff_conf', 0)
             w = d.get('usage_success_count') or 0
             l = d.get('usage_fail_count') or 0
-            record = f"  {d['node_id']} {d['title'][:40]} eff:{eff:.2f}"
-            if w or l:
-                record += f" {w}W/{l}L"
+            total = (d.get('usage_count') or 0)
+            
+            # 检测陷阱（高入线+低胜率）
+            trap_marker = ""
+            if total >= 3 and w / total < 0.5:
+                trap_marker = " ⚠️"
+            
+            # 检测矛盾
+            contradiction_marker = " ⚔️" if d.get('has_contradiction') else ""
+            
+            record = f"  {d['node_id']} {d['title'][:40]}"
+            if w and l:
+                record += " 有实战记录"
+            elif w:
+                record += " 有成功记录"
+            elif l:
+                record += " 有失败记录"
+            record += f"{trap_marker}{contradiction_marker}"
             lines.append(record)
         remaining = len(nodes) - len(shown)
         if remaining > 0:

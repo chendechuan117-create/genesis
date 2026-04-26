@@ -74,21 +74,21 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         
         self._ensure_schema()
         self._migrate_old_data()
-        
-        # 启动并加载向量引擎（守护进程可跳过以节省内存和启动时间）
-        if skip_vector_engine:
-            self.vector_engine = VectorEngine()  # 空壳，is_ready=False
-            self._last_matrix_sync = "2000-01-01 00:00:00"
-            logger.info("NodeVault: skip_vector_engine=True, 跳过嵌入模型加载")
-        else:
-            self.vector_engine = VectorEngine()
-            self.vector_engine.initialize()
-            self._load_embeddings_to_memory()
-            self._last_matrix_sync: str = self._get_db_now()
-        self._initialized = True
         self.signature = SignatureEngine(self._conn, vault=self)
         self.signature.initialize()
         self.query = KnowledgeQuery(self._conn)
+        self.vector_engine = VectorEngine()
+        self._last_matrix_sync = "2000-01-01 00:00:00"
+        
+        # 启动并加载向量引擎（守护进程可跳过以节省内存和启动时间）
+        if skip_vector_engine:
+            logger.info("NodeVault: skip_vector_engine=True, 跳过嵌入模型加载")
+        else:
+            self.vector_engine.initialize()
+            self._load_embeddings_to_memory()
+            self._last_matrix_sync: str = self._get_db_now()
+        self._ensure_concept_seeds()
+        self._initialized = True
 
     def _get_db_now(self) -> str:
         """SQLite CURRENT_TIMESTAMP 的 Python 等价"""
@@ -250,6 +250,8 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             reasoning TEXT,
             source TEXT DEFAULT 'GP',
             same_round INTEGER DEFAULT 0,
+            trace_id TEXT,
+            round_seq INTEGER,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (new_point_id) REFERENCES knowledge_nodes(node_id),
             FOREIGN KEY (basis_point_id) REFERENCES knowledge_nodes(node_id)
@@ -257,12 +259,19 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         ''')
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rl_basis ON reasoning_lines(basis_point_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rl_new ON reasoning_lines(new_point_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_rl_trace_round ON reasoning_lines(trace_id, round_seq)")
         # Schema migration: reasoning_lines 可能缺 same_round 列（IF NOT EXISTS 不加列）
         try:
             rl_cols = [r[1] for r in conn.execute("PRAGMA table_info(reasoning_lines)").fetchall()]
             if 'same_round' not in rl_cols:
                 conn.execute("ALTER TABLE reasoning_lines ADD COLUMN same_round INTEGER DEFAULT 0")
                 logger.info("Schema migration: added same_round column to reasoning_lines")
+            if 'trace_id' not in rl_cols:
+                conn.execute("ALTER TABLE reasoning_lines ADD COLUMN trace_id TEXT")
+                logger.info("Schema migration: added trace_id column to reasoning_lines")
+            if 'round_seq' not in rl_cols:
+                conn.execute("ALTER TABLE reasoning_lines ADD COLUMN round_seq INTEGER")
+                logger.info("Schema migration: added round_seq column to reasoning_lines")
         except Exception as e:
             logger.warning(f"Schema migration for reasoning_lines.same_round skipped: {e}")
         # 签名推断自学习表：C-Phase 偏差检测发现的新 marker
@@ -326,6 +335,53 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             "ON environment_epochs(scope, status, created_at)"
         )
         conn.commit()
+
+    def _ensure_concept_seeds(self):
+        """首次部署时注入概念地图种子（CONTEXT节点）。
+        概念地图 = 领域知识的冷启动注入，让 LLM 第一次面对代码时拥有导航坐标系。
+        种子从 YAML 文件读取，用固定前缀 SEED_CTX_ 标识，只注入一次。"""
+        try:
+            existing = self._conn.execute(
+                "SELECT COUNT(*) FROM knowledge_nodes WHERE node_id LIKE 'SEED_CTX_%'"
+            ).fetchone()[0]
+            if existing > 0:
+                return  # 已注入，跳过
+
+            seed_path = Path(__file__).parent / "concept_seeds.yaml"
+            if not seed_path.exists():
+                return
+
+            import yaml
+            seeds = yaml.safe_load(seed_path.read_text(encoding='utf-8'))
+            if not seeds or not isinstance(seeds, list):
+                return
+
+            for seed in seeds:
+                node_id = seed.get("id", "")
+                if not node_id or not node_id.startswith("SEED_CTX_"):
+                    continue
+                # 检查是否已存在（防止重复注入）
+                if self._conn.execute("SELECT 1 FROM knowledge_nodes WHERE node_id = ?", (node_id,)).fetchone():
+                    continue
+                self.create_node(
+                    node_id=node_id,
+                    title=seed.get("title", ""),
+                    ntype="CONTEXT",
+                    human_translation=seed.get("title", ""),
+                    tags=seed.get("tags", "concept_seed"),
+                    full_content=seed.get("content", ""),
+                    trust_tier="HUMAN"
+                )
+                # 建立种子间的边（概念地图骨架）
+                for related_id in seed.get("related", []):
+                    self._conn.execute(
+                        "INSERT OR IGNORE INTO node_edges (source_id, target_id, relation) VALUES (?,?,?)",
+                        (node_id, related_id, "RELATED_TO")
+                    )
+            self._conn.commit()
+            logger.info(f"Concept seeds injected: {len(seeds)} nodes from {seed_path}")
+        except Exception as e:
+            logger.warning(f"Concept seed injection skipped (non-fatal): {e}")
 
     def _migrate_old_data(self):
         """兼容旧版 schema（带 machine_payload 列的非常老的版本）"""
@@ -608,17 +664,27 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
 
     # ── 推理线接口（点线面架构）──
 
-    def create_reasoning_line(self, new_point_id: str, basis_point_id: str, reasoning: str = "", source: str = "GP", same_round: int = 0):
+    def create_reasoning_line(self, new_point_id: str, basis_point_id: str, reasoning: str = "", source: str = "GP", same_round: int = 0, trace_id: str = None, round_seq: int = None):
         """创建一条推理线：新点基于旧点产生"""
         try:
             self._conn.execute(
-                "INSERT INTO reasoning_lines (new_point_id, basis_point_id, reasoning, source, same_round) VALUES (?,?,?,?,?)",
-                (new_point_id, basis_point_id, reasoning, source, same_round)
+                "INSERT INTO reasoning_lines (new_point_id, basis_point_id, reasoning, source, same_round, trace_id, round_seq) VALUES (?,?,?,?,?,?,?)",
+                (new_point_id, basis_point_id, reasoning, source, same_round, trace_id, round_seq)
             )
             self._conn.commit()
             logger.debug(f"Line: {new_point_id} --[based_on]--> {basis_point_id} (source={source})")
         except Exception as e:
             logger.error(f"Failed to create reasoning line: {e}")
+
+    def get_reasoning_basis_ids(self, new_point_id: str) -> set:
+        try:
+            rows = self._conn.execute(
+                "SELECT DISTINCT basis_point_id FROM reasoning_lines WHERE new_point_id = ?",
+                (new_point_id,)
+            ).fetchall()
+            return {r[0] for r in rows}
+        except Exception:
+            return set()
 
     def get_incoming_line_count(self, node_id: str) -> int:
         """获取节点的入线数（被多少新点基于它产生）"""
@@ -626,6 +692,27 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             row = self._conn.execute(
                 "SELECT COUNT(*) FROM reasoning_lines WHERE basis_point_id = ? AND same_round = 0",
                 (node_id,)
+            ).fetchone()
+            return row[0] if row else 0
+        except Exception:
+            return 0
+
+    def get_incoming_count_percentile(self, percentile: int = 75) -> int:
+        """获取入线数分布的指定百分位数（自适应阈值用）。
+        返回值：入线数 >= 此值的节点为"基础"。
+        空库或无数据时返回 0。"""
+        try:
+            row = self._conn.execute(
+                """SELECT incoming FROM (
+                    SELECT COUNT(*) as incoming FROM reasoning_lines
+                    WHERE same_round = 0 GROUP BY basis_point_id
+                ) ORDER BY incoming LIMIT 1 OFFSET (
+                    SELECT CAST(COUNT(*) * ? / 100 AS INTEGER) FROM (
+                        SELECT COUNT(*) as incoming FROM reasoning_lines
+                        WHERE same_round = 0 GROUP BY basis_point_id
+                    )
+                )""",
+                (percentile,)
             ).fetchone()
             return row[0] if row else 0
         except Exception:
@@ -689,6 +776,50 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             logger.error(f"find_collision_candidates failed: {e}")
             return []
 
+    def ensure_virtual_point(self, area_hint: str, basis_overlap_ids: list = None) -> str:
+        """碰撞检测后自动创建/递增虚点（系统行为，非GP行为）。
+        虚点是知识饱和信号：同一区域反复碰撞 = 该区域已被充分探索。
+        如果该区域已有虚点，递增 usage_count；否则创建新虚点。
+        返回虚点 node_id。"""
+        try:
+            import hashlib
+            # 用 area_hint 生成稳定的虚点 ID（同区域同 ID）
+            vid = "VIRT_" + hashlib.md5(area_hint.encode()).hexdigest()[:8].upper()
+            existing = self._conn.execute(
+                "SELECT node_id, usage_count FROM knowledge_nodes WHERE node_id = ?",
+                (vid,)
+            ).fetchone()
+            if existing:
+                # 递增 usage_count（饱和度计数）
+                self._conn.execute(
+                    "UPDATE knowledge_nodes SET usage_count = usage_count + 1 WHERE node_id = ?",
+                    (vid,)
+                )
+                self._conn.commit()
+                logger.debug(f"Virtual point incremented: [{vid}] (area={area_hint}, count={existing[1]+1})")
+            else:
+                self._conn.execute(
+                    "INSERT INTO knowledge_nodes (node_id, type, title, human_translation, tags, is_virtual, usage_count) VALUES (?,?,?,?,?,1,1)",
+                    (vid, "CONTEXT", f"饱和:{area_hint}", f"饱和:{area_hint}", "virtual")
+                )
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO node_contents (node_id, full_content, source) VALUES (?,?,?)",
+                    (vid, f"饱和:{area_hint}", "system")
+                )
+                # 连接到碰撞涉及的 basis 节点（1-hop 可见性）
+                if basis_overlap_ids:
+                    for bid in basis_overlap_ids[:3]:
+                        self._conn.execute(
+                            "INSERT OR IGNORE INTO node_edges (source_id, target_id, relation) VALUES (?,?,?)",
+                            (vid, bid, "RELATED_TO")
+                        )
+                self._conn.commit()
+                logger.info(f"Virtual point created: [{vid}] (area={area_hint}, linked to {len(basis_overlap_ids or [])} basis nodes)")
+            return vid
+        except Exception as e:
+            logger.error(f"ensure_virtual_point failed: {e}")
+            return ""
+
     def get_virtual_saturation(self, node_ids: list) -> list:
         """查询指定节点邻域内的虚点饱和信号。
         返回 [(area_hint, count), ...] 按虚点数降序"""
@@ -731,30 +862,72 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
 
     # ── 面组装辅助查询（供 SurfaceExpander 使用）──
 
-    def get_neighbor_map(self, node_ids: list) -> dict:
-        """获取节点的 1-hop 邻居映射（node_edges + reasoning_lines 合并）"""
+    def get_neighbor_map(self, node_ids: list, include_reverse_reasoning: bool = True, weighted: bool = False) -> dict:
+        """获取节点的 1-hop 邻居映射（node_edges + reasoning_lines 合并）
+
+        Args:
+            node_ids: 要查询邻居的节点 ID 列表
+            include_reverse_reasoning: True=reasoning_lines双向映射(默认，向后兼容)，
+                False=reasoning_lines只做 new→old 单向映射（填充阶段用，防止反向跳到前沿新点）
+            weighted: True=返回带权重的邻居 {node_id: [(neighbor_id, weight), ...]}，
+                False=返回简单列表 {node_id: [neighbor_id, ...]}（默认，向后兼容）
+        """
         if not node_ids:
             return {}
         try:
             placeholders = ",".join("?" * len(node_ids))
-            neighbor_map = {}
-            # node_edges
+            neighbor_map = {} if not weighted else {}
+            
+            # node_edges（始终双向，RELATED_TO边权重提升）
             for row in self._conn.execute(
-                f"SELECT source_id, target_id FROM node_edges WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})",
+                f"SELECT source_id, target_id, relation FROM node_edges WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})",
                 node_ids + node_ids
             ).fetchall():
-                neighbor_map.setdefault(row[0], []).append(row[1])
-                neighbor_map.setdefault(row[1], []).append(row[0])
+                source, target, relation = row[0], row[1], row[2] or "RELATED_TO"
+                # RELATED_TO边权重提升到2.0，其他边保持1.0
+                weight = 2.0 if relation == "RELATED_TO" else 1.0
+                
+                if weighted:
+                    neighbor_map.setdefault(source, []).append((target, weight))
+                    neighbor_map.setdefault(target, []).append((source, weight))
+                else:
+                    neighbor_map.setdefault(source, []).append(target)
+                    neighbor_map.setdefault(target, []).append(source)
+            
             # reasoning_lines（排除同轮线，面BFS只走异轮验证路径）
+            # 设计约束：填充阶段只沿 new→old 方向走（踩稳基础），不反向跳到前沿新点
             for row in self._conn.execute(
                 f"SELECT new_point_id, basis_point_id FROM reasoning_lines WHERE same_round = 0 AND (new_point_id IN ({placeholders}) OR basis_point_id IN ({placeholders}))",
                 node_ids + node_ids
             ).fetchall():
-                neighbor_map.setdefault(row[0], []).append(row[1])
-                neighbor_map.setdefault(row[1], []).append(row[0])
+                new_point, basis_point = row[0], row[1]
+                # reasoning_lines 权重为1.5（中等优先级）
+                weight = 1.5
+                
+                # 正向：new→old（始终包含——从新点跳到被它引用的旧点=踩稳）
+                if weighted:
+                    neighbor_map.setdefault(new_point, []).append((basis_point, weight))
+                else:
+                    neighbor_map.setdefault(new_point, []).append(basis_point)
+                
+                # 反向：old→new（由 include_reverse_reasoning 控制）
+                if include_reverse_reasoning:
+                    if weighted:
+                        neighbor_map.setdefault(basis_point, []).append((new_point, weight))
+                    else:
+                        neighbor_map.setdefault(basis_point, []).append(new_point)
+            
             # 去重
             for k in neighbor_map:
-                neighbor_map[k] = list(dict.fromkeys(neighbor_map[k]))
+                if weighted:
+                    # 带权重的情况：按邻居ID去重，保留最高权重
+                    seen = {}
+                    for nid, w in neighbor_map[k]:
+                        if nid not in seen or w > seen[nid]:
+                            seen[nid] = w
+                    neighbor_map[k] = [(nid, w) for nid, w in seen.items()]
+                else:
+                    neighbor_map[k] = list(dict.fromkeys(neighbor_map[k]))
             return neighbor_map
         except Exception as e:
             logger.error(f"get_neighbor_map failed: {e}")
@@ -793,6 +966,102 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         except Exception:
             return set()
 
+    def get_gardener_ablation_candidates(self, candidate_ids: list, limit: int = 10) -> list:
+        """园丁协同：识别高入线+低胜率的节点，优先消融
+        
+        园丁机制：检测"看起来可靠但实际表现差"的节点
+        - 高入线数：被很多节点引用（看起来重要）
+        - 低胜率：实际使用成功率低（陷阱节点）
+        
+        Returns:
+            [(node_id, incoming_count, win_rate, title), ...] 按优先级降序
+        """
+        if not candidate_ids:
+            return []
+        
+        try:
+            placeholders = ",".join("?" * len(candidate_ids))
+            rows = self._conn.execute(
+                f"""SELECT kn.node_id, kn.title, kn.usage_success_count, kn.usage_fail_count, kn.usage_count,
+                          COALESCE(inc.incoming, 0) as incoming_count
+                   FROM knowledge_nodes kn
+                   LEFT JOIN (
+                       SELECT basis_point_id, COUNT(*) as incoming
+                       FROM reasoning_lines
+                       WHERE basis_point_id IN ({placeholders})
+                       GROUP BY basis_point_id
+                   ) inc ON kn.node_id = inc.basis_point_id
+                   WHERE kn.node_id IN ({placeholders})
+                     AND kn.usage_count >= 3  -- 至少有3次使用记录
+                     AND kn.ablation_active = 0  -- 未被消融
+                   ORDER BY incoming_count DESC, (kn.usage_success_count * 1.0 / kn.usage_count) ASC
+                   LIMIT ?""",
+                candidate_ids + candidate_ids + [limit]
+            ).fetchall()
+            
+            candidates = []
+            for row in rows:
+                node_id, title, wins, losses, total, incoming = row
+                win_rate = wins / total if total > 0 else 0.0
+                
+                # 园丁评分：入线数越高且胜率越低，优先级越高
+                gardener_score = incoming * (1.0 - win_rate)
+                
+                candidates.append({
+                    'node_id': node_id,
+                    'title': title,
+                    'incoming_count': incoming,
+                    'usage_success_count': wins,
+                    'usage_fail_count': losses,
+                    'usage_count': total,
+                    'win_rate': win_rate,
+                    'gardener_score': gardener_score
+                })
+            
+            # 按园丁评分降序排列
+            candidates.sort(key=lambda x: x['gardener_score'], reverse=True)
+            return candidates
+            
+        except Exception as e:
+            logger.error(f"get_gardener_ablation_candidates failed: {e}")
+            return []
+
+    def trigger_gardener_ablation(self, candidate_ids: list, max_ablations: int = 3) -> int:
+        """触发园丁消融：标记高入线+低胜率的节点为消融状态
+        
+        Returns:
+            实际消融的节点数量
+        """
+        candidates = self.get_gardener_ablation_candidates(candidate_ids, limit=max_ablations * 2)
+        
+        if not candidates:
+            return 0
+        
+        ablated_count = 0
+        for candidate in candidates[:max_ablations]:
+            node_id = candidate['node_id']
+            try:
+                # 标记为消融状态
+                self._conn.execute(
+                    "UPDATE knowledge_nodes SET ablation_active = 1 WHERE node_id = ?",
+                    (node_id,)
+                )
+                
+                logger.info(
+                    f"Gardener ablated {node_id}: incoming={candidate['incoming_count']}, "
+                    f"win_rate={candidate['win_rate']:.2f}, title='{candidate['title'][:50]}...'"
+                )
+                ablated_count += 1
+                
+            except Exception as e:
+                logger.error(f"Failed to ablate {node_id}: {e}")
+        
+        if ablated_count > 0:
+            self._conn.commit()
+            logger.info(f"Gardener completed: ablated {ablated_count} trap nodes")
+        
+        return ablated_count
+
     def batch_get_titles(self, node_ids: list) -> dict:
         """批量获取节点标题 {node_id: title}"""
         if not node_ids:
@@ -807,11 +1076,18 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         except Exception:
             return {}
 
-    def get_same_round_ids(self, node_ids: list, window_seconds: int = 600) -> set:
+    def get_same_round_ids(self, node_ids: list, window_seconds: int = 600, trace_id: str = None, round_seq: int = None) -> set:
         """检测哪些节点是最近 window_seconds 秒内创建的（同轮线标记用）"""
         if not node_ids:
             return set()
         try:
+            if trace_id and round_seq is not None:
+                placeholders = ",".join("?" * len(node_ids))
+                rows = self._conn.execute(
+                    f"SELECT DISTINCT new_point_id FROM reasoning_lines WHERE new_point_id IN ({placeholders}) AND trace_id = ? AND round_seq = ?",
+                    node_ids + [trace_id, round_seq]
+                ).fetchall()
+                return {r[0] for r in rows}
             import time
             now = time.time()
             placeholders = ",".join("?" * len(node_ids))
@@ -897,6 +1173,117 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         except Exception as e:
             logger.error(f"activate_ablation failed: {e}")
             return False
+
+    # ── 主动遗忘与置换（Proactive Pruning）──
+
+    def check_proactive_pruning_candidates(self, min_incoming: int = 8, min_idle_rounds: int = 10, min_neighbor_density: int = 5) -> list:
+        """查找满足主动修剪条件的节点（比消融更严格）：
+        1. 入线数 >= min_incoming（高度验证，惯性极强——最需要打破）
+        2. trust_tier = HUMAN 或 REFLECTION（高信任 = 惯性最强）
+        3. 1-hop 邻居数 >= min_neighbor_density（网络足够密，修剪不会导致断裂）
+        4. ablation_active = 0（未在消融观察中）
+        返回 [(node_id, incoming_count, title, neighbor_count), ...]"""
+        try:
+            rows = self._conn.execute(
+                """SELECT rl.basis_point_id, COUNT(*) as incoming, kn.title, kn.trust_tier
+                FROM reasoning_lines rl
+                JOIN knowledge_nodes kn ON rl.basis_point_id = kn.node_id
+                WHERE rl.same_round = 0
+                  AND kn.ablation_active = 0
+                  AND kn.is_virtual = 0
+                  AND kn.trust_tier IN ('HUMAN', 'REFLECTION')
+                  AND kn.node_id NOT LIKE 'SEED_CTX_%'
+                  AND kn.node_id NOT LIKE 'VIRT_%'
+                GROUP BY rl.basis_point_id
+                HAVING incoming >= ?
+                ORDER BY incoming DESC""",
+                (min_incoming,)
+            ).fetchall()
+            # 过滤：邻居密度足够（修剪不会导致区域断裂）
+            result = []
+            for r in rows:
+                nid, inc, title, tier = r
+                neighbors = self.get_neighbor_map([nid]).get(nid, [])
+                if len(neighbors) >= min_neighbor_density:
+                    result.append((nid, inc, title, len(neighbors)))
+            return result[:5]  # 每轮最多5个
+        except Exception as e:
+            logger.error(f"check_proactive_pruning_candidates failed: {e}")
+            return []
+
+    def activate_proactive_pruning(self, node_id: str, baseline_env_ratio: float = None) -> bool:
+        """激活主动修剪（ablation_active=3）：故意移除高惯性节点，诱导新解释涌现。
+        与消融(ablation_active=1)的区别：
+        - 消融 = 验证必要性（缺了它行不行？）→ 不行就恢复
+        - 修剪 = 诱导涌现（故意拿走，逼系统找新路）→ 不恢复，等新东西长出来
+        跳过观察期，直接隐藏。5轮后检查是否有新节点覆盖相同问题域。"""
+        try:
+            import time
+            self._conn.execute(
+                "UPDATE knowledge_nodes SET ablation_active = 3 WHERE node_id = ?",
+                (node_id,)
+            )
+            # 记录修剪基线（与消融共用 ablation_baselines 表，但 activated_at 前缀标记）
+            self._conn.execute(
+                "INSERT OR REPLACE INTO ablation_baselines (node_id, activated_at, baseline_env_ratio) VALUES (?,?,?)",
+                (node_id, int(time.time()), baseline_env_ratio)
+            )
+            self._conn.commit()
+            logger.info(f"Proactive pruning activated for [{node_id}] (ablation_active=3, baseline_env={baseline_env_ratio})")
+            return True
+        except Exception as e:
+            logger.error(f"activate_proactive_pruning failed: {e}")
+            return False
+
+    def evaluate_proactive_pruning(self, node_id: str, current_env_ratio: float = None) -> str:
+        """评估主动修剪结果（5轮后检查）：
+        - 该区域产生了新节点覆盖相同问题域 → 修剪成功，旧节点永久降级(ablation_active=2)
+        - 无新节点且 env_ratio 下降 → 该区域依赖旧模型，恢复(ablation_active=0)
+        - 无新节点但 env_ratio 不变 → 继续观察（再等5轮）"""
+        try:
+            row = self._conn.execute(
+                "SELECT baseline_env_ratio FROM ablation_baselines WHERE node_id = ?",
+                (node_id,)
+            ).fetchone()
+            baseline = row[0] if row else None
+
+            # 检查该区域是否有新节点（1-hop邻居中最近创建的）
+            neighbors = self.get_neighbor_map([node_id]).get(node_id, [])
+            import time
+            recent_threshold = int(time.time()) - 3600  # 最近1小时内创建
+            new_count = 0
+            if neighbors:
+                ph = ",".join("?" * len(neighbors))
+                new_count = self._conn.execute(
+                    f"SELECT COUNT(*) FROM knowledge_nodes WHERE node_id IN ({ph}) AND created_at >= ? AND ablation_active = 0",
+                    neighbors + [recent_threshold]
+                ).fetchone()[0]
+
+            if new_count > 0:
+                # 新解释已涌现：旧节点永久降级
+                self._conn.execute(
+                    "UPDATE knowledge_nodes SET ablation_active = 2 WHERE node_id = ?",
+                    (node_id,)
+                )
+                self._conn.commit()
+                logger.info(f"Proactive pruning SUCCESS: [{node_id}] → demoted, {new_count} new nodes emerged")
+                return "emerged_new"
+            elif baseline is not None and current_env_ratio is not None and current_env_ratio < baseline - 0.1:
+                # env_ratio 下降：该区域依赖旧模型，恢复
+                self._conn.execute(
+                    "UPDATE knowledge_nodes SET ablation_active = 0 WHERE node_id = ?",
+                    (node_id,)
+                )
+                self._conn.commit()
+                logger.info(f"Proactive pruning RESTORE: [{node_id}] → restored (env_ratio dropped)")
+                return "restored"
+            else:
+                # 继续观察
+                logger.info(f"Proactive pruning CONTINUE: [{node_id}] → keep observing (no new nodes, env_ratio stable)")
+                return "continue_observing"
+        except Exception as e:
+            logger.error(f"evaluate_proactive_pruning failed: {e}")
+            return "error"
 
     def deactivate_ablation(self, node_id: str, current_env_ratio: float = None) -> str:
         """结束消融观察期，自动判定向前/向后：

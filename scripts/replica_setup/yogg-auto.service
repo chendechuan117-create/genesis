@@ -11,6 +11,7 @@ Environment=HF_HUB_OFFLINE=1
 Environment=YOGG_EXIT_ON_SESSION_END=1
 Environment=YOGG_MEMORY_EXIT_THRESHOLD_MB=2560
 Environment=YOGG_MEMORY_POLL_SECS=15
+Environment=GENESIS_AUTO_RSS_EXIT_THRESHOLD_MB=2400
 ExecStart=/home/yoga/Genesis/venv/bin/python -u yogg_auto.py
 Restart=always
 RestartSec=10

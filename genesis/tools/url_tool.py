@@ -63,6 +63,9 @@ async def _get_playwright_browser():
 class ReadUrlTool(Tool):
     """读取 URL 内容并转为结构化文本"""
 
+    def is_concurrency_safe(self, arguments: Dict[str, Any]) -> bool:
+        return True  # 只读，可并行
+
     @property
     def name(self) -> str:
         return "read_url"

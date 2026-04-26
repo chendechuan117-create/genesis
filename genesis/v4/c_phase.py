@@ -193,28 +193,69 @@ class CPhaseMixin:
         except Exception as e:
             logger.debug(f"Ablation evaluation skipped (non-fatal): {e}")
 
+        # ── 主动遗忘与置换（确定性，零 LLM）──────────────────────
+        # 比消融更激进：故意移除高惯性节点，诱导新解释涌现
+        # 消融 = 验证必要性（缺了它行不行？）→ 不行就恢复
+        # 修剪 = 诱导涌现（故意拿走，逼系统找新路）→ 等新东西长出来
+        try:
+            pruning_candidates = self.vault.check_proactive_pruning_candidates(min_incoming=8, min_neighbor_density=5)
+            if pruning_candidates:
+                for nid, inc, title, ncount in pruning_candidates[:2]:  # 每轮最多2个
+                    self.vault.activate_proactive_pruning(nid, baseline_env_ratio=env_ratio)
+                    logger.info(f"Proactive pruning: [{nid}] '{title}' (incoming={inc}, neighbors={ncount}, baseline_env={env_ratio})")
+        except Exception as e:
+            logger.debug(f"Proactive pruning check skipped (non-fatal): {e}")
+
+        # 评估已修剪的节点（ablation_active=3 且已观察≥5分钟）
+        try:
+            # 复用 ablation_baselines 表，查 ablation_active=3 的节点
+            observing_pruned = self.vault.get_ablation_observing_nodes(min_duration_seconds=300)
+            # 从 observing 中筛选 ablation_active=3 的
+            for nid, title, baseline in observing_pruned[:5]:
+                node_row = self.vault._conn.execute(
+                    "SELECT ablation_active FROM knowledge_nodes WHERE node_id = ?", (nid,)
+                ).fetchone()
+                if node_row and node_row[0] == 3:
+                    result = self.vault.evaluate_proactive_pruning(nid, current_env_ratio=env_ratio)
+                    logger.info(f"Proactive pruning evaluated: [{nid}] → {result}")
+        except Exception as e:
+            logger.debug(f"Proactive pruning evaluation skipped (non-fatal): {e}")
+
         # ── Gardener: 园丁模式（单次 LLM 调用）─────────────────────
         # C 只修图不种树：矛盾→CONTRADICTS边，关联→RELATED_TO边
         # 不创建 LESSON_C_ 节点（入线数永远=0 = 拓扑死点）
+        # ── 提速：Gardener LLM 反射改为后台执行，不阻塞主流程 ──
+        # 确定性部分（Arena/Trace/Ablation）已完成，Gardener 是唯一慢的部分
         reflection_result = {"edges_added": 0, "metadata_expanded": 0, "c_tokens": 0}
         if mode != "SKIP":
-            try:
-                reflection_result = await self._run_reflection(g_final_response)
-            except Exception as e:
-                logger.warning(f"Reflection failed (non-fatal): {e}", exc_info=True)
+            async def _run_gardener():
+                """后台 Gardener：LLM 反射不阻塞主流程"""
+                try:
+                    result = await self._run_reflection(g_final_response)
+                    r_edges = result.get("edges_added", 0)
+                    r_tokens = result.get("c_tokens", 0)
+                    if r_edges > 0:
+                        logger.info(f"Reflection (background): {r_edges} edges added (c_tokens={r_tokens})")
+                        for edge in result.get("edges", []):
+                            logger.info(f"  → {edge.get('source_id','?')} --[{edge.get('relation','?')}]--> {edge.get('target_id','?')}")
+                    else:
+                        logger.info(f"Reflection (background): PASS (c_tokens={r_tokens}, reason={result.get('reason', 'none')})")
+                    return result
+                except Exception as e:
+                    logger.warning(f"Reflection (background) failed (non-fatal): {e}", exc_info=True)
+                    return {"edges_added": 0, "metadata_expanded": 0, "c_tokens": 0}
 
-            r_edges = reflection_result.get("edges_added", 0)
-            r_tokens = reflection_result.get("c_tokens", 0)
-            if r_edges > 0:
-                logger.info(f"Reflection: {r_edges} edges added (c_tokens={r_tokens})")
-                for edge in reflection_result.get("edges", []):
-                    logger.info(f"  → {edge.get('source_id','?')} --[{edge.get('relation','?')}]--> {edge.get('target_id','?')}")
-            else:
-                logger.info(f"Reflection: PASS (c_tokens={r_tokens}, reason={reflection_result.get('reason', 'none')})")
+            # Gardener 始终后台执行（确定性部分已完成，LLM 反射不需要阻塞）
+            gardener_task = asyncio.create_task(_run_gardener())
+            gardener_task.add_done_callback(
+                lambda t: t.exception() and logger.error(f"Gardener background task failed: {t.exception()}")
+                if not t.cancelled() else None
+            )
+            logger.info(f"Gardener LLM reflection launched in background (saves ~14s blocking)")
 
-        c_tokens_total = reflection_result.get("c_tokens", 0)
+        c_tokens_total = 0  # Gardener tokens 异步计入
         self.c_messages = []
-        logger.info(f"C-Process finished (Arena + Trace + Gardener). c_tokens={c_tokens_total}, edges={reflection_result.get('edges_added', 0)}, total={self.metrics.total_tokens}")
+        logger.info(f"C-Process deterministic parts finished (Arena + Trace + Ablation). Gardener running in background.")
         await self._safe_callback(step_callback, "c_phase_done", {
             "mode": mode, "c_tokens": c_tokens_total,
             "trace_pipeline": trace_pipeline_result,

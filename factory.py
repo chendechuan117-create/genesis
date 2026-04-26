@@ -83,11 +83,11 @@ def create_agent(
 
     try:
         from genesis.tools.node_tools import (
-            RecordContextNodeTool, RecordLessonNodeTool,
+            RecordContextNodeTool, RecordPointTool, RecordLineTool, RecordLessonNodeTool,
             CreateMetaNodeTool, DeleteNodeTool, CreateGraphNodeTool, CreateNodeEdgeTool,
             RecordToolNodeTool, RecordDiscoveryTool
         )
-        for t in [RecordContextNodeTool(), RecordLessonNodeTool(),
+        for t in [RecordContextNodeTool(), RecordPointTool(), RecordLineTool(), RecordLessonNodeTool(),
                    CreateMetaNodeTool(), DeleteNodeTool(), CreateGraphNodeTool(), CreateNodeEdgeTool(),
                    RecordToolNodeTool(), RecordDiscoveryTool()]:
             tools.register(t)

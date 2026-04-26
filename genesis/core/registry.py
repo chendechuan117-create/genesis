@@ -82,6 +82,40 @@ class ToolRegistry:
         """获取工具"""
         return self._tools.get(tool_name)
     
+    def _normalize_tool_name(self, tool_name: str, arguments: Optional[Dict[str, Any]] = None) -> str:
+        raw_name = (tool_name or "").strip()
+        if raw_name in self._tools:
+            return raw_name
+        for name in sorted(self._tools.keys(), key=len, reverse=True):
+            if raw_name == f"{name}{name}":
+                logger.warning(f"工具名疑似重复拼接: {raw_name} → {name}")
+                return name
+        candidates = []
+        arg_keys = set((arguments or {}).keys())
+        for left in self._tools.keys():
+            if not raw_name.startswith(left):
+                continue
+            right = raw_name[len(left):]
+            if right in self._tools:
+                candidates.extend([left, right])
+        if candidates:
+            best_name = candidates[0]
+            best_score = -1
+            for name in candidates:
+                try:
+                    params = self._tools[name].parameters or {}
+                    props = set((params.get("properties") or {}).keys())
+                    required = set(params.get("required") or [])
+                    score = len(arg_keys & props) + (10 if required and required <= arg_keys else 0)
+                except Exception:
+                    score = 0
+                if score > best_score:
+                    best_name = name
+                    best_score = score
+            logger.warning(f"工具名疑似跨工具拼接: {raw_name} → {best_name}")
+            return best_name
+        return raw_name
+    
     def list_tools(self) -> List[str]:
         """列出所有工具名称"""
         return list(self._tools.keys())
@@ -95,8 +129,20 @@ class ToolRegistry:
         self._cached_definitions = sorted(definitions, key=lambda x: x["function"]["name"])
         return self._cached_definitions
     
+    def is_concurrency_safe(self, tool_name: str, arguments: Dict[str, Any]) -> bool:
+        """查询工具是否可并行执行"""
+        tool_name = self._normalize_tool_name(tool_name, arguments)
+        tool = self.get(tool_name)
+        if not tool:
+            return False
+        try:
+            return tool.is_concurrency_safe(arguments)
+        except Exception:
+            return False
+
     async def execute(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """执行工具"""
+        tool_name = self._normalize_tool_name(tool_name, arguments)
         tool = self.get(tool_name)
         
         if not tool:

@@ -147,9 +147,10 @@ cmd_python() {
 
 cmd_test() {
     _ensure_running
-    echo "🧪 Running tests: ${*:-tests/}"
+    local target="${1:-tests/}"
+    echo "🧪 Running tests: $target"
     docker exec -w /workspace -e PYTHONPATH=/workspace "$CONTAINER" \
-        "$PYTHON" -m pytest "${@:-tests/}" -v --tb=short 2>&1
+        "$PYTHON" -m pytest "$target" -v --tb=short 2>&1
 }
 
 # Test only files related to sandbox diff (used by SelfEvolution auto-apply)

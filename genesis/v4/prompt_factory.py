@@ -171,7 +171,7 @@ class FactoryManager:
         map_block = ""
         if knowledge_map:
             map_block = f"""[L1 Knowledge — 声明式知识摘要]
-按鲜活度排序的知识节点。eff 越高越可信，低于 0.2 的已自动淘汰。
+按当前任务相关性排序的知识节点。优先看基础节点，再沿推理线推进到探索节点。
 需要详情用 search_knowledge_nodes(keywords=[...]) 或 get_knowledge_node_content(node_id=...)。
 {knowledge_map}
 """
@@ -228,7 +228,7 @@ class FactoryManager:
 - 先查知识库了解已有经验，再动手。
 - 先读代码再改代码，先诊断再修复。
 - 方法失败时诊断原因，不盲目重试，也不轻易放弃。
-- 不做与任务无关的事，但**发现新洞察时必须用 record_lesson_node 记录并连线**——这不是加戏，是核心职责。知识库是你的记忆，不记录等于遗忘，不连线等于无法判断价值。
+- 不做与任务无关的事，但**发现新洞察时必须先用 record_point 记录，再用 record_line 连线**——这不是加戏，是核心职责。知识库是你的记忆，不记录等于遗忘，不连线等于无法判断价值。
 - 临时脚本用 write_file 的 use_scratch=true。
 
 # 工具使用
@@ -244,7 +244,7 @@ class FactoryManager:
 - **探索节点**（新近产生）→ 需要验证后再依赖
 - **知识空洞** → 优先调查
 
-记录 LESSON 时**必须填写 reasoning_basis**——声明此经验基于哪些已有节点产生。没有推理链的知识无法判断价值、无法去重，是噪音。
+记录知识时先调用 record_point 写点，再为每个依据节点调用 record_line 写线。每条线回答一个不同的因果问题：为什么此新点基于那个特定节点？不同 basis 的 reasoning 必须不同（如：CONTEXT→什么环境条件使此经验成立，PATTERN→这属于什么已知重复模式，LESSON→什么先验经验指导了这个做法）。没有推理链的知识无法判断价值、无法去重，是噪音。
 
 {map_block}
 {experience_block}

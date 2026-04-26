@@ -1,0 +1,82 @@
+# 概念地图种子：领域知识的冷启动注入
+# 概念地图告诉 LLM："这是什么样的世界、你在跟什么概念打交道、哪些规则是不可违背的"
+# 用固定前缀 SEED_CTX_ 标识，只注入一次（有 SEED_CTX_ 节点存在时跳过）
+# 人工维护此文件 = 静态骨架，与菌丝网络的动态生长互补
+
+- id: SEED_CTX_ARCH
+  title: "架构：Mixin继承 + A-b-C子程序流"
+  tags: "concept_seed,architecture"
+  content: |
+    Genesis V4 架构核心：
+    - V4Loop 继承 LensPhaseMixin, CPhaseMixin, ChallengerMixin（Mixin模式，非组合）
+    - A-b-C 模型：G思考→Op执行(无状态)→C反思(修图不种树)
+    - NodeVault 单例，初始化时加载 SignatureEngine + VectorEngine
+    - 知识流6层：存储→智能→注入→生产→质量→消费
+    - 点线面 V2 中，GP 通过 record_point + record_line 写点连线；C-Phase 是园丁，只修图不种树
+  related: ["SEED_CTX_INFRA", "SEED_CTX_KNOWLEDGE", "SEED_CTX_YOGG"]
+
+- id: SEED_CTX_INFRA
+  title: "基础设施：systemd + v2rayA + Tailscale"
+  tags: "concept_seed,infrastructure"
+  content: |
+    不可违背的约束：
+    - 主机 Discord Bot 由 systemd 用户服务管理：systemctl --user restart genesis-v4.service
+    - Yogg 独立 auto runner 由 system-level 服务管理：sudo systemctl restart yogg-auto.service
+    - 绝对不要用 nohup python discord_bot.py &（systemd会自动重启，nohup产生幽灵进程）
+    - 网络按环境区分，不要盲目设置应用层 HTTPS_PROXY；优先遵循当前服务文件和网络健康检查
+    - DB路径：当前主库优先 ~/.genesis/workshop_v4.sqlite；旧 ~/.nanogenesis/ 只作为历史/备份路径
+  related: ["SEED_CTX_ARCH", "SEED_CTX_YOGG"]
+
+- id: SEED_CTX_YOGG
+  title: "Yogg：Yoga 上的独立自进化运行体"
+  tags: "concept_seed,yogg,infrastructure,auto_mode"
+  content: |
+    Yogg 是 Yoga 机器上的 Genesis 独立 auto runner：
+    - 入口是 yogg_auto.py，不走 Discord bot 对话入口
+    - 服务是 system-level yogg-auto.service，不是主机上的 genesis-v4 用户服务
+    - 管理命令：sudo systemctl status/restart yogg-auto.service；日志：sudo journalctl -u yogg-auto.service
+    - DB 主路径是 /home/yoga/.genesis/workshop_v4.sqlite
+    - Yogg 可能存在 self-evolution 本地提交与未提交工作区热改；观察前必须区分 git HEAD、origin/main、工作区 diff
+    - 部署人工维护的静态知识文件时，注意未追踪文件不会通过 git pull 自动到达 Yogg
+  related: ["SEED_CTX_INFRA", "SEED_CTX_KNOWLEDGE", "SEED_CTX_DB"]
+
+- id: SEED_CTX_KNOWLEDGE
+  title: "知识系统：点线面 + 双层记忆"
+  tags: "concept_seed,knowledge"
+  content: |
+    点线面架构替代圆锥模型：
+    - 点 = LESSON/锚点（LLM写LLM读）
+    - 线 = 推理链片段（reasoning_lines表，same_round隔离同轮）
+    - 面 = 两阶段BFS组装（填充踩稳+推进前沿）
+    - 价值信号 = 入线数（拓扑），不是confidence数字
+    - 去重 = 线逻辑去重（推理链相似度），不是内容语义相似度
+    - 双层记忆：声明性(NodeVault) + 程序性(trace网络)
+    - C-Phase园丁4职责：胜率反馈+消融触发+矛盾检测+关联发现
+  related: ["SEED_CTX_ARCH", "SEED_CTX_TRAPS"]
+
+- id: SEED_CTX_TRAPS
+  title: "已知陷阱：易犯错误清单"
+  tags: "concept_seed,traps"
+  content: |
+    容易踩的坑：
+    - RecordLessonNodeTool hardcodes tags="auto_managed"——自定义tags用vault.create_node()
+    - knowledge_nodes.tags 是纯TEXT不是JSON
+    - full_content 在 node_content 表（与 knowledge_nodes 分离）
+    - Auto模式：c_phase_blocking=True, disable_multi_g=True
+    - Multi-G 只在 input>=50字符时激活
+    - Scavenger OFF, Hypothesis engine OFF（用户决定 2026-03-26）
+    - 不创建新节点类型：7种足够，用metadata_signature维度演化
+    - MBTI人格用于Multi-G，不是功能角色(architect/reviewer)
+  related: ["SEED_CTX_KNOWLEDGE"]
+
+- id: SEED_CTX_DB
+  title: "数据库：3个SQLite文件"
+  tags: "concept_seed,database"
+  content: |
+    三个DB各司其职：
+    - ~/.genesis/workshop_v4.sqlite：NodeVault主库（knowledge_nodes, node_contents, edges, reasoning_lines, arena_results, void_tasks, ablation_baselines, persona_stats, process_heartbeat）
+    - runtime/traces.db：执行追踪（traces, spans），started_at是unix时间戳
+    - runtime/trace_entities.db：Trace管道实体（entities, relationships, communities）
+    - MCP sqlite server连接workshop_v4，用mcp2_read_query()做SELECT
+    - PRAGMA/schema查询用run_command+python3，不用mcp2
+  related: ["SEED_CTX_INFRA", "SEED_CTX_KNOWLEDGE"]

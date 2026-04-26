@@ -72,6 +72,9 @@ class TraceQueryTool(Tool):
             "required": ["mode"]
         }
 
+    def is_concurrency_safe(self, arguments: Dict[str, Any]) -> bool:
+        return True  # 只读查询，可并行
+
     async def execute(self, mode: str, query: str = "", entity_type: str = None,
                       entity_id: int = None, limit: int = 10, **kwargs) -> str:
         store = TraceEntityStore()
