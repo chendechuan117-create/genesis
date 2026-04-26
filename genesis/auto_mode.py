@@ -1231,6 +1231,23 @@ async def _call_session_planner(
         return DEFAULT_PLANNER_RESULT.copy()
 
 
+def _atomic_write_json(path, data, indent=2):
+    import json, os, tempfile
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=indent)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def describe_auto_state(auto_state: dict, channel_id: int) -> str:
     st = auto_state.get(channel_id)
     if not st:
@@ -1511,10 +1528,10 @@ class SpiralPioneer:
     def _save(self):
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
-            self._state_path.write_text(json.dumps({
-                "covered": self.covered,
-                "frontier": self.frontier,
-            }, ensure_ascii=False, indent=2), encoding="utf-8")
+            _atomic_write_json(self._state_path, {
+"covered": self.covered,
+"frontier": self.frontier,
+}, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.warning(f"SpiralPioneer state save failed: {e}")
 
@@ -1839,10 +1856,10 @@ class CrossModuleExplorer:
     def _save(self):
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
-            self._state_path.write_text(json.dumps({
-                "analyzed": self.analyzed,
-                "pair_queue": self.pair_queue,
-            }, ensure_ascii=False, indent=2), encoding="utf-8")
+            _atomic_write_json(self._state_path, {
+"analyzed": self.analyzed,
+"pair_queue": self.pair_queue,
+}, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.warning(f"CrossModuleExplorer state save failed: {e}")
 
@@ -1998,10 +2015,10 @@ class SelfEvolution:
     def _save(self):
         try:
             self._STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            self._STATE_PATH.write_text(json.dumps({
-                "file_cooldowns": self.file_cooldowns,
-                "apply_history": self.apply_history[-10:],
-            }, ensure_ascii=False, indent=2), encoding="utf-8")
+            _atomic_write_json(self._STATE_PATH, {
+"file_cooldowns": self.file_cooldowns,
+"apply_history": self.apply_history[-10:],
+}, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.warning(f"SelfEvolution state save failed: {e}")
 
@@ -2287,11 +2304,11 @@ class SelfEvolution:
         # Write restart marker for yogg_auto.py crash-loop detection
         try:
             self._RESTART_MARKER.parent.mkdir(parents=True, exist_ok=True)
-            self._RESTART_MARKER.write_text(json.dumps({
-                "rollback_commit": rollback_commit,
-                "applied_commit": applied_commit,
-                "timestamp": _time_module.strftime("%Y-%m-%d %H:%M:%S"),
-            }), encoding="utf-8")
+            _atomic_write_json(self._RESTART_MARKER, {
+"rollback_commit": rollback_commit,
+"applied_commit": applied_commit,
+"timestamp": _time_module.strftime("%Y-%m-%d %H:%M:%S"),
+})
         except Exception as e:
             logger.error(f"SelfEvolution: restart marker write failed: {e}")
 
@@ -2433,7 +2450,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 "saved_at": _time_module.strftime("%Y-%m-%d %H:%M:%S"),
             }
             _memory_path.parent.mkdir(parents=True, exist_ok=True)
-            _memory_path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+            _atomic_write_json(_memory_path, data, indent=1)
         except Exception as _e:
             logger.debug(f"session memory save failed: {_e}")
 
@@ -2489,7 +2506,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
     def _write_round_json(data: dict):
         try:
             rpath = _rounds_dir / f"round_{data['round']:03d}.json"
-            rpath.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            _atomic_write_json(rpath, data, indent=2)
         except Exception as _e:
             logger.debug(f"Round JSON write failed: {_e}")
 
@@ -3353,7 +3370,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
         "rounds_dir": str(_rounds_dir),
     }
     try:
-        _session_json_path.write_text(json.dumps(session_summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(_session_json_path, session_summary, indent=2)
     except Exception as _e:
         logger.debug(f"Session JSON write failed: {_e}")
 
