@@ -43,7 +43,7 @@ class KnowledgeQuery:
     def get_digest(self, top_k: int = 4) -> str:
         """精简认知目录：类别计数 + 入线数拓扑 + 知识缺口"""
         type_rows = self._conn.execute(
-            "SELECT type, COUNT(*) AS cnt FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%' GROUP BY type ORDER BY cnt DESC"
+            "SELECT type, COUNT(*) AS cnt FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%' AND ablation_active = 0 GROUP BY type ORDER BY cnt DESC"
         ).fetchall()
         type_counts = {r['type']: r['cnt'] for r in type_rows}
         total = sum(type_counts.values())
@@ -53,7 +53,7 @@ class KnowledgeQuery:
             """SELECT rl.basis_point_id, COUNT(*) as incoming, kn.type, kn.title
                FROM reasoning_lines rl
                JOIN knowledge_nodes kn ON rl.basis_point_id = kn.node_id
-               WHERE kn.node_id NOT LIKE 'MEM_CONV%'
+               WHERE kn.node_id NOT LIKE 'MEM_CONV%' AND kn.ablation_active = 0
                GROUP BY rl.basis_point_id
                ORDER BY incoming DESC
                LIMIT ?""",
@@ -65,6 +65,7 @@ class KnowledgeQuery:
             """SELECT kn.node_id, kn.type, kn.title, kn.created_at
                FROM knowledge_nodes kn
                WHERE kn.node_id NOT LIKE 'MEM_CONV%'
+                 AND kn.ablation_active = 0
                  AND kn.type IN ('LESSON', 'CONTEXT', 'DISCOVERY')
                  AND kn.node_id NOT IN (SELECT basis_point_id FROM reasoning_lines)
                  AND kn.node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS')
@@ -101,7 +102,7 @@ class KnowledgeQuery:
         """
         rows = self._conn.execute(
             """SELECT type, title, tags FROM knowledge_nodes
-               WHERE node_id NOT LIKE 'MEM_CONV%'
+               WHERE node_id NOT LIKE 'MEM_CONV%' AND ablation_active = 0
                ORDER BY type, usage_count DESC"""
         ).fetchall()
         if not rows:
@@ -299,7 +300,7 @@ class KnowledgeQuery:
 
         # 分层采样：每种类型取最近 30 条，避免单一类型垄断候选池
         type_names = self._conn.execute(
-            "SELECT DISTINCT type FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%'"
+            "SELECT DISTINCT type FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%' AND ablation_active = 0"
         ).fetchall()
         all_candidates = []
         for tr in type_names:
@@ -311,7 +312,7 @@ class KnowledgeQuery:
                           CASE WHEN ne.source_id IS NOT NULL THEN 1 ELSE 0 END as has_contradiction
                    FROM knowledge_nodes kn
                    LEFT JOIN node_edges ne ON kn.node_id = ne.target_id AND ne.relation = 'CONTRADICTS'
-                   WHERE kn.node_id NOT LIKE 'MEM_CONV%' AND kn.type = ?
+                   WHERE kn.node_id NOT LIKE 'MEM_CONV%' AND kn.ablation_active = 0 AND kn.type = ?
                    ORDER BY kn.updated_at DESC
                    LIMIT 30""", (t,)
             ).fetchall()
@@ -345,7 +346,7 @@ class KnowledgeQuery:
 
         # 统计
         type_rows = self._conn.execute(
-            "SELECT type, COUNT(*) AS cnt FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%' GROUP BY type"
+            "SELECT type, COUNT(*) AS cnt FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%' AND ablation_active = 0 GROUP BY type"
         ).fetchall()
         total = sum(r['cnt'] for r in type_rows)
         void_count = 0

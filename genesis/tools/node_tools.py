@@ -1,5 +1,6 @@
 import logging
 import json
+import re
 import hashlib
 from typing import Dict, Any, List
 from genesis.v4.manager import NodeVault, TRUST_TIERS
@@ -149,7 +150,36 @@ class RecordLineTool(BaseNodeTool):
             briefs = self.vault.get_node_briefs([new_point_id, basis_point_id])
             missing = [nid for nid in [new_point_id, basis_point_id] if nid not in briefs]
             if missing:
-                return f"Error: 节点不存在，无法连线: {missing}"
+                # LLM 经常编造 node_id（如 P_VERIFY_DISC_14E85206_ENTRYPOINT_LINK_20260427），
+                # 实际 ID 是 md5 生成的（如 P_94777BDE08）。尝试按 title 子串模糊匹配。
+                resolved = {}
+                for nid in missing:
+                    # 从 ID 中提取语义关键词（去掉 P_/LESSON_/CONTEXT_ 等前缀和日期后缀）
+                    hint = re.sub(r'^(P_|LESSON_|CONTEXT_|ASSET_|EPISODE_|DISC_|ACTION_|EVENT_|TOOL_)', '', nid)
+                    hint = re.sub(r'_?\d{8}$', '', hint)  # 去掉日期后缀
+                    hint = hint.strip('_')
+                    if hint and len(hint) >= 4:
+                        # 在数据库中按 title LIKE 搜索
+                        try:
+                            rows = self.vault._conn.execute(
+                                "SELECT node_id, title FROM knowledge_nodes WHERE title LIKE ? ORDER BY updated_at DESC LIMIT 3",
+                                (f"%{hint}%",)
+                            ).fetchall()
+                            if rows:
+                                resolved[nid] = rows[0]['node_id']
+                                logger.info(f"record_line: 模糊解析 {nid} → {rows[0]['node_id']} (title='{rows[0]['title'][:40]}')")
+                        except Exception:
+                            pass
+                # 替换解析成功的 ID
+                if resolved.get(new_point_id):
+                    new_point_id = resolved[new_point_id]
+                if resolved.get(basis_point_id):
+                    basis_point_id = resolved[basis_point_id]
+                # 重新检查
+                briefs = self.vault.get_node_briefs([new_point_id, basis_point_id])
+                still_missing = [nid for nid in [new_point_id, basis_point_id] if nid not in briefs]
+                if still_missing:
+                    return f"Error: 节点不存在，无法连线: {still_missing}。提示：请先调用 record_point 创建节点，然后用返回的 ID 连线。"
             if basis_point_id in self.vault.get_reasoning_basis_ids(new_point_id):
                 return f"ℹ️ LINE 已存在: {new_point_id} --[based_on]--> {basis_point_id}"
             try:
@@ -168,7 +198,29 @@ class RecordLineTool(BaseNodeTool):
                 round_seq=current_round_seq,
             )
             marker = "同轮" if same_round else "异轮"
-            return f"✅ LINE [{marker}]: {new_point_id} --[based_on]--> {basis_point_id}"
+
+            # ── 碰撞检测（写后去重）：收集该新点的完整 basis 集合，检查重叠 ──
+            # 概念要求：GP 连线到 A,B,C → 发现 A,B,C 已有节点引用 → 碰撞提醒 + 虚点
+            # record_line 是两步流程（record_point + record_line），碰撞在连线时才能判断
+            collision_hint = ""
+            try:
+                full_basis = list(self.vault.get_reasoning_basis_ids(new_point_id))
+                if len(full_basis) >= 2:
+                    collision_candidates = self.vault.find_collision_candidates(full_basis, min_overlap=2)
+                    if collision_candidates:
+                        candidate_hints = [f"[{cid}] '{ctitle}' (重叠{overlap}个basis)" for cid, overlap, ctitle in collision_candidates[:3]]
+                        collision_hint = f" ⚠️ 碰撞检测：你引用的节点已被以下节点引用：{', '.join(candidate_hints)}。确认是否重复？"
+                        logger.info(f"Collision detected for [{new_point_id}] via record_line: {candidate_hints}")
+                        # 系统自动记录虚点（饱和信号）
+                        for cid, overlap, ctitle in collision_candidates[:3]:
+                            self.vault.ensure_virtual_point(
+                                area_hint=ctitle or cid,
+                                basis_overlap_ids=full_basis[:overlap]
+                            )
+            except Exception as e:
+                logger.debug(f"Collision check in record_line skipped (non-fatal): {e}")
+
+            return f"✅ LINE [{marker}]: {new_point_id} --[based_on]--> {basis_point_id}{collision_hint}"
         except Exception as e:
             logger.error(f"Line recording failed: {e}")
             return f"Error: {e}"

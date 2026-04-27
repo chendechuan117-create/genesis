@@ -1,6 +1,7 @@
 """
 LLM 提供商实现
 """
+from __future__ import annotations
 
 from typing import List, Dict, Any, Optional
 import logging
@@ -160,6 +161,8 @@ class NativeHTTPProvider(BaseLLMProvider):
         """
         cleaned = []
         seen_non_system = False
+        tool_call_id_map = {}
+        tool_call_seq = 0
         for msg in messages:
             m = dict(msg)  # shallow copy
             role = m.get("role", "")
@@ -196,6 +199,11 @@ class NativeHTTPProvider(BaseLLMProvider):
                 fixed_tcs = []
                 for tc in m["tool_calls"]:
                     tc = dict(tc)
+                    original_id = str(tc.get("id") or "tool_call")
+                    tool_call_seq += 1
+                    new_id = f"tool_sanitized_{tool_call_seq}"
+                    tc["id"] = new_id
+                    tool_call_id_map.setdefault(original_id, []).append(new_id)
                     if "function" in tc:
                         fn = dict(tc["function"])
                         if not fn.get("name"):
@@ -203,6 +211,13 @@ class NativeHTTPProvider(BaseLLMProvider):
                         tc["function"] = fn
                     fixed_tcs.append(tc)
                 m["tool_calls"] = fixed_tcs
+
+            if role == "tool":
+                original_tool_call_id = str(m.get("tool_call_id") or "")
+                mapped_ids = tool_call_id_map.get(original_tool_call_id)
+                if mapped_ids:
+                    m["tool_call_id"] = mapped_ids.pop(0)
+                m.pop("name", None)
 
             # 清除非标准字段（MiniMax 等模型注入的额外字段）
             for field in NativeHTTPProvider._STRIP_MSG_FIELDS:
@@ -304,8 +319,8 @@ class NativeHTTPProvider(BaseLLMProvider):
                     error_msg = err_json.get('error', {}).get('message', error_body)
                 except Exception:
                     error_msg = error_body
-                # skip_content_type 偶发 400：服务器代理层解析失败，重试通常能恢复
-                if status == 400 and self.skip_content_type and attempt < retries - 1:
+                # 400 偶发重试：K2.6 API 间歇性拒绝合法请求（同 payload 重发即成功）
+                if status == 400 and attempt < retries - 1:
                     NativeHTTPProvider._stats_retries += 1
                     NativeHTTPProvider._record_stat("retry")
                     logger.warning(f"400 retry {attempt+1}/{retries}: {error_msg[:80]}")
@@ -349,6 +364,24 @@ class NativeHTTPProvider(BaseLLMProvider):
                     try:
                         with open("/tmp/genesis_400_debug.log", "a") as f:
                             f.write(f"\n=== {time.strftime('%H:%M:%S')} ===\n{detail}\n")
+                        with open(f"/tmp/genesis_400_payload_{int(time.time())}.json", "w") as f:
+                            dump_data = {"params_keys": list(params.keys()), "model": params.get("model"),
+                                        "n_msgs": len(msgs), "messages": msgs}
+                            tools_raw = params.get("tools", [])
+                            tools_dump = []
+                            for t in tools_raw:
+                                td = dict(t)
+                                if "function" in td:
+                                    fn = dict(td["function"])
+                                    if "description" in fn and len(fn["description"]) > 200:
+                                        fn["description"] = fn["description"][:200] + "...[TRUNCATED]"
+                                    td["function"] = fn
+                                tools_dump.append(td)
+                            dump_data["tools"] = tools_dump
+                            dump_data["stream"] = params.get("stream")
+                            dump_data["stop"] = params.get("stop")
+                            dump_data["tool_choice"] = params.get("tool_choice")
+                            json.dump(dump_data, f, ensure_ascii=False, indent=1)
                     except Exception: pass
                 NativeHTTPProvider._stats_errors += 1
                 NativeHTTPProvider._record_stat("error")
@@ -458,6 +491,107 @@ class NativeHTTPProvider(BaseLLMProvider):
             total_tokens=usage.get('total_tokens', 0),
             prompt_cache_hit_tokens=usage.get('prompt_cache_hit_tokens', 0)
         )
+
+    @staticmethod
+    def _try_split_concat_tool_call(raw_name: str, raw_args: str, base_idx: int) -> Optional[List[ToolCall]]:
+        """检测 K2.6 并行工具名拼接并拆分为独立 ToolCall。
+
+        K2.6 streaming 不遵守 OpenAI index 协议：多个 tool_calls 的 name/args
+        被拼接到同一个 index，产生如 name="shellsearch_knowledge_nodes",
+        args='{"command":"ps aux"}{"keywords":["daemon"]}'。
+
+        拆分策略：
+        1. 用已知工具名贪婪匹配 raw_name，找出所有拼接片段
+        2. 在 args 的 }{ 边界处拆分，与 name 片段一一对应
+        3. 无法拆分时返回 None（走原有 JSON 解析兜底）
+        """
+        if not raw_name or not raw_args:
+            return None
+
+        # 从 tools 定义中获取已知工具名（延迟导入避免循环依赖）
+        try:
+            from genesis.core.registry import ToolRegistry
+            known_names = set(ToolRegistry._global_known_names())
+        except Exception:
+            return None
+
+        if not known_names:
+            return None
+
+        # 贪婪匹配：按名称长度降序，确保最长匹配优先
+        sorted_known = sorted(known_names, key=len, reverse=True)
+        name_parts = []
+        remaining = raw_name
+        while remaining:
+            matched = False
+            for name in sorted_known:
+                if remaining.startswith(name):
+                    name_parts.append(name)
+                    remaining = remaining[len(name):]
+                    matched = True
+                    break
+            if not matched:
+                # 有无法匹配的残留，不是拼接场景
+                return None
+
+        # 只有一个匹配 → 不是拼接，走正常流程
+        if len(name_parts) <= 1:
+            return None
+
+        logger.warning(f"K2.6 拼接拆分: '{raw_name}' → {name_parts}")
+
+        # 拆分 args：在顶级 }{ 边界处切割
+        # 策略：逐字符追踪花括号深度，depth=0 且遇到 }{ 时切割
+        arg_parts = []
+        depth = 0
+        start = 0
+        in_string = False
+        escape_next = False
+        for pos, ch in enumerate(raw_args):
+            if escape_next:
+                escape_next = False
+                continue
+            if ch == '\\' and in_string:
+                escape_next = True
+                continue
+            if ch == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0 and pos + 1 < len(raw_args) and raw_args[pos + 1] == '{':
+                    arg_parts.append(raw_args[start:pos + 1])
+                    start = pos + 1
+
+        # 最后一段
+        if start < len(raw_args):
+            arg_parts.append(raw_args[start:])
+
+        # name_parts 和 arg_parts 数量必须一致
+        if len(arg_parts) != len(name_parts):
+            logger.warning(f"K2.6 拼接拆分失败: name_parts={len(name_parts)} != arg_parts={len(arg_parts)}, 降级走正常解析")
+            return None
+
+        result = []
+        for i, (name, arg_str) in enumerate(zip(name_parts, arg_parts)):
+            try:
+                args = json.loads(arg_str) if arg_str.strip() else {}
+            except json.JSONDecodeError:
+                repaired = arg_str.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+                try:
+                    args = json.loads(repaired)
+                except Exception:
+                    args = {"__json_decode_error__": arg_str}
+            result.append(ToolCall(
+                id=f"call_split_{base_idx}_{i}",
+                name=name,
+                arguments=args,
+            ))
+        return result
 
     async def _stream_with_httpx(self, client: httpx.AsyncClient, url: str, headers: Dict, params: Dict, callback) -> LLMResponse:
         """流式请求"""
@@ -603,8 +737,9 @@ class NativeHTTPProvider(BaseLLMProvider):
                 
             except httpx.HTTPStatusError as e:
                 status = e.response.status_code
-                # skip_content_type 偶发 400：可能是连接状态污染，用全新 client 重试
-                if status == 400 and self.skip_content_type and attempt < retries - 1:
+                # 400 偶发重试：K2.6 API 间歇性拒绝合法请求（同 payload 重发即成功）
+                # skip_content_type 模式下更频繁，但所有 provider 都可能遇到
+                if status == 400 and attempt < retries - 1:
                     NativeHTTPProvider._stats_retries += 1
                     NativeHTTPProvider._record_stat("retry")
                     body_bytes = json.dumps(params, ensure_ascii=False).encode('utf-8')
@@ -658,6 +793,26 @@ class NativeHTTPProvider(BaseLLMProvider):
                     try:
                         with open("/tmp/genesis_400_debug.log", "a") as f:
                             f.write(f"\n=== {time.strftime('%H:%M:%S')} (stream) ===\n{detail}\n")
+                        # 完整请求体转储（用于定位 400 根因）
+                        with open(f"/tmp/genesis_400_payload_{int(time.time())}.json", "w") as f:
+                            dump_data = {"params_keys": list(params.keys()), "model": params.get("model"),
+                                        "n_msgs": len(msgs), "messages": msgs}
+                            # Include tools schema (truncated descriptions to keep file size manageable)
+                            tools_raw = params.get("tools", [])
+                            tools_dump = []
+                            for t in tools_raw:
+                                td = dict(t)
+                                if "function" in td:
+                                    fn = dict(td["function"])
+                                    if "description" in fn and len(fn["description"]) > 200:
+                                        fn["description"] = fn["description"][:200] + "...[TRUNCATED]"
+                                    td["function"] = fn
+                                tools_dump.append(td)
+                            dump_data["tools"] = tools_dump
+                            dump_data["stream"] = params.get("stream")
+                            dump_data["stop"] = params.get("stop")
+                            dump_data["tool_choice"] = params.get("tool_choice")
+                            json.dump(dump_data, f, ensure_ascii=False, indent=1)
                     except Exception: pass
                 NativeHTTPProvider._stats_errors += 1
                 NativeHTTPProvider._record_stat("error")
@@ -681,28 +836,41 @@ class NativeHTTPProvider(BaseLLMProvider):
         # Post-processing
         for idx in sorted(tool_call_chunks.keys()):
             tc_data = tool_call_chunks[idx]
+            raw_name = tc_data["name"]
+            raw_args = tc_data["args"]
+
+            # ── K2.6 并行工具名拼接修复 ──
+            # K2.6 streaming 不遵守 index 协议，多个 tool_calls 的 name/args
+            # 被拼接到同一个 index，导致 name="shellsearch_knowledge_nodes",
+            # args="{\"command\":\"...\"}{\"keywords\":[...]\"}"
+            split_calls = self._try_split_concat_tool_call(raw_name, raw_args, idx)
+            if split_calls is not None:
+                for sc in split_calls:
+                    final_tool_calls.append(sc)
+                continue
+
             try:
-                args = json.loads(tc_data["args"]) if tc_data["args"] else {}
+                args = json.loads(raw_args) if raw_args else {}
                 final_tool_calls.append(ToolCall(
                     id=tc_data["id"] or f"call_{idx}",
-                    name=tc_data["name"],
+                    name=raw_name,
                     arguments=args
                 ))
             except json.JSONDecodeError:
                 # Try simple repair for newlines
-                repaired = tc_data["args"].replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+                repaired = raw_args.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
                 try:
                     args = json.loads(repaired)
                     final_tool_calls.append(ToolCall(
                         id=tc_data["id"] or f"call_{idx}",
-                        name=tc_data["name"],
+                        name=raw_name,
                         arguments=args
                     ))
                 except Exception:
                      final_tool_calls.append(ToolCall(
                         id=tc_data["id"] or f"call_{idx}",
-                        name=tc_data["name"],
-                        arguments={"__json_decode_error__": tc_data["args"]}
+                        name=raw_name,
+                        arguments={"__json_decode_error__": raw_args}
                     ))
 
         final_content = "".join(full_content)

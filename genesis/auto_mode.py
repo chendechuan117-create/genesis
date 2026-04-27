@@ -1231,23 +1231,6 @@ async def _call_session_planner(
         return DEFAULT_PLANNER_RESULT.copy()
 
 
-def _atomic_write_json(path, data, indent=2):
-    import json, os, tempfile
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix='.tmp')
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=indent)
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except FileNotFoundError:
-            pass
-        raise
-
-
 def describe_auto_state(auto_state: dict, channel_id: int) -> str:
     st = auto_state.get(channel_id)
     if not st:
@@ -1528,10 +1511,10 @@ class SpiralPioneer:
     def _save(self):
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_write_json(self._state_path, {
-"covered": self.covered,
-"frontier": self.frontier,
-}, ensure_ascii=False, indent=2)
+            self._state_path.write_text(json.dumps({
+                "covered": self.covered,
+                "frontier": self.frontier,
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as e:
             logger.warning(f"SpiralPioneer state save failed: {e}")
 
@@ -1856,10 +1839,10 @@ class CrossModuleExplorer:
     def _save(self):
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_write_json(self._state_path, {
-"analyzed": self.analyzed,
-"pair_queue": self.pair_queue,
-}, ensure_ascii=False, indent=2)
+            self._state_path.write_text(json.dumps({
+                "analyzed": self.analyzed,
+                "pair_queue": self.pair_queue,
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as e:
             logger.warning(f"CrossModuleExplorer state save failed: {e}")
 
@@ -1970,6 +1953,24 @@ class CrossModuleExplorer:
 
 # ─── Self-Evolution ──────────────────────────────────────────────
 
+# ─── Self-Evolution Scope Gate ───────────────────────────────────
+# Files that control GP tool path / knowledge paradigm.
+# If these appear in Doctor diff, SelfEvolution will NOT auto-apply them
+# without explicit scope filtering — they require human review.
+CRITICAL_SELF_EVOLUTION_FILES: frozenset[str] = frozenset({
+    "genesis/auto_mode.py",
+    "genesis/v4/loop.py",
+    "genesis/v4/prompt_factory.py",
+    "genesis/v4/c_phase.py",
+    "genesis/v4/manager.py",
+    "genesis/v4/surface.py",
+    "genesis/v4/concept_seeds.yaml",
+    "genesis/tools/node_tools.py",
+    "scripts/doctor.sh",
+    "scripts/replica_setup/yogg-auto.service",
+})
+
+
 class SelfEvolution:
     """Tracks Doctor sandbox modifications and auto-applies after cooling period.
 
@@ -1985,6 +1986,9 @@ class SelfEvolution:
     - Git commit before apply (rollback point stored in state)
     - Max 1 apply per session
     - Crash-loop detection in yogg_auto.py triggers rollback on next startup
+    - Scope gate: critical files (tool path / knowledge paradigm) are NOT
+      auto-applied; they require --only scoped apply or human review
+
     """
 
     _STATE_PATH = Path("runtime/self_evolution_state.json")
@@ -2015,10 +2019,10 @@ class SelfEvolution:
     def _save(self):
         try:
             self._STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_write_json(self._STATE_PATH, {
-"file_cooldowns": self.file_cooldowns,
-"apply_history": self.apply_history[-10:],
-}, ensure_ascii=False, indent=2)
+            self._STATE_PATH.write_text(json.dumps({
+                "file_cooldowns": self.file_cooldowns,
+                "apply_history": self.apply_history[-10:],
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as e:
             logger.warning(f"SelfEvolution state save failed: {e}")
 
@@ -2187,6 +2191,33 @@ class SelfEvolution:
 
         # Death loop guard: if recent apply_history shows repeated test_failed with
         # same reason, skip apply for a cooldown period instead of retrying forever.
+        # But first: prune stale entries — if the test file referenced in the reason
+        # no longer exists (sandbox was reset), those entries are stale and should not block.
+        stale_indices = []
+        for i, entry in enumerate(self.apply_history):
+            if entry.get("status") == "test_failed":
+                reason = entry.get("reason", "")
+                # Extract test file path from reason (format: "... tests/test_xxx.py::test_name ...")
+                # Note: reason is truncated (last 200 chars), so 'tests/' prefix may be missing
+                test_path = None
+                m = re.search(r'(tests/\S+\.py)', reason)
+                if m:
+                    test_path = self._STATE_PATH.parent.parent / m.group(1)
+                else:
+                    # Try bare filename: "test_xxx.py" → search in tests/ directory
+                    m2 = re.search(r'(\S+test\S*\.py)', reason)
+                    if m2:
+                        fname = m2.group(1).split('::')[0]  # remove ::test_name suffix
+                        candidate = self._STATE_PATH.parent.parent / "tests" / fname
+                        if candidate.exists():
+                            test_path = candidate
+                if test_path and not test_path.exists():
+                    stale_indices.append(i)
+        if stale_indices:
+            logger.warning(f"SelfEvolution: pruning {len(stale_indices)} stale apply_history entries (test files no longer exist)")
+            self.apply_history = [e for i, e in enumerate(self.apply_history) if i not in stale_indices]
+            self._save()
+
         recent = self.apply_history[-3:] if len(self.apply_history) >= 3 else []
         if recent and all(e.get("status") == "test_failed" for e in recent):
             # Check if reasons are similar (share a common error substring)
@@ -2204,6 +2235,45 @@ class SelfEvolution:
         await channel.send(
             f"🧬 冷却完成 | T:{len(t_files)}f max{max_t}/{self.cooldown} U:{len(u_files)}f max{max_u}/{self.untracked_cooldown} | 开始自进化应用流程..."
         )
+
+        # ── Scope gate: check for critical files in diff ──
+        # Critical files control GP tool path / knowledge paradigm.
+        # They must NOT be auto-applied without human review.
+        safe_files: list[str] = []  # non-critical files safe to apply
+        critical_found: list[str] = []  # critical files that need review
+        for path in list(self.file_cooldowns.keys()):
+            if path in CRITICAL_SELF_EVOLUTION_FILES:
+                critical_found.append(path)
+            else:
+                safe_files.append(path)
+
+        only_filter = ""
+        if critical_found:
+            if not safe_files:
+                # ALL cooled files are critical → reject entirely
+                await channel.send(
+                    f"🧬 🚫 拒绝自进化：冷却文件全部为关键文件 {critical_found}，"
+                    f"需要人工审查。关键文件控制 GP 工具路径/知识范式，不可自动应用。"
+                )
+                apply_result["apply_reason"] = f"scope_gate: critical files only ({', '.join(critical_found)})"
+                self.apply_history.append({
+                    "round": round_num,
+                    "status": "scope_gate_rejected",
+                    "reason": apply_result["apply_reason"],
+                })
+                # Reset cooldowns for critical files so they don't keep triggering
+                for p in critical_found:
+                    if p in self.file_cooldowns:
+                        self.file_cooldowns[p]["stable_count"] = 0
+                self._save()
+                return apply_result
+            else:
+                # Mixed: apply only safe files, leave critical in sandbox
+                only_filter = ",".join(safe_files)
+                await channel.send(
+                    f"🧬 ⚠️ Scope gate: 发现关键文件 {critical_found}，"
+                    f"仅应用安全文件 {safe_files}（--only 模式）"
+                )
 
         # 1. Run diff-scoped tests in sandbox (only test files related to current changes)
         await channel.send("🧬 [1/3] 沙箱测试中（差分范围）...")
@@ -2239,9 +2309,12 @@ class SelfEvolution:
 
         await channel.send("🧬 ✅ 测试通过")
 
-        # 2. Auto-apply with git safety net
+        # 2. Auto-apply with git safety net (use --only if scope gate filtered critical files)
         await channel.send("🧬 [2/3] 应用沙箱修改到本体...")
-        apply_ok, apply_output = await _run_doctor_sync_command("auto-apply", timeout_secs=60)
+        apply_cmd = ["auto-apply"]
+        if only_filter:
+            apply_cmd.extend(["--only", only_filter])
+        apply_ok, apply_output = await _run_doctor_sync_command(*apply_cmd, timeout_secs=60)
 
         # Parse output for rollback point
         rollback_commit = ""
@@ -2304,11 +2377,11 @@ class SelfEvolution:
         # Write restart marker for yogg_auto.py crash-loop detection
         try:
             self._RESTART_MARKER.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_write_json(self._RESTART_MARKER, {
-"rollback_commit": rollback_commit,
-"applied_commit": applied_commit,
-"timestamp": _time_module.strftime("%Y-%m-%d %H:%M:%S"),
-})
+            self._RESTART_MARKER.write_text(json.dumps({
+                "rollback_commit": rollback_commit,
+                "applied_commit": applied_commit,
+                "timestamp": _time_module.strftime("%Y-%m-%d %H:%M:%S"),
+            }), encoding="utf-8")
         except Exception as e:
             logger.error(f"SelfEvolution: restart marker write failed: {e}")
 
@@ -2450,7 +2523,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 "saved_at": _time_module.strftime("%Y-%m-%d %H:%M:%S"),
             }
             _memory_path.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_write_json(_memory_path, data, indent=1)
+            _memory_path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
         except Exception as _e:
             logger.debug(f"session memory save failed: {_e}")
 
@@ -2506,7 +2579,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
     def _write_round_json(data: dict):
         try:
             rpath = _rounds_dir / f"round_{data['round']:03d}.json"
-            _atomic_write_json(rpath, data, indent=2)
+            rpath.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as _e:
             logger.debug(f"Round JSON write failed: {_e}")
 
@@ -3370,7 +3443,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
         "rounds_dir": str(_rounds_dir),
     }
     try:
-        _atomic_write_json(_session_json_path, session_summary, indent=2)
+        _session_json_path.write_text(json.dumps(session_summary, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as _e:
         logger.debug(f"Session JSON write failed: {_e}")
 

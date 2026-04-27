@@ -46,9 +46,17 @@ def _tool_fingerprint(tool: Any) -> Dict[str, Any]:
 class ToolRegistry:
     """工具注册表 - 核心组件"""
     
+    # 类级缓存：所有实例注册过的工具名（供 provider 拼接拆分使用）
+    _known_names_cache: Set[str] = set()
+    
     def __init__(self):
         self._tools: Dict[str, Tool] = {}
         self._cached_definitions: Optional[List[Dict[str, Any]]] = None
+    
+    @classmethod
+    def _global_known_names(cls) -> Set[str]:
+        """返回所有实例注册过的工具名集合（供 K2.6 拼接拆分检测）。"""
+        return cls._known_names_cache
     
     def register(self, tool: Tool) -> None:
         """注册工具"""
@@ -68,6 +76,7 @@ class ToolRegistry:
             logger.warning(f"工具 {tool_name} 已存在，将被覆盖 before={before_fp} after={after_fp}")
         
         self._tools[tool_name] = tool
+        ToolRegistry._known_names_cache.add(tool_name)
         self._cached_definitions = None  # Invalidate cache
         logger.debug(f"✓ 注册工具: {tool_name}")
     
@@ -75,6 +84,7 @@ class ToolRegistry:
         """注销工具"""
         if tool_name in self._tools:
             del self._tools[tool_name]
+            ToolRegistry._known_names_cache.discard(tool_name)
             self._cached_definitions = None  # Invalidate cache
             logger.debug(f"✓ 注销工具: {tool_name}")
     

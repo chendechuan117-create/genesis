@@ -221,20 +221,35 @@ cmd_test_diff() {
 }
 
 _doctor_workspace_patch() {
+    # Optional: $1 = comma-separated file glob filter (--only)
+    local only_filter="${1:-}"
     _ensure_running
-    docker exec -i -w /workspace "$CONTAINER" bash <<'EOF'
+    docker exec -i -w /workspace "$CONTAINER" bash <<EOF
 set -euo pipefail
 
-git diff HEAD
-while IFS= read -r -d '' path; do
-    case "$path" in
-        .doctor-initialized|runtime/*|__pycache__/*|.pytest_cache/*|*.pyc|*.pyo|*.orig|*.rej|*.log)
-            continue
-            ;;
+if [ -n "$only_filter" ]; then
+    # Scoped: only emit diff for matching files
+    git diff HEAD -- $only_filter
+    for _path in \$(git ls-files --others --exclude-standard -z 2>/dev/null | tr '\0' '\n' | grep -E "^\$only_filter" || true); do
+        case "\$_path" in
+            .doctor-initialized|runtime/*|__pycache__/*|.pytest_cache/*|*.pyc|*.pyo|*.orig|*.rej|*.log)
+                continue
+                ;;
+        esac
+        git diff --no-index --binary -- /dev/null "\$_path" || true
+    done
+else
+    git diff HEAD
+    while IFS= read -r -d '' path; do
+        case "\$path" in
+            .doctor-initialized|runtime/*|__pycache__/*|.pytest_cache/*|*.pyc|*.pyo|*.orig|*.rej|*.log)
+                continue
+                ;;
     esac
 
-    git diff --no-index --binary -- /dev/null "$path" || true
-done < <(git ls-files --others --exclude-standard -z)
+    git diff --no-index --binary -- /dev/null "\$path" || true
+    done < <(git ls-files --others --exclude-standard -z)
+fi
 EOF
 }
 
@@ -314,9 +329,16 @@ cmd_patch() {
 cmd_apply() {
     _ensure_running
 
+    # Parse --only flag: doctor.sh apply [--only file1,file2,...]
+    local only_filter=""
+    if [ "${1:-}" = "--only" ] && [ -n "${2:-}" ]; then
+        only_filter="$2"
+        shift 2 2>/dev/null || true
+    fi
+
     local patch_file
     patch_file=$(mktemp "$PROJECT_DIR/doctor-apply-XXXXXX.patch")
-    if ! _doctor_workspace_patch > "$patch_file"; then
+    if ! _doctor_workspace_patch "$only_filter" > "$patch_file"; then
         rm -f "$patch_file"
         echo -e "${RED}Failed to read Doctor workspace changes.${NC}"
         return 1
@@ -415,11 +437,17 @@ cmd_restore() {
 
 cmd_auto_apply() {
     # 非交互式应用：自进化专用，带 git 安全网
+    # 支持 --only file1,file2,... 限定应用范围
     _ensure_running
+
+    local only_filter=""
+    if [ "${1:-}" = "--only" ] && [ -n "${2:-}" ]; then
+        only_filter="$2"
+    fi
 
     local patch_file
     patch_file=$(mktemp "$PROJECT_DIR/doctor-auto-apply-XXXXXX.patch")
-    if ! _doctor_workspace_patch > "$patch_file"; then
+    if ! _doctor_workspace_patch "$only_filter" > "$patch_file"; then
         rm -f "$patch_file"
         echo "READ_PATCH_FAILED"
         return 1
@@ -478,6 +506,15 @@ cmd_rollback() {
     echo "ROLLBACK_DONE: $(git rev-parse HEAD)"
 }
 
+cmd_list_changed() {
+    # List all changed files in sandbox (tracked + untracked), one per line
+    # Used by SelfEvolution scope gate before apply
+    _ensure_running
+    docker exec -w /workspace "$CONTAINER" bash -c '
+        (git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null | grep -vE "(__pycache__|\.pyc|\.pyo|\.orig|\.rej|\.log|\.pytest_cache|^runtime/|^\.)") | sort -u | grep -vE "^$"
+    ' 2>/dev/null
+}
+
 # ── 路由 ──
 case "${1:-help}" in
     start)  cmd_start ;;
@@ -491,9 +528,10 @@ case "${1:-help}" in
     diff)   cmd_diff ;;
     diff-status) cmd_diff_status ;;
     file-status) cmd_file_status ;;
+    list-changed) cmd_list_changed ;;
     patch)  cmd_patch ;;
-    apply)  cmd_apply ;;
-    auto-apply) cmd_auto_apply ;;
+    apply)  shift 2>/dev/null; cmd_apply "$@" ;;
+    auto-apply) shift 2>/dev/null; cmd_auto_apply "$@" ;;
     rollback) shift; cmd_rollback "$@" ;;
     status) cmd_status ;;
     cat)    shift; cmd_cat "$@" ;;
@@ -513,8 +551,9 @@ case "${1:-help}" in
         echo "  test [path]    运行测试（默认 tests/）"
         echo "  diff           查看所有修改"
         echo "  patch          导出修改为 .patch 文件"
-        echo "  apply          将修改应用到本体（需确认）"
-        echo "  auto-apply     非交互式应用（自进化用，带 git 安全网）"
+        echo "  list-changed   列出沙箱中所有修改文件（scope gate 用）"
+        echo "  apply [--only f1,f2]  将修改应用到本体（需确认，--only 限定范围）"
+        echo "  auto-apply [--only f1,f2]  非交互式应用（自进化用，--only 限定范围）"
         echo "  rollback <hash> 回滚到指定 commit"
         echo "  status         查看容器状态"
         echo "  cat <file>     查看容器内文件"

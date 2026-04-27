@@ -443,6 +443,63 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
 
     # ─── Environment Epoch methods → environment_mixin.py ───
     # ─── Confidence/Reliability/Arena methods → arena_mixin.py ───
+    def audit_signatures(self, limit: int = 50) -> Dict[str, int]:
+        """批量审计节点签名，补齐失效原因并返回修复统计。"""
+        try:
+            limit = max(int(limit or 0), 0)
+        except Exception:
+            limit = 50
+
+        stats = {
+            "audited": 0,
+            "fixed_normalize": 0,
+            "fixed_blacklist": 0,
+            "fixed_contradiction": 0,
+            "fixed_invalidation_reason": 0,
+        }
+        if limit == 0:
+            return stats
+
+        rows = self._conn.execute(
+            "SELECT node_id, metadata_signature, verification_source, type FROM knowledge_nodes ORDER BY updated_at DESC, rowid DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+        for row in rows:
+            stats["audited"] += 1
+            original_sig = self.signature.parse(row["metadata_signature"])
+            working_sig = dict(original_sig)
+
+            active_environment_epoch = ""
+            environment_scope = working_sig.get("applies_to_environment_scope") or working_sig.get("environment_scope") or ""
+            if environment_scope:
+                active_environment = self.get_active_environment_epoch(environment_scope)
+                active_environment_epoch = active_environment["epoch_id"] if active_environment else ""
+
+            inferred_reason = self.signature.infer_invalidation_reason(
+                working_sig,
+                verification_source=row["verification_source"] or "",
+                active_environment_epoch=active_environment_epoch,
+            )
+            had_reason = bool(self.signature.resolve_invalidation_reason(working_sig))
+            if inferred_reason and not had_reason:
+                working_sig["invalidation_reason"] = inferred_reason
+
+            normalized_sig = self.signature.normalize(working_sig)
+
+            if normalized_sig != original_sig:
+                before_reason = self.signature.resolve_invalidation_reason(original_sig)
+                after_reason = self.signature.resolve_invalidation_reason(normalized_sig)
+                if not before_reason and after_reason:
+                    stats["fixed_invalidation_reason"] += 1
+                self.patch_node_metadata(
+                    row["node_id"],
+                    metadata_signature=normalized_sig,
+                    verification_source=row["verification_source"],
+                )
+
+        return stats
+
 
     def patch_node_metadata(self, node_id: str, **kwargs) -> bool:
         """统一的节点元数据补丁接口（daemon/工具共用）。

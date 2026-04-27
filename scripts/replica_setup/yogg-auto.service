@@ -20,7 +20,7 @@ StandardError=journal
 
 # 内存保护：Yoga S730 只有 8GB
 MemoryMax=3400M
-MemoryHigh=2800M
+MemoryHigh=infinity
 
 [Install]
 WantedBy=multi-user.target

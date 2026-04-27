@@ -1,13 +1,15 @@
-"""
-RLN Envelope Boundary Test
-验证 registry.execute() 直接透传参数，无 arguments/input 解包
-"""
+
 import inspect
 import json
 import sys
 import types
 import unittest
 from unittest.mock import patch
+
+
+def _stub_provider_stack():
+    if 'httpx' not in sys.modules:
+        sys.modules['httpx'] = types.ModuleType('httpx')
 
 
 def _stub_vector_stack():
@@ -83,84 +85,58 @@ class _DummyVault:
         return {}
     def add_edge(self, *args, **kwargs):
         self.edges.append((args, kwargs))
-    def get_same_round_ids(self, *args, **kwargs):
-        return set()
-    def find_collision_candidates(self, *args, **kwargs):
-        return []
 
 
 class DoctorRLNEnvelopeBoundaryTest(unittest.IsolatedAsyncioTestCase):
-    async def test_record_lesson_node_boundary(self):
-        """验证 registry.execute() 直接透传参数，无 arguments/input 解包"""
+    async def test_record_lesson_node_boundary_unwraps_arguments_and_input(self):
+        _stub_provider_stack()
         _stub_vector_stack()
+        from factory import create_agent
 
-        from genesis.core.registry import ToolRegistry
-        from genesis.tools.node_tools import RecordLessonNodeTool
-
-        reg = ToolRegistry()
+        full = {
+            'node_id': 'LESSON_DOCTOR_BOUNDARY',
+            'title': 'Doctor boundary unwrap',
+            'trigger_verb': 'debug',
+            'trigger_noun': 'registry',
+            'trigger_context': 'doctor_envelope_boundary',
+            'action_steps': ['probe envelope', 'unwrap at boundary'],
+            'because_reason': 'prefer contract-safe normalization over leaking raw execute kwargs',
+        }
 
         with patch('genesis.tools.node_tools.NodeVault', _DummyVault):
-            tool = RecordLessonNodeTool()
-            reg.register(tool)
+            agent = create_agent(api_key='x', base_url='http://127.0.0.1', model='dummy')
+            reg = agent.tools
+            tool = reg.get('record_lesson_node')
 
-            self.assertIsNotNone(reg.get('record_lesson_node'))
+            self.assertIsNotNone(tool)
             self.assertTrue(inspect.ismethod(tool.execute))
 
-            # Test 1: 直接传参，缺少 reasoning_basis → 前置校验失败
-            direct_missing_basis = await reg.execute('record_lesson_node', {
-                'node_id': 'LESSON_TEST_DIRECT',
-                'title': 'Direct pass test',
-                'trigger_verb': 'test',
-                'trigger_noun': 'registry',
-                'trigger_context': 'direct_pass',
-                'action_steps': ['step1'],
-                'because_reason': 'test',
-                'resolves': 'test',
-            })
-            self.assertIn('reasoning_basis 不能为空', direct_missing_basis)
+            ok_direct = await reg.execute('record_lesson_node', dict(full))
+            ok_arguments = await reg.execute('record_lesson_node', {'arguments': dict(full)})
+            ok_input = await reg.execute('record_lesson_node', {'input': dict(full)})
+            bad_kwargs = await reg.execute('record_lesson_node', {'kwargs': dict(full)})
 
-            # Test 2: 直接传参，完整参数 → 成功
-            full_params = {
-                'node_id': 'LESSON_TEST_FULL',
-                'title': 'Full params test',
-                'trigger_verb': 'test',
-                'trigger_noun': 'registry',
-                'trigger_context': 'full_params',
-                'action_steps': ['step1'],
-                'because_reason': 'test',
-                'resolves': 'test',
-                'reasoning_basis': [{'basis_node_id': 'P_TEST_001', 'reasoning': 'test basis'}],
-            }
-            ok_full = await reg.execute('record_lesson_node', full_params)
-            self.assertIn('写入成功', ok_full)
+            self.assertIn('写入成功', ok_direct)
+            self.assertIn('写入成功', ok_arguments)
+            self.assertIn('写入成功', ok_input)
+            self.assertIn('不支持 kwargs envelope', bad_kwargs)
+            self.assertNotIn('unexpected keyword argument', bad_kwargs)
 
-            # Test 3: registry 无 arguments 解包：arguments 被当作普通 key
-            with_arguments_wrapper = await reg.execute('record_lesson_node', {
-                'arguments': full_params
-            })
-            self.assertIn('unexpected keyword argument', with_arguments_wrapper)
-
-            # Test 4: registry 无 input 解包：input 被当作普通 key
-            with_input_wrapper = await reg.execute('record_lesson_node', {
-                'input': full_params
-            })
-            self.assertIn('unexpected keyword argument', with_input_wrapper)
-
-            # Test 5: kwargs wrapper → Python 原生 TypeError
-            bad_kwargs = await reg.execute('record_lesson_node', {
-                'kwargs': full_params
-            })
-            self.assertIn('unexpected keyword argument', bad_kwargs)
+            created_ids = [item['node_id'] for item in tool.vault.created]
+            self.assertEqual(
+                created_ids,
+                ['LESSON_DOCTOR_BOUNDARY', 'LESSON_DOCTOR_BOUNDARY', 'LESSON_DOCTOR_BOUNDARY'],
+            )
 
             print(json.dumps({
                 'registry_class': reg.__class__.__module__ + '.' + reg.__class__.__name__,
                 'tool_class': tool.__class__.__module__ + '.' + tool.__class__.__name__,
                 'execute_signature': str(inspect.signature(tool.execute)),
-                'direct_missing_basis': direct_missing_basis[:100],
-                'ok_full': ok_full[:100],
-                'with_arguments_wrapper': with_arguments_wrapper[:100],
-                'with_input_wrapper': with_input_wrapper[:100],
-                'bad_kwargs': bad_kwargs[:100],
+                'ok_direct': ok_direct,
+                'ok_arguments': ok_arguments,
+                'ok_input': ok_input,
+                'bad_kwargs': bad_kwargs,
+                'created_ids': created_ids,
             }, ensure_ascii=False, indent=2))
 
 

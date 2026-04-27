@@ -20,6 +20,7 @@ import asyncio
 import logging
 import random
 import argparse
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -53,7 +54,7 @@ PIDFILE = RUNTIME_DIR / "autopilot.pid"
 # ── 任务库 ──────────────────────────────────────────────
 
 TASKS = {
-    # ─── 知识探索 (Multi-G + GP + C 全管线) ───
+    # ─── 知识探索 (Multi-G + G + Op + C 全管线) ───
     "explore": [
         {
             "label": "explore_ai_agents",
@@ -106,7 +107,7 @@ TASKS = {
         },
         {
             "label": "doctor_provider_audit",
-            "input": "用 Doctor 沙箱检查 provider 健康状态。检查 provider.py 的重试逻辑是否有 token 浪费风险。",
+            "input": "用 Doctor 沙箱检查 provider 健康状态。运行：./scripts/doctor.sh python \"from genesis.core.provider_manager import FreePoolManager; print(FreePoolManager.FREE_POOL_NAMES)\"。然后检查 provider.py 的重试逻辑是否有 token 浪费风险。",
             "covers": ["op_shell", "analysis"],
         },
         {
@@ -116,7 +117,7 @@ TASKS = {
         },
         {
             "label": "doctor_daemon_health",
-            "input": "检查后台守护进程的健康状态。运行：cat runtime/daemon.log | tail -50。分析最近的 cycle 产出，是否有异常或零产出。",
+            "input": "检查后台守护进程的健康状态。运行：cat runtime/daemon.log | tail -50。分析最近的 cycle 产出，是否有异常或零产出。然后检查 FreePoolManager 的 pool_status。",
             "covers": ["op_shell", "op_file", "analysis"],
         },
     ],
@@ -150,17 +151,17 @@ TASKS = {
         {
             "label": "challenge_async_debug",
             "input": "帮我写一个 Python asyncio 的并发限流器（semaphore + rate limiter 组合），要求：1) 最大并发数可配置 2) 每秒最大请求数可配置 3) 支持 async with 语法 4) 有完整的单元测试。写完后在 Doctor 沙箱中运行测试。",
-            "covers": ["gp_execute", "gp_file", "gp_shell"],
+            "covers": ["g_dispatch", "op_file", "op_shell", "multi_dispatch"],
         },
         {
             "label": "challenge_sqlite_tool",
             "input": "帮我写一个 SQLite 数据库健康检查脚本，功能：1) 检查 WAL 文件大小 2) 统计各表行数和大小 3) 检测碎片率 4) 输出 JSON 格式报告。对 runtime/genesis_v4.db 运行测试。",
-            "covers": ["gp_execute", "gp_file", "gp_shell"],
+            "covers": ["g_dispatch", "op_file", "op_shell"],
         },
         {
             "label": "challenge_log_analyzer",
             "input": "分析 runtime/daemon.log 的内容，写一个 Python 脚本统计：1) 每个 cycle 的耗时 2) 各任务（拾荒/发酵/验证/GC）的成功率 3) 免费池各 provider 的使用频率 4) 输出可视化报告（文本格式即可）。",
-            "covers": ["gp_execute", "gp_file", "gp_shell", "analysis"],
+            "covers": ["g_dispatch", "op_file", "op_shell", "analysis"],
         },
     ],
 
@@ -183,7 +184,7 @@ TASKS = {
         },
     ],
 
-    # ─── 快速任务 (/quick 跳过 Multi-G，测试纯 GP 路径) ───
+    # ─── 快速任务 (/quick 跳过 Multi-G，测试纯 G+Op 路径) ───
     "quick": [
         {
             "label": "quick_system_check",
@@ -222,12 +223,23 @@ def build_task_queue(category: str = None, shuffle: bool = True) -> list:
     return tasks
 
 
+
+
+def _atomic_write_pid(path: Path, pid: int):
+    """原子写入 PID 文件（tempfile + os.replace）"""
+    fd, tmp_path = tempfile.mkstemp(suffix='.tmp', prefix='autopilot_pid_', dir=str(path.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(str(pid))
+        os.replace(tmp_path, path)
+    except Exception:
+        os.unlink(tmp_path)
+        raise
+
 class AutopilotMetrics:
     """运行指标追踪"""
-    def __init__(self, run_id: str):
-        self.run_id = run_id
+    def __init__(self):
         self.started_at = datetime.now()
-        self.ended_at = None
         self.tasks_completed = 0
         self.tasks_failed = 0
         self.total_iterations = 0
@@ -260,39 +272,42 @@ class AutopilotMetrics:
         )
 
     def save(self):
-        """保存详细日志到 JSON"""
+        """保存详细日志到 JSON（原子写入）"""
         log_path = RUNTIME_DIR / "autopilot_results.json"
         data = {
-            "run_id": self.run_id,
             "started_at": self.started_at.isoformat(),
-            "ended_at": (self.ended_at or datetime.now()).isoformat(),
             "summary": self.summary(),
             "tasks": self.task_log,
         }
-        log_path.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".tmp", prefix="autopilot_results_", dir=str(RUNTIME_DIR))
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, log_path)
+        except Exception:
+            os.unlink(tmp_path)
+            raise
 
 
 class Autopilot:
     """Genesis 自动驾驶"""
 
-    def __init__(self, interval: int = 30, max_tasks: int = 0, category: str = None, run_id: str = None):
+    def __init__(self, interval: int = 30, max_tasks: int = 0, category: str = None):
         self.interval = interval
         self.max_tasks = max_tasks
         self.category = category
-        self.run_id = run_id or datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
-        self.metrics = AutopilotMetrics(self.run_id)
+        self.metrics = AutopilotMetrics()
         self.agent = None
         self._stop = False
 
     def _init_agent(self):
         """初始化 Genesis Agent（复用单实例）"""
         from factory import create_agent
-        logger.info(f"🧭 RUN_ID={self.run_id}")
         logger.info("🚀 初始化 Genesis Agent...")
         self.agent = create_agent()
         # Autopilot 模式：C-Phase 阻塞等待完成（保证知识写入）
         self.agent.c_phase_blocking = True
-        self._preferred_provider = getattr(self.agent.provider, '_preferred_provider_name', 'xcode')
+        self._preferred_provider = getattr(self.agent.provider, '_preferred_provider_name', 'aixj')
         logger.info(f"✅ Agent 就绪 | 首选 provider: {self._preferred_provider}")
 
     def _check_provider_guard(self) -> tuple:
@@ -307,8 +322,6 @@ class Autopilot:
     def _get_node_count(self) -> dict:
         """获取 knowledge_nodes 节点计数观测状态（中性 telemetry）。"""
         db = Path.home() / ".genesis" / "workshop_v4.sqlite"
-        if not db.exists():
-            db = Path.home() / ".nanogenesis" / "workshop_v4.sqlite"
         try:
             import sqlite3
             if not db.exists():
@@ -489,28 +502,18 @@ def main():
         pid = os.fork()
         if pid > 0:
             print(f"Autopilot started in background (PID {pid})")
-            PIDFILE.write_text(str(pid))
+            _atomic_write_pid(PIDFILE, pid)
             return
         # 子进程
         os.setsid()
 
-    run_id = datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
-
-    pid_meta = {
-        "run_id": run_id,
-        "pid": os.getpid(),
-        "started_at": datetime.now().isoformat(),
-        "entrypoint": "scripts/autopilot.py",
-        "argv": sys.argv[1:],
-    }
-    PIDFILE.write_text(json.dumps(pid_meta, ensure_ascii=False, indent=2))
-    logger.info(f"🧭 RUN_ID={run_id} started_at={pid_meta['started_at']}")
+    # 写 PID 文件
+    _atomic_write_pid(PIDFILE, os.getpid())
 
     pilot = Autopilot(
         interval=args.interval,
         max_tasks=args.max_tasks,
         category=args.category,
-        run_id=run_id,
     )
 
     # 信号处理
@@ -522,15 +525,6 @@ def main():
     try:
         asyncio.run(pilot.run())
     finally:
-        pilot.metrics.ended_at = datetime.now()
-        pilot.metrics.save()
-        try:
-            pid_meta["ended_at"] = pilot.metrics.ended_at.isoformat()
-            pid_meta["final_summary"] = pilot.metrics.summary()
-            PIDFILE.write_text(json.dumps(pid_meta, ensure_ascii=False, indent=2))
-        except Exception:
-            pass
-        logger.info(f"🧭 RUN_ID={run_id} ended_at={pilot.metrics.ended_at.isoformat()}")
         PIDFILE.unlink(missing_ok=True)
 
 

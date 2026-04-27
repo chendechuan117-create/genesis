@@ -27,9 +27,6 @@ def _format_file_success(action_title: str, path: Path, size: int, encoding: str
 class ReadFileTool(Tool):
     """读取文件工具"""
     
-    def is_concurrency_safe(self, arguments: Dict[str, Any]) -> bool:
-        return True  # 只读，可并行
-
     @property
     def name(self) -> str:
         return "read_file"
@@ -476,9 +473,6 @@ class GrepFilesTool(Tool):
 class ListDirectoryTool(Tool):
     """列出目录工具"""
     
-    def is_concurrency_safe(self, arguments: Dict[str, Any]) -> bool:
-        return True  # 只读，可并行
-
     @property
     def name(self) -> str:
         return "list_directory"
