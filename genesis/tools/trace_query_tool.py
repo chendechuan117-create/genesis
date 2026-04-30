@@ -205,6 +205,7 @@ class TraceQueryTool(Tool):
                     SELECT node_id, title, usage_success_count, usage_fail_count
                     FROM knowledge_nodes
                     WHERE type IN ('LESSON', 'CONTEXT', 'ASSET')
+                      AND ablation_active = 0
                       AND (title LIKE ? OR tags LIKE ?)
                     ORDER BY usage_success_count DESC
                     LIMIT 5

@@ -141,7 +141,7 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
             return "conditional"
         knowledge_state = reliability.get("knowledge_state")
         if knowledge_state == "unverified":
-            return "support"
+            return "conditional"  # PLS: 未验证≠无价值，入线数可能>0
         if knowledge_state == "historical":
             return "conditional"
         if ntype in ["ASSET", "LESSON", "CONTEXT"]:
@@ -194,23 +194,17 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
             parts.append(f"{row['node_id']}({reason})")
         return " | ".join(parts)
 
-    def _metric_score(self, node: Dict[str, Any]) -> float:
-        """UCB 战绩评分：未经测试的节点获得探索加成，随数据积累自然衰减。
+    def _topo_value(self, node: Dict[str, Any]) -> float:
+        """PLS 拓扑价值：入线数归一化。被更多新点基于它产生的点价值更高。
         
-        公式: exploitation + exploration_bonus
-        - exploitation = success_rate (0~1)
-        - exploration_bonus = sqrt(2 * ln(N+1) / (n+1))，N=全局总使用次数，n=该节点使用次数
-        - 未测试节点 ≈ 0.7，经过考验的好节点 > 0.8，失败多的节点 < 0.4
+        PLS 设计：价值信号 = 入线数（拓扑），不是 confidence 数字。
+        入线=0 → 0.5（探索前沿），入线越高→趋近 1.0（基础锚点）。
         """
-        success = node.get('usage_success_count', 0) or 0
-        fail = node.get('usage_fail_count', 0) or 0
-        n = success + fail
-        if n == 0:
-            return 0.7  # 探索奖励：给未测试节点显著高于旧版 0.5 的基线
-        exploitation = success / n
-        # 探索项：随 n 增大而衰减，让数据说话
-        exploration = math.sqrt(2.0 * math.log(n + 2) / (n + 1))
-        return min(1.0, exploitation + 0.15 * exploration)
+        inc = node.get('incoming_count', 0) or 0
+        if inc == 0:
+            return 0.5  # 探索前沿
+        # 对数归一化：1入线≈0.65, 3≈0.78, 10≈0.88, 30≈0.95
+        return min(1.0, 0.5 + 0.5 * math.log1p(inc) / math.log1p(30))
 
     def _type_rank(self, node: Dict[str, Any]) -> int:
         ntype = (node.get("ntype") or "").upper()
@@ -297,27 +291,26 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
         return score
 
     # ── 分数融合 (Score Fusion) ──
-    # 加权融合代替元组排序，每个信号归一化后按权重叠加
-    # 效用驱动检索（MemRL 启发）：metric(战绩) 是主信号，rerank(相关度) 是门槛
-    FUSION_WEIGHTS = {"rerank": 0.30, "trust": 0.15, "metric": 0.35, "signature": 0.20}
-    # reranker 不可用时，效用信号权重更高——缺乏相关度精排时，靠实战记录说话
-    FUSION_WEIGHTS_NO_RERANK = {"trust": 0.20, "metric": 0.50, "signature": 0.30}
+    # PLS: 加权融合——topo(入线数) 替代 metric(UCB战绩)，rerank(相关度) 是门槛
+    # 价值信号来自拓扑，不是数字评分
+    FUSION_WEIGHTS = {"rerank": 0.30, "topo": 0.35, "signature": 0.20, "trust": 0.15}
+    FUSION_WEIGHTS_NO_RERANK = {"topo": 0.45, "signature": 0.30, "trust": 0.25}
 
     def _fusion_score(self, row: Dict[str, Any], max_sig: float = 1.0) -> float:
         has_rerank = 'rerank_score' in row and row['rerank_score'] is not None
         reliability = row.get('reliability') or {}
         trust_raw = reliability.get('trust_score', 0.0)
-        trust = min(1.0, max(0.0, trust_raw / 10.0))  # trust_score 范围 ~0-10 归一化
-        metric = self._metric_score(row)
+        trust = min(1.0, max(0.0, trust_raw / 10.0))
+        topo = self._topo_value(row)  # PLS: 入线数替代 UCB 战绩
         sig_raw = row.get('signature_match_score', 0)
         sig = min(1.0, max(0.0, sig_raw / max(max_sig, 1.0))) if max_sig > 0 else 0.0
         if has_rerank:
             w = self.FUSION_WEIGHTS
             rerank = min(1.0, max(0.0, row.get('rerank_score', 0.0) or 0.0))
-            fused = w["rerank"] * rerank + w["trust"] * trust + w["metric"] * metric + w["signature"] * sig
+            fused = w["rerank"] * rerank + w["topo"] * topo + w["signature"] * sig + w["trust"] * trust
         else:
             w = self.FUSION_WEIGHTS_NO_RERANK
-            fused = w["trust"] * trust + w["metric"] * metric + w["signature"] * sig
+            fused = w["topo"] * topo + w["signature"] * sig + w["trust"] * trust
         if reliability.get('epoch_stale'):
             fused = max(0.0, fused - 0.18)
         invalidation_reason = reliability.get('invalidation_reason')
@@ -358,8 +351,10 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
             with conn:
                 query = ("SELECT node_id, type, title, tags, prerequisites, resolves, metadata_signature, "
                          "usage_count, usage_success_count, usage_fail_count, last_verified_at, "
-                         "verification_source, updated_at, trust_tier FROM knowledge_nodes "
+                         "verification_source, updated_at, trust_tier, is_virtual, ablation_active FROM knowledge_nodes "
                          "WHERE node_id NOT LIKE 'MEM_CONV%'"
+                         " AND COALESCE(is_virtual, 0) = 0"
+                         " AND COALESCE(ablation_active, 0) = 0"
                          " AND node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS')")
                 params = []
 
@@ -415,9 +410,13 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     return f"⚠️ [未命中] 未找到与 {keywords} 相关的 {ntype} 节点（字面+语义均无匹配）。当前处于未知区域，请基于通用能力处理。"
 
                 # 读时衰减：软淘汰 effective_confidence < 0.2 的节点
+                # PLS 修正：LESSON/CONTEXT/DISCOVERY 豁免——这些是 PLS 点，拓扑价值独立于 Arena 评分
                 query_str = " ".join(keywords) if keywords else ""
                 row_dicts = [normalize_node_dict(dict(r)) for r in rows]
-                row_dicts = [r for r in row_dicts if self.vault.effective_confidence(r) >= 0.2]
+                _pls_types = {'LESSON', 'CONTEXT', 'DISCOVERY'}
+                row_dicts = [r for r in row_dicts
+                             if self.vault.effective_confidence(r) >= 0.2
+                             or (r.get('type') or '').upper() in _pls_types]
                 # 虚点不直接出现在搜索结果中（仅通过 1-hop 邻居可见）
                 row_dicts = [r for r in row_dicts if not r.get('is_virtual')]
                 # 消融节点隐藏（真理区分：观察缺了它 LLM 是否仍能推出正确结论）
@@ -465,6 +464,12 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     row['reliability'] = self.vault.build_reliability_profile(row)
                     row['active_bucket'] = self._active_bucket(row)
                     row['active_reason'] = self._active_reason(row)
+                # PLS: 批量获取入线数，注入 row_dicts 供 _topo_value 使用
+                _all_ids_for_incoming = [r['node_id'] for r in row_dicts]
+                _incoming_map = self.vault.get_incoming_line_counts_batch(_all_ids_for_incoming) if _all_ids_for_incoming else {}
+                for r in row_dicts:
+                    r['incoming_count'] = _incoming_map.get(r['node_id'], 0)
+
                 # 分数融合：加权排序代替元组排序
                 max_sig = max((r.get('signature_match_score', 0) for r in row_dicts), default=1) or 1
                 for r in row_dicts:

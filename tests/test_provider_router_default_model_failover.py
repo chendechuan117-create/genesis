@@ -231,6 +231,9 @@ def test_aixj_responses_is_registered_but_not_in_failover_order(monkeypatch, rou
     assert router.failover_order == ['aixj', 'codex', 'gemini']
 
 
+@pytest.mark.asyncio
+async def test_provider_router_recovery_probe_restores_preferred_provider_default_model(monkeypatch, router_module):
+
 
 @pytest.mark.asyncio
 async def test_provider_router_recovery_probe_restores_preferred_provider_default_model(monkeypatch, router_module):

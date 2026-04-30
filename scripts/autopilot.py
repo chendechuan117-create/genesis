@@ -224,10 +224,8 @@ def build_task_queue(category: str = None, shuffle: bool = True) -> list:
 
 class AutopilotMetrics:
     """运行指标追踪"""
-    def __init__(self, run_id: str):
-        self.run_id = run_id
+    def __init__(self):
         self.started_at = datetime.now()
-        self.ended_at = None
         self.tasks_completed = 0
         self.tasks_failed = 0
         self.total_iterations = 0
@@ -263,9 +261,7 @@ class AutopilotMetrics:
         """保存详细日志到 JSON"""
         log_path = RUNTIME_DIR / "autopilot_results.json"
         data = {
-            "run_id": self.run_id,
             "started_at": self.started_at.isoformat(),
-            "ended_at": (self.ended_at or datetime.now()).isoformat(),
             "summary": self.summary(),
             "tasks": self.task_log,
         }
@@ -275,19 +271,17 @@ class AutopilotMetrics:
 class Autopilot:
     """Genesis 自动驾驶"""
 
-    def __init__(self, interval: int = 30, max_tasks: int = 0, category: str = None, run_id: str = None):
+    def __init__(self, interval: int = 30, max_tasks: int = 0, category: str = None):
         self.interval = interval
         self.max_tasks = max_tasks
         self.category = category
-        self.run_id = run_id or datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
-        self.metrics = AutopilotMetrics(self.run_id)
+        self.metrics = AutopilotMetrics()
         self.agent = None
         self._stop = False
 
     def _init_agent(self):
         """初始化 Genesis Agent（复用单实例）"""
         from factory import create_agent
-        logger.info(f"🧭 RUN_ID={self.run_id}")
         logger.info("🚀 初始化 Genesis Agent...")
         self.agent = create_agent()
         # Autopilot 模式：C-Phase 阻塞等待完成（保证知识写入）
@@ -494,23 +488,13 @@ def main():
         # 子进程
         os.setsid()
 
-    run_id = datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
-
-    pid_meta = {
-        "run_id": run_id,
-        "pid": os.getpid(),
-        "started_at": datetime.now().isoformat(),
-        "entrypoint": "scripts/autopilot.py",
-        "argv": sys.argv[1:],
-    }
-    PIDFILE.write_text(json.dumps(pid_meta, ensure_ascii=False, indent=2))
-    logger.info(f"🧭 RUN_ID={run_id} started_at={pid_meta['started_at']}")
+    # 写 PID 文件
+    PIDFILE.write_text(str(os.getpid()))
 
     pilot = Autopilot(
         interval=args.interval,
         max_tasks=args.max_tasks,
         category=args.category,
-        run_id=run_id,
     )
 
     # 信号处理
@@ -522,15 +506,6 @@ def main():
     try:
         asyncio.run(pilot.run())
     finally:
-        pilot.metrics.ended_at = datetime.now()
-        pilot.metrics.save()
-        try:
-            pid_meta["ended_at"] = pilot.metrics.ended_at.isoformat()
-            pid_meta["final_summary"] = pilot.metrics.summary()
-            PIDFILE.write_text(json.dumps(pid_meta, ensure_ascii=False, indent=2))
-        except Exception:
-            pass
-        logger.info(f"🧭 RUN_ID={run_id} ended_at={pilot.metrics.ended_at.isoformat()}")
         PIDFILE.unlink(missing_ok=True)
 
 

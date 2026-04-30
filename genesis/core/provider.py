@@ -144,13 +144,17 @@ class NativeHTTPProvider(BaseLLMProvider):
         """获取默认模型"""
         return self.default_model
 
+    def _is_deepseek_reasoning_model(self) -> bool:
+        """DeepSeek V4 Pro 等推理模型要求回传 thinking content"""
+        model = self.default_model or ""
+        return "deepseek-v4-pro" in model or "deepseek-v4-pro" in model.lower()
+
     # MiniMax 等模型在 assistant message 中注入的非标准字段，回传其他 API 会 400
     _STRIP_MSG_FIELDS = {"audio_content", "reasoning_details", "reasoning_content",
                          "input_sensitive", "output_sensitive", "input_sensitive_type",
                          "output_sensitive_type", "output_sensitive_int", "base_resp"}
 
-    @staticmethod
-    def _sanitize_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _sanitize_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """清洗消息列表，修复会导致 API 400 的格式问题：
         - content 为 None/空 → 填充占位符
         - name 为空字符串 → 删除该字段
@@ -220,7 +224,11 @@ class NativeHTTPProvider(BaseLLMProvider):
                 m.pop("name", None)
 
             # 清除非标准字段（MiniMax 等模型注入的额外字段）
-            for field in NativeHTTPProvider._STRIP_MSG_FIELDS:
+            # DeepSeek V4 Pro reasoning mode 要求回传 reasoning_content，不能剥离
+            strip_fields = NativeHTTPProvider._STRIP_MSG_FIELDS
+            if role == "assistant" and m.get("reasoning_content") and self._is_deepseek_reasoning_model():
+                strip_fields = [f for f in strip_fields if f != "reasoning_content"]
+            for field in strip_fields:
                 m.pop(field, None)
 
             cleaned.append(m)

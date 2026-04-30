@@ -123,6 +123,7 @@ def test_trace_round_marks_same_round_without_time_window(tmp_path):
 
         assert vault.get_same_round_ids(["PLS_SIBLING"], trace_id="tr-a", round_seq=7) == {"PLS_SIBLING"}
         assert vault.get_same_round_ids(["PLS_SIBLING"], trace_id="tr-b", round_seq=7) == set()
+        assert vault.get_same_round_ids(["PLS_SIBLING"]) == set()
 
         tool = RecordLessonNodeTool()
         tool.vault = vault
@@ -147,6 +148,101 @@ def test_trace_round_marks_same_round_without_time_window(tmp_path):
         ).fetchone()
         assert dict(row) == {"same_round": 1, "trace_id": "tr-a", "round_seq": 7}
         assert vault.get_incoming_line_count("PLS_SIBLING") == 0
+    finally:
+        reset_vault()
+
+
+def test_record_point_context_creation_drives_same_round_detection(tmp_path):
+    from genesis.tools.node_tools import RecordContextNodeTool, RecordLineTool, RecordPointTool
+
+    vault = make_vault(tmp_path)
+    try:
+        point_tool = RecordPointTool()
+        context_tool = RecordContextNodeTool()
+        line_tool = RecordLineTool()
+        point_tool.vault = vault
+        context_tool.vault = vault
+        line_tool.vault = vault
+
+        asyncio.run(point_tool.execute(
+            title="basis point",
+            content="basis",
+            node_id="PLS_BASIS_NEW",
+            _trace_id="tr-create",
+            _round_seq=1,
+        ))
+        asyncio.run(point_tool.execute(
+            title="child point",
+            content="child",
+            node_id="PLS_CHILD_NEW",
+            _trace_id="tr-create",
+            _round_seq=1,
+        ))
+        result = asyncio.run(line_tool.execute(
+            new_point_id="PLS_CHILD_NEW",
+            basis_point_id="PLS_BASIS_NEW",
+            reasoning="same GP turn",
+            _trace_id="tr-create",
+            _round_seq=1,
+        ))
+        assert "同轮" in result
+        assert vault.get_incoming_line_count("PLS_BASIS_NEW") == 0
+
+        asyncio.run(context_tool.execute(
+            node_id="CTX_SAME_ROUND",
+            title="same round ctx",
+            state_description="ctx",
+            _trace_id="tr-ctx",
+            _round_seq=3,
+        ))
+        asyncio.run(point_tool.execute(
+            title="ctx child",
+            content="ctx child",
+            node_id="PLS_CTX_CHILD",
+            _trace_id="tr-ctx",
+            _round_seq=3,
+        ))
+        result = asyncio.run(line_tool.execute(
+            new_point_id="PLS_CTX_CHILD",
+            basis_point_id="CTX_SAME_ROUND",
+            reasoning="same GP turn context anchor",
+            _trace_id="tr-ctx",
+            _round_seq=3,
+        ))
+        assert "同轮" in result
+        assert vault.get_incoming_line_count("CTX_SAME_ROUND") == 0
+
+        vault.create_node(
+            node_id="CTX_OLD_ANCHOR",
+            ntype="CONTEXT",
+            title="old anchor",
+            human_translation="old anchor",
+            tags="test",
+            full_content="old",
+        )
+        asyncio.run(context_tool.execute(
+            node_id="CTX_OLD_ANCHOR",
+            title="old anchor updated",
+            state_description="updated",
+            _trace_id="tr-old",
+            _round_seq=4,
+        ))
+        asyncio.run(point_tool.execute(
+            title="old anchor child",
+            content="old anchor child",
+            node_id="PLS_OLD_ANCHOR_CHILD",
+            _trace_id="tr-old",
+            _round_seq=4,
+        ))
+        result = asyncio.run(line_tool.execute(
+            new_point_id="PLS_OLD_ANCHOR_CHILD",
+            basis_point_id="CTX_OLD_ANCHOR",
+            reasoning="existing anchor remains old basis",
+            _trace_id="tr-old",
+            _round_seq=4,
+        ))
+        assert "异轮" in result
+        assert vault.get_incoming_line_count("CTX_OLD_ANCHOR") == 1
     finally:
         reset_vault()
 

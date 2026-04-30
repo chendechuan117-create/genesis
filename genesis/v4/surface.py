@@ -146,23 +146,19 @@ class SurfaceExpander:
         """
         excluded = excluded_ids or set()
         saturation_areas = saturation_areas or []
+        candidate_ids = set(incoming_counts.keys()) | set(seed_ids)
+        saturation_counts = {}
+        if saturation_areas and hasattr(self.vault, "get_saturation_penalty_counts"):
+            saturation_counts = self.vault.get_saturation_penalty_counts(list(candidate_ids), min_usage=3)
         visited = set()
         result = []
         queue = deque()
-
-        # 构建饱和区域快速查找
-        saturated_areas = {area for area, count in saturation_areas if count >= 3}
 
         def _calculate_priority(node_id: str, base_weight: float = 1.0) -> float:
             """计算节点优先级：入线数 * 边权重 * 饱和降权"""
             incoming = incoming_counts.get(node_id, 0)
             
-            # 饱和区域降权
-            saturation_penalty = 1.0
-            for area in saturated_areas:
-                if area.lower() in node_id.lower():
-                    saturation_penalty = 0.5
-                    break
+            saturation_penalty = 0.5 if saturation_counts.get(node_id, 0) > 0 else 1.0
             
             return incoming * base_weight * saturation_penalty
 

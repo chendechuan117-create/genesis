@@ -55,6 +55,34 @@ class ShellTool(Tool):
             except ImportError:
                 self.job_manager = None
 
+    # 只读命令模式 — 这些命令不修改文件系统，可并行执行
+    _READ_ONLY_PATTERNS = (
+        r'^\s*(cat|head|tail|less|more|ls|find|which|whereis|type|echo|pwd|'
+        r'stat|file|wc|diff|grep|rg|sed\s+-n|awk\s+.*print|sort|uniq|'
+        r'whoami|id|uname|hostname|date|uptime|free|df|du|ps|top|nvcc|'
+        r'python[0-9.]*\s+-c\s+.*import|python[0-9.]*\s+-m\s+pip\s+show|'
+        r'pip\s+show|pip\s+list|npm\s+list|cargo\s+--version|'
+        r'docker\s+(ps|images|inspect|logs|exec\s+.*\s+(cat|ls|head|tail|grep|find))|'
+        r'systemctl\s+status|journalctl|ss|netstat|ip\s+addr|ip\s+route|'
+        r'curl\s+.*--head|git\s+(status|log|diff|branch|remote|show)|'
+        r'env|printenv|echo)\b'
+    )
+
+    def is_concurrency_safe(self, arguments: Dict[str, Any]) -> bool:
+        """只读 shell 命令可并行，写操作不可并行。"""
+        import re
+        cmd = arguments.get("command", "")
+        if not cmd:
+            return True  # 空 command（如 poll/health_check）视为安全
+        action = arguments.get("action", "execute")
+        if action != "execute":
+            return True  # poll/list_jobs/health_check 只读
+        # 检查是否匹配只读模式
+        try:
+            return bool(re.match(self._READ_ONLY_PATTERNS, cmd.strip(), re.IGNORECASE))
+        except Exception:
+            return False
+
     @property
     def name(self) -> str:
         return "shell"
@@ -94,8 +122,7 @@ class ShellTool(Tool):
                 },
                 "cwd": {
                     "type": "string",
-                    "description": "工作目录",
-                    "default": None
+                    "description": "工作目录"
                 },
                 "is_daemon": {
                     "type": "boolean",

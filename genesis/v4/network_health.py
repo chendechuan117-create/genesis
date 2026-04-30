@@ -193,34 +193,33 @@ class NetworkHealthMonitor:
             trap_nodes = []
             
             rows = self._conn.execute(
-                """SELECT kn.node_id, kn.title, kn.usage_success_count, kn.usage_fail_count, kn.usage_count,
-                          COALESCE(inc.incoming, 0) as incoming_count
+                """SELECT kn.node_id, kn.title,
+                          COALESCE(inc.incoming, 0) as incoming_count,
+                          CASE WHEN ce.source_id IS NOT NULL THEN 1 ELSE 0 END as has_contradiction
                    FROM knowledge_nodes kn
                    LEFT JOIN (
                        SELECT basis_point_id, COUNT(*) as incoming
                        FROM reasoning_lines
                        GROUP BY basis_point_id
                    ) inc ON kn.node_id = inc.basis_point_id
+                   LEFT JOIN node_edges ce ON kn.node_id = ce.target_id AND ce.relation = 'CONTRADICTS'
                    WHERE kn.node_id NOT LIKE 'MEM_CONV%'
-                     AND kn.usage_count >= 3
                      AND kn.ablation_active = 0
                      AND inc.incoming >= 2
-                     AND (kn.usage_success_count * 1.0 / kn.usage_count) < 0.5
-                   ORDER BY inc.incoming DESC, (kn.usage_success_count * 1.0 / kn.usage_count) ASC
+                     AND ce.source_id IS NOT NULL
+                   ORDER BY inc.incoming DESC
                    LIMIT 10"""
             ).fetchall()
             
             for row in rows:
-                win_rate = (row['usage_success_count'] or 0) / max(row['usage_count'] or 1, 1)
-                if win_rate < 0.5 and row['incoming_count'] >= 2:  # 陷阱定义：高入线+低胜率
-                    trap_nodes.append({
-                        "node_id": row['node_id'],
-                        "title": row['title'][:80] + "..." if len(row['title']) > 80 else row['title'],
-                        "incoming_count": row['incoming_count'],
-                        "win_rate": round(win_rate, 3),
-                        "usage_count": row['usage_count'],
-                        "severity": "high" if win_rate < 0.3 else "medium"
-                    })
+                # PLS: 陷阱 = 高入线 + 有矛盾边（拓扑衰减信号），不是 win_rate
+                trap_nodes.append({
+                    "node_id": row['node_id'],
+                    "title": row['title'][:80] + "..." if len(row['title']) > 80 else row['title'],
+                    "incoming_count": row['incoming_count'],
+                    "has_contradiction": bool(row['has_contradiction']),
+                    "severity": "high" if row['incoming_count'] >= 5 else "medium"
+                })
             
             return {
                 "trap_count": len(trap_nodes),
@@ -402,7 +401,7 @@ class NetworkHealthMonitor:
         if traps.get("has_traps"):
             lines.append(f"🚨 陷阱节点 ({traps['trap_count']} 个):")
             for trap in traps["trap_nodes"][:3]:
-                lines.append(f"  • {trap['node_id']}: 入线{trap['incoming_count']}, 胜率{trap['win_rate']:.1%}")
+                lines.append(f"  • {trap['node_id']}: 入线{trap['incoming_count']}, 矛盾边={'是' if trap.get('has_contradiction') else '否'}")
             lines.append("")
         
         # 饱和区域

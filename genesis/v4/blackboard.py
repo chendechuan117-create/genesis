@@ -372,7 +372,7 @@ class Blackboard:
         确定性坡缩：对所有条目评分并排序。
         
         评分维度：
-        1. 基础分：节点 confidence × tier_weight + 验证动作具体性
+        1. 基础分：节点 topo_value(入线数) × tier_weight + 验证动作具体性
         2. 多样性加分：独占节点(别的透镜没引用) + ntype 覆盖广度
         3. 收敛度感知：全局收敛过高时自动记录软空洞
         
@@ -434,25 +434,30 @@ class Blackboard:
         return scored
     
     def _score_evidence(self, entry: EvidenceEntry, vault, global_node_refs=None) -> tuple[float, str]:
-        """对证据支撑型条目评分（含多样性加分）"""
+        """对证据支撑型条目评分（含多样性加分）— PLS 版：用入线数替代 effective_confidence"""
         evidence_score = 0.0
         node_details = []
         ntypes_seen = set()
         exclusive_count = 0
         
         if entry.evidence_node_ids:
-            from genesis.v4.arena_mixin import ArenaConfidenceMixin
             briefs = vault.get_node_briefs(entry.evidence_node_ids)
+            # PLS: 批量获取入线数
+            incoming_counts = vault.get_incoming_line_counts_batch(entry.evidence_node_ids) if hasattr(vault, 'get_incoming_line_counts_batch') else {}
             for nid in entry.evidence_node_ids:
                 brief = briefs.get(nid)
                 if not brief:
                     continue
-                conf = ArenaConfidenceMixin.effective_confidence(brief)
+                # PLS: 入线数作为拓扑价值，替代 effective_confidence
+                inc = incoming_counts.get(nid, 0)
+                # 对数归一化：0入线=0.3, 1≈0.5, 3≈0.65, 10≈0.8
+                import math
+                topo_value = 0.3 + 0.7 * math.log1p(inc) / math.log1p(30) if inc > 0 else 0.3
                 tier = brief.get("trust_tier") or "SCAVENGED"
                 weight = TIER_WEIGHT.get(tier, 0.6)
-                node_score = conf * weight
+                node_score = topo_value * weight
                 evidence_score += node_score
-                node_details.append(f"{nid}({conf:.2f}*{weight})")
+                node_details.append(f"{nid}(inc={inc}*{weight})")
                 ntypes_seen.add((brief.get("ntype") or "UNKNOWN").upper())
                 # 独占节点：只被这一个透镜引用
                 if global_node_refs and global_node_refs.get(nid, 0) <= 1:

@@ -132,8 +132,58 @@ cmd_exec() {
 #        SCRIPT
 cmd_run() {
     _ensure_running
-    docker exec -i -w /workspace -e PYTHONPATH=/workspace "$CONTAINER" \
-        bash -c 'cat > /tmp/_doctor_run.sh && bash /tmp/_doctor_run.sh; rm -f /tmp/_doctor_run.sh'
+    local timeout_secs="${DOCTOR_RUN_TIMEOUT_SECS:-600}"
+    local kill_after_secs="${DOCTOR_RUN_KILL_AFTER_SECS:-10}"
+    local job_id="doctor_run_$(date +%Y%m%d_%H%M%S)_$$"
+    docker exec -i -w /workspace -e PYTHONPATH=/workspace \
+        -e DOCTOR_RUN_TIMEOUT_SECS="$timeout_secs" \
+        -e DOCTOR_RUN_KILL_AFTER_SECS="$kill_after_secs" \
+        -e DOCTOR_RUN_JOB_ID="$job_id" \
+        "$CONTAINER" bash -c '
+set -u
+job_id="${DOCTOR_RUN_JOB_ID:-doctor_run_unknown}"
+timeout_secs="${DOCTOR_RUN_TIMEOUT_SECS:-600}"
+kill_after_secs="${DOCTOR_RUN_KILL_AFTER_SECS:-10}"
+case "$timeout_secs" in ""|*[!0-9]*) timeout_secs=600 ;; esac
+case "$kill_after_secs" in ""|*[!0-9]*) kill_after_secs=10 ;; esac
+[ "$timeout_secs" -gt 0 ] || timeout_secs=600
+[ "$kill_after_secs" -gt 0 ] || kill_after_secs=10
+script_path="/tmp/${job_id}.sh"
+child=""
+cat > "$script_path"
+chmod +x "$script_path"
+terminate_group() {
+    if [ -n "${child:-}" ]; then
+        kill -TERM -- "-$child" 2>/dev/null || kill -TERM "$child" 2>/dev/null || true
+        sleep "$kill_after_secs"
+        kill -KILL -- "-$child" 2>/dev/null || kill -KILL "$child" 2>/dev/null || true
+    fi
+}
+cleanup() {
+    rm -f "$script_path"
+}
+trap "terminate_group; cleanup; exit 143" INT TERM HUP
+trap "cleanup" EXIT
+setsid bash "$script_path" &
+child=$!
+deadline=$((SECONDS + timeout_secs))
+while kill -0 "$child" 2>/dev/null; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+        echo "[doctor-run] timeout after ${timeout_secs}s; terminating job ${job_id}" >&2
+        terminate_group
+        wait "$child" 2>/dev/null || true
+        exit 124
+    fi
+    sleep 1
+done
+wait "$child"
+code=$?
+if kill -TERM -- "-$child" 2>/dev/null; then
+    sleep "$kill_after_secs"
+    kill -KILL -- "-$child" 2>/dev/null || true
+fi
+exit "$code"
+'
 }
 
 cmd_python() {

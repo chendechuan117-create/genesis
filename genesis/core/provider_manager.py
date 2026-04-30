@@ -19,6 +19,7 @@ PROVIDER_KEY_MAP = {
     "newshrimp": "newshrimp_api_key",
     "newshrimp_backup": "newshrimp_api_key",
     "newshrimp_2": "newshrimp_2_api_key",
+    "newshrimp_2_backup": "newshrimp_2_api_key",
     "deepseek": "deepseek_api_key",
     "xcode_responses": "xcode_api_key",
 }
@@ -77,7 +78,7 @@ class ProviderRouter(LLMProvider):
                 logger.warning(f"Failed to build provider plugin '{name}': {e}")
         
         self.failover_order = [
-            name for name in ['newshrimp', 'newshrimp_2', 'newshrimp_backup', 'xcode', 'xcode_backup', 'deepseek'] if name in self.providers
+            name for name in ['newshrimp', 'newshrimp_2', 'newshrimp_backup', 'newshrimp_2_backup', 'xcode', 'xcode_backup', 'deepseek'] if name in self.providers
         ]
         self.active_provider_name = self.failover_order[0] if self.failover_order else 'xcode'
                 

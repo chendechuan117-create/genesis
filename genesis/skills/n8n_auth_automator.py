@@ -160,8 +160,7 @@ class N8NAuthAutomator(Tool):
             # 首先检查当前用户状态
             check_response = requests.get(
                 f"http://localhost:{n8n_port}/api/v1/me",
-                headers={"Authorization": f"Bearer {self._get_jwt_token()}"},
-                timeout=10
+                headers={"Authorization": f"Bearer {self._get_jwt_token()}"}
             )
             
             result = f"当前用户状态: {check_response.status_code}\n"

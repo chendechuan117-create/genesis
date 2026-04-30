@@ -476,7 +476,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
             if "record_context_node" in _unblocked and "record_point" in self.tools and i >= 8 and i % 5 == 3:
                 self.g_messages.append(Message(
                     role=MessageRole.SYSTEM,
-                    content="[知识路径] 回顾到目前为止是否形成了以后还会用到的新理解；如果只是复述或临时细节，不需要记录。若确实值得保存，用 record_point 写点，再用 record_line 连到依据节点；每条线的 reasoning 回答不同的因果问题。"
+                    content="[知识路径] 回顾你到目前为止的发现——有什么新认知值得写入知识库？先用 record_point 写点，再用 record_line 连到依据节点；每条线的 reasoning 回答不同的因果问题。"
                 ))
             
             self._llm_call_count += 1
@@ -787,11 +787,8 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
     def _route_from_cursor(self, cursor: Dict[str, Any]) -> Optional[str]:
         """确定性路由：沿游标节点 + 1-hop 邻居预加载"""
         node_ids = cursor["active_node_ids"][:8]
-        routed_ids, surface_roles, surface_result = self._expand_route_surface(node_ids, context_budget=24)
         return self._render_preloaded_nodes(
-            routed_ids, header="[知识游标] 上轮活跃节点组装的当轮面（连续任务，沿边导航）：",
-            surface_roles=surface_roles,
-            surface_result=surface_result,
+            node_ids, header="[知识游标] 上轮活跃节点（连续任务，沿边导航）："
         )
 
     def _route_from_vector_search(self, query_text: str) -> Optional[str]:
@@ -809,34 +806,13 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         node_ids = [r[0] for r in results]
         scores = {r[0]: r[1] for r in results}
         logger.info(f"Knowledge routing: vector search hit {len(node_ids)} nodes, top={scores.get(node_ids[0], 0):.3f}")
-        routed_ids, surface_roles, surface_result = self._expand_route_surface(node_ids, context_budget=24)
         return self._render_preloaded_nodes(
-            routed_ids, header=f"[知识预加载] 向量检索命中 {len(node_ids)} 节点并组装当轮面（无需为形式手动搜索）：",
+            node_ids, header=f"[知识预加载] 向量检索命中 {len(node_ids)} 节点（已自动遍历图谱，无需手动搜索）：",
             similarity_scores=scores,
-            surface_roles=surface_roles,
-            surface_result=surface_result,
         )
 
-    def _expand_route_surface(self, seed_ids: List[str], context_budget: int = 24) -> Tuple[List[str], Dict[str, str], Dict[str, Any]]:
-        try:
-            from genesis.v4.surface import SurfaceExpander
-            surface_result = SurfaceExpander(self.vault).expand_surface(seed_ids, context_budget=context_budget)
-            surface_nodes = surface_result.get("surface_nodes", []) if surface_result else []
-            if not surface_nodes:
-                return seed_ids, {}, {}
-            surface_ids = [nid for nid, _ in surface_nodes]
-            routed_ids = list(dict.fromkeys(seed_ids + surface_ids))
-            surface_roles = {nid: role for nid, role in surface_nodes}
-            logger.info(f"Knowledge routing: SurfaceExpander assembled {len(routed_ids)} nodes from {len(seed_ids)} seeds")
-            return routed_ids, surface_roles, surface_result
-        except Exception as e:
-            logger.debug(f"Knowledge routing surface expansion skipped: {e}")
-            return seed_ids, {}, {}
-
     def _render_preloaded_nodes(self, node_ids: List[str], header: str,
-                                 similarity_scores: Optional[Dict[str, float]] = None,
-                                 surface_roles: Optional[Dict[str, str]] = None,
-                                 surface_result: Optional[Dict[str, Any]] = None) -> Optional[str]:
+                                 similarity_scores: Optional[Dict[str, float]] = None) -> Optional[str]:
         """渲染预加载节点 + 1-hop 邻居为 GP 可读文本"""
         briefs = self.vault.get_node_briefs(node_ids)
         if not briefs:
@@ -863,7 +839,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
             title = brief.get("title", nid)
             ntype = brief.get("type", "?")
             inc = incoming_counts.get(nid, 0)
-            role = (surface_roles or {}).get(nid) or ("基础" if inc >= basis_threshold else "探索")
+            role = "基础" if inc >= basis_threshold else "探索"
             has_arena = (brief.get("usage_success_count", 0) or 0) or (brief.get("usage_fail_count", 0) or 0)
             arena_tag = " | 有实战" if has_arena else ""
             lines.append(f"  ● <{ntype}> {title} [{nid}] ({role}{arena_tag})")
@@ -898,12 +874,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         for nid in loaded_ids:
             if nid not in self.execution_active_nodes:
                 self.execution_active_nodes.append(nid)
-        if surface_result:
-            fill_count = surface_result.get("fill_count", 0)
-            push_count = surface_result.get("push_count", 0)
-            lines.append(f"\n[面状态] 已经完成填充→推进组装：基础节点 {fill_count} 个，探索节点 {push_count} 个。")
-            for area_hint, _ in surface_result.get("virtual_saturation", [])[:3]:
-                lines.append(f"[饱和] {area_hint}：该区域路径重叠频繁，优先转向不饱和邻域。")
+        
         lines.append(f"\n如需深入某个节点，用 get_knowledge_node_content 读取完整内容。")
         logger.info(f"Knowledge routing: pre-loaded {len(loaded_ids)} nodes + neighbors")
         return "\n".join(lines)

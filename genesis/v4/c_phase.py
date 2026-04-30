@@ -304,7 +304,7 @@ class CPhaseMixin:
                             tc_args = json.loads(tc_args)
                         except (json.JSONDecodeError, TypeError):
                             tc_args = {}
-                    if tc_name in ('record_lesson_node', 'record_context_node'):
+                    if tc_name in ('record_lesson_node', 'record_context_node', 'record_point', 'record_line'):
                         nid = tc_args.get('node_id', '')
                         title = tc_args.get('title', '')
                         reason = tc_args.get('because_reason', '')
@@ -323,7 +323,7 @@ class CPhaseMixin:
             if msg.role == MessageRole.TOOL and msg.content:
                 content_str = str(msg.content)
                 # 跳过知识工具的结果（已在上面单独提取）
-                if msg.name in ('record_lesson_node', 'record_context_node', 'record_discovery'):
+                if msg.name in ('record_lesson_node', 'record_context_node', 'record_discovery', 'record_point', 'record_line'):
                     continue
                 if msg.name == "shell":
                     tool_interactions.append(f"  [shell] {content_str[:250]}")

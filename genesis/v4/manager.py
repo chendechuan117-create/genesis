@@ -260,6 +260,16 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rl_basis ON reasoning_lines(basis_point_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rl_new ON reasoning_lines(new_point_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rl_trace_round ON reasoning_lines(trace_id, round_seq)")
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS point_creation_context (
+            node_id TEXT PRIMARY KEY,
+            trace_id TEXT,
+            round_seq INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (node_id) REFERENCES knowledge_nodes(node_id)
+        )
+        ''')
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pcc_trace_round ON point_creation_context(trace_id, round_seq)")
         # Schema migration: reasoning_lines 可能缺 same_round 列（IF NOT EXISTS 不加列）
         try:
             rl_cols = [r[1] for r in conn.execute("PRAGMA table_info(reasoning_lines)").fetchall()]
@@ -443,63 +453,6 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
 
     # ─── Environment Epoch methods → environment_mixin.py ───
     # ─── Confidence/Reliability/Arena methods → arena_mixin.py ───
-    def audit_signatures(self, limit: int = 50) -> Dict[str, int]:
-        """批量审计节点签名，补齐失效原因并返回修复统计。"""
-        try:
-            limit = max(int(limit or 0), 0)
-        except Exception:
-            limit = 50
-
-        stats = {
-            "audited": 0,
-            "fixed_normalize": 0,
-            "fixed_blacklist": 0,
-            "fixed_contradiction": 0,
-            "fixed_invalidation_reason": 0,
-        }
-        if limit == 0:
-            return stats
-
-        rows = self._conn.execute(
-            "SELECT node_id, metadata_signature, verification_source, type FROM knowledge_nodes ORDER BY updated_at DESC, rowid DESC LIMIT ?",
-            (limit,),
-        ).fetchall()
-
-        for row in rows:
-            stats["audited"] += 1
-            original_sig = self.signature.parse(row["metadata_signature"])
-            working_sig = dict(original_sig)
-
-            active_environment_epoch = ""
-            environment_scope = working_sig.get("applies_to_environment_scope") or working_sig.get("environment_scope") or ""
-            if environment_scope:
-                active_environment = self.get_active_environment_epoch(environment_scope)
-                active_environment_epoch = active_environment["epoch_id"] if active_environment else ""
-
-            inferred_reason = self.signature.infer_invalidation_reason(
-                working_sig,
-                verification_source=row["verification_source"] or "",
-                active_environment_epoch=active_environment_epoch,
-            )
-            had_reason = bool(self.signature.resolve_invalidation_reason(working_sig))
-            if inferred_reason and not had_reason:
-                working_sig["invalidation_reason"] = inferred_reason
-
-            normalized_sig = self.signature.normalize(working_sig)
-
-            if normalized_sig != original_sig:
-                before_reason = self.signature.resolve_invalidation_reason(original_sig)
-                after_reason = self.signature.resolve_invalidation_reason(normalized_sig)
-                if not before_reason and after_reason:
-                    stats["fixed_invalidation_reason"] += 1
-                self.patch_node_metadata(
-                    row["node_id"],
-                    metadata_signature=normalized_sig,
-                    verification_source=row["verification_source"],
-                )
-
-        return stats
-
 
     def patch_node_metadata(self, node_id: str, **kwargs) -> bool:
         """统一的节点元数据补丁接口（daemon/工具共用）。
@@ -550,6 +503,106 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         except Exception as e:
             logger.error(f"patch_node_metadata failed for {node_id}: {e}")
             return False
+
+    def audit_signatures(self, limit: int = 50) -> Dict[str, Any]:
+        """
+        签名质量审计（算法层）：
+        1. 内容重推断对比：用 signature.infer 重推断，与存储签名比较
+        2. 黑名单清洗：删除自定义维度中的运营垃圾字段
+        3. 规范化修复：确保 sort/dedup/cap 一致性
+        4. invalidation_reason 补填：对已过时节点补填缺失的 reason
+
+        自动修复可修的问题，返回审计统计。
+        供 BackgroundDaemon 定期调用。
+        """
+        rows = self._conn.execute(
+            """SELECT k.node_id, k.metadata_signature, k.type, k.title,
+                      nc.full_content
+               FROM knowledge_nodes k
+               LEFT JOIN node_contents nc ON k.node_id = nc.node_id
+               WHERE k.node_id NOT LIKE 'MEM_CONV%'
+                 AND k.metadata_signature IS NOT NULL
+                 AND k.metadata_signature != '{}'
+               ORDER BY k.updated_at ASC
+               LIMIT ?""",
+            (limit,)
+        ).fetchall()
+
+        stats = {"audited": 0, "fixed_normalize": 0, "fixed_blacklist": 0,
+                 "fixed_contradiction": 0, "fixed_invalidation_reason": 0,
+                 "unchanged": 0}
+
+        for row in rows:
+            node_id = row["node_id"]
+            content = row["full_content"] or row["title"] or ""
+            try:
+                stored_sig = json.loads(row["metadata_signature"]) if isinstance(
+                    row["metadata_signature"], str) else row["metadata_signature"]
+            except Exception:
+                continue
+            if not isinstance(stored_sig, dict):
+                continue
+
+            stats["audited"] += 1
+            new_sig = dict(stored_sig)
+            changed = False
+
+            # 1. 规范化修复（sort/dedup/cap）
+            normalized = self.signature.normalize(stored_sig)
+            if json.dumps(normalized, sort_keys=True) != json.dumps(stored_sig, sort_keys=True):
+                new_sig = normalized
+                changed = True
+                stats["fixed_normalize"] += 1
+
+            # 2. 黑名单清洗
+            blacklist_hits = [k for k in new_sig if k in _DIM_OPERATIONAL_BLACKLIST]
+            if blacklist_hits:
+                for k in blacklist_hits:
+                    del new_sig[k]
+                changed = True
+                stats["fixed_blacklist"] += 1
+
+            # 3. 内容重推断对比（仅核心字段）
+            if content and len(content) > 20:
+                re_inferred = self.signature.infer(content[:2000])
+                for key in ["language", "runtime", "os_family", "framework"]:
+                    stored_val = new_sig.get(key)
+                    inferred_val = re_inferred.get(key)
+                    if not stored_val or not inferred_val:
+                        continue
+                    stored_set = set(stored_val if isinstance(stored_val, list) else [stored_val])
+                    inferred_set = set(inferred_val if isinstance(inferred_val, list) else [inferred_val])
+                    if stored_set and inferred_set and not (stored_set & inferred_set):
+                        merged = sorted(stored_set | inferred_set)[:3]
+                        new_sig[key] = merged if len(merged) > 1 else merged[0]
+                        changed = True
+                        stats["fixed_contradiction"] += 1
+                        logger.info(f"SigAudit [{node_id}] {key}: {stored_val} ⊕ {inferred_val} → {new_sig[key]}")
+
+            # 4. invalidation_reason 补填
+            if new_sig.get("validation_status") in ("outdated", "superseded") and "invalidation_reason" not in new_sig:
+                inferred_reason = self.signature.infer_invalidation_reason(new_sig)
+                if inferred_reason:
+                    new_sig["invalidation_reason"] = inferred_reason
+                    changed = True
+                    stats["fixed_invalidation_reason"] += 1
+
+            if changed:
+                self._conn.execute(
+                    "UPDATE knowledge_nodes SET metadata_signature = ?, updated_at = CURRENT_TIMESTAMP WHERE node_id = ?",
+                    (json.dumps(new_sig, ensure_ascii=False), node_id)
+                )
+            else:
+                stats["unchanged"] += 1
+
+        if stats["audited"] > 0:
+            self._conn.commit()
+            fixed = stats["fixed_normalize"] + stats["fixed_blacklist"] + stats["fixed_contradiction"] + stats["fixed_invalidation_reason"]
+            if fixed > 0:
+                logger.info(f"SigAudit: {stats['audited']} audited, {fixed} fixed "
+                            f"(norm={stats['fixed_normalize']}, blacklist={stats['fixed_blacklist']}, "
+                            f"contradict={stats['fixed_contradiction']}, inv_reason={stats['fixed_invalidation_reason']})")
+        return stats
 
     VERSION_KEEP_LIMIT = 5
 
@@ -721,6 +774,18 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
 
     # ── 推理线接口（点线面架构）──
 
+    def record_node_creation_context(self, node_id: str, trace_id: str = None, round_seq: int = None):
+        try:
+            if not node_id:
+                return
+            self._conn.execute(
+                "INSERT OR REPLACE INTO point_creation_context (node_id, trace_id, round_seq, created_at) VALUES (?,?,?,CURRENT_TIMESTAMP)",
+                (node_id, trace_id, round_seq)
+            )
+            self._conn.commit()
+        except Exception as e:
+            logger.debug(f"record_node_creation_context failed: {e}")
+
     def create_reasoning_line(self, new_point_id: str, basis_point_id: str, reasoning: str = "", source: str = "GP", same_round: int = 0, trace_id: str = None, round_seq: int = None):
         """创建一条推理线：新点基于旧点产生"""
         try:
@@ -802,22 +867,33 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         except Exception:
             return set()
 
-    def find_collision_candidates(self, basis_ids: list, min_overlap: int = 2) -> list:
+    def find_collision_candidates(self, basis_ids: list, min_overlap: int = 2, exclude_ids: list = None) -> list:
         """碰撞检测：查找与给定 basis_ids 有重叠的已有节点。
         返回 [(new_point_id, overlap_count, title), ...] 按重叠数降序"""
         if not basis_ids:
             return []
         try:
+            exclude_ids = list(exclude_ids or [])
             placeholders = ",".join("?" * len(basis_ids))
+            exclude_clause = ""
+            params = list(basis_ids)
+            if exclude_ids:
+                exclude_placeholders = ",".join("?" * len(exclude_ids))
+                exclude_clause = f" AND rl.new_point_id NOT IN ({exclude_placeholders})"
+                params.extend(exclude_ids)
+            params.append(min_overlap)
             rows = self._conn.execute(
-                f"""SELECT new_point_id, COUNT(*) as overlap
-                FROM reasoning_lines
-                WHERE basis_point_id IN ({placeholders})
-                GROUP BY new_point_id
+                f"""SELECT rl.new_point_id, COUNT(*) as overlap
+                FROM reasoning_lines rl
+                JOIN knowledge_nodes k ON k.node_id = rl.new_point_id
+                WHERE rl.basis_point_id IN ({placeholders})
+                  AND COALESCE(k.is_virtual, 0) = 0
+                  {exclude_clause}
+                GROUP BY rl.new_point_id
                 HAVING overlap >= ?
                 ORDER BY overlap DESC
                 LIMIT 5""",
-                basis_ids + [min_overlap]
+                params
             ).fetchall()
             # 补充标题
             result = []
@@ -852,6 +928,12 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
                     "UPDATE knowledge_nodes SET usage_count = usage_count + 1 WHERE node_id = ?",
                     (vid,)
                 )
+                if basis_overlap_ids:
+                    for bid in basis_overlap_ids[:3]:
+                        self._conn.execute(
+                            "INSERT OR IGNORE INTO node_edges (source_id, target_id, relation) VALUES (?,?,?)",
+                            (vid, bid, "RELATED_TO")
+                        )
                 self._conn.commit()
                 logger.debug(f"Virtual point incremented: [{vid}] (area={area_hint}, count={existing[1]+1})")
             else:
@@ -900,7 +982,7 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             # 统计虚点
             nh_placeholders = ",".join("?" * len(neighbor_ids))
             virtual_rows = self._conn.execute(
-                f"""SELECT node_id, title FROM knowledge_nodes
+                f"""SELECT node_id, title, COALESCE(usage_count, 1) as usage_count FROM knowledge_nodes
                 WHERE node_id IN ({nh_placeholders}) AND is_virtual = 1""",
                 neighbor_ids
             ).fetchall()
@@ -909,13 +991,40 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             # 按区域聚合（取 title 前4字符作为区域标识，兼容中文）
             from collections import Counter
             area_counts = Counter()
-            for vid, vtitle in virtual_rows:
-                area = vtitle[:4] if len(vtitle) >= 4 else vtitle
-                area_counts[area] += 1
+            for vid, vtitle, usage_count in virtual_rows:
+                area = vtitle[3:] if vtitle.startswith("饱和:") else vtitle
+                area_counts[area] += max(1, int(usage_count or 1))
             return [(area, count) for area, count in area_counts.most_common(5)]
         except Exception as e:
             logger.error(f"get_virtual_saturation failed: {e}")
             return []
+
+    def get_saturation_penalty_counts(self, node_ids: list, min_usage: int = 3) -> dict:
+        if not node_ids:
+            return {}
+        try:
+            node_set = set(node_ids)
+            placeholders = ",".join("?" * len(node_ids))
+            rows = self._conn.execute(
+                f"""SELECT e.source_id, e.target_id, v.node_id, COALESCE(v.usage_count, 1) as usage_count
+                FROM node_edges e
+                JOIN knowledge_nodes v ON v.node_id = e.source_id OR v.node_id = e.target_id
+                WHERE (e.source_id IN ({placeholders}) OR e.target_id IN ({placeholders}))
+                  AND COALESCE(v.is_virtual, 0) = 1""",
+                node_ids + node_ids
+            ).fetchall()
+            counts = {}
+            for source_id, target_id, virtual_id, usage_count in rows:
+                usage = int(usage_count or 1)
+                if usage < min_usage:
+                    continue
+                node_id = target_id if source_id == virtual_id else source_id
+                if node_id in node_set:
+                    counts[node_id] = counts.get(node_id, 0) + usage
+            return counts
+        except Exception as e:
+            logger.error(f"get_saturation_penalty_counts failed: {e}")
+            return {}
 
     # ── 面组装辅助查询（供 SurfaceExpander 使用）──
 
@@ -1010,13 +1119,13 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             return []
 
     def get_excluded_ids(self, candidate_ids: list) -> set:
-        """获取消融中的节点 ID 集合（ablation_active > 0）"""
+        """获取不参与面扩散的节点 ID 集合（消融节点 + 虚点）"""
         if not candidate_ids:
             return set()
         try:
             placeholders = ",".join("?" * len(candidate_ids))
             rows = self._conn.execute(
-                f"SELECT node_id FROM knowledge_nodes WHERE node_id IN ({placeholders}) AND ablation_active > 0",
+                f"SELECT node_id FROM knowledge_nodes WHERE node_id IN ({placeholders}) AND (ablation_active > 0 OR COALESCE(is_virtual, 0) = 1)",
                 list(candidate_ids)
             ).fetchall()
             return {r[0] for r in rows}
@@ -1024,14 +1133,14 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             return set()
 
     def get_gardener_ablation_candidates(self, candidate_ids: list, limit: int = 10) -> list:
-        """园丁协同：识别高入线+低胜率的节点，优先消融
+        """园丁协同：识别高入线+有矛盾边的节点，优先消融
         
-        园丁机制：检测"看起来可靠但实际表现差"的节点
-        - 高入线数：被很多节点引用（看起来重要）
-        - 低胜率：实际使用成功率低（陷阱节点）
+        PLS 版：消融信号来自拓扑（入线数 + CONTRADICTS 边），不是 usage win_rate。
+        - 高入线数：被很多节点引用（曾经重要）
+        - 有 CONTRADICTS 边：已被新知识否定（拓扑衰减信号）
         
         Returns:
-            [(node_id, incoming_count, win_rate, title), ...] 按优先级降序
+            [(node_id, incoming_count, has_contradiction, title), ...] 按优先级降序
         """
         if not candidate_ids:
             return []
@@ -1039,8 +1148,9 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         try:
             placeholders = ",".join("?" * len(candidate_ids))
             rows = self._conn.execute(
-                f"""SELECT kn.node_id, kn.title, kn.usage_success_count, kn.usage_fail_count, kn.usage_count,
-                          COALESCE(inc.incoming, 0) as incoming_count
+                f"""SELECT kn.node_id, kn.title,
+                          COALESCE(inc.incoming, 0) as incoming_count,
+                          CASE WHEN ce.source_id IS NOT NULL THEN 1 ELSE 0 END as has_contradiction
                    FROM knowledge_nodes kn
                    LEFT JOIN (
                        SELECT basis_point_id, COUNT(*) as incoming
@@ -1048,30 +1158,27 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
                        WHERE basis_point_id IN ({placeholders})
                        GROUP BY basis_point_id
                    ) inc ON kn.node_id = inc.basis_point_id
+                   LEFT JOIN node_edges ce ON kn.node_id = ce.target_id AND ce.relation = 'CONTRADICTS'
                    WHERE kn.node_id IN ({placeholders})
-                     AND kn.usage_count >= 3  -- 至少有3次使用记录
                      AND kn.ablation_active = 0  -- 未被消融
-                   ORDER BY incoming_count DESC, (kn.usage_success_count * 1.0 / kn.usage_count) ASC
+                   ORDER BY has_contradiction DESC, incoming_count DESC
                    LIMIT ?""",
                 candidate_ids + candidate_ids + [limit]
             ).fetchall()
             
             candidates = []
             for row in rows:
-                node_id, title, wins, losses, total, incoming = row
-                win_rate = wins / total if total > 0 else 0.0
+                node_id, title, incoming, has_contradiction = row
                 
-                # 园丁评分：入线数越高且胜率越低，优先级越高
-                gardener_score = incoming * (1.0 - win_rate)
+                # PLS 园丁评分：有矛盾边 + 高入线 = 优先消融
+                # 矛盾边是拓扑衰减信号（比 win_rate 更可靠）
+                gardener_score = incoming * (2.0 if has_contradiction else 1.0)
                 
                 candidates.append({
                     'node_id': node_id,
                     'title': title,
                     'incoming_count': incoming,
-                    'usage_success_count': wins,
-                    'usage_fail_count': losses,
-                    'usage_count': total,
-                    'win_rate': win_rate,
+                    'has_contradiction': bool(has_contradiction),
                     'gardener_score': gardener_score
                 })
             
@@ -1106,7 +1213,7 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
                 
                 logger.info(
                     f"Gardener ablated {node_id}: incoming={candidate['incoming_count']}, "
-                    f"win_rate={candidate['win_rate']:.2f}, title='{candidate['title'][:50]}...'"
+                    f"has_contradiction={candidate.get('has_contradiction')}, title='{candidate['title'][:50]}...'"
                 )
                 ablated_count += 1
                 
@@ -1140,32 +1247,18 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         try:
             if trace_id and round_seq is not None:
                 placeholders = ",".join("?" * len(node_ids))
-                rows = self._conn.execute(
+                creation_rows = self._conn.execute(
+                    f"SELECT node_id FROM point_creation_context WHERE node_id IN ({placeholders}) AND trace_id = ? AND round_seq = ?",
+                    node_ids + [trace_id, round_seq]
+                ).fetchall()
+                same_round = {r[0] for r in creation_rows}
+                line_rows = self._conn.execute(
                     f"SELECT DISTINCT new_point_id FROM reasoning_lines WHERE new_point_id IN ({placeholders}) AND trace_id = ? AND round_seq = ?",
                     node_ids + [trace_id, round_seq]
                 ).fetchall()
-                return {r[0] for r in rows}
-            import time
-            now = time.time()
-            placeholders = ",".join("?" * len(node_ids))
-            rows = self._conn.execute(
-                f"SELECT node_id, created_at FROM knowledge_nodes WHERE node_id IN ({placeholders})",
-                node_ids
-            ).fetchall()
-            same_round = set()
-            for row in rows:
-                try:
-                    ca = row[1]
-                    if isinstance(ca, (int, float)) and now - ca < window_seconds:
-                        same_round.add(row[0])
-                    elif isinstance(ca, str) and ca:
-                        from datetime import datetime
-                        dt = datetime.fromisoformat(ca.replace("Z", "+00:00"))
-                        if (now - dt.timestamp()) < window_seconds:
-                            same_round.add(row[0])
-                except Exception:
-                    pass
-            return same_round
+                same_round.update(r[0] for r in line_rows)
+                return same_round
+            return set()
         except Exception:
             return set()
 
@@ -1504,7 +1597,7 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         rows = self._conn.execute(sql, (*params, limit)).fetchall()
         return [normalize_node_dict(dict(r)) for r in rows]
 
-    def get_related_nodes(self, node_id: str, relation: str = None, direction: str = "out") -> List[Dict[str, Any]]:
+    def get_related_nodes(self, node_id: str, relation: str = None, direction: str = "out", include_virtual: bool = False, include_ablation: bool = False) -> List[Dict[str, Any]]:
         """获取与指定节点相连的节点 (1-hop)
         direction: 'out' (source=node_id), 'in' (target=node_id), 'both'
         """
@@ -1515,7 +1608,7 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         if direction == "out":
             query = """
                 SELECT ne.relation, ne.weight, kn.node_id, kn.type AS ntype, kn.title, kn.tags,
-                       kn.confidence_score, kn.trust_tier, kn.usage_count
+                       kn.confidence_score, kn.trust_tier, kn.usage_count, kn.is_virtual, kn.ablation_active
                 FROM node_edges ne
                 JOIN knowledge_nodes kn ON ne.target_id = kn.node_id
                 WHERE ne.source_id = ?
@@ -1524,7 +1617,7 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         elif direction == "in":
             query = """
                 SELECT ne.relation, ne.weight, kn.node_id, kn.type AS ntype, kn.title, kn.tags,
-                       kn.confidence_score, kn.trust_tier, kn.usage_count
+                       kn.confidence_score, kn.trust_tier, kn.usage_count, kn.is_virtual, kn.ablation_active
                 FROM node_edges ne
                 JOIN knowledge_nodes kn ON ne.source_id = kn.node_id
                 WHERE ne.target_id = ?
@@ -1534,6 +1627,10 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         if relation:
             query += " AND ne.relation = ?"
             params.append(relation)
+        if not include_virtual:
+            query += " AND COALESCE(kn.is_virtual, 0) = 0"
+        if not include_ablation:
+            query += " AND COALESCE(kn.ablation_active, 0) = 0"
             
         rows = conn.execute(query, tuple(params)).fetchall()
         return [normalize_node_dict(dict(r)) for r in rows]
@@ -1553,6 +1650,7 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         return self.query.generate_l1_digest(max_nodes)
 
     def get_all_titles(self) -> str:
+        """DEPRECATED: 泄露 confidence_score 数字，且无活跃调用路径。用 generate_l1_digest() 替代。"""
         """给 G 看的极轻量目录卡片（排除对话记忆节点，记忆走单独通道）"""
         rows = self._conn.execute(
             "SELECT node_id, type, title, tags, prerequisites, resolves, metadata_signature, confidence_score, last_verified_at, verification_source, updated_at FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%' ORDER BY usage_count DESC"

@@ -212,14 +212,14 @@ class KnowledgeQuery:
 
             lines.append("")
 
-        # 基础（高入线数，已被反复验证）
+        # 基础（高入线数，已被反复验证）——含被矛盾标记的节点
         top_incoming = self._conn.execute(
             """SELECT rl.basis_point_id, COUNT(*) as incoming, kn.type, kn.title,
-                      kn.usage_success_count, kn.usage_fail_count, kn.usage_count
+                      CASE WHEN ne.source_id IS NOT NULL THEN 1 ELSE 0 END as has_contradiction
                FROM reasoning_lines rl
                JOIN knowledge_nodes kn ON rl.basis_point_id = kn.node_id
+               LEFT JOIN node_edges ne ON kn.node_id = ne.target_id AND ne.relation = 'CONTRADICTS'
                WHERE kn.node_id NOT LIKE 'MEM_CONV%'
-                 AND kn.node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS')
                GROUP BY rl.basis_point_id
                ORDER BY incoming DESC
                LIMIT 4"""
@@ -227,14 +227,9 @@ class KnowledgeQuery:
         if top_incoming:
             lines.append("基础:")
             for r in top_incoming:
-                # 计算胜率，检测陷阱
-                wins = r['usage_success_count'] or 0
-                losses = r['usage_fail_count'] or 0
-                total = r['usage_count'] or 0
-                trap_marker = ""
-                if total >= 3 and wins / total < 0.5:  # 至少3次使用且胜率<50%
-                    trap_marker = " ⚠️陷阱"
-                lines.append(f"  {r['basis_point_id']} <{r['type']}> {r['title']}{trap_marker}")
+                # PLS: 用矛盾边标记而非 usage 胜率
+                contradiction_marker = " ⚔️矛盾" if r['has_contradiction'] else ""
+                lines.append(f"  {r['basis_point_id']} <{r['type']}> {r['title']}{contradiction_marker}")
             lines.append("")
 
         # 探索（入线=0，尚未被验证的前沿）
@@ -288,16 +283,14 @@ class KnowledgeQuery:
         return "\n".join(lines)
 
     def generate_l1_digest(self, max_nodes: int = 20) -> str:
-        """L1 压缩知识摘要：用 effective_confidence 选出最鲜活的节点。
+        """L1 压缩知识摘要（PLS 版）：用入线数（拓扑价值）选出节点。
 
         替代 generate_map 注入 GP prompt。目标 ~500-800 tokens。
         设计：
-          - 按 effective_confidence 降序排，只保留 ≥0.2 的节点
+          - 按入线数降序排（拓扑价值 = 被多少新点基于它产生）
           - 按 type 分组，每组最多 6 个，每个节点一行
           - 附带 VOID 计数 + 最近 DISCOVERY
         """
-        from genesis.v4.arena_mixin import ArenaConfidenceMixin
-
         # 分层采样：每种类型取最近 30 条，避免单一类型垄断候选池
         type_names = self._conn.execute(
             "SELECT DISTINCT type FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%' AND ablation_active = 0"
@@ -321,21 +314,25 @@ class KnowledgeQuery:
         if not all_candidates:
             return "[L1] 知识库为空"
 
-        # 计算 effective_confidence 并过滤，按类型分组
+        # PLS: 批量获取入线数，按拓扑价值排序
+        all_ids = [dict(r)['node_id'] for r in all_candidates]
+        incoming_counts = self._conn.execute(
+            """SELECT basis_point_id, COUNT(*) as incoming FROM reasoning_lines
+               WHERE basis_point_id IN ({}) GROUP BY basis_point_id""".format(
+                   ','.join('?' * len(all_ids))
+               ), all_ids
+        ).fetchall()
+        inc_map = {r['basis_point_id']: r['incoming'] for r in incoming_counts}
+
         by_type_all = defaultdict(list)
         for r in all_candidates:
             d = dict(r)
-            eff = ArenaConfidenceMixin.effective_confidence(d)
-            if eff >= 0.2:
-                d['eff_conf'] = eff
-                by_type_all[d['type']].append(d)
-
-        if not by_type_all:
-            return "[L1] 所有节点已衰减（eff<0.2），知识库需要刷新"
+            d['incoming'] = inc_map.get(d['node_id'], 0)
+            by_type_all[d['type']].append(d)
 
         # 按类型分配配额：每种类型至少 1 个，剩余按比例
         for items in by_type_all.values():
-            items.sort(key=lambda x: x['eff_conf'], reverse=True)
+            items.sort(key=lambda x: x['incoming'], reverse=True)
         n_types = len(by_type_all)
         remaining = max(0, max_nodes - n_types)
         total_candidates = sum(len(v) for v in by_type_all.values())
@@ -374,30 +371,15 @@ class KnowledgeQuery:
 
     @staticmethod
     def _render_l1_group(lines: list, ntype: str, nodes: list, max_per_group: int = 6):
-        """渲染 L1 单个类型分组（紧凑格式）"""
+        """渲染 L1 单个类型分组（紧凑格式，PLS 版）"""
         shown = nodes[:max_per_group]
         lines.append(f"{ntype} ({len(nodes)}):")
         for d in shown:
-            w = d.get('usage_success_count') or 0
-            l = d.get('usage_fail_count') or 0
-            total = (d.get('usage_count') or 0)
-            
-            # 检测陷阱（高入线+低胜率）
-            trap_marker = ""
-            if total >= 3 and w / total < 0.5:
-                trap_marker = " ⚠️"
-            
-            # 检测矛盾
+            # PLS: 拓扑角色 + 矛盾标记，不用 usage 胜率
+            inc = d.get('incoming', 0)
+            role = "基础" if inc >= 2 else "探索"
             contradiction_marker = " ⚔️" if d.get('has_contradiction') else ""
-            
-            record = f"  {d['node_id']} {d['title'][:40]}"
-            if w and l:
-                record += " 有实战记录"
-            elif w:
-                record += " 有成功记录"
-            elif l:
-                record += " 有失败记录"
-            record += f"{trap_marker}{contradiction_marker}"
+            record = f"  {d['node_id']} {d['title'][:40]} ({role}{contradiction_marker})"
             lines.append(record)
         remaining = len(nodes) - len(shown)
         if remaining > 0:

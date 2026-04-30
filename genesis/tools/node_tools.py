@@ -34,8 +34,9 @@ class RecordContextNodeTool(BaseNodeTool):
             "required": ["node_id", "title", "state_description"]
         }
 
-    async def execute(self, node_id: str, title: str, state_description: str, metadata_signature: Dict[str, Any] = None, last_verified_at: str = None, verification_source: str = None) -> str:
+    async def execute(self, node_id: str, title: str, state_description: str, metadata_signature: Dict[str, Any] = None, last_verified_at: str = None, verification_source: str = None, _trace_id: str = None, _round_seq: int = None) -> str:
         try:
+            existed = node_id in self.vault.get_node_briefs([node_id])
             self.vault.create_node(
                 node_id=node_id,
                 ntype="CONTEXT",
@@ -49,6 +50,12 @@ class RecordContextNodeTool(BaseNodeTool):
                 verification_source=verification_source,
                 trust_tier="REFLECTION"
             )
+            try:
+                current_round_seq = int(_round_seq) if _round_seq is not None else None
+            except (TypeError, ValueError):
+                current_round_seq = None
+            if not existed:
+                self.vault.record_node_creation_context(node_id, trace_id=_trace_id, round_seq=current_round_seq)
             return f"✅ CONTEXT节点 [{node_id}] '{title}' 写入/覆盖成功。"
         except Exception as e:
             logger.error(f"Context node creation failed: {e}")
@@ -97,6 +104,7 @@ class RecordPointTool(BaseNodeTool):
             resolved_id = (node_id or "").strip()
             if not resolved_id:
                 resolved_id = "P_" + hashlib.md5(f"{title}:{content}".encode()).hexdigest()[:10].upper()
+            existed = resolved_id in self.vault.get_node_briefs([resolved_id])
             self.vault.create_node(
                 node_id=resolved_id,
                 ntype=resolved_type,
@@ -111,6 +119,12 @@ class RecordPointTool(BaseNodeTool):
                 verification_source=verification_source,
                 trust_tier="REFLECTION",
             )
+            try:
+                current_round_seq = int(_round_seq) if _round_seq is not None else None
+            except (TypeError, ValueError):
+                current_round_seq = None
+            if not existed:
+                self.vault.record_node_creation_context(resolved_id, trace_id=_trace_id, round_seq=current_round_seq)
             return f"✅ POINT [{resolved_id}] '{title}' 写入成功。请继续用 record_line 连接它基于的已有点。"
         except Exception as e:
             logger.error(f"Point recording failed: {e}")
@@ -206,7 +220,7 @@ class RecordLineTool(BaseNodeTool):
             try:
                 full_basis = list(self.vault.get_reasoning_basis_ids(new_point_id))
                 if len(full_basis) >= 2:
-                    collision_candidates = self.vault.find_collision_candidates(full_basis, min_overlap=2)
+                    collision_candidates = self.vault.find_collision_candidates(full_basis, min_overlap=2, exclude_ids=[new_point_id])
                     if collision_candidates:
                         candidate_hints = [f"[{cid}] '{ctitle}' (重叠{overlap}个basis)" for cid, overlap, ctitle in collision_candidates[:3]]
                         collision_hint = f" ⚠️ 碰撞检测：你引用的节点已被以下节点引用：{', '.join(candidate_hints)}。确认是否重复？"
@@ -309,7 +323,7 @@ class RecordLessonNodeTool(BaseNodeTool):
         same_round_ids = self.vault.get_same_round_ids(valid_basis, trace_id=_trace_id, round_seq=current_round_seq) if valid_basis else set()
 
         # ── 碰撞检测（写前去重）：basis 集合与已有节点重叠 ──
-        collision_candidates = self.vault.find_collision_candidates(valid_basis, min_overlap=2) if valid_basis else []
+        collision_candidates = self.vault.find_collision_candidates(valid_basis, min_overlap=2, exclude_ids=[node_id]) if valid_basis else []
         collision_hint = ""
         if collision_candidates:
             candidate_hints = [f"[{cid}] '{ctitle}' (重叠{overlap}个basis)" for cid, overlap, ctitle in collision_candidates[:3]]

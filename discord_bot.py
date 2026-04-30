@@ -237,8 +237,7 @@ async def on_message(message: discord.Message):
         upload_dir = Path("runtime/uploads")
         upload_dir.mkdir(parents=True, exist_ok=True)
         for att in message.attachments:
-            safe_filename = os.path.basename(att.filename)
-            fp = (upload_dir / f"{message.id}_{safe_filename}").resolve()
+            fp = (upload_dir / f"{message.id}_{att.filename}").resolve()
             try:
                 await att.save(fp)
                 if att.content_type and att.content_type.startswith('image/'):

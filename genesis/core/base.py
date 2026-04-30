@@ -27,6 +27,7 @@ class Message:
     name: Optional[str] = None
     tool_call_id: Optional[str] = None
     tool_calls: Optional[List[Dict[str, Any]]] = None # 新增支持 assistant 的 tool_calls
+    reasoning_content: Optional[str] = None  # DeepSeek V4 Pro thinking mode
     
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典格式"""
@@ -58,6 +59,8 @@ class Message:
                         }
                     })
             result["tool_calls"] = formatted_tc
+        if self.reasoning_content:
+            result["reasoning_content"] = self.reasoning_content
         return result
 
 
@@ -136,6 +139,11 @@ class Tool(ABC):
         elif not isinstance(params, dict):
             # logger.warning(f"Tool {self.name} parameters is not a dict. Auto-fixing.")
             params = {"type": "object", "properties": {}}
+        
+        # Remove null values from schema — some providers (e.g. DeepSeek V4) reject null enum/default
+        params = self._sanitize_schema(params)
+        # Ensure 'required' is always an array — DeepSeek V4 rejects missing/null required
+        params.setdefault("required", [])
             
         return {
             "type": "function",
@@ -145,6 +153,15 @@ class Tool(ABC):
                 "parameters": params
             }
         }
+    
+    @staticmethod
+    def _sanitize_schema(obj):
+        """Recursively remove keys with None values from tool schema dicts/lists."""
+        if isinstance(obj, dict):
+            return {k: Tool._sanitize_schema(v) for k, v in obj.items() if v is not None}
+        elif isinstance(obj, list):
+            return [Tool._sanitize_schema(v) for v in obj if v is not None]
+        return obj
 
 
 class MetaTool(Tool):
