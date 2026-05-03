@@ -254,11 +254,11 @@ cmd_test() {
 # Test only files related to sandbox diff (used by SelfEvolution auto-apply)
 # Finds test files that correspond to changed/new files in the sandbox
 cmd_test_diff() {
-    _ensure_running
     local test_files=()
 
     # Preflight: check if tracked tests in tests/ are shadowed by .gitignore.
-    # Untracked probe files being .gitignore-shadowed is correct behavior — don't warn.
+    # Run on HOST — Yogg's modifications are on the host filesystem.
+    cd "$PROJECT_DIR"
     local preflight_output
     preflight_output=$(bash <<'EOF'
 set -e
@@ -281,8 +281,7 @@ EOF
     fi
 
     # Only consider git-tracked files for test discovery.
-    # Untracked files (Yogg's self-created probes/tests in sandbox root)
-    # are practice artifacts — they must NOT gate the apply decision.
+    # Run on HOST — Yogg's modifications are on the host filesystem.
     local tracked_changed
     tracked_changed=$(git diff --name-only HEAD 2>/dev/null | grep -vE '^(archive/|blog/|docs/|\.tmp_probe/|n8n-workflows/|scripts/replica_setup/)')
     local untracked_changed
@@ -339,90 +338,84 @@ EOF
 }
 _doctor_workspace_patch() {
     # Optional: $1 = comma-separated file glob filter (--only)
+    # Run on HOST — Yogg's modifications are on the host filesystem.
     local only_filter="${1:-}"
-    _ensure_running
-    docker exec -i -w "$(_doctor_workspace_dir)" "$CONTAINER" bash <<EOF
-set -euo pipefail
+    cd "$PROJECT_DIR"
 
-if [ -n "$only_filter" ]; then
-    # Scoped: only emit diff for matching files
-    # --only uses comma-separated paths; git diff needs space-separated args
-    _only_args=\$(echo "$only_filter" | tr ',' ' ')
-    git diff HEAD -- \$_only_args
-    # Build grep pattern from individual paths: ^path1$|^path2$|^path3$
-    _only_pattern=\$(echo "$only_filter" | sed 's/,/\$|^/g' | sed 's/^/^/' | sed 's/$/\$/')
-    for _path in \$(git ls-files --others --exclude-standard -z 2>/dev/null | tr '\0' '\n' | grep -E "\$_only_pattern" || true); do
-        case "\$_path" in
-            .doctor-initialized|runtime/*|__pycache__/*|.pytest_cache/*|*.pyc|*.pyo|*.orig|*.rej|*.log)
-                continue
-                ;;
+    if [ -n "$only_filter" ]; then
+        # Scoped: only emit diff for matching files
+        # --only uses comma-separated paths; git diff needs space-separated args
+        _only_args=$(echo "$only_filter" | tr ',' ' ')
+        git diff HEAD -- $_only_args
+        # Build grep pattern from individual paths: ^path1$|^path2$|^path3$
+        _only_pattern=$(echo "$only_filter" | sed 's/,/\$|^/g' | sed 's/^/^/' | sed 's/$/\$/')
+        for _path in $(git ls-files --others --exclude-standard -z 2>/dev/null | tr '\0' '\n' | grep -E "$_only_pattern" || true); do
+            case "$_path" in
+                .doctor-initialized|runtime/*|__pycache__/*|.pytest_cache/*|*.pyc|*.pyo|*.orig|*.rej|*.log)
+                    continue
+                    ;;
+            esac
+            git diff --no-index --binary -- /dev/null "$_path" || true
+        done
+    else
+        git diff HEAD
+        while IFS= read -r -d '' path; do
+            case "$path" in
+                .doctor-initialized|runtime/*|__pycache__/*|.pytest_cache/*|*.pyc|*.pyo|*.orig|*.rej|*.log)
+                    continue
+                    ;;
         esac
-        git diff --no-index --binary -- /dev/null "\$_path" || true
-    done
-else
-    git diff HEAD
-    while IFS= read -r -d '' path; do
-        case "\$path" in
-            .doctor-initialized|runtime/*|__pycache__/*|.pytest_cache/*|*.pyc|*.pyo|*.orig|*.rej|*.log)
-                continue
-                ;;
-    esac
 
-    git diff --no-index --binary -- /dev/null "\$path" || true
-    done < <(git ls-files --others --exclude-standard -z)
-fi
-EOF
+        git diff --no-index --binary -- /dev/null "$path" || true
+        done < <(git ls-files --others --exclude-standard -z)
+    fi
 }
 
 cmd_diff_status() {
-    _ensure_running
-    docker exec -i -w "$(_doctor_workspace_dir)" "$CONTAINER" bash <<'EOF'
-set -euo pipefail
+    # Run on HOST — Yogg's modifications are on the host filesystem,
+    # not in the container's Docker volume.
+    cd "$PROJECT_DIR"
 
-# Tracked diff hash
-tracked_diff=$(git diff HEAD 2>/dev/null || echo "")
-if [ -n "$tracked_diff" ]; then
-    tracked_hash=$(echo "$tracked_diff" | md5sum | cut -d' ' -f1 | cut -c1-12)
-    tracked_lines=$(echo "$tracked_diff" | wc -l)
-else
-    tracked_hash=""
-    tracked_lines=0
-fi
+    # Tracked diff hash
+    tracked_diff=$(git diff HEAD 2>/dev/null || echo "")
+    if [ -n "$tracked_diff" ]; then
+        tracked_hash=$(echo "$tracked_diff" | md5sum | cut -d' ' -f1 | cut -c1-12)
+        tracked_lines=$(echo "$tracked_diff" | wc -l)
+    else
+        tracked_hash=""
+        tracked_lines=0
+    fi
 
-# Untracked file set hash (path list only, sorted for stability)
-untracked_list=$(git ls-files --others --exclude-standard 2>/dev/null | grep -vE '(__pycache__|\.pyc|\.pyo|\.orig|\.rej|\.log|\.pytest_cache|^runtime/|^\.)' || true)
-if [ -n "$untracked_list" ]; then
-    untracked_hash=$(echo "$untracked_list" | sort | md5sum | cut -d' ' -f1 | cut -c1-12)
-    untracked_count=$(echo "$untracked_list" | wc -l)
-else
-    untracked_hash=""
-    untracked_count=0
-fi
+    # Untracked file set hash (path list only, sorted for stability)
+    untracked_list=$(git ls-files --others --exclude-standard 2>/dev/null | grep -vE '(__pycache__|\.pyc|\.pyo|\.orig|\.rej|\.log|\.pytest_cache|^runtime/|^\.)' || true)
+    if [ -n "$untracked_list" ]; then
+        untracked_hash=$(echo "$untracked_list" | sort | md5sum | cut -d' ' -f1 | cut -c1-12)
+        untracked_count=$(echo "$untracked_list" | wc -l)
+    else
+        untracked_hash=""
+        untracked_count=0
+    fi
 
-echo "TRACKED_HASH:${tracked_hash}"
-echo "TRACKED_LINES:${tracked_lines}"
-echo "UNTRACKED_HASH:${untracked_hash}"
-echo "UNTRACKED_COUNT:${untracked_count}"
-EOF
+    echo "TRACKED_HASH:${tracked_hash}"
+    echo "TRACKED_LINES:${tracked_lines}"
+    echo "UNTRACKED_HASH:${untracked_hash}"
+    echo "UNTRACKED_COUNT:${untracked_count}"
 }
 
 cmd_file_status() {
-    _ensure_running
-    docker exec -i -w "$(_doctor_workspace_dir)" "$CONTAINER" bash <<'EOF'
-set -euo pipefail
-
-# Tracked files: per-file diff hash
-git diff HEAD --name-only 2>/dev/null | while IFS= read -r f; do
-    h=$(git diff HEAD -- "$f" 2>/dev/null | md5sum | cut -d' ' -f1 | cut -c1-12)
-    echo "T:${f}:${h}"
-done
-
-# Untracked files: per-file content hash
-git ls-files --others --exclude-standard 2>/dev/null | grep -vE '(__pycache__|\.pyc|\.pyo|\.orig|\.rej|\.log|\.pytest_cache|^runtime/|^\.)' | while IFS= read -r f; do
-    h=$(cat "$f" 2>/dev/null | md5sum | cut -d' ' -f1 | cut -c1-12)
-    echo "U:${f}:${h}"
-done
-EOF
+    # Run on HOST — Yogg's modifications are on the host filesystem,
+    # not in the container's Docker volume.
+    cd "$PROJECT_DIR"
+    # Tracked files: per-file diff hash
+    git diff HEAD --name-only 2>/dev/null | while IFS= read -r f; do
+        h=$(git diff HEAD -- "$f" 2>/dev/null | md5sum | cut -d' ' -f1 | cut -c1-12)
+        echo "T:${f}:${h}"
+    done
+    # Untracked files: per-file content hash
+    git ls-files --others --exclude-standard 2>/dev/null | grep -vE '(__pycache__|\.pyc|\.pyo|\.orig|\.rej|\.log|\.pytest_cache|^runtime/|^\.)' | while IFS= read -r f; do
+        h=$(cat "$f" 2>/dev/null | md5sum | cut -d' ' -f1 | cut -c1-12)
+        echo "U:${f}:${h}"
+    done
 }
 
 cmd_diff() {
@@ -627,111 +620,107 @@ cmd_restore() {
 cmd_auto_apply() {
     # 非交互式应用：自进化专用，带 git 安全网
     # 支持 --only file1,file2,... 限定应用范围
-    _ensure_running
+    # All operations on HOST — Yogg's modifications are on the host filesystem.
+    # Since modifications are already in the working tree, we just commit them.
+    cd "$PROJECT_DIR"
 
     local only_filter=""
     if [ "${1:-}" = "--only" ] && [ -n "${2:-}" ]; then
         only_filter="$2"
     fi
 
-    local patch_file
-    patch_file=$(mktemp "$PROJECT_DIR/doctor-auto-apply-XXXXXX.patch")
-    if ! _doctor_workspace_patch "$only_filter" > "$patch_file"; then
-        rm -f "$patch_file"
-        echo "READ_PATCH_FAILED"
-        return 1
+    # Check if there are changes to apply
+    local has_changes=false
+    if [ -n "$only_filter" ]; then
+        _only_args=$(echo "$only_filter" | tr ',' ' ')
+        for f in $_only_args; do
+            if git diff --name-only HEAD -- "$f" 2>/dev/null | grep -q .; then
+                has_changes=true
+                break
+            fi
+            if [ -f "$f" ] && git ls-files --others --exclude-standard -- "$f" 2>/dev/null | grep -q .; then
+                has_changes=true
+                break
+            fi
+        done
+    else
+        if git diff --name-only HEAD 2>/dev/null | grep -q .; then
+            has_changes=true
+        elif git ls-files --others --exclude-standard 2>/dev/null | grep -vE '(__pycache__|\.pyc|\.pyo|\.pytest_cache|^runtime/|^\.)' | grep -q .; then
+            has_changes=true
+        fi
     fi
 
-    if [ ! -s "$patch_file" ]; then
-        rm -f "$patch_file"
+    if [ "$has_changes" = "false" ]; then
         echo "NO_CHANGES"
         return 0
     fi
 
     local lines_changed
-    lines_changed=$(wc -l < "$patch_file")
+    lines_changed=$(git diff HEAD 2>/dev/null | wc -l)
     echo "PENDING_CHANGES: $lines_changed lines"
 
-    # 1. Git commit current state as rollback point + named tag (on host)
-    cd "$PROJECT_DIR"
+    # 1. Git commit current state as rollback point + named tag
     local pre_commit
     pre_commit=$(git rev-parse HEAD 2>/dev/null)
-    git add -A 2>/dev/null
-    git commit -q -m "[self-evolution] pre-apply snapshot" --allow-empty 2>/dev/null
+    # Stage only the files we want to keep (pre-apply snapshot of untouched state)
+    git stash -u 2>/dev/null
+    local stash_rc=$?
+    if [ $stash_rc -eq 0 ]; then
+        # Stash succeeded — working tree is now clean
+        :
+    else
+        # Nothing to stash — working tree already clean
+        git add -A 2>/dev/null
+    fi
+    # Create rollback tag at current HEAD (clean state)
     local rollback_tag="rollback/$(date +%Y%m%d_%H%M%S)"
     git tag "$rollback_tag" HEAD 2>/dev/null
     echo "ROLLBACK_POINT: $pre_commit"
     echo "ROLLBACK_TAG: $rollback_tag"
 
-    # 2. Apply the diff INSIDE the container (same git repo as patch source)
-    # This avoids baseline drift between container and host git repos.
-    local apply_output
-    apply_output=$(docker exec -i -w "$(_doctor_workspace_dir)" "$CONTAINER" bash -c "
-        git apply --binary - 2>&1
-    " < "$patch_file" 2>&1)
-    local apply_rc=$?
-    if [ $apply_rc -ne 0 ]; then
-        echo "APPLY_CHECK_FAILED: patch would not apply cleanly in container"
-        echo "$apply_output" | tail -5
-        rm -f "$patch_file"
-        return 1
+    # Pop the stash to restore Yogg's modifications
+    if [ $stash_rc -eq 0 ]; then
+        git stash pop 2>/dev/null
     fi
-    echo "APPLY_OK"
 
-    # 3. Smoke test canary: verify core modules still import after apply
-    # Run inside container where the applied files live
+    # 2. Stage and commit Yogg's modifications
+    if [ -n "$only_filter" ]; then
+        _only_args=$(echo "$only_filter" | tr ',' ' ')
+        git add --force -- $_only_args 2>/dev/null
+    else
+        git add -A 2>/dev/null
+    fi
+
+    # 3. Smoke test canary: verify core modules still import before commit
     local smoke_output
-    smoke_output=$(docker exec "$CONTAINER" bash -c "
-        cd /workspace && $PYTHON -c '
+    smoke_output=$("$PYTHON" -c "
 from genesis.auto_mode import SelfEvolution
 from genesis.v4.loop import V4Loop
 from genesis.v4.manager import NodeVault
 from genesis.tools.node_tools import RecordPointTool, RecordLineTool
 from genesis.tools.search_tool import SearchKnowledgeNodesTool
-print(\"SMOKE_OK\")
-' 2>&1
-    " 2>&1)
+print('SMOKE_OK')
+" 2>&1)
     if echo "$smoke_output" | grep -q "SMOKE_OK"; then
         echo "SMOKE_TEST: PASS"
     else
         echo "SMOKE_TEST: FAIL"
         echo "$smoke_output" | tail -10
-        echo "SMOKE_FAILED: core import broken after apply, rolling back container"
-        docker exec -w "$(_doctor_workspace_dir)" "$CONTAINER" bash -c "git checkout -- . 2>/dev/null; git clean -fd 2>/dev/null" 2>/dev/null
-        rm -f "$patch_file"
+        echo "SMOKE_FAILED: core import broken, rolling back"
+        git reset --hard "$rollback_tag" >/dev/null 2>&1
+        git clean -fd >/dev/null 2>&1
+        rm -f "$patch_file" 2>/dev/null
         return 5
     fi
 
-    # 4. Copy applied files from container to host
-    # The apply happened inside the container; we need to sync the result to host.
-    # /src/genesis is a read-only bind mount, so we use docker cp instead.
-    # Find files that changed after apply in container working tree.
-    local changed_files
-    changed_files=$(docker exec -w "$(_doctor_workspace_dir)" "$CONTAINER" bash -c "
-        git diff --name-only HEAD 2>/dev/null
-        git ls-files --others --exclude-standard 2>/dev/null
-    " 2>/dev/null)
-    while IFS= read -r f; do
-        [ -z "$f" ] && continue
-        case "$f" in
-            .doctor-initialized|runtime/*|__pycache__/*|.pytest_cache/*|*.pyc|*.pyo|*.orig|*.rej|*.log|*.bak|doctor-auto-apply-*|doctor-patch-*)
-                continue
-                ;;
-        esac
-        # Create parent directory on host if needed
-        mkdir -p "$PROJECT_DIR/$(dirname "$f")"
-        docker cp "$CONTAINER:$(_doctor_workspace_dir)/$f" "$PROJECT_DIR/$f" 2>/dev/null || true
-    done <<< "$changed_files"
-
-    # 5. Commit the applied changes (on host)
-    git add -A 2>/dev/null
+    # 4. Commit the applied changes
     local apply_commit_msg="[self-evolution] auto-apply $(date +%Y%m%d_%H%M%S) ($lines_changed lines)"
     git commit -q -m "$apply_commit_msg" 2>/dev/null
     local new_commit
     new_commit=$(git rev-parse HEAD 2>/dev/null)
     echo "APPLIED_COMMIT: $new_commit"
     echo "APPLY_SUCCESS"
-    rm -f "$patch_file"
 }
 
 cmd_rollback() {
@@ -750,10 +739,9 @@ cmd_rollback() {
 cmd_list_changed() {
     # List all changed files in sandbox (tracked + untracked), one per line
     # Used by SelfEvolution scope gate before apply
-    _ensure_running
-    docker exec -w "$(_doctor_workspace_dir)" "$CONTAINER" bash -c '
-        (git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null | grep -vE "(__pycache__|\.pyc|\.pyo|\.orig|\.rej|\.log|\.pytest_cache|^runtime/|^\.)") | sort -u | grep -vE "^$"
-    ' 2>/dev/null
+    # Run on HOST — Yogg's modifications are on the host filesystem.
+    cd "$PROJECT_DIR"
+    (git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null | grep -vE "(__pycache__|\.pyc|\.pyo|\.orig|\.rej|\.log|\.pytest_cache|^runtime/|^\.)") | sort -u | grep -vE "^$"
 }
 
 # ── 路由 ──
