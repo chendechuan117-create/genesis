@@ -704,9 +704,24 @@ print(\"SMOKE_OK\")
 
     # 4. Copy applied files from container to host
     # The apply happened inside the container; we need to sync the result to host.
-    docker exec "$CONTAINER" bash -c "
-        rsync -a --exclude='.git' --exclude='__pycache__' --exclude='runtime' --exclude='venv' --exclude='.tmp_probe' --exclude='*.bak' --exclude='*.orig' --exclude='*.rej' --exclude='doctor-auto-apply-*' --exclude='doctor-patch-*' /workspace/ /src/genesis/ 2>/dev/null || true
-    " 2>/dev/null
+    # /src/genesis is a read-only bind mount, so we use docker cp instead.
+    # Find files that changed after apply in container working tree.
+    local changed_files
+    changed_files=$(docker exec -w "$(_doctor_workspace_dir)" "$CONTAINER" bash -c "
+        git diff --name-only HEAD 2>/dev/null
+        git ls-files --others --exclude-standard 2>/dev/null
+    " 2>/dev/null)
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        case "$f" in
+            .doctor-initialized|runtime/*|__pycache__/*|.pytest_cache/*|*.pyc|*.pyo|*.orig|*.rej|*.log|*.bak|doctor-auto-apply-*|doctor-patch-*)
+                continue
+                ;;
+        esac
+        # Create parent directory on host if needed
+        mkdir -p "$PROJECT_DIR/$(dirname "$f")"
+        docker cp "$CONTAINER:$(_doctor_workspace_dir)/$f" "$PROJECT_DIR/$f" 2>/dev/null || true
+    done <<< "$changed_files"
 
     # 5. Commit the applied changes (on host)
     git add -A 2>/dev/null
