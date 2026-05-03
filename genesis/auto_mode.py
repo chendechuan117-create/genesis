@@ -2363,7 +2363,8 @@ class SelfEvolution:
             self._save()
 
         recent = self.apply_history[-3:] if len(self.apply_history) >= 3 else []
-        if recent and all(e.get("status") == "test_failed" for e in recent):
+        _blocking_statuses = {"test_failed", "test_collection_failed"}
+        if recent and all(e.get("status") in _blocking_statuses for e in recent):
             # Check if reasons are similar (share a common error substring)
             reasons = [e.get("reason", "")[:60] for e in recent]
             # Simple similarity: if first 30 chars of reason are identical → same root cause
@@ -2420,36 +2421,82 @@ class SelfEvolution:
                 )
 
         # 1. Run diff-scoped tests in sandbox (only test files related to current changes)
+        #    Evidence classification (PLS safety):
+        #    - exit 0: tests passed → positive evidence, proceed to apply
+        #    - exit 3 (NO_TESTS_FOUND): no test coverage → unverified, NOT passing
+        #    - exit 4 (COLLECTION_FAILED): test infra broken → negative evidence
+        #    - exit 1/2/other: actual test failure → negative evidence
         await channel.send("🧬 [1/3] 沙箱测试中（差分范围）...")
         test_ok, test_output = await _run_doctor_sync_command("test-diff", timeout_secs=180)
+        # Classify evidence type from output markers
+        is_no_tests = "NO_TESTS_FOUND" in test_output
+        is_collection_failed = "COLLECTION_FAILED" in test_output
         if not test_ok:
-            await channel.send(
-                f"🧬 ❌ 沙箱测试失败，放弃本次应用\n```\n{test_output[-500:]}\n```"
-            )
-            apply_result["apply_reason"] = test_output[-200:].replace("\n", " ").strip()
-            self.apply_history.append({
-                "round": round_num,
-                "status": "test_failed",
-                "reason": apply_result["apply_reason"],
-            })
-            # Selective reset: only reset files whose hash changed (they may be the cause),
-            # preserve stable files that weren't involved in the failure.
-            current_files = await self._get_file_status()
-            if current_files:
-                changed = [p for p, v in self.file_cooldowns.items()
-                           if p in current_files and v["hash"] != current_files[p]["hash"]]
-                for p in changed:
-                    self.file_cooldowns[p]["hash"] = current_files[p]["hash"]
-                    self.file_cooldowns[p]["stable_count"] = 0
-                # Remove files no longer in sandbox
-                stale = [p for p in self.file_cooldowns if p not in current_files]
-                for p in stale:
-                    del self.file_cooldowns[p]
+            if is_no_tests:
+                # No test coverage for changed files — unverified, not failed
+                # Allow apply but record as unverified (lower confidence, shorter cooldown reset)
+                await channel.send(
+                    "🧬 ⚠️ 无测试覆盖（NO_TESTS_FOUND），修改未经验证但非失败\n"
+                    "继续应用，但标记为 unverified"
+                )
+                apply_result["apply_reason"] = "no_test_coverage"
+                self.apply_history.append({
+                    "round": round_num,
+                    "status": "test_unverified",
+                    "reason": "NO_TESTS_FOUND: no test files found for diff changes",
+                })
+                # Don't return — proceed to apply with unverified status
+            elif is_collection_failed:
+                await channel.send(
+                    f"🧬 ❌ 测试收集失败（COLLECTION_FAILED），放弃本次应用\n```\n{test_output[-500:]}\n```"
+                )
+                apply_result["apply_reason"] = test_output[-200:].replace("\n", " ").strip()
+                self.apply_history.append({
+                    "round": round_num,
+                    "status": "test_collection_failed",
+                    "reason": apply_result["apply_reason"],
+                })
+                # Selective reset on collection failure
+                current_files = await self._get_file_status()
+                if current_files:
+                    changed = [p for p, v in self.file_cooldowns.items()
+                               if p in current_files and v["hash"] != current_files[p]["hash"]]
+                    for p in changed:
+                        self.file_cooldowns[p]["hash"] = current_files[p]["hash"]
+                        self.file_cooldowns[p]["stable_count"] = 0
+                    stale = [p for p in self.file_cooldowns if p not in current_files]
+                    for p in stale:
+                        del self.file_cooldowns[p]
+                else:
+                    self.file_cooldowns.clear()
+                self._save()
+                return apply_result
             else:
-                # Fallback: can't determine which files changed, reset all
-                self.file_cooldowns.clear()
-            self._save()
-            return apply_result
+                await channel.send(
+                    f"🧬 ❌ 沙箱测试失败，放弃本次应用\n```\n{test_output[-500:]}\n```"
+                )
+                apply_result["apply_reason"] = test_output[-200:].replace("\n", " ").strip()
+                self.apply_history.append({
+                    "round": round_num,
+                    "status": "test_failed",
+                    "reason": apply_result["apply_reason"],
+                })
+                # Selective reset: only reset files whose hash changed (they may be the cause),
+                # preserve stable files that weren't involved in the failure.
+                current_files = await self._get_file_status()
+                if current_files:
+                    changed = [p for p, v in self.file_cooldowns.items()
+                               if p in current_files and v["hash"] != current_files[p]["hash"]]
+                    for p in changed:
+                        self.file_cooldowns[p]["hash"] = current_files[p]["hash"]
+                        self.file_cooldowns[p]["stable_count"] = 0
+                    stale = [p for p in self.file_cooldowns if p not in current_files]
+                    for p in stale:
+                        del self.file_cooldowns[p]
+                else:
+                    self.file_cooldowns.clear()
+                self._save()
+                return apply_result
 
         await channel.send("🧬 ✅ 测试通过")
 

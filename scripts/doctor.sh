@@ -315,8 +315,9 @@ EOF
             echo "❌ test-diff preflight blocked: likely .gitignore-constrained tests are invisible to diff discovery"
             return 2
         fi
-        echo "🧪 No test files found for diff changes — passing by default"
-        return 0
+        echo "NO_TESTS_FOUND: no test files found for diff changes"
+        echo "⚠️  No evidence ≠ positive evidence — SelfEvolution should treat this as unverified, not as passing"
+        return 3
     fi
 
     echo "🧪 Running diff-scoped tests:"
@@ -329,9 +330,9 @@ EOF
     collect_output=$("$PYTHON" -m pytest $test_args --collect-only -q 2>&1)
     collect_rc=$?
     if [ $collect_rc -ne 0 ]; then
-        echo "❌ Smoke test: pytest collection failed for discovered tests"
+        echo "COLLECTION_FAILED: pytest collection failed for discovered tests"
         echo "$collect_output" | tail -5
-        return $collect_rc
+        return 4
     fi
 
     "$PYTHON" -m pytest $test_args -v --tb=short 2>&1
@@ -345,8 +346,12 @@ set -euo pipefail
 
 if [ -n "$only_filter" ]; then
     # Scoped: only emit diff for matching files
-    git diff HEAD -- $only_filter
-    for _path in \$(git ls-files --others --exclude-standard -z 2>/dev/null | tr '\0' '\n' | grep -E "^\$only_filter" || true); do
+    # --only uses comma-separated paths; git diff needs space-separated args
+    _only_args=\$(echo "$only_filter" | tr ',' ' ')
+    git diff HEAD -- \$_only_args
+    # Build grep pattern from individual paths: ^path1$|^path2$|^path3$
+    _only_pattern=\$(echo "$only_filter" | sed 's/,/\\$|^/g; s/^/^/; s/\$/$/')
+    for _path in \$(git ls-files --others --exclude-standard -z 2>/dev/null | tr '\0' '\n' | grep -E "\$_only_pattern" || true); do
         case "\$_path" in
             .doctor-initialized|runtime/*|__pycache__/*|.pytest_cache/*|*.pyc|*.pyo|*.orig|*.rej|*.log)
                 continue
