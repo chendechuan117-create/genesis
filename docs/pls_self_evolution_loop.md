@@ -276,7 +276,18 @@ PromotionGate 应该是原子的：
 - SelfEvolution 新增 `test_unverified` 状态：无测试覆盖但允许继续
 - Death loop guard 扩展到覆盖 `test_collection_failed`
 
-### 7.2 --only 多路径语义（2026-05-03）
+### 7.2 test-diff 只运行生产测试（2026-05-03）
+
+**文件**：`scripts/doctor.sh` `cmd_test_diff()`
+
+**根因**：Yogg 在沙箱根目录创建 probe/contract 测试文件（如 `r_rln_envelope_boundary.py`、`test_doctor_*_probe.py`），test-diff 把这些 untracked 沙箱产物当作质量门运行。当 probe 测试失败时，SelfEvolution 进入死亡循环（3x test_failed → 跳过 5 轮 → 循环）。
+
+**修复**：
+- 测试发现只基于 git-tracked 文件（`tracked_changed`），不基于 untracked 文件
+- 只发现 `tests/` 目录下的测试，跳过根目录的 `test_*.py`（沙箱产物）
+- untracked 文件仍计入 diff 范围，但不触发测试查找
+
+### 7.3 --only 多路径语义（2026-05-03）
 
 **文件**：`scripts/doctor.sh` `_doctor_workspace_patch()`
 
@@ -292,6 +303,7 @@ PromotionGate 应该是原子的：
 | 优先级 | 项目 | 依赖 | 预估工作量 |
 |--------|------|------|-----------|
 | P0 | ~~test-diff 证据分类~~ | 无 | ✅ 已完成 |
+| P0 | ~~test-diff 只运行生产测试~~ | 无 | ✅ 已完成 |
 | P0 | ~~--only 多路径语义~~ | 无 | ✅ 已完成 |
 | P1 | auto-apply --check dry-run | 无 | 20 行 bash |
 | P1 | rollback tag（替代匿名 commit） | 无 | 10 行 bash |
