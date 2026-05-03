@@ -86,21 +86,107 @@ class ReadFileTool(Tool):
         try:
             import os
             import re as _re
-            path = Path(os.path.expandvars(file_path)).expanduser().resolve()
-            
-            if not path.exists():
-                return f"Error: 文件不存在: {file_path}"
-            
-            if not path.is_file():
-                return f"Error: 不是文件: {file_path}"
-            
-            content = path.read_text(encoding=encoding)
+
+            def _resolve_lookup_path(raw_path: str) -> Path:
+                expanded = Path(os.path.expandvars(raw_path)).expanduser()
+                return expanded if expanded.is_absolute() else (Path.cwd() / expanded).resolve()
+
+            path = _resolve_lookup_path(file_path)
+
+            if not path.exists() or not path.is_file():
+                error_msg = f"Error: 文件不存在: {file_path}" if not path.exists() else f"Error: 不是文件: {file_path}"
+                candidates = []
+                seen = set()
+
+                def _add_candidate(candidate: Path):
+                    try:
+                        resolved = candidate.resolve()
+                    except Exception:
+                        resolved = candidate
+                    key = str(resolved)
+                    if key not in seen:
+                        seen.add(key)
+                        candidates.append(key)
+
+                search_roots = []
+                parent = path.parent
+                if parent.exists() and parent.is_dir():
+                    search_roots.append(parent)
+                cwd = Path.cwd()
+                if cwd not in search_roots:
+                    search_roots.append(cwd)
+
+                if not Path(file_path).is_absolute():
+                    parts = [part for part in Path(file_path).parts if part not in ('', '.')]
+                    tail_parts = parts[-2:] if len(parts) >= 2 else parts
+                    for root in list(search_roots):
+                        candidate = root.joinpath(*tail_parts) if tail_parts else root / path.name
+                        if candidate.parent.exists() and candidate.parent.is_dir() and candidate.parent not in search_roots:
+                            search_roots.append(candidate.parent)
+                    if parts:
+                        repo_hints = [base / 'genesis' for base in [cwd, *cwd.parents]]
+                        for hint in repo_hints:
+                            if hint.exists() and hint.is_dir() and hint not in search_roots:
+                                search_roots.append(hint)
+                        if len(parts) >= 2:
+                            for base in [cwd, *cwd.parents]:
+                                candidate_parent = base / parts[0]
+                                if candidate_parent.exists() and candidate_parent.is_dir() and candidate_parent not in search_roots:
+                                    search_roots.append(candidate_parent)
+
+                filename = path.name.lower()
+                suffix = path.suffix.lower()
+                for root in search_roots:
+                    if not root.exists() or not root.is_dir():
+                        continue
+                    try:
+                        direct_paths = [root / path.name]
+                        original_parts = [part for part in Path(file_path).parts if part not in ('', '.')]
+                        if original_parts:
+                            direct_paths.append(root.joinpath(*original_parts))
+                        for direct_candidate in direct_paths:
+                            if direct_candidate.exists() and direct_candidate.is_file():
+                                _add_candidate(direct_candidate)
+                        for item in root.rglob('*'):
+                            if not item.is_file():
+                                continue
+                            item_name = item.name.lower()
+                            if filename in item_name or item_name in filename or (suffix and item.suffix.lower() == suffix):
+                                _add_candidate(item)
+                    except (PermissionError, OSError):
+                        continue
+
+                if candidates:
+                    candidate_list = "\n  - " + "\n  - ".join(candidates[:10])
+                    searched = ", ".join(str(root) for root in search_roots)
+                    return f"{error_msg}\n\n搜索目录: {searched}\n发现可能的候选文件:{candidate_list}"
+
+                for root in search_roots:
+                    if root.exists() and root.is_dir():
+                        try:
+                            dir_items = [f"{'📄' if i.is_file() else '📁'} {i.name}" for i in sorted(root.iterdir())]
+                        except PermissionError:
+                            continue
+                        return f"{error_msg}\n\n{root} 目录内容:\n  " + "\n  ".join(dir_items[:20])
+
+                return f"{error_msg}\n父目录也不存在: {parent}"
+
+            try:
+                content = path.read_text(encoding=encoding)
+            except (PermissionError, OSError) as e:
+                parent = path.parent
+                error_msg = f"Error: 文件不可读: {file_path}"
+                if parent.exists() and parent.is_dir():
+                    dir_result = await ListDirectoryTool().execute(str(parent), pattern="*", include_debris=False, max_depth=2)
+                    if not dir_result.startswith("Error:"):
+                        return error_msg + "\n\n" + dir_result
+                return f"{error_msg} - {str(e)}"
+
             lines = content.splitlines()
             total_lines = len(lines)
             warn = debris_warning(path)
             header = f"{warn}文件: {path}\n总行数: {total_lines} | 大小: {path.stat().st_size} bytes\n"
 
-            # 模式 A: 文件内搜索
             if search_pattern:
                 try:
                     pattern = _re.compile(search_pattern, _re.IGNORECASE)
@@ -109,46 +195,39 @@ class ReadFileTool(Tool):
                 matches = []
                 for i, line in enumerate(lines):
                     if pattern.search(line):
-                        matches.append(i)
+                        start = max(0, i - context_lines)
+                        end = min(total_lines, i + context_lines + 1)
+                        matches.append((i + 1, line, start, end))
                 if not matches:
-                    return f"{header}搜索: '{search_pattern}'\n结果: 未找到匹配"
-                # 构建上下文片段
-                output_parts = [f"{header}搜索: '{search_pattern}' | 匹配 {len(matches)} 处\n"]
-                shown = set()
-                for m_idx in matches[:50]:  # 最多展示 50 个匹配
-                    ctx_start = max(0, m_idx - context_lines)
-                    ctx_end = min(total_lines, m_idx + context_lines + 1)
-                    for li in range(ctx_start, ctx_end):
-                        if li not in shown:
-                            marker = ">>>" if li == m_idx else "   "
-                            output_parts.append(f"{marker} {li+1:>5}: {lines[li]}")
-                            shown.add(li)
-                    output_parts.append("")
+                    return header + f"搜索: '{search_pattern}' | 无匹配"
+                out = [header + f"搜索: '{search_pattern}' | 匹配 {len(matches)} 处\n"]
+                for lineno, _line, s, e in matches[:50]:
+                    out.append(f"\n>>> {lineno}: {lines[lineno - 1]}")
+                    for j in range(s, e):
+                        if j == lineno - 1:
+                            continue
+                        out.append(f"    {j + 1}: {lines[j]}")
                 if len(matches) > 50:
-                    output_parts.append(f"... 另有 {len(matches)-50} 处匹配未展示")
-                return "\n".join(output_parts)
+                    out.append(f"\n... 其余 {len(matches) - 50} 处匹配已省略")
+                return "\n".join(out)
 
-            # 模式 B: 行范围读取
             if start_line is not None or end_line is not None:
-                s = max(1, start_line or 1) - 1
-                e = min(total_lines, end_line or total_lines)
-                selected = lines[s:e]
-                numbered = [f"{i+s+1:>5}: {line}" for i, line in enumerate(selected)]
-                body = "\n".join(numbered)
-                return f"{header}行范围: {s+1}-{e}\n\n{body}"
+                start_idx = max(1, start_line or 1)
+                end_idx = min(total_lines, end_line or total_lines)
+                selected = lines[start_idx - 1:end_idx]
+                body = [f"{i}: {line}" for i, line in enumerate(selected, start_idx)]
+                return header + f"行范围: {start_idx}-{end_idx}\n\n" + "\n".join(body)
 
-            # 模式 C: 读取整个文件（原始逻辑，截断保护）
-            limit = 8000
-            if len(content) > limit:
-                half = limit // 2
-                content = content[:half] + f"\n...[File Truncated ({len(content) - limit} chars hidden)]...\n" + content[-half:]
-            
-            return f"{header}编码: {encoding}\n\n内容:\n{content}"
-        
+            preview_limit = 200
+            preview = lines[:preview_limit]
+            body = [f"{i}: {line}" for i, line in enumerate(preview, 1)]
+            suffix = "\n... 文件较长，已截断显示前 200 行" if total_lines > preview_limit else ""
+            return header + "\n".join(body) + suffix
+
         except UnicodeDecodeError:
             logger.warning(f"文件可能是二进制文件: {file_path}")
             return f"Error: 无法使用 {encoding} 编码读取文件，可能是二进制文件"
-        
+
         except Exception as e:
             logger.error(f"读取文件失败: {file_path}, error: {e}")
             return f"Error: 读取文件失败 - {str(e)}"
