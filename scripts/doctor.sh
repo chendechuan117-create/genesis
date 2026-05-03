@@ -287,12 +287,19 @@ EOF
         echo "$preflight_output"
     fi
 
-    local changed
-    changed=$(git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null | grep -vE "(__pycache__|\.pyc|\.pyo|\.pytest_cache|^runtime/|^\.)" | sort -u | while IFS= read -r f; do [ -f "$f" ] && echo "$f"; done)
+    # Only consider git-tracked files for test discovery.
+    # Untracked files (Yogg's self-created probes/tests in sandbox root)
+    # are practice artifacts — they must NOT gate the apply decision.
+    local tracked_changed
+    tracked_changed=$(git diff --name-only HEAD 2>/dev/null)
+    local untracked_changed
+    untracked_changed=$(git ls-files --others --exclude-standard 2>/dev/null | grep -vE "(__pycache__|\.pyc|\.pyo|\.pytest_cache|^runtime/|^\.)" | while IFS= read -r f; do [ -f "$f" ] && echo "$f"; done)
 
+    # Test discovery: only from tracked changes (production source files)
     while IFS= read -r f; do
         [ -z "$f" ] && continue
-        if [[ "$f" == test_*.py ]] || [[ "$f" == tests/test_*.py ]]; then
+        # Only discover tests under tests/ directory — skip root-level test_*.py (sandbox artifacts)
+        if [[ "$f" == tests/test_*.py ]]; then
             test_files+=("$f")
             continue
         fi
@@ -305,7 +312,7 @@ EOF
                 break
             fi
         done
-    done <<< "$changed"
+    done <<< "$tracked_changed"
 
     local unique_tests
     unique_tests=$(printf '%s\n' "${test_files[@]}" 2>/dev/null | sort -u | grep -vE '^$|__pycache__|\.pyc' | grep '\.py$')
