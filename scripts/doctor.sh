@@ -688,7 +688,31 @@ cmd_auto_apply() {
         return 1
     fi
 
-    # 4. Commit the applied changes
+    # 4. Smoke test canary: verify core modules still import after apply
+    #     This catches syntax errors and broken imports BEFORE restart.
+    #     If this fails, rollback to the tag — the running process is still safe.
+    local smoke_output
+    smoke_output=$("$PYTHON" -c "
+from genesis.auto_mode import SelfEvolution
+from genesis.v4.loop import V4Loop
+from genesis.v4.manager import NodeVault
+from genesis.tools.node_tools import RecordPointTool, RecordLineTool
+from genesis.tools.search_tool import SearchKnowledgeNodesTool
+print('SMOKE_OK')
+" 2>&1)
+    if echo "$smoke_output" | grep -q "SMOKE_OK"; then
+        echo "SMOKE_TEST: PASS"
+    else
+        echo "SMOKE_TEST: FAIL"
+        echo "$smoke_output" | tail -10
+        echo "SMOKE_FAILED: core import broken after apply, rolling back"
+        git reset --hard "$rollback_tag" >/dev/null 2>&1
+        git clean -fd >/dev/null 2>&1
+        rm -f "$patch_file"
+        return 5
+    fi
+
+    # 5. Commit the applied changes
     git add -A 2>/dev/null
     local apply_commit_msg="[self-evolution] auto-apply $(date +%Y%m%d_%H%M%S) ($lines_changed lines)"
     git commit -q -m "$apply_commit_msg" 2>/dev/null

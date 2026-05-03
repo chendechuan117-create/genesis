@@ -1243,7 +1243,7 @@ def _compute_cross_round_observations(round_log: list, self_evolution=None) -> d
     apply_attempts = 0
     apply_successes = 0
     apply_blocked_reasons = []
-    _truly_blocked = {"test_failed", "test_collection_failed", "apply_failed", "apply_check_failed", "scope_gate_rejected"}
+    _truly_blocked = {"test_failed", "test_collection_failed", "apply_failed", "apply_check_failed", "smoke_failed", "scope_gate_rejected"}
     if self_evolution:
         apply_attempts = len(self_evolution.apply_history)
         apply_successes = sum(1 for h in self_evolution.apply_history if h.get("status") == "success")
@@ -2364,7 +2364,7 @@ class SelfEvolution:
             self._save()
 
         recent = self.apply_history[-3:] if len(self.apply_history) >= 3 else []
-        _blocking_statuses = {"test_failed", "test_collection_failed"}
+        _blocking_statuses = {"test_failed", "test_collection_failed", "smoke_failed"}
         if recent and all(e.get("status") in _blocking_statuses for e in recent):
             # Check if reasons are similar (share a common error substring)
             reasons = [e.get("reason", "")[:60] for e in recent]
@@ -2392,6 +2392,39 @@ class SelfEvolution:
                 critical_found.append(path)
             else:
                 safe_files.append(path)
+
+        # ── Deterministic scope review (non-blocking) ──
+        # Structural checks that don't require LLM — catch common issues early.
+        review_warnings: list[str] = []
+        total_files = len(self.file_cooldowns)
+        untracked_files = [p for p, v in self.file_cooldowns.items() if v["type"] == "U"]
+        tracked_files = [p for p, v in self.file_cooldowns.items() if v["type"] == "T"]
+
+        # Check 1: too many untracked files (Yogg's probe/test artifacts)
+        if len(untracked_files) > 10:
+            review_warnings.append(
+                f"scope_review: {len(untracked_files)} untracked files (likely probe artifacts)"
+            )
+
+        # Check 2: diff too large (exploration residue, not focused fix)
+        if total_files > 15:
+            review_warnings.append(
+                f"scope_review: {total_files} total files changed (likely exploration residue)"
+            )
+
+        # Check 3: untracked files outside tests/ (shouldn't be applied)
+        non_test_untracked = [p for p in untracked_files
+                              if not p.startswith("tests/") and not p.startswith("doctor/")]
+        if non_test_untracked:
+            review_warnings.append(
+                f"scope_review: untracked non-test files: {non_test_untracked[:5]}"
+            )
+
+        if review_warnings:
+            await channel.send(
+                "🧬 ⚠️ 范围审查意见（非阻塞）:\n" +
+                "\n".join(f"  - {w}" for w in review_warnings)
+            )
 
         only_filter = ""
         if critical_found:
@@ -2525,9 +2558,18 @@ class SelfEvolution:
 
         if not apply_ok or "APPLY_SUCCESS" not in apply_output:
             is_check_failed = "APPLY_CHECK_FAILED" in apply_output
-            status = "apply_check_failed" if is_check_failed else "apply_failed"
+            is_smoke_failed = "SMOKE_FAILED" in apply_output
+            if is_smoke_failed:
+                status = "smoke_failed"
+                msg_suffix = "（核心 import 损坏，已自动回滚）"
+            elif is_check_failed:
+                status = "apply_check_failed"
+                msg_suffix = "（dry-run 不通过）"
+            else:
+                status = "apply_failed"
+                msg_suffix = ""
             await channel.send(
-                f"🧬 ❌ 应用失败{'（dry-run 不通过）' if is_check_failed else ''}\n```\n{apply_output[-500:]}\n```"
+                f"🧬 ❌ 应用失败{msg_suffix}\n```\n{apply_output[-500:]}\n```"
             )
             apply_result["apply_reason"] = apply_output[-200:].replace("\n", " ").strip()
             self.apply_history.append({
