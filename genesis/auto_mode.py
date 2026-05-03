@@ -2464,20 +2464,23 @@ class SelfEvolution:
         test_ok, test_output = await _run_doctor_sync_command("test-diff", timeout_secs=180)
         # Classify evidence type from output markers
         is_no_tests = "NO_TESTS_FOUND" in test_output
+        is_preflight_blocked = "PREFLIGHT_BLOCKED" in test_output or "preflight blocked" in test_output.lower()
         is_collection_failed = "COLLECTION_FAILED" in test_output
+        is_unverified = is_no_tests or is_preflight_blocked
         if not test_ok:
-            if is_no_tests:
+            if is_unverified:
                 # No test coverage for changed files — unverified, not failed
                 # Allow apply but record as unverified (lower confidence, shorter cooldown reset)
+                unverified_reason = "PREFLIGHT_BLOCKED" if is_preflight_blocked else "NO_TESTS_FOUND"
                 await channel.send(
-                    "🧬 ⚠️ 无测试覆盖（NO_TESTS_FOUND），修改未经验证但非失败\n"
+                    f"🧬 ⚠️ 无测试覆盖（{unverified_reason}），修改未经验证但非失败\n"
                     "继续应用，但标记为 unverified"
                 )
-                apply_result["apply_reason"] = "no_test_coverage"
+                apply_result["apply_reason"] = f"no_test_coverage:{unverified_reason}"
                 self.apply_history.append({
                     "round": round_num,
                     "status": "test_unverified",
-                    "reason": "NO_TESTS_FOUND: no test files found for diff changes",
+                    "reason": f"{unverified_reason}: no test files found for diff changes",
                 })
                 # Don't return — proceed to apply with unverified status
                 # NOTE: fall-through skips "测试通过" message below (test_ok is False)
