@@ -634,6 +634,25 @@ cmd_auto_apply() {
         only_filter="$2"
     fi
 
+    # Sync container workspace baseline to host before generating patch.
+    # Container workspace is a Docker volume that may be behind host
+    # (e.g., after scp updates). Without sync, patch context lines
+    # won't match host files → apply_check_failed every time.
+    # Strategy: only sync files Yogg has NOT modified in sandbox.
+    # Yogg's modified files must be preserved — those are the changes to apply.
+    local yogg_modified
+    yogg_modified=$(docker exec -w "$(_doctor_workspace_dir)" "$CONTAINER" bash -c '
+        git diff --name-only HEAD 2>/dev/null
+    ' 2>/dev/null)
+    local exclude_args=""
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        exclude_args="$exclude_args --exclude=$f"
+    done <<< "$yogg_modified"
+    docker exec "$CONTAINER" bash -c "
+        rsync -a $exclude_args --exclude='.git' --exclude='__pycache__' --exclude='runtime' --exclude='venv' --exclude='.tmp_probe' /src/genesis/ /workspace/ 2>/dev/null || true
+    " 2>/dev/null
+
     local patch_file
     patch_file=$(mktemp "$PROJECT_DIR/doctor-auto-apply-XXXXXX.patch")
     if ! _doctor_workspace_patch "$only_filter" > "$patch_file"; then
