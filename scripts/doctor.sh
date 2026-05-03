@@ -22,7 +22,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 DOCTOR_DIR="$PROJECT_DIR/doctor"
 CONTAINER="genesis-doctor"
-PYTHON="/opt/venv/bin/python3"
+PYTHON="/opt/venv/bin/python3"          # Container Python (for docker exec)
+HOST_PYTHON="$PROJECT_DIR/venv/bin/python3"  # Host Python (for smoke test, etc.)
 
 # 颜色
 RED='\033[0;31m'
@@ -326,7 +327,24 @@ EOF
     test_args=$(echo "$unique_tests" | tr '\n' ' ')
     local collect_output
     local collect_rc
-    collect_output=$("$PYTHON" -m pytest $test_args --collect-only -q 2>&1)
+    # Run pytest inside container (host lacks /opt/venv dependencies)
+    _ensure_running
+    # Sync changed test files to container so pytest sees host modifications
+    for t in $test_args; do
+        if [ -f "$PROJECT_DIR/$t" ]; then
+            docker cp "$PROJECT_DIR/$t" "$CONTAINER:$(_doctor_workspace_dir)/$t" 2>/dev/null || true
+        fi
+    done
+    # Also sync changed source files that tests import
+    local src_changed
+    src_changed=$(git diff --name-only HEAD 2>/dev/null | grep -vE '^(archive/|blog/|docs/|\.tmp_probe/|n8n-workflows/|scripts/replica_setup/)' || true)
+    for s in $src_changed; do
+        if [ -f "$PROJECT_DIR/$s" ]; then
+            docker cp "$PROJECT_DIR/$s" "$CONTAINER:$(_doctor_workspace_dir)/$s" 2>/dev/null || true
+        fi
+    done
+    collect_output=$(docker exec -w "$(_doctor_workspace_dir)" -e PYTHONPATH="$(_doctor_pythonpath)" "$CONTAINER" \
+        "$PYTHON" -m pytest $test_args --collect-only -q 2>&1)
     collect_rc=$?
     if [ $collect_rc -ne 0 ]; then
         echo "COLLECTION_FAILED: pytest collection failed for discovered tests"
@@ -334,7 +352,8 @@ EOF
         return 4
     fi
 
-    "$PYTHON" -m pytest $test_args -v --tb=short 2>&1
+    docker exec -w "$(_doctor_workspace_dir)" -e PYTHONPATH="$(_doctor_pythonpath)" "$CONTAINER" \
+        "$PYTHON" -m pytest $test_args -v --tb=short 2>&1
 }
 _doctor_workspace_patch() {
     # Optional: $1 = comma-separated file glob filter (--only)
@@ -694,7 +713,7 @@ cmd_auto_apply() {
 
     # 3. Smoke test canary: verify core modules still import before commit
     local smoke_output
-    smoke_output=$("$PYTHON" -c "
+    smoke_output=$("$HOST_PYTHON" -c "
 from genesis.auto_mode import SelfEvolution
 from genesis.v4.loop import V4Loop
 from genesis.v4.manager import NodeVault
