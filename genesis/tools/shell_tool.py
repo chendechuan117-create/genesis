@@ -133,12 +133,26 @@ class ShellTool(Tool):
         }
     
     
-    def spawn_job(self, command: str, cwd: str) -> str:
+    def spawn_job(self, command: str, cwd: str, cwd_fallback_note: str = None) -> str:
         if not self.job_manager:
             return "Error: JobManager not initialized."
         try:
-            jid = self.job_manager.spawn(command, cwd)
-            return f"✅ Job Started. ID: {jid}\nUse action='poll', job_id='{jid}' to monitor."
+            resolved_cwd = cwd
+            note = cwd_fallback_note
+            if cwd:
+                try:
+                    work_dir, auto_note = self._resolve_work_dir(cwd)
+                    resolved_cwd = str(work_dir)
+                    if not note:
+                        note = auto_note
+                except Exception:
+                    resolved_cwd = cwd
+            try:
+                jid = self.job_manager.spawn(command, resolved_cwd, cwd_fallback_note=note)
+            except TypeError:
+                jid = self.job_manager.spawn(command, resolved_cwd)
+            prefix = f"{note}\n" if note else ""
+            return prefix + f"✅ Job Started. ID: {jid}\nUse action='poll', job_id='{jid}' to monitor."
         except Exception as e:
             return f"Error spawning job: {e}"
 
@@ -319,6 +333,42 @@ class ShellTool(Tool):
             if not command: return "Error: execute action requires 'command'"
             return await self._execute_sync(command, cwd, is_daemon)
 
+    @staticmethod
+    def _resolve_work_dir(cwd: str):
+        """Resolve requested cwd; if missing, prefer the repo-relative location for /workspace paths."""
+        candidate = Path(cwd).expanduser()
+        try:
+            work_dir = candidate.resolve()
+        except Exception:
+            work_dir = candidate if candidate.is_absolute() else (Path.cwd() / candidate)
+
+        if work_dir.exists():
+            return work_dir, None
+
+        current_root = Path.cwd().resolve()
+        repo_root = next(
+            (base for base in [current_root, *current_root.parents] if base.exists() and (base / 'genesis').exists()),
+            current_root if current_root.exists() else None,
+        )
+
+        fallback_candidates = []
+        doctor_workspace = Path('/workspace')
+        if repo_root is not None and candidate.is_absolute() and candidate == doctor_workspace:
+            fallback_candidates.append(repo_root)
+        elif repo_root is not None and candidate.is_absolute() and candidate.parts[:1] == ('/',) and candidate.parts[1:2] == ('workspace',):
+            fallback_candidates.append(repo_root / candidate.relative_to(doctor_workspace))
+
+        fallback_candidates.extend([current_root, *current_root.parents, Path.home().resolve(), doctor_workspace])
+
+        fallback_dir = next((base for base in fallback_candidates if base.exists() and (base / 'genesis').exists()), None)
+        if fallback_dir is None:
+            fallback_dir = next((base for base in fallback_candidates if base.exists()), None)
+        if fallback_dir is None:
+            raise FileNotFoundError(f"工作目录不存在: {cwd}; 且未找到可回退目录")
+
+        note = f"[cwd-fallback] requested={cwd} missing; using {fallback_dir}"
+        return fallback_dir, note
+
     # 自动识别可能耗时较长的命令模式
     _LONG_RUNNING_PATTERNS = (
         'install', 'update', 'upgrade', 'build', 'compile', 'make',
@@ -339,19 +389,18 @@ class ShellTool(Tool):
             if self.use_sandbox and self.sandbox:
                 cmd_to_run = f"cd {cwd} && {command}" if cwd else command
                 code, stdout, stderr = self.sandbox.exec_command(cmd_to_run, timeout=self.timeout)
-                return self._format_result(command, cwd, code, stdout, stderr)
+                return self._format_result(command, cwd, code, stdout, stderr, cwd_fallback_note=cwd_fallback_note)
 
             # 设置工作目录
             work_dir = None
+            cwd_fallback_note = None
             if cwd:
-                work_dir = Path(cwd).expanduser().resolve()
-                if not work_dir.exists():
-                    return f"Error: 工作目录不存在: {cwd}"
+                work_dir, cwd_fallback_note = self._resolve_work_dir(cwd)
 
             # 常驻服务检测
             known_daemons = ('scrcpy', 'server', 'daemon', 'npm start', 'python -m http.server')
             if is_daemon or any(d in command for d in known_daemons):
-                return self.spawn_job(command, str(work_dir or '.'))
+                return self.spawn_job(command, str(work_dir or '.'), cwd_fallback_note=cwd_fallback_note)
 
             # 长命令自动检测：先快速等待，超时后自动转 spawn+poll
             is_long = any(p in command.lower() for p in self._LONG_RUNNING_PATTERNS)
@@ -394,14 +443,14 @@ class ShellTool(Tool):
 
             stdout_text = stdout.decode('utf-8', errors='replace')
             stderr_text = stderr.decode('utf-8', errors='replace')
-            return self._format_result(command, cwd, process.returncode, stdout_text, stderr_text)
+            return self._format_result(command, cwd, process.returncode, stdout_text, stderr_text, cwd_fallback_note=cwd_fallback_note)
 
         except Exception as e:
             logger.error(f"执行命令失败: {command}, error: {e}")
             return f"Error: 执行命令失败 - {str(e)}"
 
     @staticmethod
-    def _format_result(command: str, cwd, code: int, stdout: str, stderr: str) -> str:
+    def _format_result(command: str, cwd, code: int, stdout: str, stderr: str, cwd_fallback_note: str = None) -> str:
         """统一格式化命令执行结果"""
         
         # 安全网：限制输出总长度，防止单次工具输出撑爆上下文
@@ -413,6 +462,8 @@ class ShellTool(Tool):
         result.append(f"命令: {command}")
         if cwd:
             result.append(f"目录: {cwd}")
+        if cwd_fallback_note:
+            result.append(cwd_fallback_note)
         result.append(f"退出码: {code}")
         
         if stdout:
