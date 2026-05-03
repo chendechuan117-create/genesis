@@ -743,7 +743,7 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     self._record_search_void(keywords, ntype,
                                              extra=f"topo_density={total_nodes},basis={basis_count},edges={cone_edge_count}")
 
-                # ── 面组装（点线面架构）：两阶段 BFS 扩散 ──
+                # ── 面组装（点线面架构）：三层认知场扩散 ──
                 try:
                     from genesis.v4.surface import SurfaceExpander
                     expander = SurfaceExpander(self.vault)

@@ -19,7 +19,7 @@ class RecordContextNodeTool(BaseNodeTool):
 
     @property
     def description(self) -> str:
-        return "沉淀静态参数类节点 (CONTEXT)，用于记录纯粹的 Key-Value 状态变量或环境信息。(仅超级管理员 C 进程 有权限使用)"
+        return "沉淀稳定的 CONTEXT 节点，用于记录环境参数、模块锚点或长期有效的状态说明；auto/spiral 模式下可用于创建代码结构锚点。"
 
     @property
     def parameters(self) -> Dict[str, Any]:

@@ -7,6 +7,7 @@ Genesis V4 — Auto Mode
 import gc
 import os
 import re
+import signal
 import json
 import sqlite3
 import time as _time_module
@@ -124,7 +125,7 @@ AUTO_PROMPT_FIRST = """你是 Genesis 的自主探索者。你的目标不是修
 当前系统信号（仅供参考）：
 {signals}"""
 
-AUTO_PROMPT_CONTINUE = """继续自主探索。上一轮的结论是这一轮的起点。
+AUTO_PROMPT_CONTINUE = """继续自主探索。上一轮留下的是痕迹，不是答案。
 
 ## 用户方向
 {directive}
@@ -138,7 +139,7 @@ AUTO_PROMPT_CONTINUE = """继续自主探索。上一轮的结论是这一轮的
 {history}
 
 ## 续跑原则
-- 上一轮的结论直接作为已知事实，在此基础上推进
+- 参考上一轮，但不要把它当作必须继承的结论
 - 如果上一轮的假设已验证或已证伪，提出新的假设
 - 追求让人意想不到的发现，不是流水线式的节点记录
 - 每轮聚焦一个假设，做到位
@@ -249,16 +250,19 @@ async def _run_doctor_sync_command(*args: str, timeout_secs: int = AUTO_DOCTOR_S
     proc = await asyncio.create_subprocess_exec(
         str(script_path), *args, cwd=str(project_dir),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        start_new_session=True,
     )
     try:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_secs)
     except asyncio.TimeoutError:
-        proc.kill()
+        # 杀整个进程组（含 docker exec 子进程），防止 D-state 僵尸残留导致 OOM
         try:
-            await asyncio.wait_for(proc.communicate(), timeout=10)
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=5)
         except asyncio.TimeoutError:
-            # 子进程可能进入 D 状态（不可杀），communicate 永远等不到
-            # 强制关闭 stdout transport 防止 FD 泄漏，放弃回收子进程
             logger.warning(f"doctor.sh {' '.join(args)} unkillable after SIGKILL (D state?), abandoning process")
             if proc.stdout:
                 proc.stdout.close()
@@ -411,14 +415,41 @@ def _get_auto_signals(round_num: int = 1, session_shown_voids: set | None = None
                 "JOIN knowledge_nodes t ON ne.target_id = t.node_id "
                 "WHERE ne.relation IN ('CONTRADICTS', 'RELATED_TO') "
                 "AND s.node_id NOT LIKE 'MEM_CONV_%' "
-                "ORDER BY ne.created_at DESC LIMIT 5"
+                "ORDER BY ne.created_at DESC LIMIT 8"
             ).fetchall()
             if gardener_edges:
-                lines = ["[C-Gardener 关联发现 — 跨锥体连接和矛盾标记]",
-                         "这些边由 C 园丁发现，连接了 GP 单轮看不到的知识关系。"]
+                actionable_edges = []
+                saturation_edges = []
                 for r in gardener_edges:
-                    lines.append(f"  {r['source_id']}({r['src_title'][:40]}) --[{r['relation']}]--> {r['target_id']}({r['tgt_title'][:40]})")
-                sections.append("\n".join(lines))
+                    src_id = str(r["source_id"] or "")
+                    tgt_id = str(r["target_id"] or "")
+                    src_title = str(r["src_title"] or "")
+                    tgt_title = str(r["tgt_title"] or "")
+                    is_saturation_edge = (
+                        r["relation"] == "RELATED_TO"
+                        and (
+                            src_id.startswith("VIRT_")
+                            or tgt_id.startswith("VIRT_")
+                            or src_title.startswith("饱和:")
+                            or tgt_title.startswith("饱和:")
+                        )
+                    )
+                    if is_saturation_edge:
+                        saturation_edges.append(r)
+                    else:
+                        actionable_edges.append(r)
+                if actionable_edges:
+                    lines = ["[C-Gardener 关联发现 — 跨锥体连接和矛盾标记]",
+                             "这些边由 C 园丁发现，连接了 GP 单轮看不到的知识关系。"]
+                    for r in actionable_edges[:5]:
+                        lines.append(f"  {r['source_id']}({r['src_title'][:40]}) --[{r['relation']}]--> {r['target_id']}({r['tgt_title'][:40]})")
+                    sections.append("\n".join(lines))
+                if saturation_edges:
+                    lines = ["[PLS 饱和提示 — VIRT 关联表示该区域已收束]",
+                             "这些边是拓扑密度信号；优先转向相邻未饱和问题，不要继续验证饱和边本身。"]
+                    for r in saturation_edges[:3]:
+                        lines.append(f"  {r['source_id']}({r['src_title'][:40]}) --[SATURATED:{r['relation']}]--> {r['target_id']}({r['tgt_title'][:40]})")
+                    sections.append("\n".join(lines))
 
             # ── 5. C-Phase 产出：DISCOVERY 和 PATTERN 节点可见性 ──
             disc_rows = conn.execute(
@@ -656,6 +687,44 @@ def _extract_next_checks(response: str) -> list:
     return []
 
 
+def _clean_attention_residue_line(line: str) -> str:
+    cleaned = re.sub(r"^(?:[-*>]\s*|\d+[.)]\s*)+", "", str(line or "").strip())
+    cleaned = cleaned.strip("「」“”\"'")
+    cleaned = cleaned.replace("**", "").replace("`", "").strip()
+    if not cleaned:
+        return ""
+    if cleaned.startswith(("##", "```", "已完成", "已继续", "如果你要", "下一轮可以", "下一轮我会", "我会优先")):
+        return ""
+    if re.match(r"^(✅|❌|⚠️|ℹ️|LINE \[|POINT \[|CONTEXT \[)", cleaned):
+        return ""
+    if re.fullmatch(r"[|:\-\s]+", cleaned):
+        return ""
+    if cleaned.startswith("|") and cleaned.endswith("|"):
+        return ""
+    if len(cleaned) < 12:
+        return ""
+    return _trim_frontier_item(cleaned, 160)
+
+
+def _extract_attention_residue(response: str = "", round_events: list = None) -> str:
+    candidates = []
+    for line in str(response or "").splitlines()[-24:]:
+        cleaned = _clean_attention_residue_line(line)
+        if cleaned:
+            candidates.append(cleaned)
+    if candidates:
+        return candidates[-1]
+    for event in reversed(round_events or []):
+        if event.get("type") not in ("tool_result", "search_result", "blueprint"):
+            continue
+        text = event.get("result_preview") or event.get("content") or ""
+        for line in str(text or "").splitlines()[-8:]:
+            cleaned = _clean_attention_residue_line(line)
+            if cleaned:
+                return cleaned
+    return ""
+
+
 def _collect_tool_names(events: list) -> list:
     names = []
     for event in events:
@@ -676,6 +745,70 @@ def _collect_round_result_events(events: list) -> list:
         if len(result_events) >= 12:
             break
     return result_events
+
+
+def _build_pls_telemetry(round_events: list, kb_delta: dict | None = None) -> dict:
+    telemetry = {
+        "points_created": 0,
+        "context_nodes_written": 0,
+        "legacy_lessons_written": 0,
+        "lines_created": 0,
+        "same_round_lines": 0,
+        "cross_round_lines": 0,
+        "line_existing": 0,
+        "line_errors": 0,
+        "point_errors": 0,
+        "saturation_hints": 0,
+        "knowledge_searches": 0,
+        "kb_new_nodes": 0,
+        "kb_updated_nodes": 0,
+    }
+    for event in round_events or []:
+        if event.get("type") not in ("tool_result", "search_result"):
+            continue
+        name = (event.get("name") or "").strip()
+        result = str(event.get("result_preview") or event.get("content") or "")
+        if name == "search_knowledge_nodes":
+            telemetry["knowledge_searches"] += 1
+        elif name == "record_point":
+            if result.startswith("✅ POINT"):
+                telemetry["points_created"] += 1
+            elif result.startswith("Error:"):
+                telemetry["point_errors"] += 1
+        elif name == "record_context_node":
+            if result.startswith("✅ CONTEXT"):
+                telemetry["context_nodes_written"] += 1
+            elif result.startswith("Error:"):
+                telemetry["point_errors"] += 1
+        elif name == "record_lesson_node":
+            if result.startswith("✅ LESSON") or result.startswith("♻️ LESSON"):
+                telemetry["legacy_lessons_written"] += 1
+        elif name == "record_line":
+            if result.startswith("✅ LINE"):
+                telemetry["lines_created"] += 1
+                if "[同轮]" in result:
+                    telemetry["same_round_lines"] += 1
+                elif "[异轮]" in result:
+                    telemetry["cross_round_lines"] += 1
+            elif result.startswith("ℹ️ LINE"):
+                telemetry["line_existing"] += 1
+            elif result.startswith("Error:"):
+                telemetry["line_errors"] += 1
+        if "碰撞检测" in result or "饱和:" in result or "VIRT_" in result or "SATURATED:" in result:
+            telemetry["saturation_hints"] += 1
+    if isinstance(kb_delta, dict):
+        telemetry["kb_new_nodes"] = len(kb_delta.get("new_nodes") or [])
+        telemetry["kb_updated_nodes"] = len(kb_delta.get("updated_nodes") or [])
+    return telemetry
+
+
+def _format_pls_telemetry(telemetry: dict | None) -> str:
+    t = telemetry or {}
+    return (
+        f"PLS[p={t.get('points_created', 0)} ctx={t.get('context_nodes_written', 0)} "
+        f"l={t.get('lines_created', 0)} same/cross={t.get('same_round_lines', 0)}/{t.get('cross_round_lines', 0)} "
+        f"err={t.get('point_errors', 0) + t.get('line_errors', 0)} sat={t.get('saturation_hints', 0)}]"
+    )
 
 
 def _detect_reanchor_signal(response: str, round_events: list, frontier_state: dict | None = None) -> tuple[bool, str]:
@@ -1034,6 +1167,10 @@ def _extract_description(item: str) -> str:
     return item
 
 
+def _is_saturation_signal_item(item: str) -> bool:
+    return "VIRT_" in item or "饱和:" in item or "--[SATURATED:" in item
+
+
 def _pick_focused_fallback(signals: str, round_num: int = 1) -> str:
     """Planner 失败时的确定性聚焦：从 signals 中选 1 个最高优先级方向。
     优先级：Arena 失败 > VOID > 低置信度 > 通用探索
@@ -1042,17 +1179,22 @@ def _pick_focused_fallback(signals: str, round_num: int = 1) -> str:
     arena_items, void_items, low_conf_items = [], [], []
     current_section = None
     for line in lines:
-        if "反复失效" in line or "Arena" in line:
-            current_section = "arena"
-        elif "知识空洞" in line or "VOID" in line:
-            current_section = "void"
-        elif "待验证" in line or "置信度" in line:
-            current_section = "low_conf"
-        elif "C-Phase" in line or "DISCOVERY" in line or "未经实践的新知识" in line or "从未在实际任务中使用过" in line:
-            current_section = "c_phase"
+        stripped = line.strip()
+        if stripped.startswith("["):
+            current_section = None
+            if "反复失效" in line or "Arena" in line:
+                current_section = "arena"
+            elif "知识空洞" in line or "VOID" in line:
+                current_section = "void"
+            elif "待验证" in line or "置信度" in line:
+                current_section = "low_conf"
+            elif "C-Phase" in line or "DISCOVERY" in line or "未经实践的新知识" in line or "从未在实际任务中使用过" in line:
+                current_section = "c_phase"
         elif line.startswith("  ") and not line.startswith("    →") and ":" in line:
             # 缩进行 = 某 section 下的具体条目（跳过 → 开头的 content_preview 续行）
             item = line.strip()
+            if _is_saturation_signal_item(item):
+                continue
             if current_section == "arena":
                 arena_items.append(item)
             elif current_section == "low_conf":
@@ -2871,10 +3013,19 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             if round_num == 1:
                 prompt = AUTO_PROMPT_FIRST.format(directive=round_focus, signals=signals)
             else:
-                history_entries = [
-                    f"R{e['round']}: {e.get('activity_summary') or e['kb_delta_summary']} | {e.get('frontier_preview') or e['response_preview']}"
-                    for e in round_log[-5:]
-                ]
+                history_entries = []
+                for e in round_log[-5:]:
+                    residue = e.get("attention_residue") or _extract_attention_residue(
+                        e.get("response_full") or e.get("response_preview") or "",
+                        e.get("events") or [],
+                    )
+                    residue_text = ""
+                    if residue:
+                        residue_kind = "断在" if e.get("status") in ("timeout", "interrupted", "exception") else "停在"
+                        residue_text = f"；{residue_kind}：「{residue}」"
+                    history_entries.append(
+                        f"R{e['round']}: {e.get('activity_summary') or e['kb_delta_summary']} | {e.get('frontier_preview') or e['response_preview']}{residue_text}"
+                    )
                 history = "[已完成的行动]\n" + "\n".join(history_entries) + "\n不要重复以上内容。" if history_entries else ""
                 frontier = last_frontier if last_frontier and last_frontier.strip() != "(无输出)" else "(上轮无可复用前沿；先从当前记忆中选择相邻问题)"
                 knowledge_state_text = _format_knowledge_state(last_knowledge_state)
@@ -3004,6 +3155,8 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             "stream_stats": {"content_chunks": 0, "content_chars": 0, "reasoning_chunks": 0, "reasoning_chars": 0},
             "c_phase_summary": None,
             "knowledge_search_count": 0,
+            "pls_telemetry": _build_pls_telemetry(round_events),
+            "attention_residue": "",
             "exception": None,
         }
         round_log.append(round_record)
@@ -3067,6 +3220,11 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             last_frontier = frontier_text
             last_knowledge_state = knowledge_state
             last_reanchor_streak = int(frontier_state.get("reanchor_streak", 0) or 0)
+            attention_residue = _extract_attention_residue(
+                round_record.get("response_full") or round_record.get("response_preview") or "",
+                round_events,
+            )
+            pls_telemetry = _build_pls_telemetry(round_events, kb_delta)
             round_record.update({
                 "status": "interrupted", "duration_s": round(_time_module.time() - t0, 1),
                 "kb_delta": kb_delta, "kb_delta_summary": kb_delta_summary, "kb_changed": kb_changed,
@@ -3080,7 +3238,8 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 "reanchor_required": frontier_state.get("reanchor_required", False),
                 "reanchor_reason": frontier_state.get("reanchor_reason") or "",
                 "reanchor_streak": frontier_state.get("reanchor_streak", 0),
-                "reanchor_stop_reason": reanchor_stop_reason, "exception": reason,
+                "reanchor_stop_reason": reanchor_stop_reason, "pls_telemetry": pls_telemetry,
+                "attention_residue": attention_residue, "exception": reason,
             })
             _flush_round_record()
 
@@ -3158,12 +3317,15 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                     SelfEvolution.clear_restart_marker()
             knowledge_state_text = _format_knowledge_state(knowledge_state)
             last_knowledge_state = knowledge_state
+            attention_residue = "" if round_is_error else _extract_attention_residue(response, round_events)
             reanchor_stop_reason = _derive_reanchor_stop_reason(
                 frontier_state.get("reanchor_required", False),
                 int(frontier_state.get("reanchor_streak", 0) or 0),
                 progress_profile["activity_detected"], consecutive_dry,
             )
             last_reanchor_streak = int(frontier_state.get("reanchor_streak", 0) or 0)
+            pls_telemetry = _build_pls_telemetry(round_events, kb_delta)
+            pls_diag = _format_pls_telemetry(pls_telemetry)
 
             round_record.update({
                 "status": "completed", "duration_s": round(duration, 1), "tokens": total_tokens,
@@ -3177,10 +3339,11 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 "phase_trace": result.phase_trace if hasattr(result, 'phase_trace') else None,
                 "knowledge_state": knowledge_state, "knowledge_state_text": knowledge_state_text,
                 "frontier_state": frontier_state, "frontier_text": frontier_text, "frontier_preview": frontier_preview,
+                "attention_residue": attention_residue,
                 "reanchor_required": frontier_state.get("reanchor_required", False),
                 "reanchor_reason": frontier_state.get("reanchor_reason") or "",
                 "reanchor_streak": frontier_state.get("reanchor_streak", 0),
-                "reanchor_stop_reason": reanchor_stop_reason, "exception": None,
+                "reanchor_stop_reason": reanchor_stop_reason, "pls_telemetry": pls_telemetry, "exception": None,
             })
             _flush_round_record()
             # C-Phase + 知识闭环诊断行
@@ -3192,12 +3355,13 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             _append_md(
                 f"### Knowledge State\n\n```\n{knowledge_state_text}\n```\n\n"
                 f"### C-Phase\n\n```\n{json.dumps(c_sum, ensure_ascii=False) if c_sum else 'skipped'}\n```\n\n"
+                f"### PLS Telemetry\n\n```\n{json.dumps(pls_telemetry, ensure_ascii=False)}\n```\n\n"
                 f"### Frontier\n\n```\n{frontier_text}\n```\n\n"
-                f"### Response ({duration:.0f}s | {total_tokens}t | {node_telemetry} | KB {kb_delta_summary} | {c_diag} | {k_diag} | activity {progress_profile['activity_summary']})\n\n"
+                f"### Response ({duration:.0f}s | {total_tokens}t | {node_telemetry} | KB {kb_delta_summary} | {c_diag} | {k_diag} | {pls_diag} | activity {progress_profile['activity_summary']})\n\n"
                 f"{response or '(无输出)'}\n\n"
             )
             await channel.send(
-                f"**第{round_num}轮** | {duration:.0f}s | {total_tokens}t | {node_telemetry} | KB {kb_delta_summary} | {c_diag} | {k_diag} | activity={progress_profile['activity_summary']} | idle={consecutive_dry}"
+                f"**第{round_num}轮** | {duration:.0f}s | {total_tokens}t | {node_telemetry} | KB {kb_delta_summary} | {c_diag} | {k_diag} | {pls_diag} | activity={progress_profile['activity_summary']} | idle={consecutive_dry}"
             )
             if response:
                 preview = response[:3600]
@@ -3239,6 +3403,8 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 progress_profile["activity_detected"], consecutive_dry,
             )
             last_reanchor_streak = int(frontier_state.get("reanchor_streak", 0) or 0)
+            attention_residue = _extract_attention_residue("", round_events)
+            pls_telemetry = _build_pls_telemetry(round_events, kb_delta)
             round_record.update({
                 "status": "timeout", "duration_s": round(duration, 1),
                 "kb_delta": kb_delta, "kb_delta_summary": kb_delta_summary, "kb_changed": kb_changed,
@@ -3251,7 +3417,8 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 "reanchor_required": frontier_state.get("reanchor_required", False),
                 "reanchor_reason": frontier_state.get("reanchor_reason") or "",
                 "reanchor_streak": frontier_state.get("reanchor_streak", 0),
-                "reanchor_stop_reason": reanchor_stop_reason, "exception": err_str,
+                "reanchor_stop_reason": reanchor_stop_reason, "pls_telemetry": pls_telemetry,
+                "attention_residue": attention_residue, "exception": err_str,
             })
             _flush_round_record()
             last_frontier = ""
@@ -3295,6 +3462,8 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 progress_profile["activity_detected"], consecutive_dry,
             )
             last_reanchor_streak = int(frontier_state.get("reanchor_streak", 0) or 0)
+            attention_residue = _extract_attention_residue("", round_events)
+            pls_telemetry = _build_pls_telemetry(round_events, kb_delta)
             round_record.update({
                 "status": "exception", "duration_s": round(duration, 1),
                 "kb_delta": kb_delta, "kb_delta_summary": kb_delta_summary, "kb_changed": kb_changed,
@@ -3307,7 +3476,8 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 "reanchor_required": frontier_state.get("reanchor_required", False),
                 "reanchor_reason": frontier_state.get("reanchor_reason") or "",
                 "reanchor_streak": frontier_state.get("reanchor_streak", 0),
-                "reanchor_stop_reason": reanchor_stop_reason, "exception": err_str,
+                "reanchor_stop_reason": reanchor_stop_reason, "pls_telemetry": pls_telemetry,
+                "attention_residue": attention_residue, "exception": err_str,
             })
             _flush_round_record()
             last_frontier = ""

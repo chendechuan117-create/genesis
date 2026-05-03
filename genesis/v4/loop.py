@@ -54,7 +54,7 @@ GP_BLOCKED_TOOLS = frozenset([
 class V4Loop(LensPhaseMixin, CPhaseMixin):
     """
     V4 核心管线 (GP 统一模式)
-    
+
     Phases:
     1. GP_PHASE (思考+执行): 拥有完整上下文和所有工具，搜索→思考→执行→回复。
     2. C_PHASE (反思): (Post-loop) 仅允许节点管理工具，沉淀知识。
@@ -74,13 +74,13 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         self.provider = provider
         self.max_iterations = max_iterations
         self.c_phase_blocking = c_phase_blocking
-        
+
         # 单例管理器
         self.factory = FactoryManager()
         self.vault = NodeVault()
-        
+
         self.metrics = PerformanceMetrics()
-        
+
         # 共享状态（用于最后反思和记忆）
         self.user_input = ""
         self.g_messages: List[Message] = []
@@ -88,7 +88,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         self.inferred_signature: Dict[str, Any] = {}
         self.blackboard: Optional[Blackboard] = None  # Multi-G 黑板
         self._llm_call_seq = 0
-        
+
         # 启动时恢复 persona 学习数据（只在首次 V4Loop 实例化时加载一次）
         Blackboard.load_from_db()
 
@@ -139,7 +139,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         seed_lines = [line.strip() for line in _sig_input.splitlines() if line.strip()]
         if not self.knowledge_state.get("issue") and seed_lines:
             self.knowledge_state["issue"] = self._truncate_knowledge_state_text(seed_lines[0], 240)
-        
+
         # === Multi-G 透镜预激活 ===
         disable_multi_g = self.loop_config.get("disable_multi_g")
         if disable_multi_g is None:
@@ -156,7 +156,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                 self.blackboard = None
         else:
             await self._safe_callback(step_callback, "lens_skipped", {"phase": "LENS_PHASE", "reason": "gate_closed"})
-        
+
         # === Tracing ===
         self.tracer = Tracer.get_instance()
         self.trace_id = self.tracer.start_trace(user_input)
@@ -164,18 +164,18 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         self._llm_call_count = 0
         self._tool_call_count = 0
         self._recent_tool_calls: Dict[str, int] = {}  # "tool_name|args_hash" → count
-        
+
         final_response = ""
-        
+
         try:
             # === GP-Process: Unified Thinker+Executor ===
             final_response = await self._run_main_loop(user_input, step_callback)
-            
+
         except Exception as e:
             logger.error(f"Pipeline execution error: {traceback.format_exc()}")
             self.metrics.success = False
             raise
-            
+
         # 兜底防护：确保 final_response 永不为空
         if not final_response or not str(final_response).strip():
             logger.error(f"CRITICAL: final_response is empty after pipeline. g_messages count: {len(self.g_messages)}, llm_calls: {self._llm_call_count}, tool_calls: {self._tool_call_count}")
@@ -187,12 +187,12 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                     break
             if not final_response or not str(final_response).strip():
                 final_response = "抱歉，我在处理你的请求时遇到了问题，没有生成有效的回复。请再试一次。"
-        
+
         self.metrics.total_time = time.time() - self.metrics.start_time
-        
+
         # 保存这轮完整对话作为短期记忆（同步，确保记忆不丢）
         self._save_memory(final_response)
-        
+
         # === Phase 3: C-Process (反思沉淀) ===
         # 长生命周期（Discord bot）: 后台 create_task，不阻塞用户
         # 短生命周期（API server）: await 等待完成，防止 event loop 关闭时截断
@@ -216,11 +216,11 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                 logger.info(f"C-Process launched in background (mode={c_mode}, GP={self.metrics.g_tokens}t).")
         else:
             logger.info(f"Skipping C-Process: mode=SKIP (GP={self.metrics.g_tokens}t).")
-        
+
         # Multi-G 空洞自动入库（放在 C 之后，避免改变 digest 导致 G 缓存失效）
         if self.blackboard:
             self._auto_record_voids(self.blackboard)
-        
+
         # 签名偏差数据写入 heartbeat，供外部监控和自诊断
         # 签名偏差摘要：统计盲区/误报/冲突的出现频次
         sig_drift_summary = None
@@ -273,7 +273,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         )
         if diagnostics_summary["firing_count"] > 0:
             logger.warning(f"🚨 Pipeline diagnostics: {diagnostics_summary['firing_count']}/{diagnostics_summary['total_signals']} signals firing")
-        
+
         # === End Trace ===
         self.tracer.end_trace(
             self.trace_id,
@@ -286,7 +286,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
             llm_call_count=self._llm_call_count,
             tool_call_count=self._tool_call_count
         )
-        
+
         return final_response, self.metrics
 
 
@@ -366,7 +366,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         await self._safe_callback(step_callback, "loop_start", {"phase": "GP_PHASE"})
         self._phase_count += 1
         self._g_span = self.tracer.start_span(self.trace_id, "GP_PHASE", span_type="phase", phase="GP")
-        
+
         self.vault.heartbeat("main_loop", "running", f"GP start: {user_input[:60]}")
         # 生成执行经验摘要（程序性记忆层）
         trace_exp = ""
@@ -389,7 +389,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
             trace_experience=trace_exp,
             gp_tool_names=gp_tool_names,
         )
-        
+
         # Build User Content (Multimodal if images exist)
         if hasattr(self, 'image_paths') and self.image_paths:
             import base64
@@ -421,7 +421,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
             Message(role=MessageRole.SYSTEM, content=gp_prompt),
             Message(role=MessageRole.USER, content=user_content)
         ]
-        
+
         # === Multi-G 黑板注入：如果透镜阶段已完成，将结果注入 GP 的上下文 ===
         if self.blackboard and self.blackboard.entry_count > 0:
             collapse_results = self.blackboard.collapse(self.vault)
@@ -431,7 +431,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                 e = item["entry"]
                 collapse_summary_lines.append(f"  {rank}. [{e.persona}] score={item['score']:.3f} — {e.framework}")
             collapse_text = "\n".join(collapse_summary_lines)
-            
+
             # 提取 top entry 的 verification_action，如果具体则建议 GP 优先执行
             verification_hint = ""
             if collapse_results:
@@ -440,13 +440,13 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                     va = top_entry.verification_action.strip()
                     if len(va) > 10:
                         verification_hint = f"\n\n[建议优先验证]\n透镜 {top_entry.persona} 建议的最小验证动作：{va}\n如果此动作可行，建议优先执行它，以快速确认或否定假设。"
-            
+
             self.g_messages.append(Message(
                 role=MessageRole.SYSTEM,
                 content=f"[Multi-G 透镜侦察完毕]\n你的透镜子程序已从不同认知视角检索了知识库，以下是汇总。你可以参考但不必盲从——你是主脑，保留最终判断权。\n\n{board_text}\n\n{collapse_text}{verification_hint}"
             ))
             logger.info(f"Multi-G blackboard injected into GP context: {self.blackboard.entry_count} entries, top={collapse_results[0]['entry'].persona if collapse_results else 'N/A'}")
-        
+
         # === 知识路由层：预加载上轮活跃节点，避免每次全量搜索 ===
         routing_text = self._apply_knowledge_routing()
         if routing_text:
@@ -454,23 +454,23 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                 role=MessageRole.SYSTEM,
                 content=routing_text,
             ))
-        
+
         schema = [t.to_schema() for t in gp_tools]
-        
+
         _consecutive_errors = 0
         _MAX_CONSECUTIVE_ERRORS = 3
         gp_max_iterations = _env_int("GENESIS_GP_MAX_ITERATIONS_OVERRIDE", self.max_iterations, minimum=1)
         for i in range(gp_max_iterations):
             # === 跨进程向量同步：拉取后台进程新增的节点向量 ===
             self.vault.sync_vector_matrix_incremental()
-            
+
             # ── 优雅提醒：倒数第 5 轮提醒 GP 收尾 ──
             if i == gp_max_iterations - 5:
                 self.g_messages.append(Message(
                     role=MessageRole.SYSTEM,
                     content="[系统提醒] 你还剩约 5 轮迭代。请开始收尾，向用户输出最终回复。"
                 ))
-            
+
             # ── 知识路径持续提醒（仅 auto 模式，对抗 Instruction Attenuation）──
             _unblocked = set(self.loop_config.get("gp_unblock_tools") or [])
             if "record_context_node" in _unblocked and "record_point" in self.tools and i >= 8 and i % 5 == 3:
@@ -478,7 +478,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                     role=MessageRole.SYSTEM,
                     content="[知识路径] 回顾到目前为止是否形成了以后还会用到的新理解；如果只是复述或临时细节，不需要记录。若确实值得保存，用 record_point 写点，再用 record_line 连到依据节点；每条线的 reasoning 回答不同的因果问题。"
                 ))
-            
+
             self._llm_call_count += 1
             jailbreak = {"role": "system", "content": "[Reminder] 你有知识库和执行工具。能动手就动手，能查就查，别空谈。"}
             messages_to_send = [m.to_dict() for m in self.g_messages] + [jailbreak]
@@ -508,16 +508,16 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                     content=f"[系统提示] 上次 LLM 调用因网络错误失败（{provider_err}），已自动重试。请继续未完成的任务。"
                 ))
                 continue
-            
+
             self._update_metrics(response)
-            
+
             self.g_messages.append(Message(
                 role=MessageRole.ASSISTANT,
                 content=response.content,
                 tool_calls=[tc.__dict__ for tc in response.tool_calls] if response.tool_calls else None,
                 reasoning_content=getattr(response, 'reasoning_content', None)
             ))
-            
+
             if response.tool_calls:
                 # ═══════════════════════════════════════════════════════
                 # 三阶段并行工具执行
@@ -526,13 +526,13 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                 # Phase 3: 后处理（串行）— 按原始顺序处理所有副作用
                 # ═══════════════════════════════════════════════════════
                 _unblock = set(self.loop_config.get("gp_unblock_tools") or [])
-                
+
                 # Phase 1: 预检查
                 exec_plan = []  # [(tc, should_execute, skip_reason, is_safe)]
                 for tc in response.tool_calls:
                     await self._safe_callback(step_callback, "tool_start", {"phase": "GP_PHASE", "name": tc.name, "args": tc.arguments, "iteration": i})
                     self._tool_call_count += 1
-                    
+
                     # 断路器检查
                     _call_key = f"{tc.name}|{json.dumps(tc.arguments, sort_keys=True, ensure_ascii=False)[:200]}"
                     self._recent_tool_calls[_call_key] = self._recent_tool_calls.get(_call_key, 0) + 1
@@ -540,19 +540,19 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                         logger.warning(f"Circuit breaker: {tc.name} called {self._recent_tool_calls[_call_key]}x with same args")
                         exec_plan.append((tc, False, "breaker", False))
                         continue
-                    
+
                     # GP 权限检查
                     if tc.name in GP_BLOCKED_TOOLS and tc.name not in _unblock:
                         exec_plan.append((tc, False, "blocked", False))
                         continue
-                    
+
                     # 并发安全分类
                     is_safe = self.tools.is_concurrency_safe(tc.name, tc.arguments)
                     exec_plan.append((tc, True, None, is_safe))
-                
+
                 # Phase 2: 执行
                 tool_results = {}  # tc.id → (res_text, duration_ms)
-                
+
                 async def _exec_single(tc):
                     """执行单个工具，返回 (tc, res_text, duration_ms)"""
                     t0 = time.time()
@@ -583,7 +583,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                         logger.error(f"GP tool error: {tc.name} — {e}")
                     duration_ms = (time.time() - t0) * 1000
                     return tc, str(res), duration_ms
-                
+
                 # 并行执行 safe 工具
                 safe_tasks = [tc for tc, should_exec, _, is_safe in exec_plan
                               if should_exec and is_safe]
@@ -600,14 +600,14 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                         tool_results[tc.id] = (res_text, dur)
                     if len(safe_tasks) > 1:
                         logger.info(f"GP parallel: {len(safe_tasks)} safe tools executed concurrently")
-                
+
                 # 串行执行 unsafe 工具
                 unsafe_tasks = [tc for tc, should_exec, _, is_safe in exec_plan
                                 if should_exec and not is_safe]
                 for tc in unsafe_tasks:
                     _, res_text, dur = await _exec_single(tc)
                     tool_results[tc.id] = (res_text, dur)
-                
+
                 # Phase 3: 后处理（按原始 tool_call 顺序，保证副作用一致性）
                 for tc, should_exec, skip_reason, is_safe in exec_plan:
                     if not should_exec:
@@ -625,7 +625,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                         })
                         # 签名学习
                         self._merge_signature_from_texts(res_text[:500])
-                    
+
                     await self._safe_callback(step_callback, "tool_result", {
                         "phase": "GP_PHASE",
                         "name": tc.name,
@@ -641,9 +641,9 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                     )
                     self.metrics.tools_used.append(tc.name)
                     self.g_messages.append(Message(role=MessageRole.TOOL, content=res_text, tool_call_id=tc.id, name=tc.name))
-                
+
                 continue
-                
+
             # ── 纯文本回复路径 ──
             # 无 tool_calls → GP 的文本就是对用户的最终回复
             if response.content and response.content.strip():
@@ -662,7 +662,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                 if self.g_messages and self.g_messages[-1].role == MessageRole.ASSISTANT:
                     self.g_messages.pop()
                 continue
-                
+
         logger.warning(f"GP reached max iterations ({gp_max_iterations}) without finalizing.")
         self.tracer.end_span(self._g_span, status="timeout")
         for msg in reversed(self.g_messages):
@@ -720,7 +720,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
 
     def _get_gp_tools(self) -> List[Any]:
         """获取 GP 可用的所有工具（排除 C-Phase 专属工具）
-        
+
         loop_config.gp_unblock_tools: 允许选择性解禁部分 GP_BLOCKED_TOOLS，
         例如 auto 模式下解禁 record_context_node 让 GP 创建结构锚点。
         """
@@ -757,16 +757,16 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         策略：
         1. 有游标且话题未漂移 → 确定性路由（沿游标节点 + 1-hop 导航）
         2. 无游标或话题漂移 → 向量搜索预加载（基于用户输入自动检索 + graph walk）
-        
+
         GP 拿到的是预加载的精准知识图谱片段，不需要自己猜关键词搜索。
         """
         _sig_input = self.user_input
         if "[GENESIS_USER_REQUEST_START]" in _sig_input:
             _sig_input = _sig_input.split("[GENESIS_USER_REQUEST_START]", 1)[1]
-        
+
         cursor = self._knowledge_cursor_in
         use_cursor = False
-        
+
         if cursor and cursor.get("active_node_ids"):
             # 话题漂移检测
             input_lower = _sig_input.lower()
@@ -778,7 +778,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                 overlap = 0.0
             use_cursor = overlap >= 0.3
             logger.info(f"Knowledge routing: cursor overlap={overlap:.2f}, use_cursor={use_cursor}")
-        
+
         if use_cursor:
             return self._route_from_cursor(cursor)
         else:
@@ -799,13 +799,13 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         if not self.vault.vector_engine.is_ready:
             logger.debug("Knowledge routing: vector engine not ready, skip")
             return None
-        
+
         # 向量粗排
         results = self.vault.vector_engine.search(query_text, top_k=10, threshold=0.45)
         if not results:
             logger.info("Knowledge routing: vector search returned 0 hits")
             return None
-        
+
         node_ids = [r[0] for r in results]
         scores = {r[0]: r[1] for r in results}
         logger.info(f"Knowledge routing: vector search hit {len(node_ids)} nodes, top={scores.get(node_ids[0], 0):.3f}")
@@ -841,11 +841,11 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         briefs = self.vault.get_node_briefs(node_ids)
         if not briefs:
             return None
-        
+
         lines = [header]
         loaded_ids = []
         DEEP_EDGES = {"REQUIRES", "TRIGGERS", "RESOLVES"}
-        
+
         # PLS: 用入线数判定拓扑角色，不泄露数字评分
         incoming_counts = self.vault.get_incoming_line_counts_batch(node_ids) if hasattr(self.vault, 'get_incoming_line_counts_batch') else {}
         try:
@@ -868,7 +868,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
             arena_tag = " | 有实战" if has_arena else ""
             lines.append(f"  ● <{ntype}> {title} [{nid}] ({role}{arena_tag})")
             loaded_ids.append(nid)
-            
+
             # 1-hop 邻居 + 强边 2-hop
             hop1_deep = []
             for direction in ["out", "in"]:
@@ -891,17 +891,20 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                         hop2_count += 1
                         if hop2_count >= 3:
                             break
-        
+
         if not loaded_ids:
             return None
-        
+
         for nid in loaded_ids:
             if nid not in self.execution_active_nodes:
                 self.execution_active_nodes.append(nid)
         if surface_result:
             fill_count = surface_result.get("fill_count", 0)
             push_count = surface_result.get("push_count", 0)
-            lines.append(f"\n[面状态] 已经完成填充→推进组装：基础节点 {fill_count} 个，探索节点 {push_count} 个。")
+            co_presence_count = surface_result.get("co_presence_count", 0)
+            lines.append(f"\n[面状态] 已经完成填充→推进→共场组装：基础节点 {fill_count} 个，探索节点 {push_count} 个，游离点 {co_presence_count} 个。")
+            if co_presence_count:
+                lines.append("[共场] 游离点只是受控走神材料，用于触发“或许？”，不是必须处理的任务。")
             for area_hint, _ in surface_result.get("virtual_saturation", [])[:3]:
                 lines.append(f"[饱和] {area_hint}：该区域路径重叠频繁，优先转向不饱和邻域。")
         lines.append(f"\n如需深入某个节点，用 get_knowledge_node_content 读取完整内容。")
@@ -918,7 +921,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
             _sig_input = _sig_input.split("[GENESIS_USER_REQUEST_START]", 1)[1]
         for token in re.findall(r'[\w\u4e00-\u9fff]{2,}', _sig_input):
             search_keywords.add(token.lower())
-        
+
         return {
             "active_node_ids": list(self.execution_active_nodes)[:12],
             "search_keywords": list(search_keywords)[:20],

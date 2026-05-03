@@ -172,6 +172,9 @@ async def on_ready():
 async def on_message(message: discord.Message):
     if message.author == client.user:
         return
+    # 忽略 webhook 消息（Yogg 的只读输出），防止回声
+    if message.webhook_id is not None:
+        return
 
     content = (message.content or "").strip()
     # Strip bot mention so "@Genesis /auto" works

@@ -25,6 +25,12 @@ import sys
 import time
 from pathlib import Path
 
+try:
+    import httpx
+    _HAS_HTTPX = True
+except ImportError:
+    _HAS_HTTPX = False
+
 # ── 自进化模式：沙箱生命周期由 SelfEvolution 管理，不自动 reset ──
 os.environ.setdefault("GENESIS_AUTO_SYNC_DOCTOR_SANDBOX", "0")  # 不在 session 开头 reset 沙箱
 os.environ.setdefault("GENESIS_SELF_EVOLUTION", "1")             # SelfEvolution 接管沙箱
@@ -112,7 +118,7 @@ _LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class LogChannel:
-    """模拟 discord.TextChannel，将 send() 输出到日志文件 + stdout。"""
+    """模拟 discord.TextChannel，将 send() 输出到日志文件 + stdout + Discord Webhook。"""
 
     def __init__(self, session_id: str):
         self.id = 90660  # 固定 channel id for Yogg
@@ -120,8 +126,69 @@ class LogChannel:
         self._fh = open(self._log_path, "a", encoding="utf-8")
         logger.info(f"Yogg log: {self._log_path}")
 
+        # Discord Webhook (只出不进)
+        self._webhook_url = (os.environ.get("YOGG_DISCORD_WEBHOOK_URL") or "").strip()
+        self._webhook_enabled = bool(self._webhook_url) and _HAS_HTTPX
+        self._webhook_queue: asyncio.Queue | None = None
+        self._webhook_task: asyncio.Task | None = None
+        if self._webhook_enabled:
+            logger.info("Yogg Discord webhook output enabled")
+
+    def start_webhook_sender(self):
+        """启动 webhook 发送协程（在 running event loop 中调用）。"""
+        if not self._webhook_enabled or self._webhook_task is not None:
+            return
+        self._webhook_queue = asyncio.Queue()
+        self._webhook_task = asyncio.create_task(self._webhook_sender_loop())
+
+    async def _webhook_sender_loop(self):
+        """后台协程：从队列取消息发到 Discord webhook，遵守速率限制。"""
+        assert self._webhook_queue is not None
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(10, connect=5),
+            proxy="socks5://127.0.0.1:20170",
+        ) as client:
+            while True:
+                try:
+                    content = await self._webhook_queue.get()
+                    if content is None:  # sentinel
+                        break
+                    # Discord webhook 单条最长 2000 字符
+                    chunks = []
+                    if len(content) > 2000:
+                        for i in range(0, len(content), 1990):
+                            chunks.append(content[i:i + 1990])
+                    else:
+                        chunks.append(content)
+                    for chunk in chunks:
+                        try:
+                            resp = await client.post(
+                                self._webhook_url,
+                                json={"content": chunk},
+                            )
+                            if resp.status_code == 429:
+                                retry_after = float(resp.headers.get("Retry-After", "5"))
+                                logger.warning(f"Yogg webhook rate-limited, waiting {retry_after}s")
+                                await asyncio.sleep(retry_after)
+                                # 重试
+                                await client.post(
+                                    self._webhook_url,
+                                    json={"content": chunk},
+                                )
+                            elif resp.status_code >= 400:
+                                logger.warning(f"Yogg webhook error: {resp.status_code} {resp.text[:200]}")
+                        except Exception as e:
+                            logger.error(f"Yogg webhook send failed: {e}")
+                        # Discord webhook 速率限制 ~2s/message 安全间隔
+                        await asyncio.sleep(1.0)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.error(f"Yogg webhook loop error: {e}")
+                    await asyncio.sleep(5)
+
     async def send(self, content: str, **kwargs):
-        """写到日志文件 + stdout，模拟 channel.send()。"""
+        """写到日志文件 + stdout + Discord webhook，模拟 channel.send()。"""
         ts = time.strftime("%H:%M:%S")
         line = f"[{ts}] {content}"
         # stdout (简短版)
@@ -135,12 +202,26 @@ class LogChannel:
             self._fh.flush()
         except Exception:
             pass
+        # Discord webhook (异步入队，不阻塞)
+        if self._webhook_enabled and self._webhook_queue is not None:
+            try:
+                self._webhook_queue.put_nowait(content)
+            except asyncio.QueueFull:
+                pass  # 丢弃，不阻塞主循环
 
     def close(self):
         try:
             self._fh.close()
         except Exception:
             pass
+        # 停止 webhook sender
+        if self._webhook_task and not self._webhook_task.done():
+            if self._webhook_queue:
+                try:
+                    self._webhook_queue.put_nowait(None)  # sentinel
+                except Exception:
+                    pass
+            self._webhook_task.cancel()
 
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -225,6 +306,7 @@ async def _run_session(agent, directive: str, session_num: int):
     session_ts = time.strftime("%Y%m%d_%H%M%S")
     session_id = f"yogg_{session_num:03d}_{session_ts}"
     channel = LogChannel(session_id)
+    channel.start_webhook_sender()
     auto_state = {channel.id: {"active": True}}
 
     logger.info(f"=== Yogg session #{session_num} start ({session_id}) ===")

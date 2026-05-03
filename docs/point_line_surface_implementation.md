@@ -14,11 +14,11 @@
 | reasoning_lines 表 + same_round/trace_id/round_seq | `v4/manager.py` | ✅ 入线数查询排除同轮线 |
 | 低摩擦 point/line 工具 + 旧工具兼容 | `tools/node_tools.py` | ✅ record_point / record_line 为 GP 主入口 |
 | auto_mode 工具暴露 | `auto_mode.py` | ✅ record_point / record_line 默认可见 |
-| 入线数 + 角色标签 | `tools/search_tool.py` | ✅ 只显示基础/探索，不显示数字 |
+| 入线数 + 角色标签 | `tools/search_tool.py` | ✅ 只显示基础/探索/游离，不显示数字 |
 | 碰撞检测 | `tools/node_tools.py` | ✅ find_collision_candidates，覆盖 record_lesson_node + record_line |
 | 饱和标记（原虚点） | `v4/manager.py` + `search_tool.py` | ✅ is_virtual + 搜索过滤 + 饱和信号注入面 |
-| 面两阶段组装 | `v4/surface.py` | ✅ 真替换（非追加），directional reasoning_lines |
-| 旧架构清理 | `prompt_factory.py` + `search_tool.py` + `knowledge_query.py` | ✅ GP 可见数字评分→基础/探索/面状态 |
+| 面三层组装 | `v4/surface.py` | ✅ 填充 + 推进 + 共场游离点，directional reasoning_lines |
+| 旧架构清理 | `prompt_factory.py` + `search_tool.py` + `knowledge_query.py` | ✅ GP 可见数字评分→基础/探索/游离/面状态 |
 | 必要性消融 | `v4/manager.py` + `c_phase.py` + 全通道过滤 | ✅ ablation_active + 7通道过滤 |
 | PLS 遗留机制修复（11项） | 多文件 | ✅ 入线数替代 confidence/win_rate |
 
@@ -73,6 +73,14 @@
 当前实现未显式建模该信号。现有碰撞检测只用 basis 集合重叠做 MVP，无法区分"换皮重复"与"独立路径收敛"。
 
 当前裁决：殊途同归保留为远期拓扑模式，不进入当前 PLS 核心三信号。未来可通过线语义比较、`RELATED_TO` 强化，或新增收敛关系表达。
+
+### 面：路径切片 → 认知场
+
+原稿包含"散落探索点在旧路径剔除后重新获得连接机会"的涌现思想。当前主文档已补回：面不仅是显性推理路径的切片，也是未显性关系的共场。
+
+当前实现：`SurfaceExpander` 在填充和推进之后追加少量 `游离` 角色点。游离点来自推进时被替换出的低入线节点，以及当前种子邻域中未被显性路径消费的弱关联节点。它们只在当轮面中共同出现，不写边、不自动连线、不改变入线数。
+
+当前裁决：共场不是第四个拓扑信号，也不是新节点类型。它是 Surface 对已有拓扑、弱关联和注意力边缘点的消费方式，用于给 LLM 保留受控认知熵。
 
 ### 园丁不种树
 
@@ -151,7 +159,7 @@ CREATE INDEX IF NOT EXISTS idx_rl_trace_round ON reasoning_lines(trace_id, round
 | `find_collision_candidates` | `v4/manager.py` | 碰撞检测 |
 | `ensure_virtual_point` | `v4/manager.py` | 饱和标记创建/递增 |
 | `get_virtual_saturation` | `v4/manager.py` | 饱和信号查询 |
-| `expand_surface` | `v4/surface.py` | 面两阶段组装 |
+| `expand_surface` | `v4/surface.py` | 面三层组装（填充/推进/共场） |
 | `check_ablation_candidates` | `v4/manager.py` | 消融候选 |
 | `activate_ablation / deactivate_ablation` | `v4/manager.py` | 消融激活/评估 |
 | `check_proactive_pruning_candidates` | `v4/manager.py` | 主动修剪候选（实验性） |
@@ -180,7 +188,7 @@ CREATE INDEX IF NOT EXISTS idx_rl_trace_round ON reasoning_lines(trace_id, round
 | # | 冲突点 | 文件 | 修复 |
 |---|--------|------|------|
 | 1 | 外部注意力控制 | `auto_mode.py` | 放宽阈值(5→8/2→3/3→4) + PLS 语言 |
-| 2 | 数字泄露 q/sim/W/L | `loop.py` | 基础/探索拓扑角色标签 |
+| 2 | 数字泄露 q/sim/W/L | `loop.py` | 基础/探索/游离拓扑角色标签 |
 | 3 | fusion_score 数字路由 | `search_tool.py` | _topo_value 替代 _metric_score |
 | 4 | conf*weight 坍缩 | `blackboard.py` | 入线数替代 eff_conf |
 | 5 | win_rate 消融 | `manager.py` | 入线数+CONTRADICTS 替代 win_rate |

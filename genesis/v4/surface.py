@@ -1,9 +1,10 @@
 """
-面（Surface）= 一次性的信息引用组合，由点构成，每轮搜索后组装一次，用完即弃。
+面（Surface）= 一次性的认知场，由点构成，每轮搜索后组装一次，用完即弃。
 
-两阶段组装：
+三层组装：
 1. 填充（水流扩散）：BFS 沿高入线数方向扩散，优先走已被反复验证的推理通道
-2. 推进（替换策略）：逐步将核心旧点替换成边缘新点，GP 被推向知识前沿
+2. 推进（替换策略）：保留高入线基础，逐步将低入线填充点替换成边缘新点
+3. 共场（受控走神）：少量未被显性路径消费的点共同出现，诱发"或许？"
 """
 
 import logging
@@ -17,10 +18,11 @@ logger = logging.getLogger(__name__)
 # P75 意味着约 25% 节点被标记为基础，75% 为探索。库小时阈值低，库大时阈值自动升高。
 BASIS_INCOMING_PERCENTILE = 75  # 入线数分布的百分位，>= 此分位数的节点为"基础"
 BASIS_INCOMING_FLOOR = 1  # 最低阈值：即使 P75=0，至少入线数>=1 才算基础（避免空库全基础）
+CO_PRESENCE_RATIO = 0.15
 
 
 class SurfaceExpander:
-    """面组装器：从种子点出发，两阶段 BFS 扩散组装面"""
+    """面组装器：从种子点出发组装基础、推进、共场三层认知场"""
 
     def __init__(self, vault):
         self.vault = vault
@@ -32,7 +34,7 @@ class SurfaceExpander:
         replace_ratio: float = 0.6,
     ) -> Dict:
         """
-        两阶段组装面。
+        三层组装面。
 
         Args:
             seed_ids: 搜索命中的种子点 ID 列表
@@ -41,17 +43,20 @@ class SurfaceExpander:
 
         Returns:
             {
-                "surface_nodes": [(node_id, role), ...],  # role = "基础" | "探索"
+                "surface_nodes": [(node_id, role), ...],  # role = "基础" | "探索" | "游离"
                 "fill_count": int,
                 "push_count": int,
+                "co_presence_count": int,
                 "virtual_saturation": [(area_hint, count), ...],  # 虚点饱和信号
             }
         """
         if not seed_ids:
-            return {"surface_nodes": [], "fill_count": 0, "push_count": 0, "virtual_saturation": []}
+            return {"surface_nodes": [], "fill_count": 0, "push_count": 0, "co_presence_count": 0, "virtual_saturation": []}
 
         fill_budget = int(context_budget * replace_ratio)
-        push_budget = context_budget - fill_budget
+        replacement_budget = context_budget - fill_budget
+        co_presence_budget = min(int(context_budget * CO_PRESENCE_RATIO), max(0, replacement_budget))
+        push_budget = max(0, replacement_budget - co_presence_budget)
 
         # 批量获取入线数（一次查询）
         # 先收集所有可能涉及的节点 ID，再批量查
@@ -88,22 +93,42 @@ class SurfaceExpander:
         frontier_ids = self._collect_frontier(fill_nodes, incoming_counts, ablation_ids, basis_threshold)
         retained_fill, push_nodes = self._push_phase(fill_nodes, frontier_ids, incoming_counts, push_budget)
 
-        # 合并结果：保留的 fill + 推进的 frontier
+        retained_ids = {nid for nid, _ in retained_fill}
+        used_ids = retained_ids | {nid for nid, _ in push_nodes}
+        evicted_fill = [(nid, role) for nid, role in fill_nodes if nid not in retained_ids]
+
+        # ── 阶段三：共场（受控走神）──
+        co_presence_nodes = self._co_presence_phase(
+            evicted_fill,
+            neighbor_map,
+            incoming_counts,
+            co_presence_budget,
+            used_ids,
+            ablation_ids,
+            basis_threshold,
+        )
+
+        # 合并结果：保留的 fill + 推进的 frontier + 共场游离点
         all_node_ids = list(dict.fromkeys(
-            [nid for nid, _ in retained_fill] + [nid for nid, _ in push_nodes]
+            [nid for nid, _ in retained_fill] + [nid for nid, _ in push_nodes] + [nid for nid, _ in co_presence_nodes]
         ))
+        co_presence_ids = {nid for nid, _ in co_presence_nodes}
 
         # 角色标注
         surface_nodes = []
         for nid in all_node_ids:
-            role = "基础" if incoming_counts.get(nid, 0) >= basis_threshold else "探索"
+            if nid in co_presence_ids:
+                role = "游离"
+            else:
+                role = "基础" if incoming_counts.get(nid, 0) >= basis_threshold else "探索"
             surface_nodes.append((nid, role))
 
         fill_count = sum(1 for _, r in surface_nodes if r == "基础")
         push_count = sum(1 for _, r in surface_nodes if r == "探索")
+        co_presence_count = sum(1 for _, r in surface_nodes if r == "游离")
 
         logger.info(
-            f"Surface: {len(surface_nodes)} nodes ({fill_count} basis, {push_count} frontier) "
+            f"Surface: {len(surface_nodes)} nodes ({fill_count} basis, {push_count} frontier, {co_presence_count} co-presence) "
             f"from {len(seed_ids)} seeds, budget={context_budget}"
         )
 
@@ -111,6 +136,7 @@ class SurfaceExpander:
             "surface_nodes": surface_nodes,
             "fill_count": fill_count,
             "push_count": push_count,
+            "co_presence_count": co_presence_count,
             "virtual_saturation": virtual_saturation,
         }
 
@@ -229,15 +255,53 @@ class SurfaceExpander:
 
         # 按入线数升序排列，低入线数 = 不稳固填充 = 优先踢掉
         fill_sorted = sorted(fill_nodes, key=lambda x: incoming_counts.get(x[0], 0))
+        budget = min(budget, len(frontier_ids))
         # 踢掉前 budget 个低入线数节点
         evicted = {nid for nid, _ in fill_sorted[:budget]}
         retained_fill = [(nid, role) for nid, role in fill_nodes if nid not in evicted]
 
         # 用前沿节点替换
-        push_count = min(budget, len(frontier_ids))
-        push_nodes = [(fid, "探索") for fid in frontier_ids[:push_count]]
+        push_nodes = [(fid, "探索") for fid in frontier_ids[:budget]]
 
         return retained_fill, push_nodes
+
+    def _co_presence_phase(
+        self,
+        evicted_fill: List[Tuple[str, str]],
+        neighbor_map: Dict[str, List],
+        incoming_counts: Dict[str, int],
+        budget: int,
+        used_ids: Set[str],
+        excluded_ids: Set[str] = None,
+        basis_threshold: int = 2,
+    ) -> List[Tuple[str, str]]:
+        """收集共场游离点：只共同出现，不声明推理关系"""
+        if budget <= 0:
+            return []
+
+        excluded = excluded_ids or set()
+        candidates: Dict[str, float] = {}
+
+        for nid, _ in evicted_fill:
+            if nid not in used_ids and nid not in excluded:
+                candidates[nid] = max(candidates.get(nid, 0.0), 3.0)
+
+        for neighbors in neighbor_map.values():
+            for neighbor in neighbors:
+                if isinstance(neighbor, tuple):
+                    nid, weight = neighbor
+                else:
+                    nid, weight = neighbor, 1.0
+                if nid in used_ids or nid in excluded:
+                    continue
+                incoming = incoming_counts.get(nid, 0)
+                if incoming >= basis_threshold:
+                    continue
+                novelty = 1.0 / (1.0 + incoming)
+                candidates[nid] = max(candidates.get(nid, 0.0), float(weight) + novelty)
+
+        ranked = sorted(candidates.items(), key=lambda x: (-x[1], x[0]))
+        return [(nid, "游离") for nid, _ in ranked[:budget]]
 
     def _check_virtual_saturation(self, node_ids: List[str]) -> List[Tuple[str, int]]:
         """检查虚点饱和信号：查询面节点邻域内的虚点，按区域聚合"""
@@ -260,6 +324,7 @@ class SurfaceExpander:
         lines = []
         basis_nodes = [(nid, role) for nid, role in surface_nodes if role == "基础"]
         frontier_nodes = [(nid, role) for nid, role in surface_nodes if role == "探索"]
+        co_presence_nodes = [(nid, role) for nid, role in surface_nodes if role == "游离"]
 
         if basis_nodes:
             items = [f"{titles.get(nid, nid[:12])}[{nid}]" for nid, _ in basis_nodes[:10]]
@@ -267,6 +332,10 @@ class SurfaceExpander:
         if frontier_nodes:
             items = [f"{titles.get(nid, nid[:12])}[{nid}]" for nid, _ in frontier_nodes[:10]]
             lines.append(f"[探索] {len(frontier_nodes)} 个前沿节点：{', '.join(items)}")
+        if co_presence_nodes:
+            items = [f"{titles.get(nid, nid[:12])}[{nid}]" for nid, _ in co_presence_nodes[:10]]
+            lines.append(f"[游离] {len(co_presence_nodes)} 个共场点：{', '.join(items)}")
+            lines.append("[共场] 游离点用于触发“或许？”，不是必须处理的任务，也不代表关系已成立")
 
         # 虚点饱和信号
         virtual_sat = surface_result.get("virtual_saturation", [])

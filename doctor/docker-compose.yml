@@ -9,6 +9,8 @@ services:
     entrypoint: ["/bin/bash", "/doctor/entrypoint.sh"]
     stdin_open: true
     tty: true
+    mem_limit: 1g
+    memswap_limit: 1.5g
     volumes:
       - ..:/src/genesis:ro
       - ../venv:/opt/venv:ro

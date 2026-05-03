@@ -122,7 +122,7 @@ cmd_reset() {
 
 cmd_exec() {
     _ensure_running
-    exec docker exec -w "${DOCTOR_EXEC_CWD:-/workspace}" "$CONTAINER" "$@"
+    exec docker exec -w "${DOCTOR_EXEC_CWD:-$(pwd)}" "$CONTAINER" "$@"
 }
 
 # run: 从 stdin 读取脚本，写入容器后执行。

@@ -37,6 +37,13 @@ if [ ! -f "$INIT_MARKER" ]; then
     if [ -f "$DB_SRC" ]; then
         cp "$DB_SRC" "$DB_DST"
         echo "DB 快照: $DB_DST"
+
+        # NodeVault.DB_PATH = Path.home()/.genesis/workshop_v4.sqlite
+        # 容器内 Path.home() = /，指向 /.genesis/workshop_v4.sqlite
+        # 创建符号链接让 NodeVault 找到快照数据库（search_knowledge_nodes 依赖）
+        mkdir -p /.genesis
+        ln -sf "$DB_DST" /.genesis/workshop_v4.sqlite
+        echo "DB 路径修复: /.genesis/workshop_v4.sqlite -> $DB_DST"
     else
         echo "⚠️ DB 未挂载，跳过快照"
     fi

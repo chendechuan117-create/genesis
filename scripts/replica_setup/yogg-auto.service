@@ -12,6 +12,9 @@ Environment=YOGG_EXIT_ON_SESSION_END=1
 Environment=YOGG_MEMORY_EXIT_THRESHOLD_MB=2560
 Environment=YOGG_MEMORY_POLL_SECS=15
 Environment=GENESIS_AUTO_RSS_EXIT_THRESHOLD_MB=2400
+# Doctor timeout: 600s default too long for 8GB machine, cap at 180s
+Environment=DOCTOR_RUN_TIMEOUT_SECS=180
+Environment=DOCTOR_RUN_KILL_AFTER_SECS=5
 ExecStart=/home/yoga/Genesis/venv/bin/python -u yogg_auto.py
 Restart=always
 RestartSec=10
@@ -20,7 +23,12 @@ StandardError=journal
 
 # 内存保护：Yoga S730 只有 8GB
 MemoryMax=3400M
-MemoryHigh=infinity
+MemoryHigh=2800M
+
+# OOM 保护：被 OOM kill 后不要立刻重启，等 60s 让系统回收
+# 防止 doctor.sh D-state 僵尸导致的 OOM 死循环
+OOMPolicy=stop
+RestartPreventExitStatus=133
 
 [Install]
 WantedBy=multi-user.target

@@ -23,3 +23,7 @@ playwright>=1.42.0
 
 # ── System monitoring (optional, used by JobManager) ──
 psutil>=5.9.0
+
+# ── Testing (required by doctor.sh test / test-diff) ──
+pytest>=8.0.0
+pytest-asyncio>=0.23.0

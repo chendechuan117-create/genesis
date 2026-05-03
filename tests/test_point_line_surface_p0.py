@@ -67,6 +67,70 @@ def test_surface_push_preserves_high_incoming_basis_nodes():
     assert pushed_ids == {"PLS_FRONTIER_A", "PLS_FRONTIER_B"}
 
 
+def test_surface_push_only_evicts_nodes_that_frontier_can_replace():
+    from genesis.v4.surface import SurfaceExpander
+
+    expander = SurfaceExpander(vault=None)
+    fill_nodes = [
+        ("PLS_BASIS_A", "基础"),
+        ("PLS_FILL_LOW_A", "探索"),
+        ("PLS_FILL_LOW_B", "探索"),
+    ]
+    incoming_counts = {
+        "PLS_BASIS_A": 5,
+        "PLS_FILL_LOW_A": 0,
+        "PLS_FILL_LOW_B": 0,
+    }
+
+    retained, pushed = expander._push_phase(
+        fill_nodes,
+        ["PLS_FRONTIER_A"],
+        incoming_counts,
+        budget=3,
+    )
+
+    assert len(retained) == 2
+    assert len(pushed) == 1
+    assert len(retained) + len(pushed) == len(fill_nodes)
+
+
+def test_surface_co_presence_collects_unconsumed_low_incoming_points():
+    from genesis.v4.surface import SurfaceExpander
+
+    expander = SurfaceExpander(vault=None)
+    evicted_fill = [
+        ("PLS_LOW_EDGE", "探索"),
+    ]
+    neighbor_map = {
+        "PLS_SEED": [
+            ("PLS_BASIS_A", 1.5),
+            ("PLS_SIDE_A", 2.0),
+            ("PLS_SIDE_B", 1.0),
+        ],
+    }
+    incoming_counts = {
+        "PLS_BASIS_A": 5,
+        "PLS_LOW_EDGE": 0,
+        "PLS_SIDE_A": 0,
+        "PLS_SIDE_B": 1,
+    }
+
+    co_presence = expander._co_presence_phase(
+        evicted_fill,
+        neighbor_map,
+        incoming_counts,
+        budget=2,
+        used_ids={"PLS_BASIS_A"},
+        excluded_ids=set(),
+        basis_threshold=2,
+    )
+
+    assert co_presence == [
+        ("PLS_LOW_EDGE", "游离"),
+        ("PLS_SIDE_A", "游离"),
+    ]
+
+
 def test_virtual_point_creation_uses_valid_schema(tmp_path):
     vault = make_vault(tmp_path)
     try:
