@@ -122,7 +122,12 @@ cmd_reset() {
 
 cmd_exec() {
     _ensure_running
-    exec docker exec -w "${DOCTOR_EXEC_CWD:-/workspace}" "$CONTAINER" "$@"
+    # Patch bare "python" / "python3" to venv path to avoid system Python missing deps
+    local args=("$@")
+    if [[ ${#args[@]} -gt 0 && "${args[0]}" =~ ^(python3?)$ ]]; then
+        args[0]="$PYTHON"
+    fi
+    exec docker exec -w "${DOCTOR_EXEC_CWD:-/workspace}" "$CONTAINER" "${args[@]}"
 }
 
 # run: 从 stdin 读取脚本，写入容器后执行。
