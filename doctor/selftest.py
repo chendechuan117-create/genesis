@@ -915,7 +915,25 @@ def test_tools():
             tfr, tfk = _normalize_node_tool_result(tool_fail)
             assert tfr.startswith('Error:'), f'record_tool_node fail: {tfr}'
 
-            return f"success/failure exits ok: record_context_node={context_kind}, record_point={point_kind}, record_line={line_kind}, record_lesson_node={lesson_kind}, record_discovery={discovery_kind}, search_knowledge_nodes={search_kind}/{search_miss_kind}"
+            all_exits = {
+                'record_context_node': context_kind,
+                'record_point': point_kind,
+                'record_line': line_kind,
+                'record_lesson_node': lesson_kind,
+                'record_discovery': discovery_kind,
+                'search_knowledge_nodes_hit': search_kind,
+                'search_knowledge_nodes_miss': search_miss_kind,
+                'create_meta_node': mr2,
+                'delete_node': dr,
+                'create_graph_node': gfr,
+                'create_node_edge': efr,
+                'record_tool_node_ok': tk,
+                'record_tool_node_fail': tfk,
+            }
+            failed = {k: v for k, v in all_exits.items() if not (isinstance(v, str) and v)}
+            if failed:
+                raise AssertionError(f'exit surface assertion(s) dropped: {failed}')
+            return f"exit surface audit: {len(all_exits)} tools verified, all ok"
 
         return asyncio.run(_run())
     test("node tool exit surface audit", t_node_tool_exit_surface)
