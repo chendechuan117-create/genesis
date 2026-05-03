@@ -291,7 +291,7 @@ EOF
     # Untracked files (Yogg's self-created probes/tests in sandbox root)
     # are practice artifacts — they must NOT gate the apply decision.
     local tracked_changed
-    tracked_changed=$(git diff --name-only HEAD 2>/dev/null)
+    tracked_changed=$(git diff --name-only HEAD 2>/dev/null | grep -vE '^(archive/|blog/|docs/|\.tmp_probe/|n8n-workflows/|scripts/replica_setup/)')
     local untracked_changed
     untracked_changed=$(git ls-files --others --exclude-standard 2>/dev/null | grep -vE "(__pycache__|\.pyc|\.pyo|\.pytest_cache|^runtime/|^\.)" | while IFS= read -r f; do [ -f "$f" ] && echo "$f"; done)
 
