@@ -257,9 +257,8 @@ cmd_test_diff() {
     _ensure_running
     local test_files=()
 
-    # Preflight: surface likely .gitignore gate early instead of silently passing.
-    # Check both tracked test files already shadowed by ignore rules and untracked
-    # test-like paths that ignore rules would hide from git ls-files --others.
+    # Preflight: check if tracked tests in tests/ are shadowed by .gitignore.
+    # Untracked probe files being .gitignore-shadowed is correct behavior — don't warn.
     local preflight_output
     preflight_output=$(bash <<'EOF'
 set -e
@@ -270,16 +269,10 @@ ignored_tracked_tests=$(printf '%s\n' "$tracked_tests" | while IFS= read -r f; d
     git check-ignore -v "$f" 2>/dev/null | sed "s#^#tracked:$f :: #"
 done)
 
-untracked_shadowed_tests=$(find ./genesis ./scripts -type f \( -name 'test_*.py' -o -name '*_test*.py' \) -print 2>/dev/null | sed 's#^./##' | while IFS= read -r f; do
-    git ls-files --error-unmatch "$f" >/dev/null 2>&1 && continue
-    git check-ignore -v "$f" 2>/dev/null | sed "s#^#untracked:$f :: #"
-done)
-
-if [ -n "$ignored_tracked_tests$untracked_shadowed_tests" ]; then
+if [ -n "$ignored_tracked_tests" ]; then
     echo 'DOCTOR_TEST_DIFF_PREFLIGHT:.gitignore gate detected'
-    echo 'Test-like files are hidden or shadowed by ignore rules, so baseline/add and diff discovery can drift:'
-    [ -n "$ignored_tracked_tests" ] && echo "$ignored_tracked_tests"
-    [ -n "$untracked_shadowed_tests" ] && echo "$untracked_shadowed_tests"
+    echo 'Tracked test files in tests/ are shadowed by ignore rules:'
+    echo "$ignored_tracked_tests"
 fi
 EOF
 )
