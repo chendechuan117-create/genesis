@@ -652,6 +652,12 @@ cmd_auto_apply() {
     docker exec "$CONTAINER" bash -c "
         rsync -a $exclude_args --exclude='.git' --exclude='__pycache__' --exclude='runtime' --exclude='venv' --exclude='.tmp_probe' --exclude='*.bak' --exclude='*.orig' --exclude='*.rej' --exclude='doctor-auto-apply-*' --exclude='doctor-patch-*' /src/genesis/ /workspace/ 2>/dev/null || true
     " 2>/dev/null
+    # Commit the synced baseline so container HEAD matches host HEAD.
+    # This ensures git diff HEAD produces patches with correct context lines.
+    docker exec -w "$(_doctor_workspace_dir)" "$CONTAINER" bash -c '
+        git add -A 2>/dev/null
+        git diff --cached --quiet 2>/dev/null || git commit -q -m "[auto-apply] sync baseline to host" --allow-empty 2>/dev/null
+    ' 2>/dev/null
 
     local patch_file
     patch_file=$(mktemp "$PROJECT_DIR/doctor-auto-apply-XXXXXX.patch")
