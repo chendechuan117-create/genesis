@@ -1243,10 +1243,11 @@ def _compute_cross_round_observations(round_log: list, self_evolution=None) -> d
     apply_attempts = 0
     apply_successes = 0
     apply_blocked_reasons = []
+    _truly_blocked = {"test_failed", "test_collection_failed", "apply_failed", "scope_gate_rejected"}
     if self_evolution:
         apply_attempts = len(self_evolution.apply_history)
         apply_successes = sum(1 for h in self_evolution.apply_history if h.get("status") == "success")
-        apply_blocked_reasons = [h.get("reason", "?") for h in self_evolution.apply_history if h.get("status") != "success"]
+        apply_blocked_reasons = [h.get("reason", "?") for h in self_evolution.apply_history if h.get("status") in _truly_blocked]
 
     # 3. KB change rate: how many rounds actually changed the knowledge base
     #    This is an outcome signal — kb_changed is set by actual vault mutations.
@@ -2446,6 +2447,7 @@ class SelfEvolution:
                     "reason": "NO_TESTS_FOUND: no test files found for diff changes",
                 })
                 # Don't return — proceed to apply with unverified status
+                # NOTE: fall-through skips "测试通过" message below (test_ok is False)
             elif is_collection_failed:
                 await channel.send(
                     f"🧬 ❌ 测试收集失败（COLLECTION_FAILED），放弃本次应用\n```\n{test_output[-500:]}\n```"
@@ -2498,7 +2500,9 @@ class SelfEvolution:
                 self._save()
                 return apply_result
 
-        await channel.send("🧬 ✅ 测试通过")
+        if test_ok:
+            await channel.send("🧬 ✅ 测试通过")
+        # else: test_unverified already sent its own message above
 
         # 2. Auto-apply with git safety net (use --only if scope gate filtered critical files)
         await channel.send("🧬 [2/3] 应用沙箱修改到本体...")

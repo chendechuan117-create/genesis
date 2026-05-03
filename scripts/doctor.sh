@@ -350,7 +350,7 @@ if [ -n "$only_filter" ]; then
     _only_args=\$(echo "$only_filter" | tr ',' ' ')
     git diff HEAD -- \$_only_args
     # Build grep pattern from individual paths: ^path1$|^path2$|^path3$
-    _only_pattern=\$(echo "$only_filter" | sed 's/,/\\$|^/g; s/^/^/; s/\$/$/')
+    _only_pattern=\$(echo "$only_filter" | sed 's/,/\$|^/g' | sed 's/^/^/' | sed 's/$/\$/')
     for _path in \$(git ls-files --others --exclude-standard -z 2>/dev/null | tr '\0' '\n' | grep -E "\$_only_pattern" || true); do
         case "\$_path" in
             .doctor-initialized|runtime/*|__pycache__/*|.pytest_cache/*|*.pyc|*.pyo|*.orig|*.rej|*.log)
