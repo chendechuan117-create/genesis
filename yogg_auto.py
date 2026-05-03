@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -301,6 +302,52 @@ YOGG_MEMORY_HIGH_HEADROOM_MB = _env_int("YOGG_MEMORY_HIGH_HEADROOM_MB", 256, min
 YOGG_MEMORY_POLL_SECS = _env_int("YOGG_MEMORY_POLL_SECS", 15, minimum=5)
 
 
+# ── 线程级看门狗：cgroup 节流冻结 asyncio 后的唯一逃生通道 ──
+# 根因：cgroup memory.high 节流让进程进入 D 状态，asyncio 事件循环冻结，
+# 所有 asyncio 定时器（wall_clock_timeout、memory guard）全部失效。
+# 此看门狗在独立线程运行，不受事件循环影响。
+
+def _start_cgroup_watchdog(poll_secs: int = 30, headroom_mb: int = 384):
+    """启动线程级 cgroup 内存看门狗。
+
+    当 cgroup memory.current 接近 memory.high 时，直接 os._exit(1)。
+    这比 asyncio 版更暴力，但能穿透事件循环冻结。
+    systemd 会自动重启进程。
+    """
+    def _watchdog_loop():
+        consecutive_high = 0
+        while True:
+            time.sleep(poll_secs)
+            current = _read_cgroup_int("memory.current")
+            high = _read_cgroup_int("memory.high")
+            if current is None or high is None:
+                continue
+            threshold = high - headroom_mb * 1024 * 1024
+            if current >= threshold:
+                consecutive_high += 1
+                headroom_actual = (high - current) // 1048576
+                if consecutive_high >= 2:
+                    # 连续 2 次检测到高压 → 立即退出，不等 asyncio
+                    logger.error(
+                        "CGROUP WATCHDOG: memory pressure sustained! "
+                        "current=%dMB high=%dMB headroom=%dMB consecutive=%d → force exit",
+                        current // 1048576, high // 1048576, headroom_actual, consecutive_high
+                    )
+                    os._exit(1)
+                else:
+                    logger.warning(
+                        "CGROUP WATCHDOG: memory pressure detected "
+                        "current=%dMB high=%dMB headroom=%dMB (consecutive=%d, will exit on next)",
+                        current // 1048576, high // 1048576, headroom_actual, consecutive_high
+                    )
+            else:
+                consecutive_high = 0
+
+    t = threading.Thread(target=_watchdog_loop, daemon=True, name="cgroup-watchdog")
+    t.start()
+    logger.info(f"Cgroup watchdog started: poll={poll_secs}s headroom={headroom_mb}MB")
+
+
 async def _run_session(agent, directive: str, session_num: int):
     """单次 auto session。"""
     session_ts = time.strftime("%Y%m%d_%H%M%S")
@@ -427,6 +474,10 @@ async def main():
         logger.info(
             f"Yogg memory guard enabled: headroom={YOGG_MEMORY_HIGH_HEADROOM_MB}MiB poll={YOGG_MEMORY_POLL_SECS}s"
         )
+
+    # 线程级 cgroup 看门狗：asyncio 冻结后的唯一逃生通道
+    if _read_cgroup_int("memory.high") is not None:
+        _start_cgroup_watchdog(poll_secs=30, headroom_mb=384)
 
     session_num = 0
     consecutive_crash = 0

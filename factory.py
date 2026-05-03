@@ -85,11 +85,13 @@ def create_agent(
         from genesis.tools.node_tools import (
             RecordContextNodeTool, RecordPointTool, RecordLineTool, RecordLessonNodeTool,
             CreateMetaNodeTool, DeleteNodeTool, CreateGraphNodeTool, CreateNodeEdgeTool,
-            RecordToolNodeTool, RecordDiscoveryTool
+            RecordToolNodeTool, RecordDiscoveryTool,
+            RecordPointTool, RecordLineTool, RecordContextPointTool,
         )
         for t in [RecordContextNodeTool(), RecordPointTool(), RecordLineTool(), RecordLessonNodeTool(),
                    CreateMetaNodeTool(), DeleteNodeTool(), CreateGraphNodeTool(), CreateNodeEdgeTool(),
-                   RecordToolNodeTool(), RecordDiscoveryTool()]:
+                   RecordToolNodeTool(), RecordDiscoveryTool(),
+                   RecordPointTool(), RecordLineTool(), RecordContextPointTool()]:
             tools.register(t)
     except Exception as e:
         logger.error(f"V4 tool group [node_tools] failed: {e}")

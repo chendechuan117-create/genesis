@@ -664,24 +664,7 @@ class NativeHTTPProvider(BaseLLMProvider):
                             
                             choice0 = choices[0] if choices else None
                             if not choice0: continue
-                            
-                            # finish_reason 可出现在任何 chunk（MiniMax 在中间 chunk 就带 finish_reason）
-                            if choice0.get('finish_reason'):
-                                finish_reason = choice0['finish_reason']
-                            
-                            # MiniMax 最终 chunk 用 'message' 而非 'delta'（含完整 reasoning + usage）
-                            # 优先用 delta，fallback 到 message（兼容 MiniMax 格式）
-                            delta = choice0.get('delta')
-                            if delta is None:
-                                msg = choice0.get('message')
-                                if msg is not None:
-                                    # MiniMax 最终 chunk：提取 reasoning（仅当之前未累积时），跳过已累积的 content
-                                    rc = msg.get('reasoning_content') or msg.get('reasoning')
-                                    if rc and not reasoning_content:
-                                        reasoning_content.append(rc)
-                                    delta = {}
-                            
-                            if not delta: delta = {}
+                            delta = choice0.get('delta') or {}
                             
                             # Reasoning
                             rc = delta.get('reasoning_content') or delta.get('reasoning')

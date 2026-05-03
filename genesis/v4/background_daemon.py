@@ -50,13 +50,14 @@ class BackgroundDaemon:
         sig_fixed = 0
 
         # 签名审计（零 LLM 成本）
-        try:
-            sig_stats = self.vault.audit_signatures(limit=50)
-            sig_fixed = sig_stats.get("fixed_normalize", 0) + sig_stats.get("fixed_blacklist", 0) + sig_stats.get("fixed_contradiction", 0) + sig_stats.get("fixed_invalidation_reason", 0)
-            if sig_fixed:
-                logger.info(f"签名审计: {sig_stats['audited']} 扫描, {sig_fixed} 修复")
-        except Exception as e:
-            logger.error(f"签名审计异常: {e}", exc_info=True)
+        if hasattr(self.vault, 'audit_signatures'):
+            try:
+                sig_stats = self.vault.audit_signatures(limit=50)
+                sig_fixed = sig_stats.get("fixed_normalize", 0) + sig_stats.get("fixed_blacklist", 0) + sig_stats.get("fixed_contradiction", 0) + sig_stats.get("fixed_invalidation_reason", 0)
+                if sig_fixed:
+                    logger.info(f"签名审计: {sig_stats['audited']} 扫描, {sig_fixed} 修复")
+            except Exception as e:
+                logger.error(f"签名审计异常: {e}", exc_info=True)
 
         # GC（每 N 轮一次）
         hard_del = 0
