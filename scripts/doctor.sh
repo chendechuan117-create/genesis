@@ -270,7 +270,7 @@ ignored_tracked_tests=$(printf '%s\n' "$tracked_tests" | while IFS= read -r f; d
     git check-ignore -v "$f" 2>/dev/null | sed "s#^#tracked:$f :: #"
 done)
 
-untracked_shadowed_tests=$(find . -path './.git' -prune -o -path './archive' -prune -o -path './runtime' -prune -o -path './.tmp_probe' -prune -o -path './venv' -prune -o -path './node_modules' -prune -o -type f \( -name 'test_*.py' -o -name '*_test*.py' \) -print 2>/dev/null | sed 's#^./##' | while IFS= read -r f; do
+untracked_shadowed_tests=$(find . -path './.git' -prune -o -path './archive' -prune -o -path './runtime' -prune -o -path './.tmp_probe' -prune -o -path './venv' -prune -o -path './node_modules' -prune -o -path './doctor' -prune -o -path './tests' -prune -o -type f \( -name 'test_*.py' -o -name '*_test*.py' \) -print 2>/dev/null | sed 's#^./##' | while IFS= read -r f; do
     git ls-files --error-unmatch "$f" >/dev/null 2>&1 && continue
     git check-ignore -v "$f" 2>/dev/null | sed "s#^#untracked:$f :: #"
 done)
