@@ -650,7 +650,7 @@ cmd_auto_apply() {
         exclude_args="$exclude_args --exclude=$f"
     done <<< "$yogg_modified"
     docker exec "$CONTAINER" bash -c "
-        rsync -a $exclude_args --exclude='.git' --exclude='__pycache__' --exclude='runtime' --exclude='venv' --exclude='.tmp_probe' /src/genesis/ /workspace/ 2>/dev/null || true
+        rsync -a $exclude_args --exclude='.git' --exclude='__pycache__' --exclude='runtime' --exclude='venv' --exclude='.tmp_probe' --exclude='*.bak' --exclude='*.orig' --exclude='*.rej' --exclude='doctor-auto-apply-*' --exclude='doctor-patch-*' /src/genesis/ /workspace/ 2>/dev/null || true
     " 2>/dev/null
 
     local patch_file
@@ -682,23 +682,21 @@ cmd_auto_apply() {
     echo "ROLLBACK_POINT: $pre_commit"
     echo "ROLLBACK_TAG: $rollback_tag"
 
-    # 2. Dry-run check: verify patch applies cleanly before modifying working tree
-    if ! git apply --check --binary "$patch_file" 2>&1; then
-        echo "APPLY_CHECK_FAILED: patch would not apply cleanly (dry-run)"
-        rm -f "$patch_file"
-        return 1
-    fi
-
-    # 3. Apply the diff (guaranteed clean after --check)
-    if git apply --binary "$patch_file" 2>&1; then
-        echo "APPLY_OK"
-    else
-        echo "APPLY_FAILED: unexpected failure after successful --check (should not happen)"
+    # 2. Apply the diff with 3-way merge to handle baseline drift
+    # Container HEAD and host HEAD may diverge (scp updates host but not container).
+    # --3way merges when context lines don't match, instead of failing outright.
+    local apply_output
+    apply_output=$(git apply --3way --binary "$patch_file" 2>&1)
+    local apply_rc=$?
+    if [ $apply_rc -ne 0 ]; then
+        echo "APPLY_CHECK_FAILED: patch would not apply cleanly (3-way merge failed)"
+        echo "$apply_output" | tail -5
         git reset --hard "$rollback_tag" >/dev/null 2>&1
         git clean -fd >/dev/null 2>&1
         rm -f "$patch_file"
         return 1
     fi
+    echo "APPLY_OK"
 
     # 4. Smoke test canary: verify core modules still import after apply
     #     This catches syntax errors and broken imports BEFORE restart.
