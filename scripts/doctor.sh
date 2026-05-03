@@ -34,16 +34,64 @@ _is_running() {
     docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null | grep -q true
 }
 
+DEFAULT_WORKSPACE='/workspace'
+FALLBACK_WORKSPACE='/src/genesis'
+
+_doctor_workspace_dir() {
+    local preferred="${DOCTOR_WORKSPACE_DIR:-$DEFAULT_WORKSPACE}"
+    local fallback="${DOCTOR_FALLBACK_WORKSPACE_DIR:-$FALLBACK_WORKSPACE}"
+    local chosen=""
+
+    for candidate in "$preferred" "$fallback"; do
+        if [ -n "$candidate" ] && docker exec "$CONTAINER" test -d "$candidate" >/dev/null 2>&1; then
+            chosen="$candidate"
+            break
+        fi
+    done
+
+    if [ -z "$chosen" ]; then
+        chosen="$fallback"
+        echo "Warning: no usable Doctor workspace directory found. Falling back to raw path: $chosen (checked: $preferred $fallback)" >&2
+    fi
+
+    printf '%s\n' "$chosen"
+}
+
+_doctor_exec() {
+    docker exec -w "$(_doctor_workspace_dir)" "$CONTAINER" "$@"
+}
+
+_doctor_exec_i() {
+    docker exec -i -w "$(_doctor_workspace_dir)" "$CONTAINER" "$@"
+}
+
+_doctor_exec_it() {
+    docker exec -it -w "$(_doctor_workspace_dir)" "$CONTAINER" "$@"
+}
+
+_doctor_pythonpath() {
+    _doctor_workspace_dir
+}
+
 _ensure_git_safe() {
+    local workspace
+    workspace="$(_doctor_workspace_dir)" || return 1
     # Git 2.35.2+ refuses operations when repo owner != process uid.
-    # Container runs as root (uid=0) but /workspace is owned by uid=1000.
-    docker exec "$CONTAINER" git config --global --add safe.directory /workspace 2>/dev/null || true
+    docker exec "$CONTAINER" git config --global --add safe.directory "$workspace" 2>/dev/null || true
     # Git identity required for commits; lost on container restart.
     docker exec "$CONTAINER" git config --global user.email "doctor@genesis.local" 2>/dev/null || true
     docker exec "$CONTAINER" git config --global user.name "Genesis Doctor" 2>/dev/null || true
 }
 
+_inside_doctor_container() {
+    [ -f /.dockerenv ] && [ -d /workspace ] && [ -x "$PYTHON" ]
+}
+
 _ensure_running() {
+    if _inside_doctor_container; then
+        _ensure_git_safe || return 1
+        return 0
+    fi
     if ! _is_running; then
         echo -e "${YELLOW}Doctor container not running. Starting...${NC}"
         cmd_start
@@ -83,7 +131,7 @@ cmd_reset() {
     echo "🔄 Resetting Doctor workspace..."
     if _is_running; then
         # ── 快照保护：reset 前自动保存当前改动 ──
-        docker exec -w /workspace "$CONTAINER" bash -c '
+        docker exec -w "$(_doctor_workspace_dir)" "$CONTAINER" bash -c '
             if [ -d .git ]; then
                 git add -A 2>/dev/null
                 CHANGES=$(git diff --cached --stat 2>/dev/null)
@@ -122,12 +170,7 @@ cmd_reset() {
 
 cmd_exec() {
     _ensure_running
-    # Patch bare "python" / "python3" to venv path to avoid system Python missing deps
-    local args=("$@")
-    if [[ ${#args[@]} -gt 0 && "${args[0]}" =~ ^(python3?)$ ]]; then
-        args[0]="$PYTHON"
-    fi
-    exec docker exec -w "${DOCTOR_EXEC_CWD:-/workspace}" "$CONTAINER" "${args[@]}"
+    _doctor_exec "$@"
 }
 
 # run: 从 stdin 读取脚本，写入容器后执行。
@@ -140,7 +183,7 @@ cmd_run() {
     local timeout_secs="${DOCTOR_RUN_TIMEOUT_SECS:-600}"
     local kill_after_secs="${DOCTOR_RUN_KILL_AFTER_SECS:-10}"
     local job_id="doctor_run_$(date +%Y%m%d_%H%M%S)_$$"
-    docker exec -i -w /workspace -e PYTHONPATH=/workspace \
+    docker exec -i -w "$(_doctor_workspace_dir)" -e PYTHONPATH="$(_doctor_pythonpath)" \
         -e DOCTOR_RUN_TIMEOUT_SECS="$timeout_secs" \
         -e DOCTOR_RUN_KILL_AFTER_SECS="$kill_after_secs" \
         -e DOCTOR_RUN_JOB_ID="$job_id" \
@@ -194,9 +237,9 @@ exit "$code"
 cmd_python() {
     _ensure_running
     if [ $# -eq 0 ]; then
-        docker exec -it -w /workspace "$CONTAINER" "$PYTHON"
+        _doctor_exec_it "$PYTHON"
     else
-        docker exec -w /workspace "$CONTAINER" "$PYTHON" -c "$*"
+        _doctor_exec "$PYTHON" -c "$*"
     fi
 }
 
@@ -204,58 +247,74 @@ cmd_test() {
     _ensure_running
     local target="${1:-tests/}"
     echo "🧪 Running tests: $target"
-    docker exec -w /workspace -e PYTHONPATH=/workspace "$CONTAINER" \
+    docker exec -w "$(_doctor_workspace_dir)" -e PYTHONPATH="$(_doctor_pythonpath)" "$CONTAINER" \
         "$PYTHON" -m pytest "$target" -v --tb=short 2>&1
 }
 
 # Test only files related to sandbox diff (used by SelfEvolution auto-apply)
 # Finds test files that correspond to changed/new files in the sandbox
 cmd_test_diff() {
-    # Recursion guard: test files may call `doctor.sh test-diff` via subprocess,
-    # causing infinite nesting (each layer spawns pytest which spawns more test-diff).
-    if [ -n "${DOCTOR_TEST_DIFF_DEPTH:-}" ]; then
-        echo "🧪 Recursion guard: nested test-diff blocked (depth=${DOCTOR_TEST_DIFF_DEPTH})"
-        return 0
-    fi
-    export DOCTOR_TEST_DIFF_DEPTH=1
-
     _ensure_running
     local test_files=()
 
-    # Collect changed and untracked files from sandbox
-    # Only include files that ACTUALLY EXIST in the container —
-    # git diff --name-only includes deletions, which causes pytest "file not found"
-    # and blocks all self-evolution apply attempts.
-    local changed
-    changed=$(docker exec -w /workspace "$CONTAINER" bash -c '
-        (git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null | grep -vE "(__pycache__|\.pyc|\.pyo|\.pytest_cache|^runtime/|^\.)") | sort -u | while IFS= read -r f; do [ -f "$f" ] && echo "$f"; done
-    ' 2>/dev/null)
+    # Preflight: surface likely .gitignore gate early instead of silently passing.
+    # Check both tracked test files already shadowed by ignore rules and untracked
+    # test-like paths that ignore rules would hide from git ls-files --others.
+    local preflight_output
+    preflight_output=$(bash <<'EOF'
+set -e
+pattern='(^|/)test_.*\.py$|(^|/).*_test.*\.py$'
+tracked_tests=$(git ls-files 'tests/*.py' 2>/dev/null | grep -E "$pattern" || true)
+ignored_tracked_tests=$(printf '%s\n' "$tracked_tests" | while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    git check-ignore -v "$f" 2>/dev/null | sed "s#^#tracked:$f :: #"
+done)
 
-    # Map source files to corresponding test files
+untracked_shadowed_tests=$(find . -path './.git' -prune -o -type f \( -name 'test_*.py' -o -name '*_test*.py' \) -print 2>/dev/null | sed 's#^./##' | while IFS= read -r f; do
+    git ls-files --error-unmatch "$f" >/dev/null 2>&1 && continue
+    git check-ignore -v "$f" 2>/dev/null | sed "s#^#untracked:$f :: #"
+done)
+
+if [ -n "$ignored_tracked_tests$untracked_shadowed_tests" ]; then
+    echo 'DOCTOR_TEST_DIFF_PREFLIGHT:.gitignore gate detected'
+    echo 'Test-like files are hidden or shadowed by ignore rules, so baseline/add and diff discovery can drift:'
+    [ -n "$ignored_tracked_tests" ] && echo "$ignored_tracked_tests"
+    [ -n "$untracked_shadowed_tests" ] && echo "$untracked_shadowed_tests"
+fi
+EOF
+)
+    if [ -n "$preflight_output" ]; then
+        echo "$preflight_output"
+    fi
+
+    local changed
+    changed=$(git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null | grep -vE "(__pycache__|\.pyc|\.pyo|\.pytest_cache|^runtime/|^\.)" | sort -u | while IFS= read -r f; do [ -f "$f" ] && echo "$f"; done)
+
     while IFS= read -r f; do
         [ -z "$f" ] && continue
-        # If it's a test file itself, include directly (existence already verified above)
         if [[ "$f" == test_*.py ]] || [[ "$f" == tests/test_*.py ]]; then
             test_files+=("$f")
             continue
         fi
-        # If it's a probe impl in runtime/scratch, find its test
         local base
         base=$(basename "$f" _impl.py 2>/dev/null || basename "$f" .py 2>/dev/null)
         local t
         for t in "tests/test_${base}.py" "tests/${base}.py"; do
-            if docker exec -w /workspace "$CONTAINER" test -f "$t" 2>/dev/null; then
+            if [ -f "$t" ]; then
                 test_files+=("$t")
                 break
             fi
         done
     done <<< "$changed"
 
-    # Deduplicate
     local unique_tests
     unique_tests=$(printf '%s\n' "${test_files[@]}" 2>/dev/null | sort -u | grep -vE '^$|__pycache__|\.pyc' | grep '\.py$')
 
     if [ -z "$unique_tests" ]; then
+        if [ -n "$preflight_output" ]; then
+            echo "❌ test-diff preflight blocked: likely .gitignore-constrained tests are invisible to diff discovery"
+            return 2
+        fi
         echo "🧪 No test files found for diff changes — passing by default"
         return 0
     fi
@@ -263,32 +322,25 @@ cmd_test_diff() {
     echo "🧪 Running diff-scoped tests:"
     echo "$unique_tests" | while IFS= read -r t; do echo "  $t"; done
 
-    # Smoke test: verify pytest can actually collect the discovered tests.
-    # GP-created test files often have broken imports — running pytest on them
-    # produces confusing errors. If collection fails, skip those files.
     local test_args
     test_args=$(echo "$unique_tests" | tr '\n' ' ')
     local collect_output
-    collect_output=$(docker exec -w /workspace -e PYTHONPATH=/workspace "$CONTAINER" \
-        "$PYTHON" -m pytest $test_args --collect-only -q 2>&1)
-    if [ $? -ne 0 ]; then
-        echo "⚠️ Smoke test: pytest collection failed for discovered tests"
+    local collect_rc
+    collect_output=$("$PYTHON" -m pytest $test_args --collect-only -q 2>&1)
+    collect_rc=$?
+    if [ $collect_rc -ne 0 ]; then
+        echo "❌ Smoke test: pytest collection failed for discovered tests"
         echo "$collect_output" | tail -5
-        echo "🧪 Skipping broken test files — passing by default"
-        return 0
+        return $collect_rc
     fi
 
-    # Run pytest only on the verified test files
-    # Pass DOCTOR_TEST_DIFF_DEPTH into container so nested test-diff calls are blocked
-    docker exec -w /workspace -e PYTHONPATH=/workspace -e DOCTOR_TEST_DIFF_DEPTH=1 "$CONTAINER" \
-        "$PYTHON" -m pytest $test_args -v --tb=short 2>&1
+    "$PYTHON" -m pytest $test_args -v --tb=short 2>&1
 }
-
 _doctor_workspace_patch() {
     # Optional: $1 = comma-separated file glob filter (--only)
     local only_filter="${1:-}"
     _ensure_running
-    docker exec -i -w /workspace "$CONTAINER" bash <<EOF
+    docker exec -i -w "$(_doctor_workspace_dir)" "$CONTAINER" bash <<EOF
 set -euo pipefail
 
 if [ -n "$only_filter" ]; then
@@ -319,7 +371,7 @@ EOF
 
 cmd_diff_status() {
     _ensure_running
-    docker exec -i -w /workspace "$CONTAINER" bash <<'EOF'
+    docker exec -i -w "$(_doctor_workspace_dir)" "$CONTAINER" bash <<'EOF'
 set -euo pipefail
 
 # Tracked diff hash
@@ -351,7 +403,7 @@ EOF
 
 cmd_file_status() {
     _ensure_running
-    docker exec -i -w /workspace "$CONTAINER" bash <<'EOF'
+    docker exec -i -w "$(_doctor_workspace_dir)" "$CONTAINER" bash <<'EOF'
 set -euo pipefail
 
 # Tracked files: per-file diff hash
@@ -371,6 +423,74 @@ EOF
 cmd_diff() {
     _ensure_running
     _doctor_workspace_patch
+}
+
+cmd_sync_state_preflight() {
+    _ensure_running
+
+    local head_commit
+    head_commit=$(docker exec -w /workspace "$CONTAINER" git rev-parse HEAD 2>/dev/null || true)
+    local head_snapshot_tag
+    head_snapshot_tag=$(docker exec -w /workspace "$CONTAINER" bash -lc 'git tag --points-at HEAD 2>/dev/null | grep "^snapshot/" | head -n 1 || true' 2>/dev/null || true)
+    local tracked_diff
+    tracked_diff=$(docker exec -w /workspace "$CONTAINER" git diff HEAD 2>/dev/null || true)
+
+    local tracked_hash=""
+    local tracked_lines=0
+    if [ -n "$tracked_diff" ]; then
+        tracked_hash=$(printf "%s" "$tracked_diff" | md5sum | cut -d" " -f1 | cut -c1-12)
+        tracked_lines=$(printf "%s" "$tracked_diff" | wc -l | tr -d " ")
+    fi
+
+    local untracked_list
+    untracked_list=$(docker exec -w /workspace "$CONTAINER" bash -lc "git ls-files --others --exclude-standard 2>/dev/null | grep -vE '(__pycache__|\.pyc|\.pyo|\.orig|\.rej|\.log|\.pytest_cache|^runtime/|^\.)' || true" 2>/dev/null || true)
+    local untracked_hash=""
+    local untracked_count=0
+    if [ -n "$untracked_list" ]; then
+        untracked_hash=$(printf "%s
+" "$untracked_list" | sort | md5sum | cut -d" " -f1 | cut -c1-12)
+        untracked_count=$(printf "%s
+" "$untracked_list" | wc -l | tr -d " ")
+    fi
+
+    local snapshot_count
+    snapshot_count=$(docker exec -w /workspace "$CONTAINER" bash -lc 'git tag -l "snapshot/*" 2>/dev/null | wc -l | tr -d " "' 2>/dev/null || true)
+    local initialized=0
+    if docker exec "$CONTAINER" test -f /workspace/.doctor-initialized 2>/dev/null; then
+        initialized=1
+    fi
+
+    local host_head
+    host_head=$(cat "$PROJECT_DIR/.doctor/.host_head" 2>/dev/null || true)
+    local host_sync_required=0
+    local host_sync_reason=""
+    if [ -n "$host_head" ] && [ -n "$head_commit" ] && [ "$host_head" != "$head_commit" ]; then
+        host_sync_required=1
+        host_sync_reason="host_head_mismatch"
+    fi
+
+    printf "HEAD_COMMIT:%s
+" "$head_commit"
+    printf "HEAD_SNAPSHOT_TAG:%s
+" "$head_snapshot_tag"
+    printf "SNAPSHOT_COUNT:%s
+" "$snapshot_count"
+    printf "INITIALIZED:%s
+" "$initialized"
+    printf "HOST_HEAD:%s
+" "$host_head"
+    printf "HOST_SYNC_REQUIRED:%s
+" "$host_sync_required"
+    printf "HOST_SYNC_REASON:%s
+" "$host_sync_reason"
+    printf "TRACKED_HASH:%s
+" "$tracked_hash"
+    printf "TRACKED_LINES:%s
+" "$tracked_lines"
+    printf "UNTRACKED_HASH:%s
+" "$untracked_hash"
+    printf "UNTRACKED_COUNT:%s
+" "$untracked_count"
 }
 
 cmd_patch() {
@@ -443,9 +563,9 @@ cmd_apply() {
 cmd_status() {
     if _is_running; then
         echo -e "${GREEN}● Doctor container: running${NC}"
-        docker exec -w /workspace "$CONTAINER" bash -c "
+        docker exec -w "$(_doctor_workspace_dir)" "$CONTAINER" bash -c "
             echo \"  Python: \$($PYTHON --version 2>&1)\"
-            echo \"  Workspace files: \$(find /workspace -name '*.py' | wc -l) .py files\"
+            echo \"  Workspace files: \$(find $(_doctor_workspace_dir) -name '*.py' | wc -l) .py files\"
             echo \"  Git status:\"
             git status --short 2>/dev/null | head -10
         "
@@ -456,13 +576,13 @@ cmd_status() {
 
 cmd_cat() {
     _ensure_running
-    docker exec -w /workspace "$CONTAINER" cat "$@"
+    _doctor_exec cat "$@"
 }
 
 cmd_snapshots() {
     _ensure_running
     echo "📸 Doctor workspace snapshots:"
-    docker exec -w /workspace "$CONTAINER" bash -c '
+    docker exec -w "$(_doctor_workspace_dir)" "$CONTAINER" bash -c '
         TAGS=$(git tag -l "snapshot/*" 2>/dev/null | sort -r)
         if [ -z "$TAGS" ]; then
             echo "  (no snapshots)"
@@ -574,7 +694,7 @@ cmd_list_changed() {
     # List all changed files in sandbox (tracked + untracked), one per line
     # Used by SelfEvolution scope gate before apply
     _ensure_running
-    docker exec -w /workspace "$CONTAINER" bash -c '
+    docker exec -w "$(_doctor_workspace_dir)" "$CONTAINER" bash -c '
         (git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null | grep -vE "(__pycache__|\.pyc|\.pyo|\.orig|\.rej|\.log|\.pytest_cache|^runtime/|^\.)") | sort -u | grep -vE "^$"
     ' 2>/dev/null
 }
@@ -593,6 +713,7 @@ case "${1:-help}" in
     diff-status) cmd_diff_status ;;
     file-status) cmd_file_status ;;
     list-changed) cmd_list_changed ;;
+    sync-state-preflight) cmd_sync_state_preflight ;;
     patch)  cmd_patch ;;
     apply)  shift 2>/dev/null; cmd_apply "$@" ;;
     auto-apply) shift 2>/dev/null; cmd_auto_apply "$@" ;;
@@ -614,6 +735,7 @@ case "${1:-help}" in
         echo "  python [code]  执行 Python 代码（无参数进入 REPL）"
         echo "  test [path]    运行测试（默认 tests/）"
         echo "  diff           查看所有修改"
+        echo "  sync-state-preflight  显式校验首次快照/后续增量同步状态"
         echo "  patch          导出修改为 .patch 文件"
         echo "  list-changed   列出沙箱中所有修改文件（scope gate 用）"
         echo "  apply [--only f1,f2]  将修改应用到本体（需确认，--only 限定范围）"
