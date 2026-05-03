@@ -634,31 +634,6 @@ cmd_auto_apply() {
         only_filter="$2"
     fi
 
-    # Sync container workspace baseline to host before generating patch.
-    # Container workspace is a Docker volume that may be behind host
-    # (e.g., after scp updates). Without sync, patch context lines
-    # won't match host files → apply_check_failed every time.
-    # Strategy: only sync files Yogg has NOT modified in sandbox.
-    # Yogg's modified files must be preserved — those are the changes to apply.
-    local yogg_modified
-    yogg_modified=$(docker exec -w "$(_doctor_workspace_dir)" "$CONTAINER" bash -c '
-        git diff --name-only HEAD 2>/dev/null
-    ' 2>/dev/null)
-    local exclude_args=""
-    while IFS= read -r f; do
-        [ -z "$f" ] && continue
-        exclude_args="$exclude_args --exclude=$f"
-    done <<< "$yogg_modified"
-    docker exec "$CONTAINER" bash -c "
-        rsync -a $exclude_args --exclude='.git' --exclude='__pycache__' --exclude='runtime' --exclude='venv' --exclude='.tmp_probe' --exclude='*.bak' --exclude='*.orig' --exclude='*.rej' --exclude='doctor-auto-apply-*' --exclude='doctor-patch-*' /src/genesis/ /workspace/ 2>/dev/null || true
-    " 2>/dev/null
-    # Commit the synced baseline so container HEAD matches host HEAD.
-    # This ensures git diff HEAD produces patches with correct context lines.
-    docker exec -w "$(_doctor_workspace_dir)" "$CONTAINER" bash -c '
-        git add -A 2>/dev/null
-        git diff --cached --quiet 2>/dev/null || git commit -q -m "[auto-apply] sync baseline to host" --allow-empty 2>/dev/null
-    ' 2>/dev/null
-
     local patch_file
     patch_file=$(mktemp "$PROJECT_DIR/doctor-auto-apply-XXXXXX.patch")
     if ! _doctor_workspace_patch "$only_filter" > "$patch_file"; then
@@ -677,7 +652,7 @@ cmd_auto_apply() {
     lines_changed=$(wc -l < "$patch_file")
     echo "PENDING_CHANGES: $lines_changed lines"
 
-    # 1. Git commit current state as rollback point + named tag
+    # 1. Git commit current state as rollback point + named tag (on host)
     cd "$PROJECT_DIR"
     local pre_commit
     pre_commit=$(git rev-parse HEAD 2>/dev/null)
@@ -688,47 +663,52 @@ cmd_auto_apply() {
     echo "ROLLBACK_POINT: $pre_commit"
     echo "ROLLBACK_TAG: $rollback_tag"
 
-    # 2. Apply the diff with 3-way merge to handle baseline drift
-    # Container HEAD and host HEAD may diverge (scp updates host but not container).
-    # --3way merges when context lines don't match, instead of failing outright.
+    # 2. Apply the diff INSIDE the container (same git repo as patch source)
+    # This avoids baseline drift between container and host git repos.
     local apply_output
-    apply_output=$(git apply --3way --binary "$patch_file" 2>&1)
+    apply_output=$(docker exec -w "$(_doctor_workspace_dir)" "$CONTAINER" bash -c "
+        git apply --binary - 2>&1
+    " < "$patch_file" 2>&1)
     local apply_rc=$?
     if [ $apply_rc -ne 0 ]; then
-        echo "APPLY_CHECK_FAILED: patch would not apply cleanly (3-way merge failed)"
+        echo "APPLY_CHECK_FAILED: patch would not apply cleanly in container"
         echo "$apply_output" | tail -5
-        git reset --hard "$rollback_tag" >/dev/null 2>&1
-        git clean -fd >/dev/null 2>&1
         rm -f "$patch_file"
         return 1
     fi
     echo "APPLY_OK"
 
-    # 4. Smoke test canary: verify core modules still import after apply
-    #     This catches syntax errors and broken imports BEFORE restart.
-    #     If this fails, rollback to the tag — the running process is still safe.
+    # 3. Smoke test canary: verify core modules still import after apply
+    # Run inside container where the applied files live
     local smoke_output
-    smoke_output=$("$PYTHON" -c "
+    smoke_output=$(docker exec "$CONTAINER" bash -c "
+        cd /workspace && $PYTHON -c '
 from genesis.auto_mode import SelfEvolution
 from genesis.v4.loop import V4Loop
 from genesis.v4.manager import NodeVault
 from genesis.tools.node_tools import RecordPointTool, RecordLineTool
 from genesis.tools.search_tool import SearchKnowledgeNodesTool
-print('SMOKE_OK')
-" 2>&1)
+print(\"SMOKE_OK\")
+' 2>&1
+    " 2>&1)
     if echo "$smoke_output" | grep -q "SMOKE_OK"; then
         echo "SMOKE_TEST: PASS"
     else
         echo "SMOKE_TEST: FAIL"
         echo "$smoke_output" | tail -10
-        echo "SMOKE_FAILED: core import broken after apply, rolling back"
-        git reset --hard "$rollback_tag" >/dev/null 2>&1
-        git clean -fd >/dev/null 2>&1
+        echo "SMOKE_FAILED: core import broken after apply, rolling back container"
+        docker exec -w "$(_doctor_workspace_dir)" "$CONTAINER" bash -c "git checkout -- . 2>/dev/null; git clean -fd 2>/dev/null" 2>/dev/null
         rm -f "$patch_file"
         return 5
     fi
 
-    # 5. Commit the applied changes
+    # 4. Copy applied files from container to host
+    # The apply happened inside the container; we need to sync the result to host.
+    docker exec "$CONTAINER" bash -c "
+        rsync -a --exclude='.git' --exclude='__pycache__' --exclude='runtime' --exclude='venv' --exclude='.tmp_probe' --exclude='*.bak' --exclude='*.orig' --exclude='*.rej' --exclude='doctor-auto-apply-*' --exclude='doctor-patch-*' /workspace/ /src/genesis/ 2>/dev/null || true
+    " 2>/dev/null
+
+    # 5. Commit the applied changes (on host)
     git add -A 2>/dev/null
     local apply_commit_msg="[self-evolution] auto-apply $(date +%Y%m%d_%H%M%S) ($lines_changed lines)"
     git commit -q -m "$apply_commit_msg" 2>/dev/null
