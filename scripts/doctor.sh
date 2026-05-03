@@ -659,26 +659,36 @@ cmd_auto_apply() {
     lines_changed=$(wc -l < "$patch_file")
     echo "PENDING_CHANGES: $lines_changed lines"
 
-    # 1. Git commit current state as rollback point
+    # 1. Git commit current state as rollback point + named tag
     cd "$PROJECT_DIR"
     local pre_commit
     pre_commit=$(git rev-parse HEAD 2>/dev/null)
     git add -A 2>/dev/null
     git commit -q -m "[self-evolution] pre-apply snapshot" --allow-empty 2>/dev/null
+    local rollback_tag="rollback/$(date +%Y%m%d_%H%M%S)"
+    git tag "$rollback_tag" HEAD 2>/dev/null
     echo "ROLLBACK_POINT: $pre_commit"
+    echo "ROLLBACK_TAG: $rollback_tag"
 
-    # 2. Apply the diff
+    # 2. Dry-run check: verify patch applies cleanly before modifying working tree
+    if ! git apply --check --binary "$patch_file" 2>&1; then
+        echo "APPLY_CHECK_FAILED: patch would not apply cleanly (dry-run)"
+        rm -f "$patch_file"
+        return 1
+    fi
+
+    # 3. Apply the diff (guaranteed clean after --check)
     if git apply --binary "$patch_file" 2>&1; then
         echo "APPLY_OK"
     else
-        echo "APPLY_FAILED"
-        git reset --hard HEAD >/dev/null 2>&1
+        echo "APPLY_FAILED: unexpected failure after successful --check (should not happen)"
+        git reset --hard "$rollback_tag" >/dev/null 2>&1
         git clean -fd >/dev/null 2>&1
         rm -f "$patch_file"
         return 1
     fi
 
-    # 3. Commit the applied changes
+    # 4. Commit the applied changes
     git add -A 2>/dev/null
     local apply_commit_msg="[self-evolution] auto-apply $(date +%Y%m%d_%H%M%S) ($lines_changed lines)"
     git commit -q -m "$apply_commit_msg" 2>/dev/null

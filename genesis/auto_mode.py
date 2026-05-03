@@ -1243,7 +1243,7 @@ def _compute_cross_round_observations(round_log: list, self_evolution=None) -> d
     apply_attempts = 0
     apply_successes = 0
     apply_blocked_reasons = []
-    _truly_blocked = {"test_failed", "test_collection_failed", "apply_failed", "scope_gate_rejected"}
+    _truly_blocked = {"test_failed", "test_collection_failed", "apply_failed", "apply_check_failed", "scope_gate_rejected"}
     if self_evolution:
         apply_attempts = len(self_evolution.apply_history)
         apply_successes = sum(1 for h in self_evolution.apply_history if h.get("status") == "success")
@@ -2511,23 +2511,28 @@ class SelfEvolution:
             apply_cmd.extend(["--only", only_filter])
         apply_ok, apply_output = await _run_doctor_sync_command(*apply_cmd, timeout_secs=60)
 
-        # Parse output for rollback point
+        # Parse output for rollback point and tag
         rollback_commit = ""
+        rollback_tag = ""
         applied_commit = ""
         for line in apply_output.split("\n"):
             if line.startswith("ROLLBACK_POINT:"):
                 rollback_commit = line.split(":", 1)[1].strip()
+            elif line.startswith("ROLLBACK_TAG:"):
+                rollback_tag = line.split(":", 1)[1].strip()
             elif line.startswith("APPLIED_COMMIT:"):
                 applied_commit = line.split(":", 1)[1].strip()
 
         if not apply_ok or "APPLY_SUCCESS" not in apply_output:
+            is_check_failed = "APPLY_CHECK_FAILED" in apply_output
+            status = "apply_check_failed" if is_check_failed else "apply_failed"
             await channel.send(
-                f"🧬 ❌ 应用失败\n```\n{apply_output[-500:]}\n```"
+                f"🧬 ❌ 应用失败{'（dry-run 不通过）' if is_check_failed else ''}\n```\n{apply_output[-500:]}\n```"
             )
             apply_result["apply_reason"] = apply_output[-200:].replace("\n", " ").strip()
             self.apply_history.append({
                 "round": round_num,
-                "status": "apply_failed",
+                "status": status,
                 "reason": apply_result["apply_reason"],
             })
             # Selective reset on apply failure too
