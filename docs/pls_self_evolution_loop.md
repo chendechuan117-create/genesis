@@ -305,8 +305,8 @@ PromotionGate 应该是原子的：
 | P0 | ~~test-diff 证据分类~~ | 无 | ✅ 已完成 |
 | P0 | ~~test-diff 只运行生产测试~~ | 无 | ✅ 已完成 |
 | P0 | ~~--only 多路径语义~~ | 无 | ✅ 已完成 |
-| P1 | auto-apply --check dry-run | 无 | 20 行 bash |
-| P1 | rollback tag（替代匿名 commit） | 无 | 10 行 bash |
+| P1 | ~~auto-apply --check dry-run~~ | 无 | ✅ 已完成 |
+| P1 | ~~rollback tag（替代匿名 commit）~~ | 无 | ✅ 已完成 |
 | P2 | C-Phase 非阻塞审查 | C-Phase Gardener | 50 行 Python |
 | P2 | Canary 部署观察窗口 | auto-apply 修复 | 80 行 Python |
 | P3 | C-Phase 阻塞审查 | Phase 2 验证 | 20 行 Python |
