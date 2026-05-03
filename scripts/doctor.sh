@@ -666,7 +666,7 @@ cmd_auto_apply() {
     # 2. Apply the diff INSIDE the container (same git repo as patch source)
     # This avoids baseline drift between container and host git repos.
     local apply_output
-    apply_output=$(docker exec -w "$(_doctor_workspace_dir)" "$CONTAINER" bash -c "
+    apply_output=$(docker exec -i -w "$(_doctor_workspace_dir)" "$CONTAINER" bash -c "
         git apply --binary - 2>&1
     " < "$patch_file" 2>&1)
     local apply_rc=$?
