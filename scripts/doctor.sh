@@ -329,18 +329,16 @@ EOF
     local collect_rc
     # Run pytest inside container (host lacks /opt/venv dependencies)
     _ensure_running
-    # Sync changed test files to container so pytest sees host modifications
-    for t in $test_args; do
-        if [ -f "$PROJECT_DIR/$t" ]; then
-            docker cp "$PROJECT_DIR/$t" "$CONTAINER:$(_doctor_workspace_dir)/$t" 2>/dev/null || true
-        fi
-    done
-    # Also sync changed source files that tests import
-    local src_changed
-    src_changed=$(git diff --name-only HEAD 2>/dev/null | grep -vE '^(archive/|blog/|docs/|\.tmp_probe/|n8n-workflows/|scripts/replica_setup/)' || true)
-    for s in $src_changed; do
-        if [ -f "$PROJECT_DIR/$s" ]; then
-            docker cp "$PROJECT_DIR/$s" "$CONTAINER:$(_doctor_workspace_dir)/$s" 2>/dev/null || true
+    # Sync ALL git-tracked Python files to container before pytest.
+    # Container /workspace is a snapshot from container start time — host files
+    # may have been fixed by auto-apply commits since then. Only syncing diff
+    # files is insufficient because tests import other source files that may
+    # also be stale/broken in the container.
+    local _ws_dir
+    _ws_dir=$(_doctor_workspace_dir)
+    git ls-files -- '*.py' 2>/dev/null | while IFS= read -r f; do
+        if [ -f "$PROJECT_DIR/$f" ]; then
+            docker cp "$PROJECT_DIR/$f" "$CONTAINER:$_ws_dir/$f" 2>/dev/null || true
         fi
     done
     collect_output=$(docker exec -w "$(_doctor_workspace_dir)" -e PYTHONPATH="$(_doctor_pythonpath)" "$CONTAINER" \
@@ -711,7 +709,29 @@ cmd_auto_apply() {
         git add -A 2>/dev/null
     fi
 
-    # 3. Smoke test canary: verify core modules still import before commit
+    # 3. Syntax check: verify all staged Python files pass py_compile
+    #    Catches syntax errors (empty function defs, bad indentation) that
+    #    smoke test (import check) doesn't catch.
+    local syntax_broken=""
+    git diff --cached --name-only -- '*.py' 2>/dev/null | while IFS= read -r f; do
+        if ! "$HOST_PYTHON" -c "import ast; ast.parse(open('$PROJECT_DIR/$f').read())" 2>/dev/null; then
+            echo "SYNTAX_BROKEN:$f"
+        fi
+    done > /tmp/doctor_syntax_check_$$
+    syntax_broken=$(grep "SYNTAX_BROKEN:" /tmp/doctor_syntax_check_$$ 2>/dev/null)
+    rm -f /tmp/doctor_syntax_check_$$
+    if [ -n "$syntax_broken" ]; then
+        echo "SYNTAX_CHECK: FAIL"
+        echo "$syntax_broken" | sed 's/SYNTAX_BROKEN:/  /'
+        echo "SYNTAX_FAILED: staged Python files have syntax errors, rolling back"
+        git reset --hard "$rollback_tag" >/dev/null 2>&1
+        git clean -fd >/dev/null 2>&1
+        rm -f "$patch_file" 2>/dev/null
+        return 6
+    fi
+    echo "SYNTAX_CHECK: PASS"
+
+    # 4. Smoke test canary: verify core modules still import before commit
     local smoke_output
     smoke_output=$("$HOST_PYTHON" -c "
 from genesis.auto_mode import SelfEvolution

@@ -2364,7 +2364,7 @@ class SelfEvolution:
             self._save()
 
         recent = self.apply_history[-3:] if len(self.apply_history) >= 3 else []
-        _blocking_statuses = {"test_failed", "test_collection_failed", "smoke_failed"}
+        _blocking_statuses = {"test_failed", "test_collection_failed", "smoke_failed", "syntax_failed"}
         if recent and all(e.get("status") in _blocking_statuses for e in recent):
             # Check if reasons are similar (share a common error substring)
             reasons = [e.get("reason", "")[:60] for e in recent]
@@ -2562,7 +2562,11 @@ class SelfEvolution:
         if not apply_ok or "APPLY_SUCCESS" not in apply_output:
             is_check_failed = "APPLY_CHECK_FAILED" in apply_output
             is_smoke_failed = "SMOKE_FAILED" in apply_output
-            if is_smoke_failed:
+            is_syntax_failed = "SYNTAX_FAILED" in apply_output
+            if is_syntax_failed:
+                status = "syntax_failed"
+                msg_suffix = "（Python 语法错误，已自动回滚）"
+            elif is_smoke_failed:
                 status = "smoke_failed"
                 msg_suffix = "（核心 import 损坏，已自动回滚）"
             elif is_check_failed:
