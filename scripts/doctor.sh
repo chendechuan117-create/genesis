@@ -74,6 +74,43 @@ _doctor_pythonpath() {
     _doctor_workspace_dir
 }
 
+_sync_container_to_host() {
+    # Copy container-side modifications to host working tree.
+    # Yogg modifies files via both: (a) shell tool on host, (b) doctor.sh exec/run in container.
+    # Host-side commands only see host working tree, so we sync container changes first.
+    #
+    # Strategy: only copy files that are MODIFIED IN CONTAINER (container git diff)
+    # AND NOT ALREADY MODIFIED ON HOST (host git diff). This prevents stale container
+    # snapshots from overwriting newer host versions committed via auto-apply/scp.
+    if ! _is_running; then
+        return 0
+    fi
+    local _ws_dir
+    _ws_dir=$(_doctor_workspace_dir)
+
+    # Get list of files modified on host (don't overwrite these)
+    local host_modified
+    host_modified=$(git diff --name-only HEAD 2>/dev/null)
+
+    # Get list of files modified in container
+    local container_modified
+    container_modified=$(docker exec -w "$_ws_dir" "$CONTAINER" bash -c '
+        git diff --name-only HEAD 2>/dev/null
+        git ls-files --others --exclude-standard 2>/dev/null | grep -vE "(__pycache__|\.pyc|\.pyo|\.orig|\.rej|\.log|\.pytest_cache|^runtime/|^\.|__auto_apply)"
+    ' 2>/dev/null)
+
+    # Sync container modifications that host doesn't already have
+    echo "$container_modified" | while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        # Skip if host already has modifications to this file
+        if echo "$host_modified" | grep -qxF "$f"; then
+            continue
+        fi
+        mkdir -p "$PROJECT_DIR/$(dirname "$f")"
+        docker cp "$CONTAINER:$_ws_dir/$f" "$PROJECT_DIR/$f" 2>/dev/null || true
+    done
+}
+
 _ensure_git_safe() {
     local workspace
     workspace="$(_doctor_workspace_dir)" || return 1
@@ -389,8 +426,9 @@ _doctor_workspace_patch() {
 }
 
 cmd_diff_status() {
-    # Run on HOST — Yogg's modifications are on the host filesystem,
-    # not in the container's Docker volume.
+    # Run on HOST — but first sync container changes to host,
+    # since Yogg may modify files via doctor.sh exec/run inside container.
+    _sync_container_to_host
     cd "$PROJECT_DIR"
 
     # Tracked diff hash
@@ -420,8 +458,9 @@ cmd_diff_status() {
 }
 
 cmd_file_status() {
-    # Run on HOST — Yogg's modifications are on the host filesystem,
-    # not in the container's Docker volume.
+    # Run on HOST — but first sync container changes to host,
+    # since Yogg may modify files via doctor.sh exec/run inside container.
+    _sync_container_to_host
     cd "$PROJECT_DIR"
     # Tracked files: per-file diff hash
     git diff HEAD --name-only 2>/dev/null | while IFS= read -r f; do
@@ -637,8 +676,9 @@ cmd_restore() {
 cmd_auto_apply() {
     # 非交互式应用：自进化专用，带 git 安全网
     # 支持 --only file1,file2,... 限定应用范围
-    # All operations on HOST — Yogg's modifications are on the host filesystem.
-    # Since modifications are already in the working tree, we just commit them.
+    # All operations on HOST — but first sync container changes to host,
+    # since Yogg may modify files via doctor.sh exec/run inside container.
+    _sync_container_to_host
     cd "$PROJECT_DIR"
 
     local only_filter=""
