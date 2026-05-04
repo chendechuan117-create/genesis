@@ -74,42 +74,96 @@ _doctor_pythonpath() {
     _doctor_workspace_dir
 }
 
-_sync_container_to_host() {
-    # Copy container-side NEW files (untracked) to host working tree.
-    # Yogg creates new test files via doctor.sh exec/run in container.
-    # Host-side commands only see host working tree, so we sync these first.
+_container_file_status() {
+    # Get file status from container, filtering out stale HEAD diffs.
+    # For each container modified file, compare against host HEAD content.
+    # Only report files where container content differs from host HEAD
+    # (i.e., Yogg genuinely modified it, not just stale container HEAD).
     #
-    # NOTE: We only sync UNTRACKED (new) files. We do NOT sync tracked files
-    # modified in container because container HEAD is a stale snapshot —
-    # container "git diff HEAD" includes files that host has already committed
-    # (host HEAD is newer), and we cannot reliably distinguish Yogg's edits
-    # from host-committed updates. Tracked file modifications should happen
-    # on host via shell tool, not in container.
+    # EXCLUDE core paths (scripts/, genesis/, yogg_auto.py, etc.) — these are
+    # managed on host and container edits are based on stale versions.
     if ! _is_running; then
         return 0
     fi
     local _ws_dir
     _ws_dir=$(_doctor_workspace_dir)
 
-    # Sync untracked files (new files Yogg created in container)
-    # BUT skip files that are already tracked on host — container HEAD is stale,
-    # so host-tracked files may appear as untracked in container.
-    # Syncing those would overwrite newer host-committed versions.
-    local _host_tracked_file
-    _host_tracked_file=$(mktemp)
-    git ls-files > "$_host_tracked_file" 2>/dev/null
+    # Container tracked modified files (exclude host-managed paths)
     docker exec -w "$_ws_dir" "$CONTAINER" bash -c '
-        git ls-files --others --exclude-standard 2>/dev/null | grep -vE "(__pycache__|\.pyc|\.pyo|\.orig|\.rej|\.log|\.pytest_cache|^runtime/|^\.|__auto_apply)"
-    ' 2>/dev/null | while IFS= read -r f; do
+        git diff --name-only HEAD 2>/dev/null
+    ' 2>/dev/null | grep -vE '^scripts/|^genesis/|^yogg_auto\.py|^factory\.py|^autopilot\.py|^discord_bot\.py' | while IFS= read -r f; do
         [ -z "$f" ] && continue
-        # Skip if this file is already tracked on host
-        if grep -qxF "$f" "$_host_tracked_file" 2>/dev/null; then
+        # Get container file hash
+        local container_hash
+        container_hash=$(docker exec "$CONTAINER" md5sum "$_ws_dir/$f" 2>/dev/null | cut -d' ' -f1)
+        [ -z "$container_hash" ] && continue
+        # Compare against host HEAD
+        local host_head_hash=""
+        if git -C "$PROJECT_DIR" cat-file -e HEAD:"$f" 2>/dev/null; then
+            host_head_hash=$(git -C "$PROJECT_DIR" show HEAD:"$f" 2>/dev/null | md5sum | cut -d' ' -f1)
+        fi
+        # Skip if matches host HEAD (stale container HEAD, not Yogg's edit)
+        if [ -n "$host_head_hash" ] && [ "$container_hash" = "$host_head_hash" ]; then
             continue
         fi
+        # Also skip if matches host working tree (already on host)
+        if [ -f "$PROJECT_DIR/$f" ]; then
+            local host_wt_hash
+            host_wt_hash=$(md5sum "$PROJECT_DIR/$f" 2>/dev/null | cut -d' ' -f1)
+            if [ "$container_hash" = "$host_wt_hash" ]; then
+                continue
+            fi
+        fi
+        echo "T:${f}:${container_hash:0:12}"
+    done
+
+    # Container untracked files (new files Yogg created, exclude host-managed paths)
+    docker exec -w "$_ws_dir" "$CONTAINER" bash -c '
+        git ls-files --others --exclude-standard 2>/dev/null | grep -vE "(__pycache__|\.pyc|\.pyo|\.orig|\.rej|\.log|\.pytest_cache|^runtime/|^\.|__auto_apply)"
+    ' 2>/dev/null | grep -vE '^scripts/|^genesis/|^yogg_auto\.py|^factory\.py|^autopilot\.py|^discord_bot\.py' | while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        # Skip if already exists on host with same content
+        if [ -f "$PROJECT_DIR/$f" ]; then
+            local host_wt_hash
+            host_wt_hash=$(md5sum "$PROJECT_DIR/$f" 2>/dev/null | cut -d' ' -f1)
+            local container_hash
+            container_hash=$(docker exec "$CONTAINER" md5sum "$_ws_dir/$f" 2>/dev/null | cut -d' ' -f1)
+            if [ "$container_hash" = "$host_wt_hash" ]; then
+                continue
+            fi
+        fi
+        local container_hash
+        container_hash=$(docker exec "$CONTAINER" md5sum "$_ws_dir/$f" 2>/dev/null | cut -d' ' -f1)
+        echo "U:${f}:${container_hash:0:12}"
+    done
+}
+
+_sync_container_to_host() {
+    # Sync Yogg's container-side modifications to host working tree.
+    # Uses _container_file_status to identify only genuine Yogg modifications
+    # (not stale container HEAD diffs), then copies those files to host.
+    if ! _is_running; then
+        return 0
+    fi
+    local _ws_dir
+    _ws_dir=$(_doctor_workspace_dir)
+
+    # Get genuine Yogg modifications from container
+    local yogg_files
+    yogg_files=$(_container_file_status)
+
+    [ -z "$yogg_files" ] && return 0
+
+    # Sync each file to host
+    echo "$yogg_files" | while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        # Parse T:path:hash or U:path:hash
+        local f
+        f=$(echo "$line" | cut -d: -f2)
+        [ -z "$f" ] && continue
         mkdir -p "$PROJECT_DIR/$(dirname "$f")"
         docker cp "$CONTAINER:$_ws_dir/$f" "$PROJECT_DIR/$f" 2>/dev/null || true
     done
-    rm -f "$_host_tracked_file"
 }
 
 _ensure_git_safe() {
@@ -427,8 +481,8 @@ _doctor_workspace_patch() {
 }
 
 cmd_diff_status() {
-    # Run on HOST — but first sync container changes to host,
-    # since Yogg may modify files via doctor.sh exec/run inside container.
+    # Merge HOST + container file status.
+    # Yogg modifies files via both host shell and container exec/run.
     _sync_container_to_host
     cd "$PROJECT_DIR"
 
@@ -459,20 +513,23 @@ cmd_diff_status() {
 }
 
 cmd_file_status() {
-    # Run on HOST — but first sync container changes to host,
-    # since Yogg may modify files via doctor.sh exec/run inside container.
+    # Merge HOST + container file status.
+    # Yogg modifies files via both host shell and container exec/run.
+    # First sync genuine container modifications to host.
     _sync_container_to_host
     cd "$PROJECT_DIR"
-    # Tracked files: per-file diff hash
+    # Host tracked files: per-file diff hash
     git diff HEAD --name-only 2>/dev/null | while IFS= read -r f; do
         h=$(git diff HEAD -- "$f" 2>/dev/null | md5sum | cut -d' ' -f1 | cut -c1-12)
         echo "T:${f}:${h}"
     done
-    # Untracked files: per-file content hash
+    # Host untracked files: per-file content hash
     git ls-files --others --exclude-standard 2>/dev/null | grep -vE '(__pycache__|\.pyc|\.pyo|\.orig|\.rej|\.log|\.pytest_cache|^runtime/|^\.)' | while IFS= read -r f; do
         h=$(cat "$f" 2>/dev/null | md5sum | cut -d' ' -f1 | cut -c1-12)
         echo "U:${f}:${h}"
     done
+    # Container-side modifications (not already on host)
+    _container_file_status
 }
 
 cmd_diff() {
