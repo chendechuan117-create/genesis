@@ -75,40 +75,41 @@ _doctor_pythonpath() {
 }
 
 _sync_container_to_host() {
-    # Copy container-side modifications to host working tree.
-    # Yogg modifies files via both: (a) shell tool on host, (b) doctor.sh exec/run in container.
-    # Host-side commands only see host working tree, so we sync container changes first.
+    # Copy container-side NEW files (untracked) to host working tree.
+    # Yogg creates new test files via doctor.sh exec/run in container.
+    # Host-side commands only see host working tree, so we sync these first.
     #
-    # Strategy: only copy files that are MODIFIED IN CONTAINER (container git diff)
-    # AND NOT ALREADY MODIFIED ON HOST (host git diff). This prevents stale container
-    # snapshots from overwriting newer host versions committed via auto-apply/scp.
+    # NOTE: We only sync UNTRACKED (new) files. We do NOT sync tracked files
+    # modified in container because container HEAD is a stale snapshot —
+    # container "git diff HEAD" includes files that host has already committed
+    # (host HEAD is newer), and we cannot reliably distinguish Yogg's edits
+    # from host-committed updates. Tracked file modifications should happen
+    # on host via shell tool, not in container.
     if ! _is_running; then
         return 0
     fi
     local _ws_dir
     _ws_dir=$(_doctor_workspace_dir)
 
-    # Get list of files modified on host (don't overwrite these)
-    local host_modified
-    host_modified=$(git diff --name-only HEAD 2>/dev/null)
-
-    # Get list of files modified in container
-    local container_modified
-    container_modified=$(docker exec -w "$_ws_dir" "$CONTAINER" bash -c '
-        git diff --name-only HEAD 2>/dev/null
+    # Sync untracked files (new files Yogg created in container)
+    # BUT skip files that are already tracked on host — container HEAD is stale,
+    # so host-tracked files may appear as untracked in container.
+    # Syncing those would overwrite newer host-committed versions.
+    local _host_tracked_file
+    _host_tracked_file=$(mktemp)
+    git ls-files > "$_host_tracked_file" 2>/dev/null
+    docker exec -w "$_ws_dir" "$CONTAINER" bash -c '
         git ls-files --others --exclude-standard 2>/dev/null | grep -vE "(__pycache__|\.pyc|\.pyo|\.orig|\.rej|\.log|\.pytest_cache|^runtime/|^\.|__auto_apply)"
-    ' 2>/dev/null)
-
-    # Sync container modifications that host doesn't already have
-    echo "$container_modified" | while IFS= read -r f; do
+    ' 2>/dev/null | while IFS= read -r f; do
         [ -z "$f" ] && continue
-        # Skip if host already has modifications to this file
-        if echo "$host_modified" | grep -qxF "$f"; then
+        # Skip if this file is already tracked on host
+        if grep -qxF "$f" "$_host_tracked_file" 2>/dev/null; then
             continue
         fi
         mkdir -p "$PROJECT_DIR/$(dirname "$f")"
         docker cp "$CONTAINER:$_ws_dir/$f" "$PROJECT_DIR/$f" 2>/dev/null || true
     done
+    rm -f "$_host_tracked_file"
 }
 
 _ensure_git_safe() {
