@@ -37,6 +37,7 @@ _is_running() {
 
 DEFAULT_WORKSPACE='/workspace'
 FALLBACK_WORKSPACE='/src/genesis'
+HOST_MANAGED_SYNC_EXCLUDE='^scripts/|^genesis/|^yogg_auto\.py|^factory\.py|^autopilot\.py|^discord_bot\.py'
 
 _doctor_workspace_dir() {
     local preferred="${DOCTOR_WORKSPACE_DIR:-$DEFAULT_WORKSPACE}"
@@ -91,7 +92,7 @@ _container_file_status() {
     # Container tracked modified files (exclude host-managed paths)
     docker exec -w "$_ws_dir" "$CONTAINER" bash -c '
         git diff --name-only HEAD 2>/dev/null
-    ' 2>/dev/null | grep -vE '^scripts/|^genesis/|^yogg_auto\.py|^factory\.py|^autopilot\.py|^discord_bot\.py' | while IFS= read -r f; do
+    ' 2>/dev/null | grep -vE "$HOST_MANAGED_SYNC_EXCLUDE" | while IFS= read -r f; do
         [ -z "$f" ] && continue
         # Get container file hash
         local container_hash
@@ -120,7 +121,7 @@ _container_file_status() {
     # Container untracked files (new files Yogg created, exclude host-managed paths)
     docker exec -w "$_ws_dir" "$CONTAINER" bash -c '
         git ls-files --others --exclude-standard 2>/dev/null | grep -vE "(__pycache__|\.pyc|\.pyo|\.orig|\.rej|\.log|\.pytest_cache|^runtime/|^\.|__auto_apply)"
-    ' 2>/dev/null | grep -vE '^scripts/|^genesis/|^yogg_auto\.py|^factory\.py|^autopilot\.py|^discord_bot\.py' | while IFS= read -r f; do
+    ' 2>/dev/null | grep -vE "$HOST_MANAGED_SYNC_EXCLUDE" | while IFS= read -r f; do
         [ -z "$f" ] && continue
         # Skip if already exists on host with same content
         if [ -f "$PROJECT_DIR/$f" ]; then
@@ -135,6 +136,31 @@ _container_file_status() {
         local container_hash
         container_hash=$(docker exec "$CONTAINER" md5sum "$_ws_dir/$f" 2>/dev/null | cut -d' ' -f1)
         echo "U:${f}:${container_hash:0:12}"
+    done
+}
+
+_container_host_managed_status() {
+    if ! _is_running; then
+        return 0
+    fi
+    local _ws_dir
+    _ws_dir=$(_doctor_workspace_dir)
+
+    docker exec -w "$_ws_dir" "$CONTAINER" bash -c '
+        (git diff --name-only HEAD 2>/dev/null; git ls-files --others --exclude-standard 2>/dev/null) | sort -u
+    ' 2>/dev/null | grep -E "$HOST_MANAGED_SYNC_EXCLUDE" | while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        local container_hash
+        container_hash=$(docker exec "$CONTAINER" md5sum "$_ws_dir/$f" 2>/dev/null | cut -d' ' -f1)
+        [ -z "$container_hash" ] && continue
+        if [ -f "$PROJECT_DIR/$f" ]; then
+            local host_wt_hash
+            host_wt_hash=$(md5sum "$PROJECT_DIR/$f" 2>/dev/null | cut -d' ' -f1)
+            if [ "$container_hash" = "$host_wt_hash" ]; then
+                continue
+            fi
+        fi
+        echo "H:${f}:host-managed"
     done
 }
 
@@ -373,6 +399,14 @@ EOF
         echo "$preflight_output"
     fi
 
+    local host_managed_output
+    host_managed_output=$(_container_host_managed_status || true)
+    if [ -n "$host_managed_output" ]; then
+        echo "HOST_MANAGED_BLOCKED: Doctor container changed host-managed files; sync is blocked pending human review"
+        echo "$host_managed_output"
+        return 5
+    fi
+
     # Only consider git-tracked files for test discovery.
     # Run on HOST — Yogg's modifications are on the host filesystem.
     local tracked_changed
@@ -506,10 +540,21 @@ cmd_diff_status() {
         untracked_count=0
     fi
 
+    local host_managed_list
+    local host_managed_hash=""
+    local host_managed_count=0
+    host_managed_list=$(_container_host_managed_status || true)
+    if [ -n "$host_managed_list" ]; then
+        host_managed_hash=$(echo "$host_managed_list" | sort | md5sum | cut -d" " -f1 | cut -c1-12)
+        host_managed_count=$(echo "$host_managed_list" | wc -l)
+    fi
+
     echo "TRACKED_HASH:${tracked_hash}"
     echo "TRACKED_LINES:${tracked_lines}"
     echo "UNTRACKED_HASH:${untracked_hash}"
     echo "UNTRACKED_COUNT:${untracked_count}"
+    echo "HOST_MANAGED_HASH:${host_managed_hash}"
+    echo "HOST_MANAGED_COUNT:${host_managed_count}"
 }
 
 cmd_file_status() {
@@ -530,6 +575,7 @@ cmd_file_status() {
     done
     # Container-side modifications (not already on host)
     _container_file_status
+    _container_host_managed_status
 }
 
 cmd_diff() {

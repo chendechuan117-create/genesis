@@ -2148,6 +2148,7 @@ class SelfEvolution:
         # Session state
         self.applied_this_session: bool = False
         self.apply_history: list = []
+        self.apply_attempt_seq: int = 0
         # Diff-status snapshot for outcome detection (ground truth)
         self._pre_round_snapshot: str = ""
         self._load()
@@ -2158,6 +2159,7 @@ class SelfEvolution:
                 data = json.loads(self._STATE_PATH.read_text(encoding="utf-8"))
                 self.apply_history = data.get("apply_history", [])
                 self.file_cooldowns = data.get("file_cooldowns", {})
+                self.apply_attempt_seq = int(data.get("apply_attempt_seq", 0) or 0)
         except Exception:
             pass
 
@@ -2167,6 +2169,7 @@ class SelfEvolution:
             self._STATE_PATH.write_text(json.dumps({
                 "file_cooldowns": self.file_cooldowns,
                 "apply_history": self.apply_history[-10:],
+                "apply_attempt_seq": self.apply_attempt_seq,
             }, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as e:
             logger.warning(f"SelfEvolution state save failed: {e}")
@@ -2198,9 +2201,9 @@ class SelfEvolution:
         # ── Update per-file cooldown state ──
         cooled_files = []
         for path, info in current_files.items():
-            ftype = info["type"]  # "T" or "U"
+            ftype = info["type"]  # "T", "U", or "H"
             fhash = info["hash"]
-            threshold = self.untracked_cooldown if ftype == "U" else self.cooldown
+            threshold = 1 if ftype == "H" else (self.untracked_cooldown if ftype == "U" else self.cooldown)
 
             if path in self.file_cooldowns:
                 old = self.file_cooldowns[path]
@@ -2242,6 +2245,7 @@ class SelfEvolution:
         # ── Status reporting ──
         t_files = {p: v for p, v in self.file_cooldowns.items() if v["type"] == "T"}
         u_files = {p: v for p, v in self.file_cooldowns.items() if v["type"] == "U"}
+        h_files = {p: v for p, v in self.file_cooldowns.items() if v["type"] == "H"}
         parts = []
         if t_files:
             max_t = max(v["stable_count"] for v in t_files.values())
@@ -2249,6 +2253,9 @@ class SelfEvolution:
         if u_files:
             max_u = max(v["stable_count"] for v in u_files.values())
             parts.append(f"U:{len(u_files)}f max{max_u}/{self.untracked_cooldown}")
+        if h_files:
+            max_h = max(v["stable_count"] for v in h_files.values())
+            parts.append(f"H:{len(h_files)}f max{max_h}/review")
         status_text = " | ".join(parts) if parts else ""
 
         # Any file cooled → trigger apply
@@ -2299,7 +2306,7 @@ class SelfEvolution:
 
     async def _get_file_status(self) -> dict:
         """Check Doctor sandbox for per-file status.
-        Returns dict: {path: {"hash": str, "type": "T"|"U"}}
+        Returns dict: {path: {"hash": str, "type": "T"|"U"|"H"}}
 
         NOTE: doctor.sh file-status uses pipefail + while-read pipe, which can
         exit with code=1 even when output is perfectly valid (read returns non-zero
@@ -2312,9 +2319,9 @@ class SelfEvolution:
                 line = line.strip()
                 if not line:
                     continue
-                # Format: T:path:hash or U:path:hash
+                # Format: T:path:hash or U:path:hash or H:path:host-managed
                 parts = line.split(":", 2)
-                if len(parts) == 3 and parts[0] in ("T", "U"):
+                if len(parts) == 3 and parts[0] in ("T", "U", "H"):
                     result[parts[1]] = {"hash": parts[2], "type": parts[0]}
             if not result and output.strip():
                 logger.warning(f"SelfEvolution file-status: got output but no valid T:/U: lines parsed: {output[:200]}")
@@ -2329,8 +2336,12 @@ class SelfEvolution:
         Returns dict: {"apply_attempted": True, "apply_succeeded": bool, "apply_reason": str}
         """
         apply_result = {"apply_attempted": True, "apply_succeeded": False, "apply_reason": ""}
+        self.apply_attempt_seq += 1
+        current_attempt_seq = self.apply_attempt_seq
+        self._save()
         t_files = {p: v for p, v in self.file_cooldowns.items() if v["type"] == "T"}
         u_files = {p: v for p, v in self.file_cooldowns.items() if v["type"] == "U"}
+        h_files = {p: v for p, v in self.file_cooldowns.items() if v["type"] == "H"}
         max_t = max((v["stable_count"] for v in t_files.values()), default=0)
         max_u = max((v["stable_count"] for v in u_files.values()), default=0)
 
@@ -2370,13 +2381,31 @@ class SelfEvolution:
             reasons = [e.get("reason", "")[:60] for e in recent]
             # Simple similarity: if first 30 chars of reason are identical → same root cause
             if len(set(r[:30] for r in reasons)) == 1:
-                last_fail_round = recent[-1].get("round", 0)
-                skip_remaining = 5 - (round_num - last_fail_round)
-                if skip_remaining > 0:
-                    await channel.send(
-                        f"🧬 ⏭ 跳过自进化（连续测试失败同原因，冷却 {skip_remaining} 轮）| T:{len(t_files)}f max{max_t}/{self.cooldown}"
-                    )
-                    return apply_result
+                last_fail_attempt_seq = recent[-1].get("attempt_seq")
+                if last_fail_attempt_seq is not None:
+                    skip_remaining = 5 - (current_attempt_seq - int(last_fail_attempt_seq))
+                    if skip_remaining > 0:
+                        await channel.send(
+                            f"🧬 ⏭ 跳过自进化（连续测试失败同原因，冷却 {skip_remaining} 次尝试）| T:{len(t_files)}f max{max_t}/{self.cooldown}"
+                        )
+                        return apply_result
+
+        if h_files:
+            await channel.send(
+                f"🧬 🚫 拒绝自进化：Doctor 容器包含 host-managed 文件改动 {list(h_files.keys())[:5]}，需要人工审查。"
+            )
+            apply_result["apply_reason"] = f"host_managed_blocked: {', '.join(h_files.keys())}"
+            self.apply_history.append({
+                "round": round_num,
+                "attempt_seq": current_attempt_seq,
+                "status": "host_managed_blocked",
+                "reason": apply_result["apply_reason"],
+            })
+            for p in h_files:
+                if p in self.file_cooldowns:
+                    self.file_cooldowns[p]["stable_count"] = 0
+            self._save()
+            return apply_result
 
         await channel.send(
             f"🧬 冷却完成 | T:{len(t_files)}f max{max_t}/{self.cooldown} U:{len(u_files)}f max{max_u}/{self.untracked_cooldown} | 开始自进化应用流程..."
@@ -2437,6 +2466,7 @@ class SelfEvolution:
                 apply_result["apply_reason"] = f"scope_gate: critical files only ({', '.join(critical_found)})"
                 self.apply_history.append({
                     "round": round_num,
+                    "attempt_seq": current_attempt_seq,
                     "status": "scope_gate_rejected",
                     "reason": apply_result["apply_reason"],
                 })
@@ -2479,6 +2509,7 @@ class SelfEvolution:
                 apply_result["apply_reason"] = f"no_test_coverage:{unverified_reason}"
                 self.apply_history.append({
                     "round": round_num,
+                    "attempt_seq": current_attempt_seq,
                     "status": "test_unverified",
                     "reason": f"{unverified_reason}: no test files found for diff changes",
                 })
@@ -2491,6 +2522,7 @@ class SelfEvolution:
                 apply_result["apply_reason"] = test_output[-200:].replace("\n", " ").strip()
                 self.apply_history.append({
                     "round": round_num,
+                    "attempt_seq": current_attempt_seq,
                     "status": "test_collection_failed",
                     "reason": apply_result["apply_reason"],
                 })
@@ -2516,6 +2548,7 @@ class SelfEvolution:
                 apply_result["apply_reason"] = test_output[-200:].replace("\n", " ").strip()
                 self.apply_history.append({
                     "round": round_num,
+                    "attempt_seq": current_attempt_seq,
                     "status": "test_failed",
                     "reason": apply_result["apply_reason"],
                 })
@@ -2581,6 +2614,7 @@ class SelfEvolution:
             apply_result["apply_reason"] = apply_output[-200:].replace("\n", " ").strip()
             self.apply_history.append({
                 "round": round_num,
+                "attempt_seq": current_attempt_seq,
                 "status": status,
                 "reason": apply_result["apply_reason"],
             })
@@ -2615,6 +2649,7 @@ class SelfEvolution:
         self.applied_this_session = True
         self.apply_history.append({
             "round": round_num,
+            "attempt_seq": current_attempt_seq,
             "status": "success",
             "timestamp": _time_module.strftime("%Y-%m-%d %H:%M:%S"),
             "rollback_commit": rollback_commit,

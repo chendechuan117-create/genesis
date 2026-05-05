@@ -86,12 +86,10 @@ def create_agent(
             RecordContextNodeTool, RecordPointTool, RecordLineTool, RecordLessonNodeTool,
             CreateMetaNodeTool, DeleteNodeTool, CreateGraphNodeTool, CreateNodeEdgeTool,
             RecordToolNodeTool, RecordDiscoveryTool,
-            RecordPointTool, RecordLineTool, RecordContextPointTool,
         )
         for t in [RecordContextNodeTool(), RecordPointTool(), RecordLineTool(), RecordLessonNodeTool(),
                    CreateMetaNodeTool(), DeleteNodeTool(), CreateGraphNodeTool(), CreateNodeEdgeTool(),
-                   RecordToolNodeTool(), RecordDiscoveryTool(),
-                   RecordPointTool(), RecordLineTool(), RecordContextPointTool()]:
+                   RecordToolNodeTool(), RecordDiscoveryTool()]:
             tools.register(t)
     except Exception as e:
         logger.error(f"V4 tool group [node_tools] failed: {e}")
