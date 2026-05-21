@@ -31,7 +31,7 @@ class GlobalConfig:
     newshrimp_api_key: Optional[str] = None
     newshrimp_base_url: Optional[str] = None
     newshrimp_backup_base_url: Optional[str] = None
-    newshrimp_model: str = "deepseek-v4-pro"
+    newshrimp_model: str = "glm-5.1"
     newshrimp_ssl_verify: bool = True
     newshrimp_backup_ssl_verify: bool = True
     
@@ -42,6 +42,12 @@ class GlobalConfig:
     newshrimp_2_model: Optional[str] = None
     newshrimp_2_ssl_verify: bool = True
     newshrimp_2_backup_ssl_verify: bool = True
+    newshrimp_3_api_key: Optional[str] = None
+    newshrimp_3_base_url: Optional[str] = None
+    newshrimp_3_backup_base_url: Optional[str] = None
+    newshrimp_3_model: Optional[str] = None
+    newshrimp_3_ssl_verify: bool = True
+    newshrimp_3_backup_ssl_verify: bool = True
     
     tavily_api_key: Optional[str] = None
     
@@ -161,6 +167,12 @@ class ConfigManager:
         "NEWSHRIMP_2_MODEL": "newshrimp_2_model",
         "NEWSHRIMP_2_SSL_VERIFY": "newshrimp_2_ssl_verify",
         "NEWSHRIMP_2_BACKUP_SSL_VERIFY": "newshrimp_2_backup_ssl_verify",
+        "NEWSHRIMP_3_API_KEY": "newshrimp_3_api_key",
+        "NEWSHRIMP_3_BASE_URL": "newshrimp_3_base_url",
+        "NEWSHRIMP_3_BACKUP_BASE_URL": "newshrimp_3_backup_base_url",
+        "NEWSHRIMP_3_MODEL": "newshrimp_3_model",
+        "NEWSHRIMP_3_SSL_VERIFY": "newshrimp_3_ssl_verify",
+        "NEWSHRIMP_3_BACKUP_SSL_VERIFY": "newshrimp_3_backup_ssl_verify",
         "TAVILY_API_KEY": "tavily_api_key",
         "LANGFUSE_PUBLIC_KEY": "langfuse_public_key",
         "LANGFUSE_SECRET_KEY": "langfuse_secret_key",
@@ -203,7 +215,7 @@ class ConfigManager:
                 setattr(self._config, "xcode_api_keys", keys)
                 if keys and not self._config.xcode_api_key:
                     self._config.xcode_api_key = keys[0]
-            elif upper_key in ("XCODE_SSL_VERIFY", "XCODE_BACKUP_SSL_VERIFY", "NEWSHRIMP_SSL_VERIFY", "NEWSHRIMP_BACKUP_SSL_VERIFY", "NEWSHRIMP_2_SSL_VERIFY", "NEWSHRIMP_2_BACKUP_SSL_VERIFY"):
+            elif upper_key in ("XCODE_SSL_VERIFY", "XCODE_BACKUP_SSL_VERIFY", "NEWSHRIMP_SSL_VERIFY", "NEWSHRIMP_BACKUP_SSL_VERIFY", "NEWSHRIMP_2_SSL_VERIFY", "NEWSHRIMP_2_BACKUP_SSL_VERIFY", "NEWSHRIMP_3_SSL_VERIFY", "NEWSHRIMP_3_BACKUP_SSL_VERIFY"):
                 setattr(self._config, attr, val.strip().lower() not in ("0", "false", "no", "off", ""))
             else:
                 setattr(self._config, attr, val)

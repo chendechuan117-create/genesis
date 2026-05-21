@@ -20,8 +20,26 @@ class EnvironmentEpochMixin:
     # ─── 作用域归一化 ───
 
     def _normalize_environment_scope(self, scope: Any) -> str:
+        if isinstance(scope, (list, tuple, set)):
+            for item in scope:
+                normalized = self._normalize_environment_scope(item)
+                if normalized:
+                    return normalized
+            return ""
         value = str(scope or "").strip().lower()
         if not value:
+            return ""
+        if len(value) >= 2 and value[0] in "[(" and value[-1] in "])":
+            try:
+                parsed = json.loads(value)
+            except Exception:
+                try:
+                    import ast
+                    parsed = ast.literal_eval(value)
+                except Exception:
+                    parsed = None
+            if isinstance(parsed, (list, tuple, set)):
+                return self._normalize_environment_scope(parsed)
             return ""
         return _ENVIRONMENT_SCOPE_ALIASES.get(value, value)
 

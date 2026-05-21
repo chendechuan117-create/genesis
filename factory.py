@@ -101,6 +101,12 @@ def create_agent(
         logger.error(f"V4 tool group [search_tool] failed: {e}")
 
     try:
+        from genesis.tools.pls_query_tool import PLSQueryTool
+        tools.register(PLSQueryTool())
+    except Exception as e:
+        logger.error(f"V4 tool group [pls_query] failed: {e}")
+
+    try:
         from genesis.tools.trace_query_tool import TraceQueryTool
         tools.register(TraceQueryTool())
     except Exception as e:
@@ -108,6 +114,8 @@ def create_agent(
 
     # TOOL 节点自动激活：从 vault 加载 C-Phase 创建的动态工具
     activate_vault_tools(tools)
+    # 物理存量技能自动激活：仅在启动时加载一次磁盘幽灵技能，避免运行时轮次重复扫描刷屏
+    autoload_physical_skills(tools)
 
     # 核心改动：把带有 Failover 能力的 Router 直接传给 Agent
     agent = GenesisV4(tools=tools, provider=provider)
@@ -160,3 +168,43 @@ def activate_vault_tools(registry: ToolRegistry) -> int:
     if activated:
         logger.info(f"activate_vault_tools: {activated} vault tools activated")
     return activated
+
+
+def autoload_physical_skills(registry: ToolRegistry) -> int:
+    """自动扫描本地 skills_dir 目录下的物理技能并动态加载一次。
+    由于此逻辑扫描本地磁盘，仅应在服务初始化时调用一次，严禁内嵌到轮次主循环中以免造成日志和文件系统扫描的冗余负荷。
+    """
+    try:
+        from pathlib import Path
+        skills_dir = Path(__file__).parent / "genesis" / "skills"
+        if not skills_dir.exists():
+            skills_dir = Path(__file__).parent / "skills"
+        if not skills_dir.exists():
+            return 0
+        
+        phys_activated = 0
+        for py_file in skills_dir.glob("*.py"):
+            if py_file.name == "__init__.py":
+                continue
+            tool_name = py_file.stem
+            if tool_name in registry:
+                continue
+            try:
+                source_code = py_file.read_text(encoding="utf-8")
+                ok = registry.register_from_source(
+                    name=tool_name,
+                    source_code=source_code,
+                    node_id=f"PHYS_{tool_name.upper()}",
+                    trust_tier="REFLECTION",
+                )
+                if ok:
+                    phys_activated += 1
+                    logger.info(f"autoload_physical_skills: ✓ '{tool_name}' loaded from physical skill file")
+            except Exception as ex:
+                logger.debug(f"failed to load physical skill '{tool_name}': {ex}")
+        if phys_activated:
+            logger.info(f"autoload_physical_skills: {phys_activated} physical skills autoloaded")
+        return phys_activated
+    except Exception as e:
+        logger.debug(f"physical skill autoloading skipped: {e}")
+        return 0

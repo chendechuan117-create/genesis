@@ -1,5 +1,6 @@
 
 import logging
+import os
 import asyncio
 import time
 from typing import Dict, Any, List, Optional
@@ -17,9 +18,17 @@ PROVIDER_KEY_MAP = {
     "xcode": "xcode_api_key",
     "xcode_backup": "xcode_api_key",
     "newshrimp": "newshrimp_api_key",
+    "newshrimp_openai": "newshrimp_api_key",
     "newshrimp_backup": "newshrimp_api_key",
+    "newshrimp_backup_openai": "newshrimp_api_key",
     "newshrimp_2": "newshrimp_2_api_key",
+    "newshrimp_2_openai": "newshrimp_2_api_key",
     "newshrimp_2_backup": "newshrimp_2_api_key",
+    "newshrimp_2_backup_openai": "newshrimp_2_api_key",
+    "newshrimp_3": "newshrimp_3_api_key",
+    "newshrimp_3_openai": "newshrimp_3_api_key",
+    "newshrimp_3_backup": "newshrimp_3_api_key",
+    "newshrimp_3_backup_openai": "newshrimp_3_api_key",
     "deepseek": "deepseek_api_key",
     "xcode_responses": "xcode_api_key",
 }
@@ -77,8 +86,25 @@ class ProviderRouter(LLMProvider):
             except Exception as e:
                 logger.warning(f"Failed to build provider plugin '{name}': {e}")
         
+        newshrimp_order = ['newshrimp_3', 'newshrimp_2', 'newshrimp', 'newshrimp_3_backup', 'newshrimp_2_backup', 'newshrimp_backup']
+        newshrimp_openai_order = [
+            'newshrimp_3_openai', 'newshrimp_2_openai', 'newshrimp_openai',
+            'newshrimp_3_backup_openai', 'newshrimp_2_backup_openai', 'newshrimp_backup_openai'
+        ]
+        prefer_newshrimp_openai = os.getenv("GENESIS_NEWSHRIMP_OPENAI_FIRST", "").lower() in ("1", "true", "yes", "on")
+        fallback_order = (
+            newshrimp_openai_order + newshrimp_order
+            if prefer_newshrimp_openai else
+            newshrimp_order + newshrimp_openai_order
+        ) + ['xcode', 'xcode_backup', 'deepseek']
+        requires_anthropic_messages = any(
+            name in self.providers
+            and 'deepseek-v4-pro' in ((getattr(self.providers[name], 'default_model', '') or '').lower())
+            for name in newshrimp_order
+        )
+        provider_order = newshrimp_order if requires_anthropic_messages else fallback_order
         self.failover_order = [
-            name for name in ['newshrimp', 'newshrimp_2', 'newshrimp_backup', 'newshrimp_2_backup', 'xcode', 'xcode_backup', 'deepseek'] if name in self.providers
+            name for name in provider_order if name in self.providers
         ]
         self.active_provider_name = self.failover_order[0] if self.failover_order else 'xcode'
                 

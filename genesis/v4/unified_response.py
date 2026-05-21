@@ -83,6 +83,7 @@ class UnifiedResponse(BaseModel):
         error_info: Optional[Dict[str, str]] = None,
         phase_trace: Optional[Dict[str, Any]] = None,
         knowledge_state: Optional[Dict[str, Any]] = None,
+        structured_result: Optional[Dict[str, Any]] = None,
     ) -> "UnifiedResponse":
         """
         从 GP 执行结果构建统一响应
@@ -105,6 +106,11 @@ class UnifiedResponse(BaseModel):
             iterations=metrics.iterations,
             duration_ms=metrics.total_time * 1000,
             trace_id=trace_id,
+            summary=(structured_result or {}).get("summary"),
+            findings=(structured_result or {}).get("findings"),
+            changes_made=(structured_result or {}).get("changes_made"),
+            artifacts=(structured_result or {}).get("artifacts"),
+            open_questions=(structured_result or {}).get("open_questions"),
             input_tokens=metrics.input_tokens,
             output_tokens=metrics.output_tokens,
             total_tokens=metrics.total_tokens,

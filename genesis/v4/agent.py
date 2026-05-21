@@ -52,7 +52,7 @@ class GenesisV4:
         )
 
         try:
-            final_response, metrics = await loop.run(
+            loop_result = await loop.run(
                 user_input=user_input,
                 step_callback=step_callback,
                 image_paths=image_paths,
@@ -60,6 +60,11 @@ class GenesisV4:
                 initial_knowledge_state=initial_knowledge_state,
                 knowledge_cursor=self._knowledge_cursor,
             )
+            structured_result = None
+            if isinstance(loop_result, tuple) and len(loop_result) == 3:
+                final_response, metrics, structured_result = loop_result
+            else:
+                final_response, metrics = loop_result
             # 更新知识游标供下一轮使用
             self._knowledge_cursor = loop.export_knowledge_cursor()
             
@@ -85,6 +90,7 @@ class GenesisV4:
                 degraded=False,
                 phase_trace=loop.get_phase_trace(),
                 knowledge_state=loop.get_knowledge_state(),
+                structured_result=structured_result,
             )
             
         except Exception as e:

@@ -18,6 +18,7 @@ import json
 import asyncio
 import logging
 import time
+import httpx
 
 from genesis.core.provider import NativeHTTPProvider, LLMResponse, ToolCall
 from genesis.core.base import LLMProvider as BaseLLMProvider

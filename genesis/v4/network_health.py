@@ -1,6 +1,9 @@
 """
-网络健康状态可视化模块
-为 GP 提供知识图谱健康状态的直观展示
+[DEPRECATED 2026-05] 网络健康状态可视化模块
+
+状态: dead code — 零导入，从未接入生产路径。
+决策: 保留源码作为设计参考，不删除。健康监控已由 PipelineDiagnostics + daemon heartbeat 覆盖。
+如需复活: 接入 daemon run_cycle() 作为 diagnostics 渲染层，而非独立模块。
 """
 
 import json
@@ -11,7 +14,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 class NetworkHealthMonitor:
-    """网络健康监控器 - 为 GP 提供知识图谱健康状态的可视化界面"""
+    """[DEPRECATED] 网络健康监控器 - 为 GP 提供知识图谱健康状态的可视化界面"""
     
     def __init__(self, vault):
         self.vault = vault
@@ -22,12 +25,12 @@ class NetworkHealthMonitor:
         try:
             report = {
                 "timestamp": datetime.now().isoformat(),
-                "overall_health": self._calculate_overall_health(),
+                "overall_observability": self._calculate_overall_health(),
                 "knowledge_distribution": self._analyze_knowledge_distribution(),
-                "connection_health": self._analyze_connection_health(),
-                "trap_analysis": self._analyze_trap_nodes(),
+                "connection_markers": self._analyze_connection_health(),
+                "topology_risk_markers": self._analyze_trap_nodes(),
                 "saturation_zones": self._analyze_saturation_zones(),
-                "growth_metrics": self._analyze_growth_metrics(),
+                "write_claim_metrics": self._analyze_growth_metrics(),
                 "recommendations": self._generate_recommendations()
             }
             return report
@@ -53,7 +56,7 @@ class NetworkHealthMonitor:
             
             # 计算健康指标
             connectivity_ratio = total_edges / max(total_nodes, 1)
-            activity_ratio = active_nodes / max(total_nodes, 1)
+            visibility_ratio = active_nodes / max(total_nodes, 1)
             
             # 陷阱节点比例（越低越好）
             trap_nodes = self._count_trap_nodes()
@@ -62,19 +65,20 @@ class NetworkHealthMonitor:
             # 综合健康评分
             health_score = (
                 min(connectivity_ratio * 20, 20) +  # 连通性 (0-20分)
-                min(activity_ratio * 30, 30) +      # 活跃度 (0-30分)
+                min(visibility_ratio * 30, 30) +      # 活跃度 (0-30分)
                 max(0, 25 - trap_ratio * 25) +      # 陷阱惩罚 (0-25分)
                 25  # 基础分
             )
             
             return {
                 "score": round(health_score, 1),
+                "score_signal_kind": "topology_observability_proxy",
                 "total_nodes": total_nodes,
-                "active_nodes": active_nodes,
+                "visible_nodes": active_nodes,
                 "total_edges": total_edges,
                 "connectivity_ratio": round(connectivity_ratio, 3),
-                "activity_ratio": round(activity_ratio, 3),
-                "trap_ratio": round(trap_ratio, 3),
+                "visibility_ratio": round(visibility_ratio, 3),
+                "topology_risk_marker_ratio": round(trap_ratio, 3),
                 "status": self._get_health_status(health_score)
             }
         except Exception as e:
@@ -107,7 +111,9 @@ class NetworkHealthMonitor:
             
             return {
                 "by_type": type_distribution,
-                "by_trust_tier": tier_distribution,
+                "type_signal_kind": "tool_shaped_schema_field",
+                "by_trust_tier_claim": tier_distribution,
+                "trust_tier_signal_kind": "legacy_claim_or_default_field",
                 "incoming_distribution": incoming_dist
             }
         except Exception as e:
@@ -179,9 +185,10 @@ class NetworkHealthMonitor:
             
             return {
                 "edge_types": edge_types,
-                "contradiction_count": contradiction_count,
+                "contradiction_marker_count": contradiction_count,
                 "reasoning_lines": reasoning_lines,
-                "has_contradictions": contradiction_count > 0
+                "has_contradiction_markers": contradiction_count > 0,
+                "contradiction_signal_kind": "edge_claim_not_falsification"
             }
         except Exception as e:
             logger.error(f"_analyze_connection_health failed: {e}")
@@ -200,6 +207,7 @@ class NetworkHealthMonitor:
                    LEFT JOIN (
                        SELECT basis_point_id, COUNT(*) as incoming
                        FROM reasoning_lines
+                       WHERE same_round = 0
                        GROUP BY basis_point_id
                    ) inc ON kn.node_id = inc.basis_point_id
                    LEFT JOIN node_edges ce ON kn.node_id = ce.target_id AND ce.relation = 'CONTRADICTS'
@@ -207,6 +215,7 @@ class NetworkHealthMonitor:
                      AND kn.ablation_active = 0
                      AND inc.incoming >= 2
                      AND ce.source_id IS NOT NULL
+                   GROUP BY kn.node_id
                    ORDER BY inc.incoming DESC
                    LIMIT 10"""
             ).fetchall()
@@ -217,14 +226,15 @@ class NetworkHealthMonitor:
                     "node_id": row['node_id'],
                     "title": row['title'][:80] + "..." if len(row['title']) > 80 else row['title'],
                     "incoming_count": row['incoming_count'],
-                    "has_contradiction": bool(row['has_contradiction']),
+                    "has_contradiction_marker": bool(row['has_contradiction']),
                     "severity": "high" if row['incoming_count'] >= 5 else "medium"
                 })
             
             return {
-                "trap_count": len(trap_nodes),
-                "trap_nodes": trap_nodes[:5],  # 只返回前5个
-                "has_traps": len(trap_nodes) > 0
+                "risk_marker_count": len(trap_nodes),
+                "risk_markers": trap_nodes[:5],  # 只返回前5个
+                "has_risk_markers": len(trap_nodes) > 0,
+                "risk_signal_kind": "topology_marker_not_node_failure"
             }
         except Exception as e:
             logger.error(f"_analyze_trap_nodes failed: {e}")
@@ -255,7 +265,8 @@ class NetworkHealthMonitor:
             return {
                 "zone_count": len(saturation_zones),
                 "zones": saturation_zones,
-                "has_saturation": len(saturation_zones) > 0
+                "has_saturation": len(saturation_zones) > 0,
+                "saturation_signal_kind": "virtual_collision_marker"
             }
         except Exception as e:
             logger.error(f"_analyze_saturation_zones failed: {e}")
@@ -285,10 +296,12 @@ class NetworkHealthMonitor:
             ).fetchone()['cnt'] or 0
             
             return {
-                "nodes_created_last_week": recent_nodes,
-                "nodes_verified_last_week": recent_verified,
-                "void_tasks_count": void_count,
-                "growth_rate": "healthy" if recent_nodes > 5 else "slow"
+                "node_write_count_last_week": recent_nodes,
+                "nodes_with_recent_verification_claim": recent_verified,
+                "verification_signal_kind": "legacy_claim_timestamp",
+                "open_void_task_count": void_count,
+                "recent_write_activity": "active" if recent_nodes > 5 else "quiet",
+                "write_activity_signal_kind": "write_activity_proxy_not_health"
             }
         except Exception as e:
             logger.error(f"_analyze_growth_metrics failed: {e}")
@@ -301,8 +314,8 @@ class NetworkHealthMonitor:
         try:
             # 基于陷阱节点分析
             trap_analysis = self._analyze_trap_nodes()
-            if trap_analysis.get("has_traps"):
-                recommendations.append(f"发现 {trap_analysis['trap_count']} 个陷阱节点，建议运行园丁消融机制")
+            if trap_analysis.get("has_risk_markers"):
+                recommendations.append(f"发现 {trap_analysis['risk_marker_count']} 个拓扑风险标记，建议审查入线与 CONTRADICTS 标记")
             
             # 基于饱和区域分析
             saturation = self._analyze_saturation_zones()
@@ -311,16 +324,16 @@ class NetworkHealthMonitor:
             
             # 基于连接健康
             connection = self._analyze_connection_health()
-            if connection.get("has_contradictions"):
-                recommendations.append(f"发现 {connection['contradiction_count']} 个矛盾关系，需要人工审查")
+            if connection.get("has_contradiction_markers"):
+                recommendations.append(f"发现 {connection['contradiction_marker_count']} 个 CONTRADICTS 标记，需按声明审查而非直接视为证伪")
             
             # 基于增长指标
             growth = self._analyze_growth_metrics()
-            if growth.get("nodes_created_last_week", 0) < 3:
-                recommendations.append("知识增长缓慢，建议增加学习活动")
+            if growth.get("node_write_count_last_week", 0) < 3:
+                recommendations.append("近期节点写入活动较低，建议结合任务上下文判断是否需要补证")
             
             if not recommendations:
-                recommendations.append("网络健康状态良好，继续保持当前策略")
+                recommendations.append("代理指标未显示明显风险，继续采集真实证据")
             
             return recommendations
         except Exception as e:
@@ -331,17 +344,19 @@ class NetworkHealthMonitor:
         """统计陷阱节点数量"""
         try:
             count = self._conn.execute(
-                """SELECT COUNT(*) as cnt
+                """SELECT COUNT(DISTINCT kn.node_id) as cnt
                    FROM knowledge_nodes kn
                    LEFT JOIN (
                        SELECT basis_point_id, COUNT(*) as incoming
                        FROM reasoning_lines
+                       WHERE same_round = 0
                        GROUP BY basis_point_id
                    ) inc ON kn.node_id = inc.basis_point_id
+                   LEFT JOIN node_edges ce ON kn.node_id = ce.target_id AND ce.relation = 'CONTRADICTS'
                    WHERE kn.node_id NOT LIKE 'MEM_CONV%'
-                     AND kn.usage_count >= 3
+                     AND kn.ablation_active = 0
                      AND inc.incoming >= 2
-                     AND (kn.usage_success_count * 1.0 / kn.usage_count) < 0.5"""
+                     AND ce.source_id IS NOT NULL"""
             ).fetchone()['cnt']
             return count or 0
         except Exception:
@@ -350,13 +365,13 @@ class NetworkHealthMonitor:
     def _get_health_status(self, score: float) -> str:
         """根据评分获取健康状态"""
         if score >= 80:
-            return "excellent"
+            return "high_proxy_density"
         elif score >= 60:
-            return "good"
+            return "moderate_proxy_density"
         elif score >= 40:
-            return "warning"
+            return "low_proxy_density"
         else:
-            return "critical"
+            return "sparse_proxy_density"
     
     def render_health_dashboard(self) -> str:
         """渲染健康仪表板（GP友好格式）"""
@@ -366,42 +381,42 @@ class NetworkHealthMonitor:
             return f"❌ 网络健康报告生成失败: {report['error']}"
         
         lines = []
-        overall = report["overall_health"]
+        overall = report["overall_observability"]
         
         # 整体状态
         status_emoji = {
-            "excellent": "🟢",
-            "good": "🟡", 
-            "warning": "🟠",
-            "critical": "🔴"
+            "high_proxy_density": "🟢",
+            "moderate_proxy_density": "🟡",
+            "low_proxy_density": "🟠",
+            "sparse_proxy_density": "🔴"
         }
         
-        lines.append(f"📊 知识网络健康仪表板 {status_emoji.get(overall['status'], '⚪')}")
-        lines.append(f"整体评分: {overall['score']}/100 ({overall['status']})")
-        lines.append(f"节点总数: {overall['total_nodes']} (活跃: {overall['active_nodes']})")
-        lines.append(f"连接总数: {overall['total_edges']} (连通比: {overall['connectivity_ratio']})")
+        lines.append(f"📊 知识网络观测代理报告 {status_emoji.get(overall['status'], '⚪')}")
+        lines.append(f"代理评分: {overall['score']}/100 ({overall['status']}, {overall['score_signal_kind']})")
+        lines.append(f"节点总数: {overall['total_nodes']} (可见: {overall['visible_nodes']})")
+        lines.append(f"连接总数: {overall['total_edges']} (拓扑连通比: {overall['connectivity_ratio']})")
         lines.append("")
         
         # 知识分布
         dist = report["knowledge_distribution"]
-        lines.append("📈 知识分布:")
+        lines.append("📈 字段分布（type 是工具塑形字段）:")
         for node_type, count in list(dist["by_type"].items())[:5]:
             lines.append(f"  {node_type}: {count}")
         lines.append("")
         
         # 连接健康
-        conn = report["connection_health"]
-        if conn.get("has_contradictions"):
-            lines.append(f"⚠️ 发现 {conn['contradiction_count']} 个矛盾关系")
+        conn = report["connection_markers"]
+        if conn.get("has_contradiction_markers"):
+            lines.append(f"⚠️ CONTRADICTS 标记: {conn['contradiction_marker_count']} 个（不等同证伪）")
         lines.append(f"🔗 推理线: {conn['reasoning_lines']}")
         lines.append("")
         
         # 陷阱节点
-        traps = report["trap_analysis"]
-        if traps.get("has_traps"):
-            lines.append(f"🚨 陷阱节点 ({traps['trap_count']} 个):")
-            for trap in traps["trap_nodes"][:3]:
-                lines.append(f"  • {trap['node_id']}: 入线{trap['incoming_count']}, 矛盾边={'是' if trap.get('has_contradiction') else '否'}")
+        traps = report["topology_risk_markers"]
+        if traps.get("has_risk_markers"):
+            lines.append(f"🚨 拓扑风险标记 ({traps['risk_marker_count']} 个):")
+            for trap in traps["risk_markers"][:3]:
+                lines.append(f"  • {trap['node_id']}: 入线{trap['incoming_count']}, CONTRADICTS标记={'是' if trap.get('has_contradiction_marker') else '否'}")
             lines.append("")
         
         # 饱和区域
@@ -413,15 +428,15 @@ class NetworkHealthMonitor:
             lines.append("")
         
         # 增长指标
-        growth = report["growth_metrics"]
-        lines.append("📊 增长指标:")
-        lines.append(f"  本周新增: {growth['nodes_created_last_week']} 节点")
-        lines.append(f"  本周验证: {growth['nodes_verified_last_week']} 节点")
-        lines.append(f"  VOID任务: {growth['void_tasks_count']} 个")
+        growth = report["write_claim_metrics"]
+        lines.append("📊 写入/声明指标:")
+        lines.append(f"  本周节点写入: {growth['node_write_count_last_week']} 节点")
+        lines.append(f"  近7日验证声明时间戳: {growth['nodes_with_recent_verification_claim']} 节点 ({growth['verification_signal_kind']})")
+        lines.append(f"  开放VOID任务: {growth['open_void_task_count']} 个")
         lines.append("")
         
         # 建议
-        lines.append("💡 改进建议:")
+        lines.append("💡 审查建议:")
         for rec in report["recommendations"][:3]:
             lines.append(f"  • {rec}")
         

@@ -171,6 +171,32 @@ class ToolRegistry:
         if "type" in arguments and "ntype" not in arguments:
             arguments["ntype"] = arguments.pop("type")
 
+        try:
+            params = getattr(tool, "parameters", None)
+            if isinstance(params, dict):
+                properties = params.get("properties") or {}
+                required = params.get("required") or []
+                missing = [name for name in required if name not in arguments]
+                if missing:
+                    return f"Error: 工具 {tool_name} 缺少必填字段: {', '.join(missing)}"
+                if isinstance(properties, dict) and properties:
+                    allowed = set(properties)
+                    try:
+                        execute_params = inspect.signature(getattr(tool, "execute")).parameters
+                        allowed.update(execute_params)
+                        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in execute_params.values())
+                    except Exception:
+                        accepts_kwargs = False
+                    
+                    if not accepts_kwargs:
+                        allowed.update({"_trace_id", "_round_seq"})
+                        unexpected = [name for name in arguments if name not in allowed]
+                        if unexpected:
+                            arguments = {name: value for name, value in arguments.items() if name in allowed}
+                            logger.warning(f"工具 {tool_name} 忽略多余参数: {', '.join(unexpected)}")
+        except Exception:
+            pass
+
         active_fp = _tool_fingerprint(tool)
         execute_attr = getattr(tool, "execute")
         if isinstance(tool, type) and active_fp.get("tool_type") == "ABCMeta":

@@ -397,6 +397,13 @@ def _clear_crash_counter():
 
 
 def _get_provider_override_kwargs():
+    newshrimp_keys = (
+        os.environ.get("NEWSHRIMP_API_KEY"),
+        os.environ.get("NEWSHRIMP_2_API_KEY"),
+        os.environ.get("NEWSHRIMP_3_API_KEY"),
+    )
+    if any((k or "").strip() for k in newshrimp_keys):
+        return {}
     api_key = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
     if not api_key:
         return {}

@@ -27,6 +27,18 @@ class ArenaConfidenceMixin:
 
     # ─── 工具方法 ───
 
+    HARD_EVIDENCE_REF_TYPES = {
+        "file",
+        "command",
+        "db_query",
+        "trace",
+        "runtime_observation",
+        "runtime_test",
+        "code_reading",
+        "database_query",
+        "shell",
+        "read_file",
+    }
     TIER_BASE = {"HUMAN": 1.0, "REFLECTION": 0.6, "SCAVENGED": 0.4,
                  "CONVERSATION": 0.55, "FERMENTED": 0.45, "OBSERVATION": 0.6}
 
@@ -75,8 +87,78 @@ class ArenaConfidenceMixin:
         # 未匹配任何规则：轻微降权
         return 0.0
 
-    @staticmethod
-    def effective_confidence(node_row: Dict[str, Any]) -> float:
+    @classmethod
+    def _parse_reliability_signature(cls, raw_signature: Any) -> Dict[str, Any]:
+        if isinstance(raw_signature, dict):
+            return raw_signature
+        if isinstance(raw_signature, str) and raw_signature.strip():
+            try:
+                parsed = json.loads(raw_signature)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    @classmethod
+    def _signature_has_hard_evidence(cls, signature: Dict[str, Any], trust_tier: str = "") -> bool:
+        if str(trust_tier or "").strip().upper() == "HUMAN":
+            return True
+        evidence_refs = signature.get("evidence_refs") or signature.get("evidence_ref") or []
+        if isinstance(evidence_refs, str):
+            try:
+                evidence_refs = json.loads(evidence_refs)
+            except Exception:
+                evidence_refs = []
+        if isinstance(evidence_refs, dict):
+            evidence_refs = [evidence_refs]
+        for evidence_ref in evidence_refs if isinstance(evidence_refs, list) else []:
+            ref_type = str((evidence_ref or {}).get("type") or "").strip().lower()
+            if ref_type in cls.HARD_EVIDENCE_REF_TYPES:
+                return True
+        raw_types = signature.get("evidence_ref_types") or ""
+        if isinstance(raw_types, str):
+            evidence_types = [part.strip().lower() for part in raw_types.split(",")]
+        elif isinstance(raw_types, list):
+            evidence_types = [str(part).strip().lower() for part in raw_types]
+        else:
+            evidence_types = []
+        return any(ref_type in cls.HARD_EVIDENCE_REF_TYPES for ref_type in evidence_types)
+
+    @classmethod
+    def _evidence_artifact_types(cls, signature: Dict[str, Any]) -> List[str]:
+        evidence_refs = signature.get("evidence_refs") or signature.get("evidence_ref") or []
+        if isinstance(evidence_refs, str):
+            try:
+                evidence_refs = json.loads(evidence_refs)
+            except Exception:
+                evidence_refs = []
+        if isinstance(evidence_refs, dict):
+            evidence_refs = [evidence_refs]
+        artifact_types = []
+        for evidence_ref in evidence_refs if isinstance(evidence_refs, list) else []:
+            ref_type = str((evidence_ref or {}).get("type") or "").strip()
+            if ref_type and ref_type not in artifact_types:
+                artifact_types.append(ref_type)
+        raw_types = signature.get("evidence_ref_types") or ""
+        if isinstance(raw_types, str):
+            raw_type_values = [part.strip() for part in raw_types.split(",")]
+        elif isinstance(raw_types, list):
+            raw_type_values = [str(part).strip() for part in raw_types]
+        else:
+            raw_type_values = []
+        for ref_type in raw_type_values:
+            if ref_type and ref_type not in artifact_types:
+                artifact_types.append(ref_type)
+        return artifact_types
+
+    @classmethod
+    def _verification_is_event(cls, row_dict: Dict[str, Any], signature: Dict[str, Any] = None) -> bool:
+        trust_tier = row_dict.get("trust_tier") or "REFLECTION"
+        parsed_signature = signature if isinstance(signature, dict) else cls._parse_reliability_signature(row_dict.get("metadata_signature"))
+        return cls._signature_has_hard_evidence(parsed_signature, trust_tier)
+
+    @classmethod
+    def effective_confidence(cls, node_row: Dict[str, Any]) -> float:
         """基于使用战绩 + 验证来源的质量评分。无时间衰减。
 
         知识不会因时间流逝失效——只会因事件失效（环境变化、矛盾、使用失败）。
@@ -97,7 +179,9 @@ class ArenaConfidenceMixin:
 
         # 解析 verification_source → boost（关键词模糊匹配）
         ver_src = (node_row.get("verification_source") or "").lower()
-        boost = ArenaConfidenceMixin._resolve_verification_boost(ver_src)
+        if not cls._verification_is_event(node_row):
+            ver_src = ""
+        boost = cls._resolve_verification_boost(ver_src)
 
         if total > 0:
             base = 0.5 + 0.4 * (success / total)
@@ -124,9 +208,10 @@ class ArenaConfidenceMixin:
             if total_nodes > 0:
                 return {
                     "total_nodes": total_nodes,
-                    "failing_pct": round((total_row[1] or 0) / total_nodes, 3),
-                    "proven_pct": round((total_row[2] or 0) / total_nodes, 3),
-                    "untested_pct": round((total_row[3] or 0) / total_nodes, 3),
+                    "arena_negative_feedback_pct": round((total_row[1] or 0) / total_nodes, 3),
+                    "arena_positive_feedback_pct": round((total_row[2] or 0) / total_nodes, 3),
+                    "no_usage_feedback_pct": round((total_row[3] or 0) / total_nodes, 3),
+                    "usage_signal_kind": "arena_environment_feedback",
                 }
         except Exception:
             pass
@@ -139,6 +224,12 @@ class ArenaConfidenceMixin:
         signature = self.signature.parse(row_dict.get("metadata_signature"))
         validation_status = self.signature.resolve_validation_status(signature)
         knowledge_state = self.signature.resolve_knowledge_state(signature, row_dict.get("ntype") or row_dict.get("type") or "")
+        verification_is_event = self._verification_is_event(row_dict, signature)
+        verification_claim_status = validation_status
+        if validation_status == "validated" and not verification_is_event:
+            validation_status = "partial"
+            if knowledge_state == "current":
+                knowledge_state = "unverified"
         observed_environment_scope = self._resolve_observed_environment_scope(signature)
         observed_environment_epoch = self._resolve_observed_environment_epoch(signature)
         environment_scope = self._resolve_applicable_environment_scope(signature)
@@ -163,7 +254,7 @@ class ArenaConfidenceMixin:
         )
         quality_score = self.effective_confidence(row_dict)
 
-        verified_at = self._parse_db_timestamp(row_dict.get("last_verified_at"))
+        verified_at = self._parse_db_timestamp(row_dict.get("last_verified_at")) if verification_is_event else None
         updated_at = self._parse_db_timestamp(row_dict.get("updated_at"))
         freshness_anchor = verified_at or updated_at
         freshness_days = None
@@ -186,6 +277,7 @@ class ArenaConfidenceMixin:
                 freshness_label = "stale"
 
         trust_tier = row_dict.get("trust_tier") or "REFLECTION"
+        evidence_artifact_types = self._evidence_artifact_types(signature)
         tier_bonus = {"HUMAN": 2.0, "REFLECTION": 0.5, "FERMENTED": -0.5, "SCAVENGED": -1.5, "CONVERSATION": 0.0}
         state_bonus = {"current": 0.3, "unverified": -0.8, "historical": -0.2}
         trust_score = quality_score * 6.0 + freshness_score + tier_bonus.get(trust_tier, 0.0) + state_bonus.get(knowledge_state, 0.0)
@@ -238,6 +330,12 @@ class ArenaConfidenceMixin:
             "valid_until": valid_until,
             "last_verified_at": row_dict.get("last_verified_at") or "",
             "verification_source": row_dict.get("verification_source") or "",
+            "verification_is_event": verification_is_event,
+            "verification_claim_status": verification_claim_status,
+            "evidence_signal_kind": "artifact_type_only",
+            "evidence_artifact_types": evidence_artifact_types,
+            "source_identity_status": "human_tier_asserted" if str(trust_tier).upper() == "HUMAN" else "absent",
+            "usage_signal_kind": "arena_environment_feedback",
         }
 
     # ─── 使用反馈 ───

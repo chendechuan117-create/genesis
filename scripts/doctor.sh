@@ -657,14 +657,28 @@ cmd_patch() {
     if ! _doctor_workspace_patch > "$patch_file"; then
         rm -f "$patch_file"
         echo -e "${RED}Failed to export Doctor workspace changes.${NC}"
+        echo "PATCH_STATUS:failed"
+        echo "PATCH_HAS_CHANGES:0"
+        echo "PATCH_FILE:"
+        echo "PATCH_LINES_CHANGED:0"
         return 1
     fi
     if [ -s "$patch_file" ]; then
+        local lines_changed
+        lines_changed=$(wc -l < "$patch_file" | tr -d ' ')
         echo -e "${GREEN}Patch exported to: $patch_file${NC}"
-        echo "Lines changed: $(wc -l < "$patch_file")"
+        echo "Lines changed: $lines_changed"
+        echo "PATCH_STATUS:success"
+        echo "PATCH_HAS_CHANGES:1"
+        echo "PATCH_FILE:$patch_file"
+        echo "PATCH_LINES_CHANGED:$lines_changed"
     else
         rm -f "$patch_file"
         echo -e "${YELLOW}No changes to export.${NC}"
+        echo "PATCH_STATUS:empty"
+        echo "PATCH_HAS_CHANGES:0"
+        echo "PATCH_FILE:"
+        echo "PATCH_LINES_CHANGED:0"
     fi
 }
 
