@@ -6,9 +6,10 @@ Genesis V4 - 认知装配师 (The Factory Manager G)
 import json
 import sqlite3
 import functools
+import hashlib
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 from genesis.v4.vector_engine import VectorEngine
 from genesis.v4.signature_engine import SignatureEngine
@@ -29,6 +30,31 @@ TOOL_EXEC_MIN_TIER = "REFLECTION"  # TOOL 节点 exec() 最低信任等级
 
 KNOWLEDGE_STATES = ("current", "unverified", "historical")
 
+# ── Schema 退役登记簿 ──────────────────────────────────────
+# 以下字段仍存在于 knowledge_nodes 表中（保持旧 DB 兼容），
+# 但已不再被生产逻辑消费。新代码不应写入或依赖这些字段。
+# 迁移策略：保留列定义不删除，渲染时忽略，未来大版本迁移时统一清理。
+SCHEMA_DEPRECATED_FIELDS = {
+    "epistemic_status": {
+        "deprecated_since": "2026-04",
+        "replaced_by": "validation_status + knowledge_state (signature_engine)",
+        "migration": "现有值 BELIEF/FACT 无迁移路径；新节点由 signature.resolve_validation_status() 推导",
+        "render_strategy": "ignore",
+    },
+    "confidence_score": {
+        "deprecated_since": "2026-04",
+        "replaced_by": "effective_confidence() (arena_mixin, 基于 usage stats + freshness)",
+        "migration": "旧值保留在 DB 中不读取；新节点默认 0.55 仅占位",
+        "render_strategy": "ignore",
+    },
+    "parent_node_id": {
+        "deprecated_since": "2026-04",
+        "replaced_by": "node_edges (RELATED_TO / REQUIRES 边)",
+        "migration": "无自动迁移；旧树形父子关系已由图谱边替代",
+        "render_strategy": "ignore",
+    },
+}
+
 # ── 签名常量从 signature_constants.py 统一导入 ──────────────────────
 from genesis.v4.signature_constants import (  # noqa: E402
     METADATA_SIGNATURE_FIELDS,
@@ -48,6 +74,34 @@ from genesis.v4.signature_constants import (  # noqa: E402
 class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
     """万物皆节点库 — 双层架构（索引 + 内容）, 单例模式"""
     _instance = None
+    HARD_EVIDENCE_REF_TYPES = {
+        "file",
+        "command",
+        "db_query",
+        "trace",
+        "runtime_observation",
+        "runtime_test",
+        "code_reading",
+        "database_query",
+        "shell",
+        "read_file",
+    }
+    PLS_PROPOSAL_PAYLOAD_SCHEMA_VERSION = 1
+    PERSONA_STATS_STALE_AFTER_DAYS = 7
+    PLS_PROPOSAL_ALLOWED_POINT_TYPES = {"LESSON", "CONTEXT"}
+    PLS_PROPOSAL_FORBIDDEN_PAYLOAD_KEYS = {
+        "incoming",
+        "incoming_count",
+        "rl_out",
+        "usage",
+        "usage_count",
+        "links",
+        "link_count",
+        "score",
+        "fusion_score",
+        "win_rate",
+        "basis_set_score",
+    }
     
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
@@ -259,7 +313,6 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         ''')
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rl_basis ON reasoning_lines(basis_point_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_rl_new ON reasoning_lines(new_point_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_rl_trace_round ON reasoning_lines(trace_id, round_seq)")
         conn.execute('''
         CREATE TABLE IF NOT EXISTS point_creation_context (
             node_id TEXT PRIMARY KEY,
@@ -270,6 +323,95 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         )
         ''')
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pcc_trace_round ON point_creation_context(trace_id, round_seq)")
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS potential_samples (
+            sample_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trace_id TEXT,
+            round_seq INTEGER,
+            source TEXT DEFAULT 'surface',
+            potential_type TEXT NOT NULL,
+            triage_category TEXT DEFAULT 'structural',
+            target_basin TEXT,
+            title TEXT NOT NULL,
+            detail TEXT,
+            node_ids TEXT,
+            evidence TEXT,
+            triage_note TEXT,
+            status TEXT DEFAULT 'open',
+            dedupe_key TEXT,
+            occurrence_count INTEGER DEFAULT 1,
+            last_seen_at TIMESTAMP,
+            last_seen_trace_id TEXT,
+            last_seen_round_seq INTEGER,
+            last_seen_source TEXT,
+            resolution_node_id TEXT,
+            resolution_note TEXT,
+            resolved_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        ''')
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_potential_trace_round ON potential_samples(trace_id, round_seq)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_potential_type_created ON potential_samples(potential_type, created_at)")
+        try:
+            potential_cols = [r[1] for r in conn.execute("PRAGMA table_info(potential_samples)").fetchall()]
+            for col_name, col_def in [
+                ("status", "TEXT DEFAULT 'open'"),
+                ("resolution_node_id", "TEXT"),
+                ("resolution_note", "TEXT"),
+                ("resolved_at", "TIMESTAMP"),
+                ("triage_category", "TEXT DEFAULT 'structural'"),
+                ("target_basin", "TEXT"),
+                ("triage_note", "TEXT"),
+                ("dedupe_key", "TEXT"),
+                ("occurrence_count", "INTEGER DEFAULT 1"),
+                ("last_seen_at", "TIMESTAMP"),
+                ("last_seen_trace_id", "TEXT"),
+                ("last_seen_round_seq", "INTEGER"),
+                ("last_seen_source", "TEXT"),
+            ]:
+                if col_name not in potential_cols:
+                    conn.execute(f"ALTER TABLE potential_samples ADD COLUMN {col_name} {col_def}")
+            conn.execute("UPDATE potential_samples SET occurrence_count = 1 WHERE occurrence_count IS NULL OR occurrence_count < 1")
+            conn.execute("UPDATE potential_samples SET last_seen_at = created_at WHERE last_seen_at IS NULL")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_potential_status_created ON potential_samples(status, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_potential_triage_created ON potential_samples(triage_category, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_potential_dedupe_status ON potential_samples(dedupe_key, status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_potential_last_seen ON potential_samples(last_seen_at)")
+        except Exception as e:
+            logger.warning(f"Schema migration for potential_samples lifecycle skipped: {e}")
+        conn.execute('''
+        CREATE TABLE IF NOT EXISTS pls_proposals (
+            proposal_id TEXT PRIMARY KEY,
+            parent_trace_id TEXT,
+            parent_round_seq INTEGER,
+            branch_id TEXT,
+            proposal_type TEXT NOT NULL,
+            source TEXT DEFAULT 'async_branch',
+            payload_json TEXT NOT NULL,
+            basis_ids_json TEXT,
+            status TEXT DEFAULT 'pending',
+            merge_result TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        ''')
+        try:
+            proposal_cols = [r[1] for r in conn.execute("PRAGMA table_info(pls_proposals)").fetchall()]
+            for col_name, col_def in [
+                ("parent_trace_id", "TEXT"),
+                ("parent_round_seq", "INTEGER"),
+                ("branch_id", "TEXT"),
+                ("source", "TEXT DEFAULT 'async_branch'"),
+                ("basis_ids_json", "TEXT"),
+                ("status", "TEXT DEFAULT 'pending'"),
+                ("merge_result", "TEXT"),
+            ]:
+                if col_name not in proposal_cols:
+                    conn.execute(f"ALTER TABLE pls_proposals ADD COLUMN {col_name} {col_def}")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_pls_proposals_status_created ON pls_proposals(status, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_pls_proposals_branch_created ON pls_proposals(branch_id, created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_pls_proposals_parent ON pls_proposals(parent_trace_id, parent_round_seq)")
+        except Exception as e:
+            logger.warning(f"Schema migration for pls_proposals skipped: {e}")
         # Schema migration: reasoning_lines 可能缺 same_round 列（IF NOT EXISTS 不加列）
         try:
             rl_cols = [r[1] for r in conn.execute("PRAGMA table_info(reasoning_lines)").fetchall()]
@@ -282,6 +424,7 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             if 'round_seq' not in rl_cols:
                 conn.execute("ALTER TABLE reasoning_lines ADD COLUMN round_seq INTEGER")
                 logger.info("Schema migration: added round_seq column to reasoning_lines")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_rl_trace_round ON reasoning_lines(trace_id, round_seq)")
         except Exception as e:
             logger.warning(f"Schema migration for reasoning_lines.same_round skipped: {e}")
         # 签名推断自学习表：C-Phase 偏差检测发现的新 marker
@@ -382,12 +525,13 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
                     full_content=seed.get("content", ""),
                     trust_tier="HUMAN"
                 )
-                # 建立种子间的边（概念地图骨架）
+            # 建立种子间的边（概念地图骨架）
+            for seed in seeds:
+                node_id = seed.get("id", "")
+                if not node_id or not node_id.startswith("SEED_CTX_"):
+                    continue
                 for related_id in seed.get("related", []):
-                    self._conn.execute(
-                        "INSERT OR IGNORE INTO node_edges (source_id, target_id, relation) VALUES (?,?,?)",
-                        (node_id, related_id, "RELATED_TO")
-                    )
+                    self.add_edge(node_id, related_id, "RELATED_TO")
             self._conn.commit()
             logger.info(f"Concept seeds injected: {len(seeds)} nodes from {seed_path}")
         except Exception as e:
@@ -641,16 +785,25 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         task_stats = {}
         try:
             rows = self._conn.execute(
-                "SELECT persona, task_kind, wins, losses FROM persona_stats"
+                "SELECT persona, task_kind, wins, losses, updated_at FROM persona_stats"
             ).fetchall()
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            skipped_stale = 0
             for r in rows:
                 persona, tk, wins, losses = r['persona'], r['task_kind'], r['wins'], r['losses']
+                updated_at = self._parse_db_timestamp(r['updated_at'])
+                age_days = (now - updated_at).days if updated_at else None
+                if age_days is None or age_days > self.PERSONA_STATS_STALE_AFTER_DAYS:
+                    skipped_stale += 1
+                    continue
                 if not tk:
                     global_stats[persona] = {"wins": wins, "losses": losses}
                 else:
                     task_stats[f"{persona}:{tk}"] = {"wins": wins, "losses": losses}
             if global_stats:
                 logger.info(f"PersonaStats: loaded {len(global_stats)} personas, {len(task_stats)} task entries")
+            if skipped_stale:
+                logger.info(f"PersonaStats: skipped {skipped_stale} stale snapshot rows")
         except Exception as e:
             logger.debug(f"PersonaStats: load failed (table may not exist yet): {e}")
         return global_stats, task_stats
@@ -679,12 +832,12 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         """写入一个 VOID 任务（知识缺口）。返回 True 表示新增，False 表示已存在。"""
         sig_json = json.dumps(task_signature, ensure_ascii=False) if task_signature else None
         try:
-            self._conn.execute(
+            cur = self._conn.execute(
                 "INSERT OR IGNORE INTO void_tasks (void_id, query, source, persona, task_signature) VALUES (?,?,?,?,?)",
                 (void_id, query, source, persona, sig_json)
             )
             self._conn.commit()
-            return self._conn.total_changes > 0
+            return cur.rowcount > 0
         except Exception as e:
             logger.debug(f"add_void_task failed for {void_id}: {e}")
             return False
@@ -701,21 +854,50 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         """最近 VOID → 委托给 KnowledgeQuery"""
         return self.query.get_recent_voids(limit)
 
-    def resolve_void(self, void_id: str, resolution_node_id: str = None):
+    def resolve_void(self, void_id: str, resolution_node_id: str = None) -> bool:
         """标记 VOID 已解决（被升格为 LESSON 或已过时）"""
-        self._conn.execute(
-            "UPDATE void_tasks SET status = 'resolved', resolution_node_id = ?, resolved_at = CURRENT_TIMESTAMP WHERE void_id = ?",
+        if resolution_node_id and not self._node_existence_map([resolution_node_id]).get(resolution_node_id):
+            logger.warning(f"resolve_void refused missing resolution node {resolution_node_id} for {void_id}")
+            return False
+        cur = self._conn.execute(
+            "UPDATE void_tasks SET status = 'resolved', resolution_node_id = ?, resolved_at = CURRENT_TIMESTAMP WHERE void_id = ? AND status = 'open'",
             (resolution_node_id, void_id)
         )
         self._conn.commit()
+        return cur.rowcount > 0
 
-    def stale_void(self, void_id: str):
+    def stale_void(self, void_id: str) -> bool:
         """标记 VOID 已过时（不再需要追踪）"""
-        self._conn.execute(
-            "UPDATE void_tasks SET status = 'stale' WHERE void_id = ?",
+        cur = self._conn.execute(
+            "UPDATE void_tasks SET status = 'stale', resolved_at = CURRENT_TIMESTAMP WHERE void_id = ? AND status = 'open'",
             (void_id,)
         )
         self._conn.commit()
+        return cur.rowcount > 0
+
+    def resolve_matching_voids_for_node(self, node_id: str, title: str = "", full_content: str = "", limit: int = 5) -> int:
+        try:
+            if not node_id or not title:
+                return 0
+            text = f"{title}\n{full_content or ''}".lower()
+            rows = self._conn.execute(
+                "SELECT void_id, query FROM void_tasks WHERE status = 'open' ORDER BY created_at ASC LIMIT 200"
+            ).fetchall()
+            resolved = 0
+            for row in rows:
+                query = str(row["query"] or "").strip()
+                q = query.lower()
+                if len(q) < 4:
+                    continue
+                matched = q in text or (len(title) >= 4 and str(title).lower() in q)
+                if matched and self.resolve_void(row["void_id"], node_id):
+                    resolved += 1
+                    if resolved >= limit:
+                        break
+            return resolved
+        except Exception as e:
+            logger.debug(f"resolve_matching_voids_for_node failed for {node_id}: {e}")
+            return 0
 
     def void_exists(self, void_id: str) -> bool:
         """检查 VOID 是否已存在（任何状态）"""
@@ -731,6 +913,147 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         ).fetchall()
         return {r['status']: r['cnt'] for r in rows}
 
+    def void_maintenance_report(self, stale_days: int = 14) -> Dict[str, Any]:
+        """VOID 干跑维护报告（只读，不修改数据）。
+
+        返回:
+        - stale_candidates: 超过 stale_days 天仍 open 的 VOID
+        - duplicate_queries: 相似查询的重复 VOID
+        - potentially_resolved: 可能已被现有知识覆盖的 VOID
+        - summary: 各类计数
+        """
+        import logging
+        _log = logging.getLogger(__name__)
+        stale_candidates = []
+        duplicate_queries = []
+        potentially_resolved = []
+
+        # 1. Stale VOIDs: open 超过 N 天
+        rows = self._conn.execute(
+            "SELECT void_id, query, source, created_at FROM void_tasks "
+            "WHERE status = 'open' AND created_at < datetime('now', ?) "
+            "ORDER BY created_at ASC LIMIT 50",
+            (f'-{stale_days} days',)
+        ).fetchall()
+        for r in rows:
+            stale_candidates.append({"void_id": r["void_id"], "query": r["query"][:80], "created_at": r["created_at"]})
+
+        # 2. Duplicate queries: 相似查询的重复 VOID
+        dup_rows = self._conn.execute(
+            "SELECT query, COUNT(*) as cnt, GROUP_CONCAT(void_id) as ids FROM void_tasks "
+            "WHERE status = 'open' GROUP BY LOWER(query) HAVING cnt > 1 LIMIT 20"
+        ).fetchall()
+        for r in dup_rows:
+            duplicate_queries.append({"query": r["query"][:80], "count": r["cnt"], "void_ids": r["ids"][:200]})
+
+        # 3. Potentially resolved: VOID query 匹配已有知识节点标题
+        for row in stale_candidates[:10]:
+            match = self._conn.execute(
+                "SELECT node_id, title FROM knowledge_nodes WHERE title LIKE ? LIMIT 1",
+                (f"%{row['query'][:30]}%",)
+            ).fetchone()
+            if match:
+                potentially_resolved.append({
+                    "void_id": row["void_id"],
+                    "query": row["query"],
+                    "matched_node": match["node_id"],
+                    "matched_title": match["title"][:80],
+                })
+
+        return {
+            "stale_candidates": stale_candidates,
+            "stale_count": len(stale_candidates),
+            "duplicate_queries": duplicate_queries,
+            "duplicate_count": len(duplicate_queries),
+            "potentially_resolved": potentially_resolved,
+            "resolvable_count": len(potentially_resolved),
+        }
+
+    def topology_audit_report(self) -> Dict[str, Any]:
+        """拓扑干跑审计报告（只读，不修改数据）。
+
+        返回:
+        - orphan_edges: 指向不存在节点的边
+        - zero_incoming_nodes: 入线数为 0 的非 LESSON 节点
+        - virtual_nodes: 虚拟节点统计
+        - contradicts_edges: CONTRADICTS 边统计
+        - schema_issues: metadata_signature 格式问题
+        """
+        orphan_edges = []
+        zero_incoming = []
+        schema_issues = []
+
+        # 1. Orphan edges: source 或 target 不存在
+        orphan_rows = self._conn.execute(
+            "SELECT ne.edge_id, ne.source_id, ne.target_id, ne.relation FROM node_edges ne "
+            "WHERE ne.source_id NOT IN (SELECT node_id FROM knowledge_nodes) "
+            "   OR ne.target_id NOT IN (SELECT node_id FROM knowledge_nodes) "
+            "LIMIT 50"
+        ).fetchall()
+        for r in orphan_rows:
+            orphan_edges.append({
+                "edge_id": r["edge_id"], "source_id": r["source_id"],
+                "target_id": r["target_id"], "relation": r["relation"],
+            })
+
+        # 2. Zero incoming: 入线数为 0 的节点（排除 LESSON/CONTEXT/DISCOVERY/EPISODE）
+        zi_rows = self._conn.execute(
+            "SELECT kn.node_id, kn.type, kn.title FROM knowledge_nodes kn "
+            "WHERE kn.node_id NOT IN (SELECT target_id FROM node_edges) "
+            "AND kn.type NOT IN ('LESSON', 'CONTEXT', 'DISCOVERY', 'EPISODE') "
+            "AND kn.is_virtual = 0 AND COALESCE(kn.ablation_active, 0) = 0 "
+            "LIMIT 30"
+        ).fetchall()
+        for r in zi_rows:
+            zero_incoming.append({"node_id": r["node_id"], "type": r["type"], "title": r["title"][:80]})
+
+        # 3. Virtual nodes: 虚拟节点统计
+        virtual_total = self._conn.execute(
+            "SELECT COUNT(*) FROM knowledge_nodes WHERE is_virtual = 1"
+        ).fetchone()[0]
+        virtual_by_type = self._conn.execute(
+            "SELECT type, COUNT(*) as cnt FROM knowledge_nodes WHERE is_virtual = 1 GROUP BY type"
+        ).fetchall()
+        virtual_nodes = {
+            "total": virtual_total,
+            "by_type": {r["type"]: r["cnt"] for r in virtual_by_type},
+        }
+
+        # 4. CONTRADICTS edges: 矛盾边统计
+        contradicts_total = self._conn.execute(
+            "SELECT COUNT(*) FROM node_edges WHERE relation = 'CONTRADICTS'"
+        ).fetchone()[0]
+        contradicts_recent = self._conn.execute(
+            "SELECT COUNT(*) FROM node_edges WHERE relation = 'CONTRADICTS' "
+            "AND created_at > datetime('now', '-30 days')"
+        ).fetchone()[0]
+        contradicts_info = {
+            "total": contradicts_total,
+            "recent_30d": contradicts_recent,
+        }
+
+        # 5. Schema issues: metadata_signature 缺少关键字段
+        schema_rows = self._conn.execute(
+            "SELECT node_id, type, metadata_signature FROM knowledge_nodes "
+            "WHERE metadata_signature IS NOT NULL AND metadata_signature != '' "
+            "AND (metadata_signature NOT LIKE '%validation_status%' "
+            "  OR metadata_signature NOT LIKE '%knowledge_state%') "
+            "LIMIT 20"
+        ).fetchall()
+        for r in schema_rows:
+            schema_issues.append({"node_id": r["node_id"], "type": r["type"]})
+
+        return {
+            "orphan_edges": orphan_edges,
+            "orphan_count": len(orphan_edges),
+            "zero_incoming_nodes": zero_incoming,
+            "zero_incoming_count": len(zero_incoming),
+            "virtual_nodes": virtual_nodes,
+            "contradicts_edges": contradicts_info,
+            "schema_issues": schema_issues,
+            "schema_issue_count": len(schema_issues),
+        }
+
     def heartbeat(self, process_name: str, status: str = "running", summary: str = "", extra: Dict[str, Any] = None):
         """写入当前进程心跳"""
         import os
@@ -740,6 +1063,17 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             (process_name, status, summary, os.getpid(), extra_json)
         )
         self._conn.commit()
+
+    def cleanup_stale_heartbeats(self, cutoff_iso: str) -> int:
+        """清理超过 cutoff_iso 的旧心跳（保留 daemon 自身）。返回删除数。"""
+        result = self._conn.execute(
+            "DELETE FROM process_heartbeat WHERE last_heartbeat < ? AND process_name != 'daemon'",
+            (cutoff_iso,)
+        )
+        deleted = result.rowcount
+        if deleted:
+            self._conn.commit()
+        return deleted
 
     def get_heartbeats(self) -> List[Dict[str, Any]]:
         """心跳状态 → 委托给 KnowledgeQuery"""
@@ -760,17 +1094,95 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         except Exception as e:
             logger.warning(f"touch_node failed for {node_id}: {e}")
 
-    def add_edge(self, source_id: str, target_id: str, relation: str, weight: float = 1.0):
+    def _normalize_edge_relation(self, relation: str) -> str:
+        rel = str(relation or "").strip().upper().replace(" ", "_").replace("-", "_")
+        aliases = {
+            "CONTRADICT": "CONTRADICTS",
+            "CONTRADICTED_BY": "CONTRADICTS",
+            "FALSIFY": "CONTRADICTS",
+            "FALSIFIES": "CONTRADICTS",
+            "REQUIRE": "REQUIRES",
+            "REQUIRED_BY": "REQUIRES",
+        }
+        return aliases.get(rel, rel)
+
+    def _node_existence_map(self, node_ids: List[str]) -> Dict[str, bool]:
+        clean_ids = list(dict.fromkeys(str(nid or "").strip() for nid in node_ids if str(nid or "").strip()))
+        if not clean_ids:
+            return {}
+        placeholders = ",".join("?" * len(clean_ids))
+        rows = self._conn.execute(
+            f"SELECT node_id FROM knowledge_nodes WHERE node_id IN ({placeholders})",
+            clean_ids
+        ).fetchall()
+        found = {row[0] for row in rows}
+        return {nid: nid in found for nid in clean_ids}
+
+    def _node_visibility_map(self, node_ids: List[str]) -> Dict[str, Dict[str, bool]]:
+        clean_ids = list(dict.fromkeys(str(nid or "").strip() for nid in node_ids if str(nid or "").strip()))
+        result = {nid: {"exists": False, "hidden": False, "virtual": False} for nid in clean_ids}
+        if not clean_ids:
+            return result
+        placeholders = ",".join("?" * len(clean_ids))
+        rows = self._conn.execute(
+            f"SELECT node_id, COALESCE(ablation_active, 0) hidden, COALESCE(is_virtual, 0) virtual FROM knowledge_nodes WHERE node_id IN ({placeholders})",
+            clean_ids
+        ).fetchall()
+        for row in rows:
+            result[row["node_id"]] = {
+                "exists": True,
+                "hidden": int(row["hidden"] or 0) > 0,
+                "virtual": int(row["virtual"] or 0) == 1,
+            }
+        return result
+
+    def _active_node_filter(self, alias: str, include_hidden: bool = False, include_virtual: bool = False) -> str:
+        clauses = []
+        if not include_hidden:
+            clauses.append(f"COALESCE({alias}.ablation_active, 0) = 0")
+        if not include_virtual:
+            clauses.append(f"COALESCE({alias}.is_virtual, 0) = 0")
+        return " AND ".join(clauses) if clauses else "1=1"
+
+    def _validate_node_edge(self, source_id: str, target_id: str, relation: str, allow_hidden: bool = False, allow_virtual: bool = False) -> tuple[bool, str, str, str, str]:
+        source = str(source_id or "").strip()
+        target = str(target_id or "").strip()
+        rel = self._normalize_edge_relation(relation)
+        if not source or not target or not rel:
+            return False, source, target, rel, "missing endpoint or relation"
+        if source == target:
+            return False, source, target, rel, "self edge refused"
+        visibility = self._node_visibility_map([source, target])
+        if not visibility.get(source, {}).get("exists") or not visibility.get(target, {}).get("exists"):
+            return False, source, target, rel, f"missing endpoint source_ok={visibility.get(source, {}).get('exists', False)} target_ok={visibility.get(target, {}).get('exists', False)}"
+        blocked = []
+        for role, nid in (("source", source), ("target", target)):
+            info = visibility.get(nid, {})
+            if info.get("hidden") and not allow_hidden:
+                blocked.append(f"{role}_hidden")
+            if info.get("virtual") and not allow_virtual:
+                blocked.append(f"{role}_virtual")
+        if blocked:
+            return False, source, target, rel, "inactive endpoint " + ",".join(blocked)
+        return True, source, target, rel, ""
+
+    def add_edge(self, source_id: str, target_id: str, relation: str, weight: float = 1.0, allow_hidden: bool = False, allow_virtual: bool = False) -> bool:
         """添加一条图谱边 (Idempotent)"""
         try:
+            ok, source_id, target_id, relation, reason = self._validate_node_edge(source_id, target_id, relation, allow_hidden=allow_hidden, allow_virtual=allow_virtual)
+            if not ok:
+                logger.warning(f"Graph: Refused edge {source_id} --[{relation}]--> {target_id}: {reason}")
+                return False
             self._conn.execute(
                 "INSERT OR REPLACE INTO node_edges (source_id, target_id, relation, weight) VALUES (?,?,?,?)",
-                (source_id, target_id, relation, weight)
+                (source_id, target_id, relation, float(weight))
             )
             self._conn.commit()
             logger.debug(f"Graph: Added edge {source_id} --[{relation}]--> {target_id}")
+            return True
         except Exception as e:
             logger.error(f"Failed to add edge: {e}")
+            return False
 
     # ── 推理线接口（点线面架构）──
 
@@ -786,52 +1198,860 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         except Exception as e:
             logger.debug(f"record_node_creation_context failed: {e}")
 
-    def create_reasoning_line(self, new_point_id: str, basis_point_id: str, reasoning: str = "", source: str = "GP", same_round: int = 0, trace_id: str = None, round_seq: int = None):
+    def _json_dumps_potential_value(self, value: Any) -> str:
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            return json.dumps(str(value), ensure_ascii=False)
+
+    def _normalize_potential_node_ids(self, node_ids: Any) -> List[str]:
+        return list(dict.fromkeys(self._parse_potential_node_ids(node_ids)))
+
+    def _initial_potential_status(self, triage_category: str, sample: Dict[str, Any]) -> str:
+        explicit = str(sample.get("status") or "").strip().lower()
+        if explicit in {"open", "actionable", "observed", "noise"}:
+            return explicit
+        if triage_category == "actionable":
+            return "open"
+        if triage_category == "noise":
+            return "noise"
+        return "observed"
+
+    def _potential_dedupe_key(self, potential_type: str, title: str, target_basin: str, node_ids: List[str], evidence: Any) -> str:
+        clean_type = str(potential_type or "unknown").strip().lower() or "unknown"
+        clean_title = " ".join(str(title or clean_type).strip().lower().split())
+        clean_basin = " ".join(str(target_basin or "").strip().lower().split())
+        sorted_nodes = sorted(dict.fromkeys(node_ids or []))
+        if clean_type == "saturation":
+            basis = {
+                "v": 1,
+                "type": clean_type,
+                "basin": clean_basin or clean_title.replace("饱和势：", "").strip(),
+            }
+        elif clean_type in {"missing_basis", "co_presence", "frontier_pressure"}:
+            basis = {
+                "v": 1,
+                "type": clean_type,
+                "title": clean_title,
+                "basin": clean_basin,
+                "nodes": sorted_nodes,
+            }
+        else:
+            basis = {
+                "v": 1,
+                "type": clean_type,
+                "title": clean_title,
+                "basin": clean_basin,
+                "nodes": sorted_nodes,
+                "evidence": evidence,
+            }
+        return hashlib.sha256(self._json_dumps_potential_value(basis).encode("utf-8")).hexdigest()
+
+    def record_potential_samples(self, samples: List[Dict[str, Any]], trace_id: str = None, round_seq: int = None, source: str = "surface") -> int:
+        try:
+            if not samples:
+                return 0
+            inserted = 0
+            for sample in samples:
+                if not isinstance(sample, dict):
+                    continue
+                potential_type = str(sample.get("type") or "unknown").strip() or "unknown"
+                title = str(sample.get("title") or potential_type).strip()
+                detail = str(sample.get("detail") or "").strip()
+                node_ids = self._normalize_potential_node_ids(sample.get("node_ids") or [])
+                evidence = sample.get("evidence") or {}
+                triage_category, target_basin, triage_note = self._triage_potential_sample(
+                    potential_type,
+                    title,
+                    detail,
+                    evidence,
+                    sample,
+                )
+                dedupe_key = self._potential_dedupe_key(potential_type, title, target_basin, node_ids, evidence)
+                node_ids_json = self._json_dumps_potential_value(node_ids)
+                evidence_json = self._json_dumps_potential_value(evidence)
+                status = self._initial_potential_status(triage_category, sample)
+                existing = self._conn.execute(
+                    "SELECT sample_id FROM potential_samples WHERE dedupe_key = ? "
+                    "AND COALESCE(status, 'open') IN ('open', 'actionable', 'observed', 'noise') "
+                    "ORDER BY created_at ASC, sample_id ASC LIMIT 1",
+                    (dedupe_key,)
+                ).fetchone()
+                if existing:
+                    self._conn.execute(
+                        "UPDATE potential_samples SET occurrence_count = COALESCE(occurrence_count, 1) + 1, "
+                        "last_seen_at = CURRENT_TIMESTAMP, last_seen_trace_id = ?, last_seen_round_seq = ?, last_seen_source = ?, "
+                        "target_basin = COALESCE(?, target_basin), detail = ?, evidence = ?, triage_note = ? "
+                        "WHERE sample_id = ?",
+                        (trace_id, round_seq, source, target_basin, detail, evidence_json, triage_note, existing["sample_id"])
+                    )
+                    continue
+                self._conn.execute(
+                    "INSERT INTO potential_samples "
+                    "(trace_id, round_seq, source, potential_type, triage_category, target_basin, title, detail, node_ids, evidence, triage_note, status, dedupe_key, occurrence_count, last_seen_at, last_seen_trace_id, last_seen_round_seq, last_seen_source) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,?,?,?)",
+                    (
+                        trace_id,
+                        round_seq,
+                        source,
+                        potential_type,
+                        triage_category,
+                        target_basin,
+                        title,
+                        detail,
+                        node_ids_json,
+                        evidence_json,
+                        triage_note,
+                        status,
+                        dedupe_key,
+                        1,
+                        trace_id,
+                        round_seq,
+                        source,
+                    )
+                )
+                inserted += 1
+            if inserted == 0:
+                self._conn.commit()
+                return 0
+            self._conn.commit()
+            return inserted
+        except Exception as e:
+            logger.debug(f"record_potential_samples failed: {e}")
+            return 0
+
+    def _triage_potential_sample(self, potential_type: str, title: str, detail: str, evidence: Any, sample: Dict[str, Any]) -> tuple:
+        category = str(sample.get("triage_category") or "").strip().lower()
+        allowed = {"actionable", "structural", "exit", "noise"}
+        text = f"{potential_type} {title} {detail}".lower()
+        if category not in allowed:
+            if potential_type == "missing_basis":
+                category = "actionable"
+            elif potential_type == "saturation":
+                category = "structural"
+            elif potential_type in {"frontier_pressure", "co_presence"}:
+                category = "exit"
+            elif any(token in text for token in ("出口", "转向", "下一缺口", "escape", "frontier")):
+                category = "exit"
+            elif any(token in text for token in ("验证", "补足", "复查", "actionable", "check")):
+                category = "actionable"
+            elif any(token in text for token in ("噪声", "不可验证", "noise")):
+                category = "noise"
+            else:
+                category = "structural"
+        target_basin = str(sample.get("target_basin") or "").strip()
+        if not target_basin and isinstance(evidence, dict):
+            target_basin = str(evidence.get("area_hint") or evidence.get("target_basin") or "").strip()
+        if not target_basin and potential_type == "saturation":
+            target_basin = title.replace("饱和势：", "").strip()
+        notes = {
+            "actionable": "可验证势：保留为下一轮可检查线索，不自动转点或任务。",
+            "structural": "结构势：仅提示地形状态，不代表事实成立。",
+            "exit": "出口势：提示离开当前盆地或转向前沿，不强制执行。",
+            "noise": "噪声势：保留审计痕迹，默认不进入主要上下文。",
+        }
+        triage_note = str(sample.get("triage_note") or notes.get(category, "")).strip()
+        return category, target_basin or None, triage_note
+
+    def count_potential_samples(self, trace_id: str = None) -> int:
+        try:
+            if trace_id:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) FROM potential_samples WHERE trace_id = ?",
+                    (trace_id,)
+                ).fetchone()
+            else:
+                row = self._conn.execute("SELECT COUNT(*) FROM potential_samples").fetchone()
+            return int(row[0] or 0) if row else 0
+        except Exception as e:
+            logger.debug(f"count_potential_samples failed: {e}")
+            return 0
+
+    def get_open_potential_samples(self, limit: int = 20, potential_type: str = None, triage_category: str = None) -> List[Dict[str, Any]]:
+        try:
+            params: List[Any] = []
+            type_clause = ""
+            if potential_type:
+                type_clause = " AND potential_type = ?"
+                params.append(potential_type)
+            triage_clause = ""
+            if triage_category:
+                triage_clause = " AND COALESCE(triage_category, 'structural') = ?"
+                params.append(str(triage_category).strip().lower())
+            params.append(limit)
+            rows = self._conn.execute(
+                "SELECT sample_id, trace_id, round_seq, source, potential_type, COALESCE(triage_category, 'structural') triage_category, target_basin, title, detail, node_ids, evidence, triage_note, created_at "
+                "FROM potential_samples WHERE COALESCE(status, 'open') IN ('open', 'actionable')" + type_clause + triage_clause +
+                " ORDER BY created_at ASC, sample_id ASC LIMIT ?",
+                params
+            ).fetchall()
+            return [dict(r) for r in rows]
+        except Exception as e:
+            logger.debug(f"get_open_potential_samples failed: {e}")
+            return []
+
+    def resolve_potential_sample(self, sample_id: int, status: str, resolution_node_id: str = None, resolution_note: str = "") -> bool:
+        try:
+            resolved_status = str(status or "").strip().lower()
+            allowed = {"open", "actionable", "observed", "resolved", "ignored", "rejected", "stale", "noise", "crystallized"}
+            if resolved_status not in allowed:
+                logger.warning(f"resolve_potential_sample refused invalid status {status}")
+                return False
+            if resolution_node_id and not self._node_existence_map([resolution_node_id]).get(resolution_node_id):
+                logger.warning(f"resolve_potential_sample refused missing resolution node {resolution_node_id}")
+                return False
+            resolved_at_expr = "CURRENT_TIMESTAMP" if resolved_status not in {"open", "actionable", "observed", "noise"} else "NULL"
+            cur = self._conn.execute(
+                f"UPDATE potential_samples SET status = ?, resolution_node_id = ?, resolution_note = ?, resolved_at = {resolved_at_expr} "
+                "WHERE sample_id = ?",
+                (resolved_status, resolution_node_id, resolution_note, sample_id)
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+        except Exception as e:
+            logger.debug(f"resolve_potential_sample failed: {e}")
+            return False
+
+    def get_potential_triage_report(self, limit: int = 12, since: str = None) -> Dict[str, Any]:
+        try:
+            since_clause = ""
+            params: List[Any] = []
+            if since:
+                since_clause = " AND created_at >= ?"
+                params.append(str(since).strip())
+            distribution = self._conn.execute(
+                "SELECT COALESCE(triage_category, 'structural') triage_category, COALESCE(status, 'open') status, potential_type, COUNT(*) count "
+                "FROM potential_samples WHERE 1=1" + since_clause +
+                " GROUP BY COALESCE(triage_category, 'structural'), COALESCE(status, 'open'), potential_type "
+                "ORDER BY count DESC LIMIT ?",
+                params + [limit],
+            ).fetchall()
+            recent = self._conn.execute(
+                "SELECT sample_id, created_at, source, potential_type, COALESCE(triage_category, 'structural') triage_category, target_basin, COALESCE(status, 'open') status, title, detail, triage_note "
+                "FROM potential_samples WHERE 1=1" + since_clause +
+                " ORDER BY created_at DESC, sample_id DESC LIMIT ?",
+                params + [limit],
+            ).fetchall()
+            return {
+                "distribution": [dict(r) for r in distribution],
+                "recent": [dict(r) for r in recent],
+            }
+        except Exception as e:
+            logger.debug(f"get_potential_triage_report failed: {e}")
+            return {"distribution": [], "recent": []}
+
+    def preview_potential_sample_maintenance(self, limit: int = 12, since: str = None) -> Dict[str, Any]:
+        try:
+            since_clause = ""
+            params: List[Any] = []
+            if since:
+                since_clause = " AND created_at >= ?"
+                params.append(str(since).strip())
+
+            def scalar(sql: str) -> int:
+                row = self._conn.execute(sql, params).fetchone()
+                return int(row[0] or 0) if row else 0
+
+            total_rows = scalar("SELECT COUNT(*) FROM potential_samples WHERE 1=1" + since_clause)
+            missing_dedupe_total = scalar(
+                "SELECT COUNT(*) FROM potential_samples WHERE (dedupe_key IS NULL OR dedupe_key = '')" + since_clause
+            )
+            active_open_total = scalar(
+                "SELECT COUNT(*) FROM potential_samples WHERE COALESCE(status, 'open') IN ('open', 'actionable')" + since_clause
+            )
+            active_open_actionable = scalar(
+                "SELECT COUNT(*) FROM potential_samples WHERE COALESCE(status, 'open') IN ('open', 'actionable') "
+                "AND COALESCE(triage_category, 'structural') = 'actionable'" + since_clause
+            )
+            active_open_non_actionable = scalar(
+                "SELECT COUNT(*) FROM potential_samples WHERE COALESCE(status, 'open') IN ('open', 'actionable') "
+                "AND COALESCE(triage_category, 'structural') <> 'actionable'" + since_clause
+            )
+            status_distribution = self._conn.execute(
+                "SELECT COALESCE(triage_category, 'structural') triage_category, COALESCE(status, 'open') status, "
+                "potential_type, COUNT(*) rows, SUM(COALESCE(occurrence_count, 1)) seen, "
+                "SUM(CASE WHEN dedupe_key IS NULL OR dedupe_key = '' THEN 1 ELSE 0 END) missing_dedupe "
+                "FROM potential_samples WHERE 1=1" + since_clause +
+                " GROUP BY COALESCE(triage_category, 'structural'), COALESCE(status, 'open'), potential_type "
+                "ORDER BY rows DESC LIMIT ?",
+                params + [limit],
+            ).fetchall()
+            non_actionable_open = self._conn.execute(
+                "SELECT COALESCE(triage_category, 'structural') triage_category, potential_type, COUNT(*) rows, "
+                "SUM(CASE WHEN dedupe_key IS NULL OR dedupe_key = '' THEN 1 ELSE 0 END) missing_dedupe, "
+                "MIN(created_at) first_created, MAX(COALESCE(last_seen_at, created_at)) last_seen "
+                "FROM potential_samples WHERE COALESCE(status, 'open') IN ('open', 'actionable') "
+                "AND COALESCE(triage_category, 'structural') <> 'actionable'" + since_clause +
+                " GROUP BY COALESCE(triage_category, 'structural'), potential_type "
+                "ORDER BY rows DESC LIMIT ?",
+                params + [limit],
+            ).fetchall()
+            duplicate_hotspots = self._conn.execute(
+                "SELECT potential_type, COALESCE(triage_category, 'structural') triage_category, "
+                "COALESCE(status, 'open') status, title, COALESCE(target_basin, '') target_basin, node_ids, "
+                "COUNT(*) rows, SUM(COALESCE(occurrence_count, 1)) seen, "
+                "SUM(CASE WHEN dedupe_key IS NULL OR dedupe_key = '' THEN 1 ELSE 0 END) missing_dedupe, "
+                "MIN(created_at) first_created, MAX(created_at) last_created "
+                "FROM potential_samples WHERE (dedupe_key IS NULL OR dedupe_key = '')" + since_clause +
+                " GROUP BY potential_type, COALESCE(triage_category, 'structural'), COALESCE(status, 'open'), "
+                "title, COALESCE(target_basin, ''), node_ids HAVING COUNT(*) > 1 "
+                "ORDER BY rows DESC, last_created DESC LIMIT ?",
+                params + [limit],
+            ).fetchall()
+            actionable_open_recent = self._conn.execute(
+                "SELECT sample_id, created_at, source, potential_type, title, detail, node_ids, evidence, "
+                "COALESCE(occurrence_count, 1) occurrence_count, dedupe_key "
+                "FROM potential_samples WHERE COALESCE(status, 'open') IN ('open', 'actionable') "
+                "AND COALESCE(triage_category, 'structural') = 'actionable'" + since_clause +
+                " ORDER BY COALESCE(last_seen_at, created_at) DESC, sample_id DESC LIMIT ?",
+                params + [limit],
+            ).fetchall()
+            return {
+                "summary": {
+                    "total_rows": total_rows,
+                    "missing_dedupe_total": missing_dedupe_total,
+                    "active_open_total": active_open_total,
+                    "active_open_actionable": active_open_actionable,
+                    "active_open_non_actionable": active_open_non_actionable,
+                },
+                "status_distribution": [dict(r) for r in status_distribution],
+                "non_actionable_open": [dict(r) for r in non_actionable_open],
+                "duplicate_hotspots": [dict(r) for r in duplicate_hotspots],
+                "actionable_open_recent": [dict(r) for r in actionable_open_recent],
+            }
+        except Exception as e:
+            logger.debug(f"preview_potential_sample_maintenance failed: {e}")
+            return {
+                "summary": {},
+                "status_distribution": [],
+                "non_actionable_open": [],
+                "duplicate_hotspots": [],
+                "actionable_open_recent": [],
+            }
+
+    def _parse_potential_node_ids(self, raw_node_ids: Any) -> List[str]:
+        try:
+            parsed = json.loads(raw_node_ids) if isinstance(raw_node_ids, str) else raw_node_ids
+        except Exception:
+            parsed = []
+        if isinstance(parsed, str):
+            parsed = [parsed]
+        if not isinstance(parsed, list):
+            return []
+        return [str(item).strip() for item in parsed if str(item or "").strip()]
+
+    def crystallize_potential_samples_for_node(self, node_id: str, title: str = "", limit: int = 10) -> int:
+        try:
+            if not node_id:
+                return 0
+            like_node = f"%{node_id}%"
+            rows = self._conn.execute(
+                "SELECT sample_id, node_ids FROM potential_samples WHERE COALESCE(status, 'open') IN ('open', 'actionable') "
+                "AND COALESCE(triage_category, 'structural') = 'actionable' "
+                "AND node_ids LIKE ? ORDER BY created_at ASC, sample_id ASC LIMIT ?",
+                (like_node, max(limit * 3, limit))
+            ).fetchall()
+            resolved = 0
+            for row in rows:
+                if node_id not in self._parse_potential_node_ids(row["node_ids"]):
+                    continue
+                if self.resolve_potential_sample(row["sample_id"], "crystallized", resolution_node_id=node_id, resolution_note="node_created"):
+                    resolved += 1
+                    if resolved >= limit:
+                        break
+            return resolved
+        except Exception as e:
+            logger.debug(f"crystallize_potential_samples_for_node failed for {node_id}: {e}")
+            return 0
+
+    def _clean_pls_proposal_basis_ids(self, basis_ids: Any) -> List[str]:
+        if isinstance(basis_ids, str):
+            raw_items = [basis_ids]
+        elif isinstance(basis_ids, list):
+            raw_items = basis_ids
+        elif isinstance(basis_ids, tuple):
+            raw_items = list(basis_ids)
+        else:
+            raw_items = []
+        return list(dict.fromkeys(str(nid or "").strip() for nid in raw_items if str(nid or "").strip()))
+
+    def _json_safe_pls_proposal_value(self, value: Any) -> Any:
+        try:
+            json.dumps(value, ensure_ascii=False)
+            return value
+        except Exception:
+            return str(value)
+
+    def _normalize_pls_proposal_payload(
+        self,
+        payload: Dict[str, Any],
+        basis_ids: Any = None,
+        branch_id: str = "",
+        parent_trace_id: str = None,
+        parent_round_seq: int = None,
+        source: str = "async_branch",
+    ) -> tuple[Dict[str, Any], List[str], List[str]]:
+        issues: List[str] = []
+        if not isinstance(payload, dict):
+            return {}, [], ["invalid_payload_type"]
+        forbidden = sorted(k for k in payload if str(k).strip() in self.PLS_PROPOSAL_FORBIDDEN_PAYLOAD_KEYS)
+        issues.extend(f"forbidden_payload_key:{key}" for key in forbidden)
+        raw_basis = basis_ids if basis_ids is not None else payload.get("basis_ids")
+        clean_basis = self._clean_pls_proposal_basis_ids(raw_basis)
+        point_type = str(payload.get("point_type") or "CONTEXT").strip().upper()
+        if point_type not in self.PLS_PROPOSAL_ALLOWED_POINT_TYPES:
+            issues.append("invalid_point_type")
+            point_type = "CONTEXT"
+        consumed = {
+            "schema_version",
+            "node_id",
+            "new_point_id",
+            "target_node_id",
+            "title",
+            "name",
+            "summary",
+            "content",
+            "detail",
+            "description",
+            "point_type",
+            "tags",
+            "resolves",
+            "target_basin",
+            "reasoning",
+            "line_reasoning",
+            "basis_reasoning",
+            "basis_ids",
+            "origin",
+        }
+        extra = {
+            str(k): self._json_safe_pls_proposal_value(v)
+            for k, v in payload.items()
+            if str(k) not in consumed and str(k) not in self.PLS_PROPOSAL_FORBIDDEN_PAYLOAD_KEYS
+        }
+        origin = payload.get("origin") if isinstance(payload.get("origin"), dict) else {}
+        origin = {str(k): self._json_safe_pls_proposal_value(v) for k, v in origin.items()}
+        if branch_id:
+            origin["branch_id"] = str(branch_id).strip()
+        if parent_trace_id is not None:
+            origin["parent_trace_id"] = parent_trace_id
+        if parent_round_seq is not None:
+            origin["parent_round_seq"] = parent_round_seq
+        if source:
+            origin["source"] = str(source).strip()
+        normalized = {
+            "schema_version": self.PLS_PROPOSAL_PAYLOAD_SCHEMA_VERSION,
+            "node_id": str(payload.get("node_id") or payload.get("new_point_id") or payload.get("target_node_id") or "").strip(),
+            "title": str(payload.get("title") or payload.get("name") or payload.get("summary") or "").strip(),
+            "content": str(payload.get("content") or payload.get("detail") or payload.get("description") or "").strip(),
+            "point_type": point_type,
+            "tags": str(payload.get("tags") or "async_proposal").strip(),
+            "resolves": str(payload.get("resolves") or payload.get("target_basin") or "").strip(),
+            "reasoning": str(payload.get("reasoning") or payload.get("line_reasoning") or payload.get("basis_reasoning") or "").strip(),
+            "basis_ids": clean_basis,
+            "origin": origin,
+            "extra": extra,
+        }
+        return normalized, clean_basis, issues
+
+    def record_pls_proposal(
+        self,
+        proposal_id: str,
+        proposal_type: str,
+        payload: Dict[str, Any],
+        basis_ids: List[str] = None,
+        parent_trace_id: str = None,
+        parent_round_seq: int = None,
+        branch_id: str = "",
+        source: str = "async_branch",
+    ) -> bool:
+        try:
+            proposal_id = str(proposal_id or "").strip()
+            proposal_type = str(proposal_type or "").strip()
+            branch_id = str(branch_id or "").strip()
+            source = str(source or "async_branch").strip() or "async_branch"
+            if not proposal_id or not proposal_type or not isinstance(payload, dict):
+                logger.warning(f"record_pls_proposal refused invalid proposal {proposal_id} type={proposal_type}")
+                return False
+            normalized_payload, clean_basis, schema_issues = self._normalize_pls_proposal_payload(
+                payload,
+                basis_ids=basis_ids,
+                branch_id=branch_id,
+                parent_trace_id=parent_trace_id,
+                parent_round_seq=parent_round_seq,
+                source=source,
+            )
+            if schema_issues:
+                logger.warning(f"record_pls_proposal refused schema issues for {proposal_id}: {schema_issues}")
+                return False
+            cur = self._conn.execute(
+                "INSERT OR IGNORE INTO pls_proposals "
+                "(proposal_id, parent_trace_id, parent_round_seq, branch_id, proposal_type, source, payload_json, basis_ids_json) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    proposal_id,
+                    parent_trace_id,
+                    parent_round_seq,
+                    branch_id,
+                    proposal_type,
+                    source,
+                    json.dumps(normalized_payload, ensure_ascii=False),
+                    json.dumps(clean_basis, ensure_ascii=False),
+                ),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+        except Exception as e:
+            logger.debug(f"record_pls_proposal failed: {e}")
+            return False
+
+    def get_pls_proposals(self, status: str = "pending", limit: int = 20, branch_id: str = "") -> List[Dict[str, Any]]:
+        try:
+            resolved_status = str(status or "pending").strip().lower()
+            params: List[Any] = []
+            where = []
+            if resolved_status:
+                where.append("COALESCE(status, 'pending') = ?")
+                params.append(resolved_status)
+            if branch_id:
+                where.append("branch_id = ?")
+                params.append(str(branch_id).strip())
+            clause = ("WHERE " + " AND ".join(where)) if where else ""
+            params.append(max(1, min(int(limit or 20), 100)))
+            rows = self._conn.execute(
+                "SELECT proposal_id, parent_trace_id, parent_round_seq, branch_id, proposal_type, source, "
+                "payload_json, basis_ids_json, status, merge_result, created_at FROM pls_proposals "
+                + clause +
+                " ORDER BY created_at ASC LIMIT ?",
+                params,
+            ).fetchall()
+            proposals = []
+            for row in rows:
+                item = dict(row)
+                try:
+                    item["payload"] = json.loads(item.get("payload_json") or "{}")
+                except Exception:
+                    item["payload"] = {}
+                try:
+                    item["basis_ids"] = json.loads(item.get("basis_ids_json") or "[]")
+                except Exception:
+                    item["basis_ids"] = []
+                normalized_payload, clean_basis, schema_issues = self._normalize_pls_proposal_payload(
+                    item["payload"],
+                    basis_ids=item["basis_ids"],
+                    branch_id=item.get("branch_id") or "",
+                    parent_trace_id=item.get("parent_trace_id"),
+                    parent_round_seq=item.get("parent_round_seq"),
+                    source=item.get("source") or "async_branch",
+                )
+                item["payload"] = normalized_payload
+                item["basis_ids"] = clean_basis
+                item["schema_issues"] = schema_issues
+                proposals.append(item)
+            return proposals
+        except Exception as e:
+            logger.debug(f"get_pls_proposals failed: {e}")
+            return []
+
+    def update_pls_proposal_status(self, proposal_id: str, status: str, merge_result: str = "") -> bool:
+        try:
+            proposal_id = str(proposal_id or "").strip()
+            resolved_status = str(status or "").strip().lower()
+            allowed = {"pending", "validated", "accepted", "rejected", "stale", "needs_rebase", "duplicate", "unsafe_same_generation"}
+            if not proposal_id or resolved_status not in allowed:
+                logger.warning(f"update_pls_proposal_status refused {proposal_id} status={status}")
+                return False
+            cur = self._conn.execute(
+                "UPDATE pls_proposals SET status = ?, merge_result = ? WHERE proposal_id = ?",
+                (resolved_status, merge_result, proposal_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+        except Exception as e:
+            logger.debug(f"update_pls_proposal_status failed: {e}")
+            return False
+
+    def validate_pls_proposal(self, proposal_id: str, update_status: bool = False) -> Dict[str, Any]:
+        report = {
+            "proposal_id": str(proposal_id or "").strip(),
+            "ok": False,
+            "recommended_status": "rejected",
+            "reasons": [],
+            "basis_state": {},
+        }
+        try:
+            pid = report["proposal_id"]
+            if not pid:
+                report["reasons"].append("missing_proposal_id")
+                return report
+            row = self._conn.execute(
+                "SELECT proposal_id, parent_trace_id, parent_round_seq, branch_id, proposal_type, payload_json, basis_ids_json, status "
+                "FROM pls_proposals WHERE proposal_id = ?",
+                (pid,),
+            ).fetchone()
+            if not row:
+                report["reasons"].append("proposal_not_found")
+                return report
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except Exception:
+                payload = {}
+            try:
+                basis_ids = json.loads(row["basis_ids_json"] or "[]")
+            except Exception:
+                basis_ids = []
+            payload, clean_basis, schema_issues = self._normalize_pls_proposal_payload(
+                payload,
+                basis_ids=basis_ids,
+                branch_id=row["branch_id"] or "",
+                parent_trace_id=row["parent_trace_id"],
+                parent_round_seq=row["parent_round_seq"],
+            )
+            report.update({
+                "branch_id": row["branch_id"],
+                "proposal_type": row["proposal_type"],
+                "status": row["status"],
+                "basis_ids": clean_basis,
+                "payload_schema_version": payload.get("schema_version"),
+            })
+            if schema_issues:
+                report["reasons"].extend(schema_issues)
+            candidate_node_id = str(payload.get("node_id") or "").strip()
+            if candidate_node_id and self._node_existence_map([candidate_node_id]).get(candidate_node_id):
+                report["reasons"].append("candidate_node_already_exists")
+                report["recommended_status"] = "duplicate"
+            if not clean_basis:
+                report["reasons"].append("missing_basis_ids")
+            else:
+                placeholders = ",".join("?" * len(clean_basis))
+                rows = self._conn.execute(
+                    f"SELECT node_id, COALESCE(is_virtual,0) is_virtual, COALESCE(ablation_active,0) ablation_active "
+                    f"FROM knowledge_nodes WHERE node_id IN ({placeholders})",
+                    clean_basis,
+                ).fetchall()
+                states = {r["node_id"]: {"exists": True, "is_virtual": int(r["is_virtual"] or 0), "ablation_active": int(r["ablation_active"] or 0)} for r in rows}
+                for bid in clean_basis:
+                    state = states.get(bid) or {"exists": False, "is_virtual": 0, "ablation_active": 0}
+                    report["basis_state"][bid] = state
+                    if not state["exists"]:
+                        report["reasons"].append(f"missing_basis:{bid}")
+                    if state["is_virtual"]:
+                        report["reasons"].append(f"virtual_basis:{bid}")
+                    if state["ablation_active"]:
+                        report["reasons"].append(f"hidden_basis:{bid}")
+                parent_trace_id = row["parent_trace_id"]
+                parent_round_seq = row["parent_round_seq"]
+                existing_basis = [bid for bid in clean_basis if report["basis_state"].get(bid, {}).get("exists")]
+                if parent_trace_id is not None and parent_round_seq is not None and existing_basis:
+                    existing_placeholders = ",".join("?" * len(existing_basis))
+                    same_rows = self._conn.execute(
+                        f"SELECT node_id FROM point_creation_context WHERE trace_id = ? AND round_seq = ? AND node_id IN ({existing_placeholders})",
+                        [parent_trace_id, parent_round_seq] + existing_basis,
+                    ).fetchall()
+                    same_generation = [r["node_id"] for r in same_rows]
+                    if same_generation:
+                        report["same_generation_basis"] = same_generation
+                        report["reasons"].append("basis_from_same_generation")
+                        report["recommended_status"] = "unsafe_same_generation"
+            if report["reasons"]:
+                if report["recommended_status"] not in {"duplicate", "unsafe_same_generation"}:
+                    report["recommended_status"] = "needs_rebase"
+            else:
+                report["ok"] = True
+                report["recommended_status"] = "validated"
+            if update_status:
+                self.update_pls_proposal_status(
+                    pid,
+                    report["recommended_status"],
+                    json.dumps({"ok": report["ok"], "reasons": report["reasons"]}, ensure_ascii=False),
+                )
+            return report
+        except Exception as e:
+            report["reasons"].append(f"validation_error:{str(e)[:120]}")
+            return report
+
+    def preview_pls_proposal_merge(self, proposal_id: str) -> Dict[str, Any]:
+        preview = {
+            "proposal_id": str(proposal_id or "").strip(),
+            "ok": False,
+            "mode": "dry_run",
+            "blockers": [],
+            "operations": [],
+            "notes": ["preview_only_no_topology_writes"],
+        }
+        try:
+            pid = preview["proposal_id"]
+            if not pid:
+                preview["blockers"].append("missing_proposal_id")
+                return preview
+            row = self._conn.execute(
+                "SELECT proposal_id, parent_trace_id, parent_round_seq, branch_id, proposal_type, payload_json, basis_ids_json, status "
+                "FROM pls_proposals WHERE proposal_id = ?",
+                (pid,),
+            ).fetchone()
+            if not row:
+                preview["blockers"].append("proposal_not_found")
+                return preview
+            validation = self.validate_pls_proposal(pid, update_status=False)
+            preview["validation"] = validation
+            if not validation.get("ok"):
+                preview["blockers"].extend(validation.get("reasons") or ["validation_not_ok"])
+                return preview
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except Exception:
+                payload = {}
+            try:
+                basis_ids = json.loads(row["basis_ids_json"] or "[]")
+            except Exception:
+                basis_ids = []
+            payload, clean_basis, schema_issues = self._normalize_pls_proposal_payload(
+                payload,
+                basis_ids=basis_ids,
+                branch_id=row["branch_id"] or "",
+                parent_trace_id=row["parent_trace_id"],
+                parent_round_seq=row["parent_round_seq"],
+            )
+            if schema_issues:
+                preview["blockers"].extend(schema_issues)
+            node_id = str(payload.get("node_id") or "").strip()
+            title = str(payload.get("title") or "").strip()
+            content = str(payload.get("content") or "").strip()
+            point_type = str(payload.get("point_type") or "CONTEXT").strip().upper()
+            tags = str(payload.get("tags") or "async_proposal").strip()
+            resolves = str(payload.get("resolves") or "").strip()
+            reasoning = str(payload.get("reasoning") or "").strip()
+            if not node_id:
+                preview["blockers"].append("missing_node_id")
+            if not title:
+                preview["blockers"].append("missing_title")
+            if not content:
+                preview["blockers"].append("missing_content")
+            if point_type not in {"LESSON", "CONTEXT"}:
+                preview["blockers"].append("invalid_point_type")
+            if not clean_basis:
+                preview["blockers"].append("missing_basis_ids")
+            if not reasoning:
+                preview["blockers"].append("missing_line_reasoning")
+            if preview["blockers"]:
+                return preview
+            preview["operations"] = [
+                {
+                    "op": "planned_point_write",
+                    "node_id": node_id,
+                    "point_type": point_type,
+                    "title": title,
+                    "content": content,
+                    "tags": tags,
+                    "resolves": resolves,
+                    "source": "proposal_merge",
+                }
+            ]
+            for basis_id in clean_basis:
+                preview["operations"].append({
+                    "op": "planned_line_write",
+                    "new_point_id": node_id,
+                    "basis_point_id": basis_id,
+                    "reasoning": reasoning,
+                    "same_round": 0,
+                    "source": "proposal_merge",
+                })
+            preview["ok"] = True
+            return preview
+        except Exception as e:
+            preview["blockers"].append(f"preview_error:{str(e)[:120]}")
+            return preview
+
+    def create_reasoning_line(self, new_point_id: str, basis_point_id: str, reasoning: str = "", source: str = "GP", same_round: int = 0, trace_id: str = None, round_seq: int = None, allow_hidden: bool = False, allow_virtual: bool = False) -> bool:
         """创建一条推理线：新点基于旧点产生"""
         try:
+            new_point_id = str(new_point_id or "").strip()
+            basis_point_id = str(basis_point_id or "").strip()
+            if not new_point_id or not basis_point_id:
+                logger.warning(f"Line: Refused missing endpoint {new_point_id} -> {basis_point_id}")
+                return False
+            if new_point_id == basis_point_id:
+                logger.warning(f"Line: Refused self line {new_point_id} -> {basis_point_id}")
+                return False
+            visibility = self._node_visibility_map([new_point_id, basis_point_id])
+            if not visibility.get(new_point_id, {}).get("exists") or not visibility.get(basis_point_id, {}).get("exists"):
+                logger.warning(
+                    f"Line: Refused orphan line {new_point_id} -> {basis_point_id} "
+                    f"(new_ok={visibility.get(new_point_id, {}).get('exists', False)}, basis_ok={visibility.get(basis_point_id, {}).get('exists', False)})"
+                )
+                return False
+            blocked = []
+            for role, nid in (("new", new_point_id), ("basis", basis_point_id)):
+                info = visibility.get(nid, {})
+                if info.get("hidden") and not allow_hidden:
+                    blocked.append(f"{role}_hidden")
+                if info.get("virtual") and not allow_virtual:
+                    blocked.append(f"{role}_virtual")
+            if blocked:
+                logger.warning(f"Line: Refused inactive endpoint {new_point_id} -> {basis_point_id}: {','.join(blocked)}")
+                return False
             self._conn.execute(
                 "INSERT INTO reasoning_lines (new_point_id, basis_point_id, reasoning, source, same_round, trace_id, round_seq) VALUES (?,?,?,?,?,?,?)",
                 (new_point_id, basis_point_id, reasoning, source, same_round, trace_id, round_seq)
             )
             self._conn.commit()
             logger.debug(f"Line: {new_point_id} --[based_on]--> {basis_point_id} (source={source})")
+            return True
         except Exception as e:
             logger.error(f"Failed to create reasoning line: {e}")
+            return False
 
-    def get_reasoning_basis_ids(self, new_point_id: str) -> set:
+    def get_reasoning_basis_ids(self, new_point_id: str, include_same_round: bool = True) -> set:
         try:
+            same_round_clause = "" if include_same_round else " AND same_round = 0"
             rows = self._conn.execute(
-                "SELECT DISTINCT basis_point_id FROM reasoning_lines WHERE new_point_id = ?",
+                "SELECT DISTINCT basis_point_id FROM reasoning_lines WHERE new_point_id = ?" + same_round_clause,
                 (new_point_id,)
             ).fetchall()
             return {r[0] for r in rows}
         except Exception:
             return set()
 
-    def get_incoming_line_count(self, node_id: str) -> int:
+    def get_incoming_line_count(self, node_id: str, include_hidden: bool = False, include_virtual: bool = False) -> int:
         """获取节点的入线数（被多少新点基于它产生）"""
         try:
+            new_filter = self._active_node_filter("new_node", include_hidden, include_virtual)
+            basis_filter = self._active_node_filter("basis_node", include_hidden, include_virtual)
             row = self._conn.execute(
-                "SELECT COUNT(*) FROM reasoning_lines WHERE basis_point_id = ? AND same_round = 0",
+                f"""SELECT COUNT(*)
+                    FROM reasoning_lines rl
+                    JOIN knowledge_nodes new_node ON new_node.node_id = rl.new_point_id
+                    JOIN knowledge_nodes basis_node ON basis_node.node_id = rl.basis_point_id
+                    WHERE rl.basis_point_id = ?
+                      AND COALESCE(rl.same_round, 0) = 0
+                      AND {new_filter}
+                      AND {basis_filter}""",
                 (node_id,)
             ).fetchone()
             return row[0] if row else 0
         except Exception:
             return 0
 
-    def get_incoming_count_percentile(self, percentile: int = 75) -> int:
+    def get_incoming_count_percentile(self, percentile: int = 75, include_hidden: bool = False, include_virtual: bool = False) -> int:
         """获取入线数分布的指定百分位数（自适应阈值用）。
         返回值：入线数 >= 此值的节点为"基础"。
         空库或无数据时返回 0。"""
         try:
+            new_filter = self._active_node_filter("new_node", include_hidden, include_virtual)
+            basis_filter = self._active_node_filter("basis_node", include_hidden, include_virtual)
+            incoming_subquery = f"""SELECT COUNT(*) as incoming
+                    FROM reasoning_lines rl
+                    JOIN knowledge_nodes new_node ON new_node.node_id = rl.new_point_id
+                    JOIN knowledge_nodes basis_node ON basis_node.node_id = rl.basis_point_id
+                    WHERE COALESCE(rl.same_round, 0) = 0
+                      AND {new_filter}
+                      AND {basis_filter}
+                    GROUP BY rl.basis_point_id"""
             row = self._conn.execute(
-                """SELECT incoming FROM (
-                    SELECT COUNT(*) as incoming FROM reasoning_lines
-                    WHERE same_round = 0 GROUP BY basis_point_id
+                f"""SELECT incoming FROM (
+                    {incoming_subquery}
                 ) ORDER BY incoming LIMIT 1 OFFSET (
                     SELECT CAST(COUNT(*) * ? / 100 AS INTEGER) FROM (
-                        SELECT COUNT(*) as incoming FROM reasoning_lines
-                        WHERE same_round = 0 GROUP BY basis_point_id
+                        {incoming_subquery}
                     )
                 )""",
                 (percentile,)
@@ -840,14 +2060,24 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         except Exception:
             return 0
 
-    def get_incoming_line_counts_batch(self, node_ids: list) -> dict:
+    def get_incoming_line_counts_batch(self, node_ids: list, include_hidden: bool = False, include_virtual: bool = False) -> dict:
         """批量获取入线数，避免 N+1 查询"""
         if not node_ids:
             return {}
         try:
             placeholders = ",".join("?" * len(node_ids))
+            new_filter = self._active_node_filter("new_node", include_hidden, include_virtual)
+            basis_filter = self._active_node_filter("basis_node", include_hidden, include_virtual)
             rows = self._conn.execute(
-                f"SELECT basis_point_id, COUNT(*) as cnt FROM reasoning_lines WHERE basis_point_id IN ({placeholders}) AND same_round = 0 GROUP BY basis_point_id",
+                f"""SELECT rl.basis_point_id, COUNT(*) as cnt
+                    FROM reasoning_lines rl
+                    JOIN knowledge_nodes new_node ON new_node.node_id = rl.new_point_id
+                    JOIN knowledge_nodes basis_node ON basis_node.node_id = rl.basis_point_id
+                    WHERE rl.basis_point_id IN ({placeholders})
+                      AND COALESCE(rl.same_round, 0) = 0
+                      AND {new_filter}
+                      AND {basis_filter}
+                    GROUP BY rl.basis_point_id""",
                 node_ids
             ).fetchall()
             result = {nid: 0 for nid in node_ids}
@@ -856,11 +2086,91 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         except Exception:
             return {nid: 0 for nid in node_ids}
 
-    def get_basis_set_for_node(self, new_point_id: str) -> set:
+    def get_dependency_impact_report(self, node_id: str, max_depth: int = 3, limit: int = 80) -> Dict[str, Any]:
+        try:
+            node_id = str(node_id or "").strip()
+            if not node_id:
+                return {"root": "", "title": "", "impacts": [], "summary": {}}
+            root = self._conn.execute(
+                "SELECT node_id, title FROM knowledge_nodes WHERE node_id = ?",
+                (node_id,)
+            ).fetchone()
+            if not root:
+                return {"root": node_id, "title": "", "impacts": [], "summary": {"missing_root": 1}}
+            max_depth = max(1, min(6, int(max_depth or 3)))
+            limit = max(1, min(200, int(limit or 80)))
+            frontier = [(node_id, 0)]
+            visited = {node_id}
+            impacts: List[Dict[str, Any]] = []
+            while frontier and len(impacts) < limit:
+                current, depth = frontier.pop(0)
+                if depth >= max_depth:
+                    continue
+                rows = self._conn.execute(
+                    """SELECT rl.new_point_id, rl.reasoning, k.title,
+                              (SELECT COUNT(*) FROM reasoning_lines rb WHERE rb.new_point_id = rl.new_point_id AND COALESCE(rb.same_round,0)=0) basis_count,
+                              (SELECT COUNT(*) FROM node_edges e WHERE e.target_id = rl.new_point_id AND LOWER(e.relation) IN ('contradicts','falsifies','falsify','contradict','rebuts','undercuts','supersedes','narrows_scope')) incoming_decay
+                       FROM reasoning_lines rl
+                       LEFT JOIN knowledge_nodes k ON k.node_id = rl.new_point_id
+                       WHERE rl.basis_point_id = ? AND COALESCE(rl.same_round,0)=0
+                       ORDER BY rl.created_at DESC""",
+                    (current,)
+                ).fetchall()
+                for row in rows:
+                    child = row["new_point_id"]
+                    if not child or child in visited:
+                        continue
+                    visited.add(child)
+                    child_depth = depth + 1
+                    basis_count = int(row["basis_count"] or 0)
+                    incoming_decay = int(row["incoming_decay"] or 0)
+                    if child_depth == 1 and basis_count <= 1:
+                        status = "needs_recheck"
+                    elif basis_count <= child_depth:
+                        status = "dependency_risk"
+                    elif incoming_decay > 0:
+                        status = "already_under_decay"
+                    else:
+                        status = "still_supported"
+                    impacts.append({
+                        "node_id": child,
+                        "title": row["title"],
+                        "depth": child_depth,
+                        "basis_count": basis_count,
+                        "status": status,
+                        "reasoning": row["reasoning"],
+                    })
+                    if len(impacts) >= limit:
+                        break
+                    frontier.append((child, child_depth))
+            summary: Dict[str, int] = {}
+            for item in impacts:
+                key = item.get("status") or "unknown"
+                summary[key] = summary.get(key, 0) + 1
+            return {
+                "root": root["node_id"],
+                "title": root["title"],
+                "impacts": impacts,
+                "summary": summary,
+            }
+        except Exception as e:
+            logger.debug(f"get_dependency_impact_report failed for {node_id}: {e}")
+            return {"root": node_id, "title": "", "impacts": [], "summary": {"error": 1}}
+
+    def get_basis_set_for_node(self, new_point_id: str, include_same_round: bool = False, include_hidden: bool = False, include_virtual: bool = False) -> set:
         """获取某新点连线指向的所有 basis_point_id 集合（碰撞检测用）"""
         try:
+            same_round_clause = "" if include_same_round else " AND same_round = 0"
+            new_filter = self._active_node_filter("new_node", include_hidden, include_virtual)
+            basis_filter = self._active_node_filter("basis_node", include_hidden, include_virtual)
             rows = self._conn.execute(
-                "SELECT basis_point_id FROM reasoning_lines WHERE new_point_id = ?",
+                f"""SELECT rl.basis_point_id
+                FROM reasoning_lines rl
+                JOIN knowledge_nodes new_node ON new_node.node_id = rl.new_point_id
+                JOIN knowledge_nodes basis_node ON basis_node.node_id = rl.basis_point_id
+                WHERE rl.new_point_id = ?{same_round_clause}
+                  AND {new_filter}
+                  AND {basis_filter}""",
                 (new_point_id,)
             ).fetchall()
             return {row[0] for row in rows}
@@ -886,8 +2196,11 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
                 f"""SELECT rl.new_point_id, COUNT(*) as overlap
                 FROM reasoning_lines rl
                 JOIN knowledge_nodes k ON k.node_id = rl.new_point_id
+                JOIN knowledge_nodes b ON b.node_id = rl.basis_point_id
                 WHERE rl.basis_point_id IN ({placeholders})
+                  AND rl.same_round = 0
                   AND COALESCE(k.is_virtual, 0) = 0
+                  AND COALESCE(k.ablation_active, 0) = 0
                   {exclude_clause}
                 GROUP BY rl.new_point_id
                 HAVING overlap >= ?
@@ -930,10 +2243,7 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
                 )
                 if basis_overlap_ids:
                     for bid in basis_overlap_ids[:3]:
-                        self._conn.execute(
-                            "INSERT OR IGNORE INTO node_edges (source_id, target_id, relation) VALUES (?,?,?)",
-                            (vid, bid, "RELATED_TO")
-                        )
+                        self.add_edge(vid, bid, "RELATED_TO", allow_virtual=True)
                 self._conn.commit()
                 logger.debug(f"Virtual point incremented: [{vid}] (area={area_hint}, count={existing[1]+1})")
             else:
@@ -948,10 +2258,7 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
                 # 连接到碰撞涉及的 basis 节点（1-hop 可见性）
                 if basis_overlap_ids:
                     for bid in basis_overlap_ids[:3]:
-                        self._conn.execute(
-                            "INSERT OR IGNORE INTO node_edges (source_id, target_id, relation) VALUES (?,?,?)",
-                            (vid, bid, "RELATED_TO")
-                        )
+                        self.add_edge(vid, bid, "RELATED_TO", allow_virtual=True)
                 self._conn.commit()
                 logger.info(f"Virtual point created: [{vid}] (area={area_hint}, linked to {len(basis_overlap_ids or [])} basis nodes)")
             return vid
@@ -1028,7 +2335,7 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
 
     # ── 面组装辅助查询（供 SurfaceExpander 使用）──
 
-    def get_neighbor_map(self, node_ids: list, include_reverse_reasoning: bool = True, weighted: bool = False) -> dict:
+    def get_neighbor_map(self, node_ids: list, include_reverse_reasoning: bool = True, weighted: bool = False, include_hidden: bool = False, include_virtual: bool = False) -> dict:
         """获取节点的 1-hop 邻居映射（node_edges + reasoning_lines 合并）
 
         Args:
@@ -1043,10 +2350,21 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         try:
             placeholders = ",".join("?" * len(node_ids))
             neighbor_map = {} if not weighted else {}
+            src_filter = self._active_node_filter("src", include_hidden, include_virtual)
+            dst_filter = self._active_node_filter("dst", include_hidden, include_virtual)
+            new_filter = self._active_node_filter("new_node", include_hidden, include_virtual)
+            basis_filter = self._active_node_filter("basis_node", include_hidden, include_virtual)
             
             # node_edges（始终双向，RELATED_TO边权重提升）
             for row in self._conn.execute(
-                f"SELECT source_id, target_id, relation FROM node_edges WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})",
+                f"""SELECT e.source_id, e.target_id, e.relation
+                    FROM node_edges e
+                    JOIN knowledge_nodes src ON src.node_id = e.source_id
+                    JOIN knowledge_nodes dst ON dst.node_id = e.target_id
+                    WHERE e.source_id != e.target_id
+                      AND {src_filter}
+                      AND {dst_filter}
+                      AND (e.source_id IN ({placeholders}) OR e.target_id IN ({placeholders}))""",
                 node_ids + node_ids
             ).fetchall():
                 source, target, relation = row[0], row[1], row[2] or "RELATED_TO"
@@ -1063,7 +2381,15 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             # reasoning_lines（排除同轮线，面BFS只走异轮验证路径）
             # 设计约束：填充阶段只沿 new→old 方向走（踩稳基础），不反向跳到前沿新点
             for row in self._conn.execute(
-                f"SELECT new_point_id, basis_point_id FROM reasoning_lines WHERE same_round = 0 AND (new_point_id IN ({placeholders}) OR basis_point_id IN ({placeholders}))",
+                f"""SELECT rl.new_point_id, rl.basis_point_id
+                    FROM reasoning_lines rl
+                    JOIN knowledge_nodes new_node ON new_node.node_id = rl.new_point_id
+                    JOIN knowledge_nodes basis_node ON basis_node.node_id = rl.basis_point_id
+                    WHERE rl.same_round = 0
+                      AND rl.new_point_id != rl.basis_point_id
+                      AND {new_filter}
+                      AND {basis_filter}
+                      AND (rl.new_point_id IN ({placeholders}) OR rl.basis_point_id IN ({placeholders}))""",
                 node_ids + node_ids
             ).fetchall():
                 new_point, basis_point = row[0], row[1]
@@ -1155,7 +2481,7 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
                    LEFT JOIN (
                        SELECT basis_point_id, COUNT(*) as incoming
                        FROM reasoning_lines
-                       WHERE basis_point_id IN ({placeholders})
+                       WHERE same_round = 0 AND basis_point_id IN ({placeholders})
                        GROUP BY basis_point_id
                    ) inc ON kn.node_id = inc.basis_point_id
                    LEFT JOIN node_edges ce ON kn.node_id = ce.target_id AND ce.relation = 'CONTRADICTS'
@@ -1205,11 +2531,8 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         for candidate in candidates[:max_ablations]:
             node_id = candidate['node_id']
             try:
-                # 标记为消融状态
-                self._conn.execute(
-                    "UPDATE knowledge_nodes SET ablation_active = 1 WHERE node_id = ?",
-                    (node_id,)
-                )
+                if not self.activate_ablation(node_id):
+                    continue
                 
                 logger.info(
                     f"Gardener ablated {node_id}: incoming={candidate['incoming_count']}, "
@@ -1221,7 +2544,6 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
                 logger.error(f"Failed to ablate {node_id}: {e}")
         
         if ablated_count > 0:
-            self._conn.commit()
             logger.info(f"Gardener completed: ablated {ablated_count} trap nodes")
         
         return ablated_count
@@ -1288,25 +2610,84 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             logger.error(f"check_ablation_candidates failed: {e}")
             return []
 
-    def get_ablation_observing_nodes(self, min_duration_seconds: int = 300) -> list:
+    def get_ablation_observing_nodes(self, min_duration_seconds: int = 300, ablation_states: list = None) -> list:
         """获取正在消融观察中的节点（已观察超过 min_duration_seconds 秒）。
         返回 [(node_id, title, baseline_env_ratio), ...]"""
         try:
+            states = [1] if ablation_states is None else [int(s) for s in ablation_states]
+            if not states:
+                return []
+            placeholders = ",".join("?" * len(states))
             rows = self._conn.execute(
-                """SELECT kn.node_id, kn.title, ab.baseline_env_ratio
+                f"""SELECT kn.node_id, kn.title, ab.baseline_env_ratio
                 FROM knowledge_nodes kn JOIN ablation_baselines ab ON kn.node_id = ab.node_id
-                WHERE kn.ablation_active = 1 AND ab.activated_at <= strftime('%s','now') - ?""",
-                (min_duration_seconds,)
+                WHERE kn.ablation_active IN ({placeholders}) AND ab.activated_at <= strftime('%s','now') - ?""",
+                states + [min_duration_seconds]
             ).fetchall()
             return [(r[0], r[1], r[2]) for r in rows]
         except Exception as e:
             logger.error(f"get_ablation_observing_nodes failed: {e}")
             return []
 
+    def get_ablation_integrity_report(self, limit: int = 20) -> Dict[str, Any]:
+        try:
+            active_without_baseline = self._conn.execute(
+                """SELECT k.node_id, k.ablation_active, k.title
+                   FROM knowledge_nodes k
+                   LEFT JOIN ablation_baselines a ON a.node_id = k.node_id
+                   WHERE COALESCE(k.ablation_active,0) > 0 AND a.node_id IS NULL
+                   ORDER BY k.updated_at DESC LIMIT ?""",
+                (limit,)
+            ).fetchall()
+            baseline_without_active = self._conn.execute(
+                """SELECT a.node_id, k.ablation_active, k.title
+                   FROM ablation_baselines a
+                   LEFT JOIN knowledge_nodes k ON k.node_id = a.node_id
+                   WHERE k.node_id IS NULL OR COALESCE(k.ablation_active,0) = 0
+                   ORDER BY a.activated_at DESC LIMIT ?""",
+                (limit,)
+            ).fetchall()
+            return {
+                "active_without_baseline": [dict(r) for r in active_without_baseline],
+                "baseline_without_active": [dict(r) for r in baseline_without_active],
+            }
+        except Exception as e:
+            logger.error(f"get_ablation_integrity_report failed: {e}")
+            return {"active_without_baseline": [], "baseline_without_active": []}
+
+    def repair_ablation_baseline_gaps(self, baseline_env_ratio: float = None, limit: int = 20) -> int:
+        try:
+            import time
+            rows = self._conn.execute(
+                """SELECT k.node_id
+                   FROM knowledge_nodes k
+                   LEFT JOIN ablation_baselines a ON a.node_id = k.node_id
+                   WHERE COALESCE(k.ablation_active,0) > 0 AND a.node_id IS NULL
+                   ORDER BY k.updated_at DESC LIMIT ?""",
+                (limit,)
+            ).fetchall()
+            now = int(time.time())
+            repaired = 0
+            for row in rows:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO ablation_baselines (node_id, activated_at, baseline_env_ratio) VALUES (?,?,?)",
+                    (row["node_id"], now, baseline_env_ratio)
+                )
+                repaired += 1
+            if repaired:
+                self._conn.commit()
+            return repaired
+        except Exception as e:
+            logger.error(f"repair_ablation_baseline_gaps failed: {e}")
+            return 0
+
     def activate_ablation(self, node_id: str, baseline_env_ratio: float = None) -> bool:
         """激活消融：从面和搜索中隐藏该节点，观察 N 轮。
         baseline_env_ratio: 消融前的环境成功率，用于后续评估向前/向后判定。"""
         try:
+            if not self._node_existence_map([node_id]).get(node_id):
+                logger.warning(f"activate_ablation refused missing node {node_id}")
+                return False
             import time
             self._conn.execute(
                 "UPDATE knowledge_nodes SET ablation_active = 1 WHERE node_id = ?",
@@ -1399,13 +2780,12 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
 
             # 检查该区域是否有新节点（1-hop邻居中最近创建的）
             neighbors = self.get_neighbor_map([node_id]).get(node_id, [])
-            import time
-            recent_threshold = int(time.time()) - 3600  # 最近1小时内创建
+            recent_threshold = (datetime.utcnow() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")  # 最近1小时内创建
             new_count = 0
             if neighbors:
                 ph = ",".join("?" * len(neighbors))
                 new_count = self._conn.execute(
-                    f"SELECT COUNT(*) FROM knowledge_nodes WHERE node_id IN ({ph}) AND created_at >= ? AND ablation_active = 0",
+                    f"SELECT COUNT(*) FROM knowledge_nodes WHERE node_id IN ({ph}) AND created_at >= ? AND COALESCE(ablation_active,0) = 0",
                     neighbors + [recent_threshold]
                 ).fetchone()[0]
 
@@ -1563,15 +2943,10 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             logger.error(f"update_node_content failed for {node_id}: {e}")
             return False
 
-    def create_node_edge(self, source_id: str, target_id: str, relation: str, weight: float = 0.5) -> bool:
+    def create_node_edge(self, source_id: str, target_id: str, relation: str, weight: float = 0.5, allow_hidden: bool = False, allow_virtual: bool = False) -> bool:
         """统一的边创建接口（daemon/工具共用）。"""
         try:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO node_edges (source_id, target_id, relation, weight) VALUES (?,?,?,?)",
-                (source_id, target_id, relation, weight)
-            )
-            self._conn.commit()
-            return True
+            return self.add_edge(source_id, target_id, relation, weight, allow_hidden=allow_hidden, allow_virtual=allow_virtual)
         except Exception as e:
             logger.error(f"create_node_edge failed ({source_id} -> {target_id}): {e}")
             return False
@@ -1709,12 +3084,71 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
 
     # ─── 写入接口 ───
 
-    def create_node(self, node_id: str, ntype: str, title: str, 
+    def _normalize_evidence_refs(self, evidence_refs: Any) -> List[Dict[str, str]]:
+        if not evidence_refs:
+            return []
+        raw_refs = evidence_refs
+        if isinstance(raw_refs, str):
+            try:
+                raw_refs = json.loads(raw_refs)
+            except Exception:
+                return []
+        if isinstance(raw_refs, dict):
+            raw_refs = [raw_refs]
+        if not isinstance(raw_refs, list):
+            return []
+        normalized_refs: List[Dict[str, str]] = []
+        for raw_ref in raw_refs:
+            if not isinstance(raw_ref, dict):
+                continue
+            ref_type = str(raw_ref.get("type") or raw_ref.get("kind") or "").strip()
+            ref_value = str(
+                raw_ref.get("ref")
+                or raw_ref.get("path")
+                or raw_ref.get("command")
+                or raw_ref.get("query")
+                or raw_ref.get("trace_id")
+                or raw_ref.get("source")
+                or ""
+            ).strip()
+            excerpt = str(
+                raw_ref.get("excerpt")
+                or raw_ref.get("output")
+                or raw_ref.get("result")
+                or raw_ref.get("observation")
+                or ""
+            ).strip()
+            observed_at = str(raw_ref.get("observed_at") or raw_ref.get("timestamp") or "").strip()
+            if not ref_type or not (ref_value or excerpt):
+                continue
+            normalized_ref = {"type": ref_type[:80]}
+            if ref_value:
+                normalized_ref["ref"] = ref_value[:300]
+            if excerpt:
+                normalized_ref["excerpt"] = excerpt[:500]
+            if observed_at:
+                normalized_ref["observed_at"] = observed_at[:80]
+            normalized_refs.append(normalized_ref)
+            if len(normalized_refs) >= 10:
+                break
+        return normalized_refs
+
+    def _has_hard_evidence(self, verification_source: str, evidence_refs: List[Dict[str, str]], trust_tier: str = "") -> bool:
+        if str(trust_tier or "").strip().upper() == "HUMAN":
+            return True
+        for evidence_ref in evidence_refs:
+            ref_type = str((evidence_ref or {}).get("type") or "").strip().lower()
+            if ref_type in self.HARD_EVIDENCE_REF_TYPES:
+                return True
+        return False
+
+    def create_node(self, node_id: str, ntype: str, title: str,
                     human_translation: str, tags: str,
                     full_content: str, source: str = "sedimenter",
                     prerequisites: str = None, resolves: str = None,
                     parent_node_id: str = None,
                     metadata_signature: Optional[Dict[str, Any]] = None,
+                    evidence_refs: Optional[List[Dict[str, Any]]] = None,
                     confidence_score: Optional[float] = None,
                     last_verified_at: Optional[str] = None,
                     verification_source: Optional[str] = None,
@@ -1725,22 +3159,53 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         """创建一个新的双层节点（索引 + 内容），支持注入因果属性和自动向量化"""
         # 如果是知识类节点，自动计算其向量
         embedding_json = None
+        signature_input = metadata_signature
+        signature_evidence_refs = None
+        if isinstance(metadata_signature, dict):
+            signature_input = dict(metadata_signature)
+            signature_evidence_refs = signature_input.pop("evidence_refs", None)
+            if signature_evidence_refs is None:
+                signature_evidence_refs = signature_input.pop("evidence_ref", None)
+        normalized_evidence_refs = self._normalize_evidence_refs(evidence_refs or signature_evidence_refs)
         normalized_signature = self.bind_environment_signature(
-            metadata_signature,
+            signature_input,
             ntype,
             context_text=f"{title}\n{full_content[:500]}" if full_content else title,
         )
+        if normalized_evidence_refs:
+            normalized_signature["evidence_refs"] = normalized_evidence_refs
+            normalized_signature["evidence_ref_count"] = str(len(normalized_evidence_refs))
+            normalized_signature["evidence_ref_types"] = ",".join(sorted({ref["type"] for ref in normalized_evidence_refs}))
         resolved_validation_status = self.signature.resolve_validation_status(normalized_signature)
         if resolved_validation_status:
             normalized_signature["validation_status"] = resolved_validation_status
-        normalized_signature["knowledge_state"] = self.signature.resolve_knowledge_state(normalized_signature, ntype)
+        downgraded_validation = False
+        if normalized_signature.get("validation_status") == "validated" and not self._has_hard_evidence(verification_source or source, normalized_evidence_refs, trust_tier):
+            normalized_signature["validation_status"] = "partial"
+            normalized_signature["validation_gate"] = "missing_hard_evidence"
+            downgraded_validation = True
+            try:
+                from genesis.v4.diagnostics import PipelineDiagnostics
+                PipelineDiagnostics.empty_evidence_validated.record(True)
+            except Exception:
+                pass
+        else:
+            try:
+                from genesis.v4.diagnostics import PipelineDiagnostics
+                PipelineDiagnostics.empty_evidence_validated.record(False)
+            except Exception:
+                pass
+        if downgraded_validation:
+            normalized_signature["knowledge_state"] = "unverified"
+        else:
+            normalized_signature["knowledge_state"] = self.signature.resolve_knowledge_state(normalized_signature, ntype)
         # Temporal metadata: auto-set valid_from if not already present
         if "valid_from" not in normalized_signature:
             normalized_signature["valid_from"] = datetime.utcnow().strftime("%Y-%m-%d")
         signature_json = json.dumps(normalized_signature, ensure_ascii=False) if normalized_signature else None
         signature_text = self.signature.render(normalized_signature)
         validated_tier = trust_tier if trust_tier in TRUST_TIERS else "REFLECTION"
-        normalized_last_verified = last_verified_at
+        normalized_last_verified = None if downgraded_validation else last_verified_at
         if not normalized_last_verified and normalized_signature.get("validation_status") == "validated":
             normalized_last_verified = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         normalized_verification_source = verification_source or (source if normalized_last_verified else None)
@@ -1753,6 +3218,10 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
                 embedding_json = json.dumps(vec)
                 self.vector_engine.add_to_matrix(node_id, vec)
 
+        existing_node = self._conn.execute(
+            "SELECT 1 FROM knowledge_nodes WHERE node_id = ? LIMIT 1",
+            (node_id,)
+        ).fetchone()
         # 版本链：如果节点已存在，先快照旧版本
         self._snapshot_if_exists(node_id)
 
@@ -1784,6 +3253,13 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         )
         self._conn.commit()
         logger.info(f"NodeVault: Created node [{node_id}] ({ntype}) — {title}")
+        try:
+            resolved_voids = self.resolve_matching_voids_for_node(node_id, title=title, full_content=full_content)
+            crystallized = 0 if existing_node else self.crystallize_potential_samples_for_node(node_id, title=title)
+            if resolved_voids or crystallized:
+                logger.info(f"NodeVault lifecycle: [{node_id}] resolved_voids={resolved_voids}, crystallized_potential={crystallized}")
+        except Exception as e:
+            logger.debug(f"Node lifecycle hooks skipped for {node_id}: {e}")
 
     def backfill_embeddings(self) -> Dict[str, int]:
         """
@@ -1882,7 +3358,7 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             return
         placeholders = ','.join('?' * len(node_ids))
         self._conn.execute(
-            f"UPDATE knowledge_nodes SET usage_count = usage_count + 1, updated_at = CURRENT_TIMESTAMP WHERE node_id IN ({placeholders})",
+            f"UPDATE knowledge_nodes SET usage_count = usage_count + 1, updated_at = CURRENT_TIMESTAMP WHERE node_id IN ({placeholders}) AND COALESCE(ablation_active,0) = 0",
             tuple(node_ids)
         )
 
