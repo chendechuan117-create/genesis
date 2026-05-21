@@ -19,6 +19,9 @@ import discord
 
 from genesis.core.models import CallbackEvent
 from genesis.v4.manager import NodeVault
+from genesis.v4.chapter_state import build_chapter_state_packet
+from genesis.v4.diagnostics import PipelineDiagnostics
+from genesis.tools.pls_async_scout import build_pls_terrain_brief, build_pls_branch_proposals, stage_pls_branch_proposals
 
 logger = logging.getLogger("DiscordBot.Auto")
 
@@ -94,24 +97,39 @@ SPIRAL_CONCURRENCY = _env_int("GENESIS_SPIRAL_CONCURRENCY", 3, minimum=1)
 SELF_EVOLUTION_ENABLED = _env_bool("GENESIS_SELF_EVOLUTION", False)
 SELF_EVOLUTION_COOLDOWN = _env_int("GENESIS_SELF_EVOLUTION_COOLDOWN", 10, minimum=3)
 SELF_EVOLUTION_UNTRACKED_COOLDOWN = _env_int("GENESIS_SELF_EVOLUTION_UNTRACKED_COOLDOWN", 5, minimum=2)
+SELF_EVOLUTION_CANARY_ROUNDS = _env_int("GENESIS_SELF_EVOLUTION_CANARY_ROUNDS", 3, minimum=1)
+SELF_EVOLUTION_REVIEW_MODE = os.getenv("GENESIS_SELF_EVOLUTION_REVIEW_MODE", "shadow").strip().lower()
+if SELF_EVOLUTION_REVIEW_MODE not in ("shadow", "blocking"):
+    logger.warning(f"Invalid GENESIS_SELF_EVOLUTION_REVIEW_MODE={SELF_EVOLUTION_REVIEW_MODE!r}; fallback to shadow")
+    SELF_EVOLUTION_REVIEW_MODE = "shadow"
+PLS_TERRAIN_SCOUT_ENABLED = _env_bool("GENESIS_PLS_TERRAIN_SCOUT", True)
+PLS_TERRAIN_SCOUT_TIMEOUT_SECS = _env_int("GENESIS_PLS_TERRAIN_SCOUT_TIMEOUT_SECS", 8, minimum=1)
+PLS_BRANCH_PROPOSALS_ENABLED = _env_bool("GENESIS_PLS_BRANCH_PROPOSALS", True)
+PLS_BRANCH_PROPOSALS_TIMEOUT_SECS = _env_int("GENESIS_PLS_BRANCH_PROPOSALS_TIMEOUT_SECS", 8, minimum=1)
+PLS_BRANCH_PROPOSAL_STAGING_ENABLED = _env_bool("GENESIS_PLS_BRANCH_PROPOSAL_STAGING", False)
+PLS_BRANCH_PROPOSAL_STAGING_TIMEOUT_SECS = _env_int("GENESIS_PLS_BRANCH_PROPOSAL_STAGING_TIMEOUT_SECS", 8, minimum=1)
 
-AUTO_PROMPT_FIRST = """你是 Genesis 的自主探索者。你的目标不是修 bug 或填空洞——而是基于已有知识，发现 Genesis 还没想到的新可能性。
+AUTO_PROMPT_FIRST = """你是 Genesis 的自主概念探索者。你的目标不是修 bug、填代码空洞或为了产出而修改系统——而是基于已有知识，让 LLM 对 Genesis/Yogg 这个概念越来越理解。
 
 ## 用户方向
 {directive}
 
 ## 方法
 1. 先利用当前上下文里的记忆和经验；不够时再用 `search_knowledge_nodes`
-2. 基于已有经验，提出一个大胆假设：Genesis 还可以怎样变得更强？
-3. 在 Doctor 沙箱中实验验证你的假设
-4. 如果形成了值得以后复用的新理解，用 record_point 记下，再用 record_line 说明它来自哪些已有经验
+2. 围绕一个概念切片提出假设：why / what / how / boundary / failure / practice 哪一面还不清楚？
+3. 优先补全概念面；代码、Doctor 和运行观察只是实践证据，不是默认行动目标
+4. 只有当概念判断必须依赖实践证据时，才在 Doctor 沙箱中做最小验证
+5. 把共场、势和 branch proposal 当作注意力候选，不当作事实；只有形成可复用结晶时才用 record_point 记下，再用 record_line 说明它来自哪些已有经验
 
 ## 规则
 - 围绕用户方向行动
-- 每轮聚焦一个假设，做到位
+- 每轮聚焦一个概念缺口，做到位
 - 已有知识直接用，你的价值在于发现新的
+- 不要把代码细节越补越密；你的目标是让概念面更具体、更有边界、更可复用
 - 不要做琐碎的环境检查——只在实验需要时才检查环境
-- **基础节点**可直接依赖，**探索节点**需验证后再用
+- **基础候选**可优先参考但不是验证证明，**探索候选**需证据支撑后再用
+- `record_point` 默认是 CONTEXT；只有经过验证、可复用的强结晶经验才显式写 LESSON
+- 可验证势、出口势和 proposal 只是候选，不要为了落库把它们改写成 LESSON，也不要从它们直接升级为改代码
 - 不要把记忆当成外部报告反复质疑；只有当证据冲突或结果失败时，才停下来核对
 
 ## 沙箱规则（严格遵守）
@@ -123,9 +141,11 @@ AUTO_PROMPT_FIRST = """你是 Genesis 的自主探索者。你的目标不是修
 - 你可以自由读取本体代码（read_file）用于诊断，但写入只能进沙箱
 
 当前系统信号（仅供参考）：
-{signals}"""
+{signals}
 
-AUTO_PROMPT_CONTINUE = """继续自主探索。上一轮留下的是痕迹，不是答案。
+{chapter_state}"""
+
+AUTO_PROMPT_CONTINUE = """继续自主概念探索。上一轮留下的是痕迹，不是答案。
 
 ## 用户方向
 {directive}
@@ -140,10 +160,13 @@ AUTO_PROMPT_CONTINUE = """继续自主探索。上一轮留下的是痕迹，不
 
 ## 续跑原则
 - 参考上一轮，但不要把它当作必须继承的结论
-- 如果上一轮的假设已验证或已证伪，提出新的假设
-- 追求让人意想不到的发现，不是流水线式的节点记录
-- 每轮聚焦一个假设，做到位
-- 如果形成了值得以后复用的新理解，用 record_point 记下，再用 record_line 说明它来自哪些已有经验；没有新理解时，不需要为了记录而记录
+- 如果上一轮的概念假设已验证、已证伪或已饱和，转向相邻概念缺口
+- 追求让人意想不到的概念补全，不是流水线式的节点记录或代码补洞
+- 每轮聚焦一个概念缺口，做到位
+- 代码、Doctor 和运行观察只是实践证据；不要为了显示进展而默认修改代码
+- 把共场、势和 branch proposal 当作注意力候选，不当作事实；只有形成可复用结晶时才用 record_point 记下，再用 record_line 说明它来自哪些已有经验；没有新理解时，不需要为了记录而记录
+- `record_point` 默认是 CONTEXT；只有经过验证、可复用的强结晶经验才显式写 LESSON
+- 可验证势、出口势和 proposal 只是候选，不要为了落库把它们改写成 LESSON，也不要从它们直接升级为改代码
 
 ## 沙箱规则（严格遵守）
 - **禁止直接修改 genesis/ 目录下的任何 .py 源文件**——那是正在运行的本体
@@ -154,13 +177,16 @@ AUTO_PROMPT_CONTINUE = """继续自主探索。上一轮留下的是痕迹，不
 - 你可以自由读取本体代码（read_file）用于诊断，但写入只能进沙箱
 
 当前信号（仅供参考）：
-{signals}"""
+{signals}
+
+{chapter_state}"""
 
 
 AUTO_DEFAULT_DIRECTIVE = (
-    "基于 Genesis 的元信息系统（知识库、经验图谱、Arena），改进 Genesis 系统本身。"
-    "方法：读已有知识 → 提出改进假设 → 在 Doctor 沙箱中修改 → 测试验证 → 记录可复用的新理解。"
-    "所有代码修改必须在 Doctor 沙箱中进行（单行用 doctor.sh exec，多行脚本用 doctor.sh run），严禁直接改本体源码。"
+    "围绕 Genesis/Yogg 作为一个概念整体进行 PLS 概念面探索。"
+    "目标：补全 why / what / how / boundary / failure / practice，让后续 LLM 对这个概念形成更具体的大局观。"
+    "方法：读已有知识 → 找出一个概念缺口或概念势 → 补全概念面 → 必要时用代码、Doctor 或运行观察作为最小实践证据 → 记录可复用的新理解。"
+    "不要把默认目标设为修 bug、改代码或填代码空洞；所有代码修改如确有必要，必须在 Doctor 沙箱中进行，严禁直接改本体源码。"
     "每轮只做一件事，做到位。"
 )
 
@@ -345,13 +371,12 @@ def _get_auto_signals(round_num: int = 1, session_shown_voids: set | None = None
                 "ORDER BY usage_fail_count DESC LIMIT 5"
             ).fetchall()
             if failing_rows:
-                lines = ["[实践中反复失败的知识 — 失败次数>成功次数]"]
+                lines = ["[实践中表现不稳定的知识 — 需要复核]"]
                 for r in failing_rows:
                     nid = r['node_id']
                     if session_shown_nodes and nid in session_shown_nodes:
                         continue
-                    w, l = r['usage_success_count'] or 0, r['usage_fail_count'] or 0
-                    lines.append(f"  {nid}: {r['title']} ({w}W/{l}L)")
+                    lines.append(f"  {nid}: {r['title']}（实践表现不稳定，需复核）")
                     if session_shown_nodes is not None:
                         session_shown_nodes.add(nid)
                 if len(lines) > 1:
@@ -582,6 +607,36 @@ def _trim_frontier_item(text: str, limit: int = 220) -> str:
     return text[: limit - 3].rstrip() + "..."
 
 
+def _format_kb_node_ref(node: dict, title_limit: int = 60) -> str:
+    node = node if isinstance(node, dict) else {}
+    node_id = str(node.get("node_id") or "?").strip()
+    title = _trim_frontier_item(node.get("title") or "?", title_limit)
+    return f"[{node_id}] {title}"
+
+
+def _summarize_confirmed_pls_results(round_events: list, kb_delta: dict | None = None, limit: int = 5) -> str:
+    entries = []
+    for event in round_events or []:
+        if event.get("type") != "tool_result":
+            continue
+        name = str(event.get("name") or "").strip()
+        result = str(event.get("result_preview") or "")
+        if name in ("record_point", "record_context_node") and result.startswith("✅"):
+            match = re.search(r"\[([^\]]+)\]\s*'([^']*)'", result)
+            if match:
+                entries.append(f"POINT [{match.group(1)}] {_trim_frontier_item(match.group(2), 50)}")
+        elif name == "record_line" and (result.startswith("✅ LINE") or result.startswith("ℹ️ LINE")):
+            match = re.search(r":\s*([^\s]+)\s+--\[based_on\]-->\s*([^\s]+)", result)
+            if match:
+                entries.append(f"LINE {match.group(1)}→{match.group(2)}")
+        if len(entries) >= limit:
+            break
+    if not entries and isinstance(kb_delta, dict):
+        for node in (kb_delta.get("new_nodes") or [])[:limit]:
+            entries.append("NODE " + _format_kb_node_ref(node, 50))
+    return "落库: " + " | ".join(entries) if entries else ""
+
+
 def _summarize_event_args(args: dict | None) -> dict:
     if not isinstance(args, dict):
         return {}
@@ -626,18 +681,52 @@ def _extract_blueprint_goal(events: list) -> str:
     return ""
 
 
+def _clean_candidate_issue_text(text: str) -> str:
+    cleaned = _compact_whitespace(text).lstrip("> ").strip()
+    cleaned = re.sub(r"^\*+\s*", "", cleaned)
+    cleaned = re.sub(r"\s*\*+$", "", cleaned)
+    return cleaned.strip(" ：:。")
+
+
+def _is_candidate_issue_boilerplate(text: str) -> bool:
+    cleaned = _compact_whitespace(text).strip("* ：:。")
+    if not cleaned:
+        return True
+    boilerplate_prefixes = (
+        "本轮探索", "...本轮探索", "本轮概念探索", "...本轮概念探索",
+        "收束完成", "...收束完成", "完成", "已完成一轮", "已继续完成一轮",
+        "已继续推进", "不过", "如果你要",
+    )
+    return any(cleaned.startswith(prefix) for prefix in boilerplate_prefixes)
+
+
+def _extract_labeled_issue(line: str) -> str:
+    cleaned = _clean_candidate_issue_text(line)
+    match = re.search(r"(?:核心发现|核心验证|核心结论|本轮发现|核心机制)\*{0,2}\s*[：:]\s*(.+)$", cleaned)
+    if not match:
+        return ""
+    issue = _clean_candidate_issue_text(match.group(1))
+    if issue in ("如下", "如下：") or _is_candidate_issue_boilerplate(issue):
+        return ""
+    return _trim_frontier_item(issue, 240)
+
+
 def _extract_candidate_issue(response: str) -> str:
     lines = [line.strip() for line in str(response or "").splitlines() if line.strip()]
     section_starts = ("## 本轮新问题", "## 本轮选中的新问题", "## 本轮选中的问题", "## 这轮修的是什么", "## 本轮问题")
     stop_markers = ("如果你要，我下一轮可以", "如果你要，我下一轮我会", "如果你要，我会优先", "下一轮可以继续", "下一轮我会优先")
+    for line in lines:
+        issue = _extract_labeled_issue(line)
+        if issue:
+            return issue
     for idx, line in enumerate(lines):
         if any(line.startswith(prefix) for prefix in section_starts):
             collected = []
             for candidate in lines[idx + 1:]:
                 if candidate.startswith("## "):
                     break
-                cleaned = candidate.lstrip("> ").strip()
-                if not cleaned:
+                cleaned = _clean_candidate_issue_text(candidate)
+                if not cleaned or _is_candidate_issue_boilerplate(cleaned):
                     continue
                 if any(marker in cleaned for marker in stop_markers):
                     break
@@ -651,16 +740,24 @@ def _extract_candidate_issue(response: str) -> str:
                 return issue
     for line in lines:
         if line.startswith(">"):
-            issue = _trim_frontier_item(line.lstrip("> ").strip(), 240)
-            if issue:
+            issue = _trim_frontier_item(_clean_candidate_issue_text(line), 240)
+            if issue and not _is_candidate_issue_boilerplate(issue):
                 return issue
-    skip_prefixes = ("已完成一轮", "已继续完成一轮", "已继续推进", "不过", "如果你要", "- ", "## ")
+    skip_prefixes = ("已完成一轮", "已继续完成一轮", "已继续推进", "不过", "如果你要", "- ", "## ", "落库:", "✅", "❌", "⚠️", "ℹ️", "LINE", "POINT")
     for line in lines:
         if any(line.startswith(prefix) for prefix in skip_prefixes):
             continue
-        cleaned = _trim_frontier_item(line, 240)
-        if cleaned:
-            return cleaned
+        cleaned = _trim_frontier_item(_clean_candidate_issue_text(line), 240)
+        if not cleaned or _is_candidate_issue_boilerplate(cleaned):
+            continue
+        # 过滤元操作宣告（如落库: / ✅ / POINT等）以及过短的噪声
+        if any(p in cleaned for p in ("LINE [", "POINT [", "CONTEXT [", "落库:")) or cleaned.startswith(("✅", "❌", "⚠️", "ℹ️")):
+            continue
+        if cleaned.startswith("|") and cleaned.endswith("|"):
+            continue
+        if len(cleaned) < 8:
+            continue
+        return cleaned
     return ""
 
 
@@ -762,6 +859,20 @@ def _build_pls_telemetry(round_events: list, kb_delta: dict | None = None) -> di
         "knowledge_searches": 0,
         "kb_new_nodes": 0,
         "kb_updated_nodes": 0,
+        "tool_cost_cheap": 0,
+        "tool_cost_moderate": 0,
+        "tool_cost_expensive": 0,
+    }
+    # 工具成本映射（与 Tool.cost_estimate 保持一致）
+    _TOOL_COST = {
+        "read_file": "cheap", "list_directory": "cheap", "grep_files": "cheap",
+        "search_knowledge_nodes": "cheap", "get_knowledge_node_content": "cheap",
+        "trace_query": "cheap", "pls_query": "cheap",
+        "write_file": "moderate", "append_file": "moderate", "shell": "moderate",
+        "record_lesson_node": "moderate", "record_context_node": "moderate",
+        "record_point": "moderate", "record_line": "moderate",
+        "create_node_edge": "moderate", "record_discovery": "moderate",
+        "web_search": "expensive", "browser_use": "expensive", "read_url": "expensive",
     }
     for event in round_events or []:
         if event.get("type") not in ("tool_result", "search_result"):
@@ -796,6 +907,10 @@ def _build_pls_telemetry(round_events: list, kb_delta: dict | None = None) -> di
                 telemetry["line_errors"] += 1
         if "碰撞检测" in result or "饱和:" in result or "VIRT_" in result or "SATURATED:" in result:
             telemetry["saturation_hints"] += 1
+        # 工具成本统计
+        cost_tier = _TOOL_COST.get(name)
+        if cost_tier:
+            telemetry[f"tool_cost_{cost_tier}"] += 1
     if isinstance(kb_delta, dict):
         telemetry["kb_new_nodes"] = len(kb_delta.get("new_nodes") or [])
         telemetry["kb_updated_nodes"] = len(kb_delta.get("updated_nodes") or [])
@@ -804,10 +919,14 @@ def _build_pls_telemetry(round_events: list, kb_delta: dict | None = None) -> di
 
 def _format_pls_telemetry(telemetry: dict | None) -> str:
     t = telemetry or {}
+    cheap = t.get('tool_cost_cheap', 0)
+    mod = t.get('tool_cost_moderate', 0)
+    exp = t.get('tool_cost_expensive', 0)
+    cost_str = f"cost:[c{cheap}/m{mod}/e{exp}]" if (cheap + mod + exp) > 0 else ""
     return (
         f"PLS[p={t.get('points_created', 0)} ctx={t.get('context_nodes_written', 0)} "
         f"l={t.get('lines_created', 0)} same/cross={t.get('same_round_lines', 0)}/{t.get('cross_round_lines', 0)} "
-        f"err={t.get('point_errors', 0) + t.get('line_errors', 0)} sat={t.get('saturation_hints', 0)}]"
+        f"err={t.get('point_errors', 0) + t.get('line_errors', 0)} sat={t.get('saturation_hints', 0)}] {cost_str}"
     )
 
 
@@ -847,6 +966,35 @@ def _dedupe_trimmed_items(values: list, item_limit: int, list_limit: int) -> lis
     return items
 
 
+def _dedupe_compact_items(values: list) -> list:
+    items = []
+    for value in values or []:
+        cleaned = _compact_whitespace(value)
+        if cleaned and cleaned.upper() != "NONE" and cleaned not in items:
+            items.append(cleaned)
+    return items
+
+
+def _sanitize_rolling_state_text(value: str) -> str:
+    text = _compact_whitespace(value)
+    if not text:
+        return ""
+    replacements = {
+        "已确认:": "候选观察(source=rolling_state_proxy):",
+        "已确认事实": "已写入观察",
+        "已知事实": "已写入节点",
+        "有活动但无持久产出": "有工具/回复活动但未观察到 sandbox tracked diff 变化(source=sandbox_diff_snapshot, semantic_progress=unknown)",
+        "无持久产出": "未观察到 sandbox tracked diff 变化(source=sandbox_diff_snapshot, semantic_progress=unknown)",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
+
+def _sanitize_rolling_state_items(values: list) -> list:
+    return _dedupe_compact_items(_sanitize_rolling_state_text(value) for value in values or [])
+
+
 def _derive_reanchor_stop_reason(reanchor_required: bool, reanchor_streak: int, activity_detected: bool, consecutive_dry: int) -> str:
     if not reanchor_required:
         return ""
@@ -866,48 +1014,51 @@ def _build_frontier_state(round_index, response, kb_delta_summary, kb_changed, n
     tool_names = _collect_tool_names(round_events)
     reanchor_required, reanchor_reason = _detect_reanchor_signal(response, round_events)
     reanchor_streak = prior_reanchor_streak + 1 if reanchor_required else 0
-    observations = [f"KB {kb_delta_summary}", node_telemetry]
-    # Inject actual node titles so GP knows what it already verified
+    observations = [f"KB(source=vault_delta) {kb_delta_summary}", node_telemetry]
+    # Inject actual node titles so GP sees concrete vault deltas
     # (not just meta counts like "+3新/8更新" which tell GP nothing about content)
     if kb_delta:
-        new_titles = [n.get("title", "?")[:60] for n in (kb_delta.get("new_nodes") or [])[:3]]
-        upd_titles = [n.get("title", "?")[:60] for n in (kb_delta.get("updated_nodes") or [])[:3]]
-        if new_titles:
-            observations.append("本轮新增: " + " | ".join(new_titles))
-        if upd_titles:
-            observations.append("本轮更新: " + " | ".join(upd_titles))
+        new_nodes = [_format_kb_node_ref(n) for n in (kb_delta.get("new_nodes") or [])[:3]]
+        upd_nodes = [_format_kb_node_ref(n) for n in (kb_delta.get("updated_nodes") or [])[:3]]
+        if new_nodes:
+            observations.append("本轮新增: " + " | ".join(new_nodes))
+        if upd_nodes:
+            observations.append("本轮更新: " + " | ".join(upd_nodes))
+    confirmed_pls = _summarize_confirmed_pls_results(round_events, kb_delta, limit=4)
+    if confirmed_pls:
+        observations.append(confirmed_pls)
     if candidate_issue and candidate_issue not in ("未提取", "未从上轮回复中提取到稳定问题定义"):
-        observations.insert(0, f"已确认: {candidate_issue[:150]}")
+        observations.insert(0, f"候选问题(source=response_text): {candidate_issue[:150]}")
     if tool_names:
-        observations.append("工具结果: " + ", ".join(tool_names))
+        observations.append("工具结果(source=tool_event): " + ", ".join(tool_names))
     if reanchor_required:
         observations.append(f"锚定状态: 已连续 {reanchor_streak} 轮需要重新锚定" if reanchor_streak >= 2 else "锚定状态: 需要重新锚定")
-    observations.append("文本回复: 有" if response and str(response).strip() else "文本回复: 无")
+    observations.append("文本回复(source=response_text): 有" if response and str(response).strip() else "文本回复(source=response_text): 无")
     carry_warnings = []
     # ── Strong-but-dry: GP is active but producing no durable outcome ──
     # This is the key signal that breaks the verification loop.
     # kb_changed=True + tools used → old logic never warned → GP kept re-verifying.
     if progress_class in ("strong", "soft") and consecutive_dry >= 3:  # PLS: 2→3，多给一轮深挖机会
-        carry_warnings.insert(0, f"已连续{consecutive_dry}轮有活动但无持久产出(progress={progress_class})——先判断当前线索是否已说清；若已说清，再转向相邻问题")
+        carry_warnings.insert(0, f"连续{consecutive_dry}轮未观察到 sandbox tracked diff 变化(source=sandbox_diff_snapshot, progress_proxy={progress_class}, semantic_progress=unknown)——先收束当前证据链，说明它补全了哪一类概念面；若已说清，切换到新的 why / what / how / boundary / failure / practice 概念缺口，不要沿代码细节续挖")
     if response and not kb_changed:
-        carry_warnings.append("上轮无新知识写入：如果只是复述，换到相邻问题；如果仍有代码证据未看完，继续推进")
+        carry_warnings.append("上轮未观察到新知识写入(source=vault_delta, semantic_progress=unknown)：如果只是复述，收束概念贡献并切换概念缺口；只有概念判断缺证据时才补最小代码/Doctor 证据")
     if not tool_names:
-        carry_warnings.append("上轮无工具调用：如果相关知识已足够，推进到相邻问题；否则先补关键证据")
+        carry_warnings.append("上轮无工具调用(source=tool_event_absence, semantic_progress=unknown)：如果概念面已足够，切换概念缺口；否则只补能支撑概念判断的关键证据")
     if reanchor_required:
-        carry_warnings.insert(0, f"检测到信息错位：{reanchor_reason}")
+        carry_warnings.insert(0, f"检测到信息错位信号(source=response_or_tool_trace_pattern)：{reanchor_reason}")
     if reanchor_streak >= 2:
-        carry_warnings.insert(0, f"信息错位已连续 {reanchor_streak} 轮出现；如重锚后仍无新的外部证据，应停止当前路径")
+        carry_warnings.insert(0, f"信息错位信号已连续 {reanchor_streak} 轮出现(source=response_or_tool_trace_pattern)；如重锚后仍无新的外部证据，应停止当前路径")
     if not next_checks:
         if consecutive_dry >= 4:  # PLS: 3→4，与 carry_warnings 阈值对齐
-            next_checks = ["当前线索已连续空转，判断是缺少证据还是问题已说清", "若已说清，转向相邻问题；不要为了换方向而跳到无关问题"]
+            next_checks = ["当前线索已连续缺少 sandbox tracked diff 变化(source=sandbox_diff_snapshot, semantic_progress=unknown)，先把已获得证据收束成概念贡献", "若已说清，切换到新的 why / what / how / boundary / failure / practice 缺口；不要继续沿代码实现细节挖"]
         elif kb_changed:
-            next_checks = ["在已确认事实基础上探索新的相邻问题", "避免重复验证已知事实"]
+            next_checks = ["在已观察到的 KB 变化(source=vault_delta, semantic_progress=unknown)基础上探索新的概念切片", "避免重复验证已写入节点或把代码证据当成默认目标"]
         else:
-            next_checks = ["当前方向已无新信息，先判断是否已经说清", "若已说清，转向相邻问题；不要重复验证已有结论"]
+            next_checks = ["当前方向未观察到新 KB 写入(source=vault_delta, semantic_progress=unknown)，先判断概念贡献是否已经说清", "若已说清，切换到新的概念缺口；不要重复验证已有结论"]
     if reanchor_required:
         next_checks = ["先确认 Doctor /workspace 快照、实际导入目标和测试入口是否一致", "确认当前 diff/修改落在哪个副本，再继续沿当前问题推进", *next_checks]
     if reanchor_streak >= 2:
-        next_checks = ["若重新锚定后仍只剩文本推进或空转，结束当前线索并转向相邻问题", *next_checks]
+        next_checks = ["若重新锚定后仍只剩文本推进或空转，收束当前概念贡献并切换到新的概念缺口", *next_checks]
     return {
         "round": round_index,
         "local_goal": local_goal or candidate_issue or "待重新锁定",
@@ -954,33 +1105,33 @@ def _build_auto_knowledge_state(frontier_state, round_events, raw_state=None):
     issue_seed = (
         frontier_state.get("candidate_issue") or frontier_state.get("local_goal") or raw_state.get("issue") or "待重新锁定"
     )
-    issue = _trim_frontier_item(issue_seed, 240)
-    # verified_facts: frontier observations 优先（本轮新鲜数据），raw_state 补充
-    frontier_obs = _dedupe_trimmed_items(frontier_state.get("observations") or [], 220, 3)
-    raw_facts = _dedupe_trimmed_items(raw_state.get("verified_facts") or [], 220, 3)
-    verified_facts = _dedupe_trimmed_items(frontier_obs + raw_facts, 220, 5)
-    # failed_attempts / next_checks: frontier 优先，raw_state 补充
-    frontier_warnings = _dedupe_trimmed_items(frontier_state.get("carry_warnings") or [], 220, 3)
-    raw_failures = _dedupe_trimmed_items(raw_state.get("failed_attempts") or [], 220, 3)
-    failed_attempts = _dedupe_trimmed_items(frontier_warnings + raw_failures, 220, 5)
-    next_checks = _dedupe_trimmed_items(
-        (frontier_state.get("next_checks") or []) + (raw_state.get("next_checks") or []), 180, 5
+    issue = _compact_whitespace(issue_seed)
+    # verified_facts: frontier observations 优先（本轮新鲜数据），raw_state 补充（上限 5 条防累积冻结）
+    frontier_obs = _dedupe_compact_items(frontier_state.get("observations") or [])
+    raw_facts = _sanitize_rolling_state_items(raw_state.get("verified_facts") or [])
+    verified_facts = _dedupe_compact_items(frontier_obs + raw_facts)
+    # failed_attempts / next_checks: frontier 优先，raw_state 补充（上限 5 条）
+    frontier_warnings = _dedupe_compact_items(frontier_state.get("carry_warnings") or [])
+    raw_failures = _sanitize_rolling_state_items(raw_state.get("failed_attempts") or [])
+    failed_attempts = _dedupe_compact_items(frontier_warnings + raw_failures)
+    next_checks = _dedupe_compact_items(
+        (frontier_state.get("next_checks") or []) + _sanitize_rolling_state_items(raw_state.get("next_checks") or [])
     )
     if frontier_state.get("reanchor_required"):
         anchor_warning = f"信息错位风险：{frontier_state.get('reanchor_reason') or '当前修改目标与实际生效环境可能不一致'}"
-        failed_attempts = _dedupe_trimmed_items([anchor_warning, *failed_attempts], 220, 5)
-        next_checks = _dedupe_trimmed_items([
+        failed_attempts = _dedupe_compact_items([anchor_warning, *failed_attempts])
+        next_checks = _dedupe_compact_items([
             "先确认 Doctor /workspace 快照、实际导入目标和测试入口是否一致",
             "确认当前 diff/修改落在哪个副本，再继续沿当前问题推进", *next_checks,
-        ], 180, 5)
+        ])
     if frontier_state.get("reanchor_streak", 0) >= 2:
-        failed_attempts = _dedupe_trimmed_items([
+        failed_attempts = _dedupe_compact_items([
             f"信息错位已连续 {frontier_state.get('reanchor_streak')} 轮出现；未重锚前不要继续沿当前假设叠加修改",
             *failed_attempts,
-        ], 220, 5)
-        next_checks = _dedupe_trimmed_items([
-            "若重新锚定后仍只剩文本推进或空转，收束当前线索并转向相邻问题", *next_checks,
-        ], 180, 5)
+        ])
+        next_checks = _dedupe_compact_items([
+            "若重新锚定后仍只剩文本推进或空转，收束当前概念贡献并切换到新的概念缺口", *next_checks,
+        ])
     return {"issue": issue, "verified_facts": verified_facts, "failed_attempts": failed_attempts, "next_checks": next_checks}
 
 
@@ -988,12 +1139,17 @@ def _format_knowledge_state(knowledge_state: dict) -> str:
     if not knowledge_state:
         return "(上轮没有稳定工作记忆，回到外部观测重新取证)"
     lines = [f"- issue: {knowledge_state.get('issue') or '待重新锁定'}"]
+    labels = {
+        "verified_facts": "observations [freshness=rolling, capped_at_5]",
+        "failed_attempts": "avoid_repeating [freshness=rolling, capped_at_5]",
+        "next_checks": "next_checks [freshness=rolling, capped_at_5]",
+    }
     for key in ["verified_facts", "failed_attempts", "next_checks"]:
         values = knowledge_state.get(key) or []
         if values:
-            lines.append(f"- {key}:")
-            for item in values:
-                lines.append(f"  - {item}")
+            lines.append(f"- {labels.get(key, key)}:")
+            for item in values[:5]:
+                lines.append(f"  - {_sanitize_rolling_state_text(item)}")
     return "\n".join(lines)
 
 
@@ -1005,7 +1161,7 @@ def _is_source_path(path: str) -> bool:
 
 def _classify_auto_round_progress(response, round_events, kb_changed, frontier_state=None, is_error=False, outcome_detected=False):
     if is_error:
-        signals = ["progress=error"]
+        signals = ["progress=error", "progress_signal_kind=error_response", "semantic_progress=unknown"]
         response_text = (response or "").strip()
         if response_text:
             signals.append(f"reply={len(response_text)}c")
@@ -1059,14 +1215,19 @@ def _classify_auto_round_progress(response, round_events, kb_changed, frontier_s
     # This replaces all indirect signal synthesis (new_source_this_round, cooldowns, etc.)
     if outcome_detected:
         progress_class = "evidence"  # sandbox diff changed → real durable outcome
+        progress_signal_kind = "sandbox_diff_outcome"
     elif touched_files or ran_tests or inspected_diff:
         progress_class = "strong"   # GP was active but sandbox diff unchanged
+        progress_signal_kind = "tool_event_activity_proxy"
     elif result_events:
         progress_class = "soft"   # GP produced tool results but no write/test/diff activity
+        progress_signal_kind = "tool_result_activity_proxy"
     elif response_text or stable_issue:
         progress_class = "soft"
+        progress_signal_kind = "response_text_activity_proxy"
     else:
         progress_class = "idle"
+        progress_signal_kind = "absence_proxy"
     activity_detected = progress_class in ("strong", "evidence")
 
     # Source-written signal (for display only, not for outcome_detected)
@@ -1078,34 +1239,35 @@ def _classify_auto_round_progress(response, round_events, kb_changed, frontier_s
         for name in [entry.get("name", "")]
     )
 
-    signals = [f"progress={progress_class}"]
-    if kb_changed: signals.append("kb")
-    if touched_files: signals.append("write")
-    if source_written: signals.append("source")
-    if ran_tests: signals.append("test")
-    if inspected_diff: signals.append("diff")
-    if tool_names: signals.append(f"tools={','.join(tool_names[:3])}")
-    if stable_issue: signals.append("issue")
-    if reanchor_required: signals.append("reanchor")
-    if response_text: signals.append(f"reply={len(response_text)}c")
-    if progress_class == "idle": signals.append("no_external_progress")
-    if outcome_detected: signals.append("outcome✓")
+    signals = [f"progress={progress_class}", f"progress_signal_kind={progress_signal_kind}", "semantic_progress=unknown"]
+    if kb_changed: signals.append("kb(source=vault_delta)")
+    if touched_files: signals.append("write(source=tool_or_shell_event)")
+    if source_written: signals.append("source_write(source=tool_event)")
+    if ran_tests: signals.append("test(source=tool_or_shell_event)")
+    if inspected_diff: signals.append("diff(source=tool_or_shell_event)")
+    if tool_names: signals.append(f"tools(source=tool_event)={','.join(tool_names[:3])}")
+    if stable_issue: signals.append("issue(source=response_text)")
+    if reanchor_required: signals.append("reanchor(source=response_or_tool_trace_pattern)")
+    if response_text: signals.append(f"reply(source=response_text)={len(response_text)}c")
+    if progress_class == "idle": signals.append("no_external_progress(source=absence_proxy)")
+    if outcome_detected: signals.append("outcome✓(source=sandbox_diff_snapshot)")
     return {"activity_detected": activity_detected, "activity_summary": " | ".join(signals), "progress_class": progress_class, "outcome_detected": outcome_detected}
 
 
 # ─── Session Planner ─────────────────────────────────────────────
 PLANNER_REVIEW_INTERVAL = 5  # 每 N 轮审查一次
 
-SESSION_PLANNER_SYSTEM = """你是 Genesis 自主探索的 Session Planner。
-你负责帮助当前探索保持连续、具体、不过早发散。
+SESSION_PLANNER_SYSTEM = """你是 Genesis 自主概念探索的 Session Planner。
+你负责帮助当前探索保持连续、具体、不过早发散，让每轮都服务于 Genesis/Yogg 概念面的理解。
 
 规则：
 1. 先沿当前记忆和上一轮结果自然推进，不要为了多样性强行换方向
 2. 只有证据冲突、连续失败、或当前问题已经说清楚时，才切到相邻问题
 3. API错误轮不算进度；不要把网络/配额问题解释成知识方向失败
-4. next_focus 必须是具体可执行的单轮指令，不要写工具命令
+4. next_focus 必须是具体可执行的单轮概念指令，不要写工具命令
 5. agenda 是轻量工作记忆，不是固定预算表；保留当前线索，必要时只加少量相邻线索
-6. 如果所有有价值的线索都已探索或无法推进，设 should_continue=false"""
+6. 代码、Doctor 和运行观察只作为 practice/failure 证据；不要把 agenda 默认写成修代码或补洞
+7. 如果所有有价值的线索都已探索或无法推进，设 should_continue=false"""
 
 SESSION_PLANNER_INITIAL = """## 用户指令
 {directive}
@@ -1119,7 +1281,7 @@ SESSION_PLANNER_INITIAL = """## 用户指令
   "agenda": [
     {{"topic": "当前最自然的下一条线索", "budget": 3, "priority": 1, "status": "pending"}}
   ],
-  "next_focus": "第一轮要推进的具体问题（描述要调查/修复什么，不要写工具命令）",
+  "next_focus": "第一轮要推进的具体概念缺口（描述要澄清什么、需要哪类实践证据，不要写工具命令）",
   "should_continue": true,
   "reasoning": "选择理由（一句话）"
 }}"""
@@ -1142,7 +1304,7 @@ SESSION_PLANNER_REVIEW = """## 用户指令
   "agenda": [
     {{"topic": "当前线索或相邻线索", "budget": 3, "priority": 1, "status": "pending|in_progress|done|stuck"}}
   ],
-  "next_focus": "下一轮要推进的具体问题（描述要调查/修复什么，不要写工具命令）",
+  "next_focus": "下一轮要推进的具体概念缺口（描述要澄清什么、需要哪类实践证据，不要写工具命令）",
   "should_continue": true,
   "reasoning": "选择理由（一句话）"
 }}"""
@@ -1158,7 +1320,7 @@ DEFAULT_PLANNER_RESULT = {
 
 def _extract_description(item: str) -> str:
     """从 'NODE_ID: description' 格式中提取描述部分。
-    Directive 应描述验证任务，不嵌入 node_id 防止定向搜索锁定方向。"""
+    Directive 应描述概念缺口或实践证据，不嵌入 node_id 防止定向搜索锁定方向。"""
     if ": " in item:
         prefix, desc = item.split(": ", 1)
         # NODE_ID 格式：全大写+下划线（如 LESSON_C_XXX, P_XXX）
@@ -1174,7 +1336,7 @@ def _is_saturation_signal_item(item: str) -> bool:
 def _pick_focused_fallback(signals: str, round_num: int = 1) -> str:
     """Planner 失败时的确定性聚焦：从 signals 中选 1 个最高优先级方向。
     优先级：Arena 失败 > VOID > 低置信度 > 通用探索
-    设计原则：directive 描述验证任务，不嵌入 node_id（防止定向搜索锁定方向）。"""
+    设计原则：directive 描述概念缺口，不嵌入 node_id（防止定向搜索锁定方向）。"""
     lines = signals.strip().splitlines()
     arena_items, void_items, low_conf_items = [], [], []
     current_section = None
@@ -1202,18 +1364,18 @@ def _pick_focused_fallback(signals: str, round_num: int = 1) -> str:
             elif current_section == "void":
                 void_items.append(item)
             elif current_section == "c_phase":
-                low_conf_items.append(item)  # C-Phase 产出也可作为验证方向
+                low_conf_items.append(item)  # C-Phase 产出也可作为概念缺口线索
     # 优先级：Arena 翻车 > VOID 空洞 > 低置信/C-Phase > 通用探索
     if arena_items:
         pick = _extract_description(arena_items[0])
-        return f"聚焦验证这条翻车知识并改进: {pick[:120]}"
+        return f"把这条翻车知识当作 failure/practice 证据，补全 Genesis/Yogg 概念面中的边界缺口: {pick[:120]}"
     if void_items:
         pick = void_items[round_num % max(len(void_items), 1)]
-        return f"调查这个知识空洞并尝试填充: {pick[:120]}"
+        return f"把这个知识空洞当作概念缺口，判断它属于 why / what / how / boundary / failure / practice 哪一面并补全面: {pick[:120]}"
     if low_conf_items:
         pick = _extract_description(low_conf_items[round_num % max(len(low_conf_items), 1)])
-        return f"验证这条待确认的知识: {pick[:120]}"
-    return "继续探索 Genesis 系统，寻找可改进之处并在沙箱中实践"
+        return f"把这条待确认知识当作实践证据，提炼它对 Genesis/Yogg 概念面哪一处边界或失败模式有贡献: {pick[:120]}"
+    return "继续围绕 Genesis/Yogg 概念整体探索一个 why / what / how / boundary / failure / practice 缺口"
 
 
 def _compute_cross_round_observations(round_log: list, self_evolution=None) -> dict:
@@ -1282,16 +1444,22 @@ def _compute_cross_round_observations(round_log: list, self_evolution=None) -> d
     error_count = sum(1 for r in recent if r.get("progress_class") == "error")
 
     obs = {
+        "signal_kind": "cross_round_outcome_proxy",
+        "semantic_progress": "unknown",
         "total_rounds": total_rounds,
         "outcome_ratio": round(outcome_ratio, 2),
+        "outcome_signal_kind": "sandbox_diff_snapshot",
         "outcome_rounds_in_window": outcome_rounds,
         "auto_apply_attempts": apply_attempts,
         "auto_apply_successes": apply_successes,
+        "auto_apply_signal_kind": "rolling_apply_history_state",
         "auto_apply_blocked_reasons": apply_blocked_reasons[-5:],
         "kb_change_rate": f"{kb_changed_rounds}/{len(recent)}",
+        "kb_change_signal_kind": "vault_delta",
         "lesson_total_in_window": lesson_total,
         "lesson_rounds_in_window": lesson_rounds,
         "sandbox_stability": sandbox_stability,
+        "sandbox_stability_signal_kind": "self_evolution_cooldown_state",
         "error_rounds_in_window": error_count,
         "window_size": len(recent),
     }
@@ -1312,10 +1480,11 @@ def _compact_round_history(round_log: list, last_n: int = 10) -> str:
         ks = r.get("knowledge_search_count", 0)
         if ks:
             parts.append(f"search={ks}")
-        if r.get("frontier_preview"):
-            parts.append(r["frontier_preview"][:80])
-        elif r.get("response_preview"):
-            parts.append(r["response_preview"][:80])
+        confirmed = _summarize_confirmed_pls_results(r.get("events") or [], r.get("kb_delta") or {}, limit=3)
+        if confirmed:
+            parts.append(confirmed[:120])
+        else:
+            parts.append("落库: 无确认PLS结果")
         if r.get("exception"):
             parts.append(f"err:{str(r['exception'])[:60]}")
         entries.append(" | ".join(parts))
@@ -1408,10 +1577,18 @@ class TopicTracker:
 
     MAX_ROUNDS_PER_TOPIC = 8  # PLS: 给拓扑深挖更多空间，5轮太短
     SIMILARITY_THRESHOLD = 0.35
+    TEMPLATE_WINDOW = 6
+    TEMPLATE_LIMIT = 4
+    TEMPLATE_MOTIFS = (
+        "形态完备", "功能休眠", "功能悬置", "拟像", "孤儿", "orphan",
+        "幽灵", "墓园", "活墓园", "stale_snapshot", "三层断裂", "三层结构",
+        "结构性断裂", "防御性休眠", "语义漂白", "信号垄断",
+    )
 
     def __init__(self):
         self.topics: list = []
         self.active_idx: int | None = None
+        self.template_history: list = []
 
     @staticmethod
     def _bigrams(text: str) -> set:
@@ -1432,10 +1609,66 @@ class TopicTracker:
                 best_idx, best_sim = i, sim
         return best_idx
 
+    def _template_key(self, candidate: str) -> str:
+        text = str(candidate or "").lower()
+        if any(motif.lower() in text for motif in self.TEMPLATE_MOTIFS):
+            return "structural_absence_template"
+        return ""
+
+    def _remember_template(self, round_num: int, candidate: str) -> dict | None:
+        key = self._template_key(candidate)
+        self.template_history.append({"round": round_num, "key": key, "topic": candidate[:120]})
+        self.template_history = self.template_history[-self.TEMPLATE_WINDOW:]
+        return self._current_template_saturation()
+
+    def _current_template_saturation(self) -> dict | None:
+        counts = {}
+        for item in self.template_history:
+            key = item.get("key") or ""
+            if key:
+                counts[key] = counts.get(key, 0) + 1
+        if not counts:
+            return None
+        key, count = max(counts.items(), key=lambda item: item[1])
+        if count < self.TEMPLATE_LIMIT:
+            return None
+        examples = [item["topic"] for item in self.template_history if item.get("key") == key][-3:]
+        return {
+            "key": key,
+            "label": "形态/休眠/孤儿/三层断裂同构模板",
+            "count": count,
+            "window": len(self.template_history),
+            "examples": examples,
+        }
+
+    def get_saturation_focus(self) -> str:
+        saturation = self._current_template_saturation()
+        if not saturation:
+            return ""
+        examples = "；".join(saturation.get("examples") or [])
+        return (
+            f"结构控制层检测到解释模板饱和(source=topic_tracker, template={saturation['label']}, "
+            f"recent={saturation['count']}/{saturation['window']})。下一轮不要继续把新对象归入该模板；"
+            f"必须选择非同构问题：优先找反例、边界条件、修复路径、或与 Genesis 自身治理无关的低饱和邻域。"
+            f"最近样本: {examples[:240]}"
+        )
+
     def update(self, round_num: int, candidate_issue: str, had_progress: bool) -> dict:
         _skip = ("未提取", "未从上轮回复中提取到稳定问题定义", "待重新锁定", "")
         if not candidate_issue or candidate_issue in _skip:
             return {"action": "continue", "topic_info": None, "message": ""}
+        template_key = self._template_key(candidate_issue)
+        template_saturation = self._remember_template(round_num, candidate_issue)
+        if template_key and template_saturation:
+            return {
+                "action": "close_template",
+                "topic_info": template_saturation,
+                "message": (
+                    f"解释模板「{template_saturation['label']}」在最近 "
+                    f"{template_saturation['window']} 轮中出现 {template_saturation['count']} 次，"
+                    "已判定为同构饱和"
+                ),
+            }
         match_idx = self._find_match(candidate_issue)
         if match_idx is not None:
             topic = self.topics[match_idx]
@@ -1448,7 +1681,7 @@ class TopicTracker:
                 return {
                     "action": "close_topic",
                     "topic_info": topic,
-                    "message": f"话题「{topic['topic'][:60]}」已持续 {topic['rounds_spent']} 轮，建议收束并转向相邻问题",
+                    "message": f"话题「{topic['topic'][:60]}」已持续 {topic['rounds_spent']} 轮，建议收束概念贡献并切换到新的概念缺口",
                 }
             if topic["rounds_spent"] >= 5 and not had_progress:  # PLS: 3→5，给深挖更多空间
                 return {
@@ -1470,14 +1703,52 @@ class TopicTracker:
 
     def format_for_prompt(self) -> str:
         if not self.topics:
-            return ""
-        lines = ["[已探索话题——标记为✓的线索已收束，可转向相邻问题]"]
+            saturation = self._current_template_saturation()
+            if not saturation:
+                return ""
+            return (
+                "[已饱和解释模板——不要继续套用同一框架]\n"
+                f"  ✓ {saturation['label']} ({saturation['count']}/{saturation['window']}轮)"
+            )
+        lines = ["[已探索话题——标记为✓的线索已收束，可切换到新的概念缺口]"]
         for t in self.topics:
             if t["verdict"] == "exhausted":
                 lines.append(f"  ✓ {t['topic'][:80]} ({t['rounds_spent']}轮, 已收束)")
             else:
                 lines.append(f"  → {t['topic'][:80]} ({t['rounds_spent']}轮)")
+        saturation = self._current_template_saturation()
+        if saturation:
+            lines.append("[已饱和解释模板——不要继续套用同一框架]")
+            lines.append(f"  ✓ {saturation['label']} ({saturation['count']}/{saturation['window']}轮)")
         return "\n".join(lines)
+
+
+def _seed_topic_tracker_from_reports(topic_tracker: TopicTracker, report_dir: Path, limit: int = 12) -> int:
+    try:
+        files = sorted(report_dir.glob("*/round_*.json"), key=lambda p: p.stat().st_mtime)[-limit:]
+    except Exception:
+        return 0
+    seeded = 0
+    for idx, path in enumerate(files, 1):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            continue
+        if data.get("status") not in ("completed", "interrupted", "timeout"):
+            continue
+        if data.get("progress_class") == "error":
+            continue
+        issue = _extract_candidate_issue(data.get("response_full") or data.get("response_preview") or "")
+        if not issue:
+            frontier = data.get("frontier_state") or {}
+            issue = str(frontier.get("candidate_issue") or "")
+        if not issue or _is_candidate_issue_boilerplate(issue):
+            continue
+        if "V4 Execution Error" in issue or "LLM provider" in issue:
+            continue
+        topic_tracker.update(idx, issue, bool(data.get("activity_detected")))
+        seeded += 1
+    return seeded
 
 
 class ActionHistory:
@@ -1552,7 +1823,7 @@ class ActionHistory:
         repeated = self.get_repeated()
         if not repeated:
             return ""
-        lines = ["[以下操作已多次执行——结果已知，不要重复]"]
+        lines = ["[工具动作重复观测 source=tool_result_args，不代表用户输入重复；以下工具动作已多次执行，避免原样重复]"]
         for key, count in repeated:
             desc = key.split(":", 1)[-1][:80] if ":" in key else key
             lines.append(f"  ×{count}: {desc}")
@@ -1592,6 +1863,39 @@ class SpiralPioneer:
         self._refresh_from_vault()
         self._refresh_all_edges()
 
+    def _insert_edge_if_valid(self, conn, source_id: str, target_id: str, relation: str, weight: float) -> int:
+        source_id = str(source_id or "").strip()
+        target_id = str(target_id or "").strip()
+        relation = str(relation or "").strip().upper()
+        if not source_id or not target_id or not relation:
+            logger.warning(f"SpiralPioneer: refused edge with missing endpoint/relation {source_id} --[{relation}]--> {target_id}")
+            return 0
+        if source_id == target_id:
+            logger.warning(f"SpiralPioneer: refused self edge {source_id} --[{relation}]--> {target_id}")
+            return 0
+        rows = conn.execute(
+            "SELECT node_id, COALESCE(ablation_active,0) ablation_active, COALESCE(is_virtual,0) is_virtual FROM knowledge_nodes WHERE node_id IN (?,?)",
+            (source_id, target_id)
+        ).fetchall()
+        visibility = {r[0]: {"hidden": int(r[1] or 0) > 0, "virtual": int(r[2] or 0) == 1} for r in rows}
+        if source_id not in visibility or target_id not in visibility:
+            logger.warning(f"SpiralPioneer: refused orphan edge {source_id} --[{relation}]--> {target_id}")
+            return 0
+        if visibility[source_id]["hidden"] or visibility[target_id]["hidden"] or visibility[source_id]["virtual"] or visibility[target_id]["virtual"]:
+            logger.warning(f"SpiralPioneer: refused inactive endpoint edge {source_id} --[{relation}]--> {target_id}")
+            return 0
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO node_edges (source_id, target_id, relation, weight) VALUES (?,?,?,?)",
+            (source_id, target_id, relation, float(weight))
+        )
+        return max(0, cur.rowcount)
+
+    def _node_exists(self, conn, node_id: str) -> bool:
+        node_id = str(node_id or "").strip()
+        if not node_id:
+            return False
+        return conn.execute("SELECT 1 FROM knowledge_nodes WHERE node_id = ?", (node_id,)).fetchone() is not None
+
     def _refresh_all_edges(self):
         """Rebuild edges for all covered files in one pass (idempotent — INSERT OR IGNORE)."""
         if not self.covered or not self._db_path.exists():
@@ -1623,6 +1927,9 @@ class SpiralPioneer:
                 patterns = all_patterns.get(filepath, [])
                 if not patterns:
                     continue
+                if not self._node_exists(conn, anchor_id):
+                    logger.debug(f"SpiralPioneer: skipped edge refresh for missing anchor {anchor_id}")
+                    continue
                 for nid, title, content in rows:
                     text = f"{title or ''} {content or ''}"
                     if not any(p in text for p in patterns):
@@ -1631,11 +1938,7 @@ class SpiralPioneer:
                         continue
                     if node_file_counts.get(nid, 0) >= 5:
                         continue
-                    conn.execute(
-                        "INSERT OR IGNORE INTO node_edges (source_id, target_id, relation, weight) VALUES (?,?,?,?)",
-                        (anchor_id, nid, "RELATED_TO", 0.5)
-                    )
-                    total += 1
+                    total += self._insert_edge_if_valid(conn, anchor_id, nid, "RELATED_TO", 0.5)
             conn.commit()
             conn.close()
             if total:
@@ -1858,6 +2161,10 @@ class SpiralPioneer:
             patterns.append(f"/{stem}.py")
         try:
             conn = sqlite3.connect(str(self._db_path))
+            if not self._node_exists(conn, anchor_id):
+                conn.close()
+                logger.warning(f"SpiralPioneer: skipped edge building for missing anchor {anchor_id}")
+                return 0
             rows = conn.execute(
                 "SELECT n.node_id, n.title, nc.full_content "
                 "FROM knowledge_nodes n "
@@ -1884,11 +2191,7 @@ class SpiralPioneer:
                     continue
                 if node_file_counts.get(nid, 0) >= 5:
                     continue
-                conn.execute(
-                    "INSERT OR IGNORE INTO node_edges (source_id, target_id, relation, weight) VALUES (?,?,?,?)",
-                    (anchor_id, nid, "RELATED_TO", 0.5)
-                )
-                inserted += 1
+                inserted += self._insert_edge_if_valid(conn, anchor_id, nid, "RELATED_TO", 0.5)
             conn.commit()
             conn.close()
             logger.info(f"SpiralPioneer: built {inserted} edges for {anchor_id}")
@@ -2181,7 +2484,7 @@ class SelfEvolution:
         """
         self._pre_round_snapshot = await self._get_diff_status_hash()
 
-    async def check_round(self, round_num: int, channel) -> dict:
+    async def check_round(self, round_num: int, channel, agent=None) -> dict:
         """Called each round after GP execution. Manages file-level cooling + auto-apply.
 
         Each file's cooldown is independent: adding new files doesn't reset
@@ -2264,7 +2567,7 @@ class SelfEvolution:
             await channel.send(
                 f"🧬 冷却完成 | {sample[0]} ({sample[1]}) {sample[2]}轮未变 | {status_text} | 开始自进化应用流程..."
             )
-            apply_result = await self._try_apply(round_num, channel)
+            apply_result = await self._try_apply(round_num, channel, agent)
             if apply_result:
                 result.update(apply_result)
         elif status_text:
@@ -2330,7 +2633,7 @@ class SelfEvolution:
             logger.warning(f"SelfEvolution file-status check failed: {e}")
             return {}
 
-    async def _try_apply(self, round_num: int, channel) -> dict:
+    async def _try_apply(self, round_num: int, channel, agent=None) -> dict:
         """Test → apply → write restart marker.
 
         Returns dict: {"apply_attempted": True, "apply_succeeded": bool, "apply_reason": str}
@@ -2573,8 +2876,88 @@ class SelfEvolution:
             await channel.send("🧬 ✅ 测试通过")
         # else: test_unverified already sent its own message above
 
+        # ── C-Phase LLM 审查 (Twin-Review) ──
+        review_decision = "SKIPPED"
+        review_comment = "未获得 agent 引用，跳过 LLM 审查"
+        if agent and hasattr(agent, "provider"):
+            try:
+                await channel.send("🧬 [2/4] C-Phase 独立 LLM 审查中 (Twin-Review)...")
+                diff_ok, diff_output = await _run_doctor_sync_command("diff", timeout_secs=60)
+                if not diff_ok or not diff_output.strip():
+                    diff_output = "（无 tracked diff，可能全是 untracked 新文件）"
+                
+                # 长度裁剪安全锁
+                if len(diff_output) > 30000:
+                    diff_output = diff_output[:15000] + "\n... [diff truncated for length] ...\n" + diff_output[-15000:]
+
+                review_prompt = f"""你正在审查 Yogg 自进化的沙箱变更。以下是当前在沙箱中测试通过、等待应用到生产环境的 diff：
+
+{diff_output}
+
+审查标准：
+1. 范围审查：变更是否只修改了它声称要修改的问题？是否包含乱改、夹带私货或不相关实验代码？
+2. 安全审查：变更是否引入了潜在的死循环、安全注入漏洞或严重的逻辑退化？
+3. 知识对齐：变更是否引入了低质量、易崩溃或违背代码库基础范式的改动？
+
+请发表你作为独立高级架构师、冷酷且严谨的 C-Phase Gardener 评审意见。
+最后，必须在你的回复中，明确给出以下格式之一的结论（必须占单独一行且前缀一致）：
+APPROVE — 如果变更安全、聚焦且代码质量高
+REJECT: <原因> — 如果变更有明显漏洞、设计硬伤或夹带私货
+NEEDS_CHANGES: <建议> — 如果变更方向对但还需继续打磨
+
+你的输出将作为重要的 ReviewLine（审查线）沉淀进自进化图谱中。"""
+
+                messages = [
+                    {"role": "user", "content": review_prompt}
+                ]
+                
+                # 非 loop 轻量级单轮 chat 激发
+                llm_resp = await agent.provider.chat(messages=messages)
+                review_comment = llm_resp.response if hasattr(llm_resp, "response") else str(llm_resp)
+                
+                # 解析结论
+                decision_match = re.search(r"^\s*(APPROVE|REJECT:|NEEDS_CHANGES:).*$", review_comment, re.MULTILINE)
+                if decision_match:
+                    review_decision = decision_match.group(1).split(":")[0].strip()
+                else:
+                    if "APPROVE" in review_comment:
+                        review_decision = "APPROVE"
+                    elif "REJECT" in review_comment:
+                        review_decision = "REJECT"
+                    else:
+                        review_decision = "NEEDS_CHANGES"
+
+                emoji = "🟢" if review_decision == "APPROVE" else ("🔴" if review_decision == "REJECT" else "🟡")
+                truncated_comment = review_comment if len(review_comment) <= 800 else review_comment[:780] + "\n... [comment truncated] ..."
+                await channel.send(
+                    f"🧬 {emoji} **Twin-Review 独立审查意见** ({review_decision})\n"
+                    f"```markdown\n{truncated_comment}\n```"
+                )
+                
+            except Exception as _rev_ex:
+                review_decision = "REVIEW_ERROR"
+                review_comment = str(_rev_ex)
+                logger.warning(f"Twin-Review execution failed: {_rev_ex}")
+                mode_suffix = "阻塞" if SELF_EVOLUTION_REVIEW_MODE == "blocking" else "shadow 继续"
+                await channel.send(f"🧬 ⚠️ Twin-Review 审查执行异常: {_rev_ex}（{mode_suffix}）")
+
+        if SELF_EVOLUTION_REVIEW_MODE == "blocking" and review_decision != "APPROVE":
+            apply_result["apply_reason"] = f"twin_review:{review_decision}:{review_comment[:160]}"
+            self.apply_history.append({
+                "round": round_num,
+                "attempt_seq": current_attempt_seq,
+                "status": "review_blocked",
+                "reason": apply_result["apply_reason"],
+            })
+            self._save()
+            await channel.send(
+                f"🧬 🚫 Twin-Review blocking gate 拒绝晋升: {review_decision}\n"
+                f"```markdown\n{review_comment[:800]}\n```"
+            )
+            return apply_result
+
         # 2. Auto-apply with git safety net (use --only if scope gate filtered critical files)
-        await channel.send("🧬 [2/3] 应用沙箱修改到本体...")
+        await channel.send("🧬 [3/4] 应用沙箱修改到本体...")
         apply_cmd = ["auto-apply"]
         if only_filter:
             apply_cmd.extend(["--only", only_filter])
@@ -2636,15 +3019,15 @@ class SelfEvolution:
 
         await channel.send(f"🧬 ✅ 代码已应用 | commit={applied_commit[:8]}")
 
-        # 3. Reset sandbox to new production baseline (production now has the changes)
-        await channel.send("🧬 [3/4] 重置沙箱到新基线...")
+        # 4. Reset sandbox to new production baseline (production now has the changes)
+        await channel.send("🧬 [4/5] 重置沙箱到新基线...")
         reset_ok, reset_output = await _run_doctor_sync_command("reset", timeout_secs=60)
         if reset_ok:
             await channel.send("🧬 ✅ 沙箱已同步到新基线")
         else:
             await channel.send(f"🧬 ⚠️ 沙箱重置失败（不影响本体）: {reset_output[-200:]}")
 
-        # 4. Write restart marker + record history + clear cooling state
+        # 5. Write restart marker + record history + clear cooling state
         apply_result["apply_succeeded"] = True
         self.applied_this_session = True
         self.apply_history.append({
@@ -2658,20 +3041,22 @@ class SelfEvolution:
         self.file_cooldowns.clear()  # 沙箱已 reset，diff 应为空
         self._save()
 
-        # Write restart marker for yogg_auto.py crash-loop detection
+        # Write restart marker for yogg_auto.py crash-loop detection + canary observation
         try:
             self._RESTART_MARKER.parent.mkdir(parents=True, exist_ok=True)
             self._RESTART_MARKER.write_text(json.dumps({
                 "rollback_commit": rollback_commit,
                 "applied_commit": applied_commit,
                 "timestamp": _time_module.strftime("%Y-%m-%d %H:%M:%S"),
+                "canary_rounds": SELF_EVOLUTION_CANARY_ROUNDS,
             }), encoding="utf-8")
         except Exception as e:
             logger.error(f"SelfEvolution: restart marker write failed: {e}")
 
         await channel.send(
-            f"🧬 [4/4] 自进化完成 | rollback={rollback_commit[:8]} → applied={applied_commit[:8]}\n"
-            f"🔄 正在重启服务以加载新代码..."
+            f"🧬 [5/5] 自进化完成 | rollback={rollback_commit[:8]} → applied={applied_commit[:8]}\n"
+            f"🔄 正在重启服务以加载新代码...\n"
+            f"[canary] 金丝雀观察: 重启后观察 {SELF_EVOLUTION_CANARY_ROUNDS} 轮，无崩溃则标记成功"
         )
 
         # 5. Restart — this kills the current process, systemd restarts it
@@ -2687,9 +3072,10 @@ class SelfEvolution:
 
     @staticmethod
     def check_and_rollback_if_needed():
-        """Called at startup. Logs marker info but does NOT clear it.
-        Marker is cleared only after first successful round (see clear_restart_marker).
-        This ensures yogg_auto.py crash-loop detector can still see the marker."""
+        """Called at startup. Decrements canary counter.
+        If canary_rounds > 0: still observing, do NOT clear marker.
+        If canary_rounds == 0: canary passed, clear marker.
+        Crash during canary → rollback on next startup (handled by yogg_auto.py)."""
         marker = SelfEvolution._RESTART_MARKER
         if not marker.exists():
             return False
@@ -2698,11 +3084,27 @@ class SelfEvolution:
             rollback_commit = data.get("rollback_commit", "")
             applied_commit = data.get("applied_commit", "")
             ts = data.get("timestamp", "?")
-            logger.info(
-                f"SelfEvolution: post-apply startup | "
-                f"applied={applied_commit[:8]} rollback={rollback_commit[:8]} ts={ts} | "
-                f"marker preserved for crash-loop detection"
-            )
+            canary = data.get("canary_rounds", 0)
+            if canary > 0:
+                canary -= 1
+                data["canary_rounds"] = canary
+                if canary > 0:
+                    marker.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+                    logger.info(
+                        f"SelfEvolution: canary observing round {SELF_EVOLUTION_CANARY_ROUNDS - canary}/{SELF_EVOLUTION_CANARY_ROUNDS} | "
+                        f"applied={applied_commit[:8]} rollback={rollback_commit[:8]}"
+                    )
+                else:
+                    marker.unlink(missing_ok=True)
+                    logger.info(
+                        f"SelfEvolution: canary PASSED after {SELF_EVOLUTION_CANARY_ROUNDS} rounds | "
+                        f"applied={applied_commit[:8]} → production"
+                    )
+            else:
+                logger.info(
+                    f"SelfEvolution: post-apply startup (no canary) | "
+                    f"applied={applied_commit[:8]} rollback={rollback_commit[:8]} ts={ts}"
+                )
             return False
         except Exception as e:
             logger.error(f"SelfEvolution: marker check failed: {e}")
@@ -2777,6 +3179,9 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
 
     _report_dir = Path("runtime/auto_reports")
     _report_dir.mkdir(parents=True, exist_ok=True)
+    seeded_topics = _seed_topic_tracker_from_reports(topic_tracker, _report_dir)
+    if seeded_topics:
+        logger.info(f"/auto topic tracker seeded from reports | count={seeded_topics}")
     _session_ts = _time_module.strftime("%Y%m%d_%H%M%S")
     _session_id = f"{channel.id}_{_session_ts}"
     _rounds_dir = _report_dir / _session_id
@@ -2792,6 +3197,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
         """每轮结束后持久化关键工作记忆，crash 后新 session 可恢复。"""
         try:
             data = {
+                "directive": directive,
                 "round_num": round_num,
                 "consecutive_dry": consecutive_dry,
                 "last_frontier": last_frontier,
@@ -2817,6 +3223,11 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             if not _memory_path.exists():
                 return None
             data = json.loads(_memory_path.read_text(encoding="utf-8"))
+            # 校验 directive 是否发生变更（若不同说明新 session 方向重置，应放弃旧状态避免主题死锁）
+            saved_directive = data.get("directive", "")
+            if saved_directive and saved_directive.strip() != directive.strip():
+                logger.info("session directive changed, starting fresh without recovery to prevent theme leakage")
+                return None
             # 过期检查：超过 2 小时的记忆不恢复
             saved_at = data.get("saved_at", "")
             if saved_at:
@@ -2924,9 +3335,39 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
         round_start_utc_iso = _time_module.strftime("%Y-%m-%d %H:%M:%S", _time_module.gmtime(round_start_ts))
 
         signals = _get_auto_signals(round_num=round_num, session_shown_voids=session_shown_voids, session_shown_nodes=session_shown_nodes)
+        if PLS_TERRAIN_SCOUT_ENABLED:
+            try:
+                terrain_brief = await asyncio.wait_for(
+                    build_pls_terrain_brief(limit=6),
+                    timeout=PLS_TERRAIN_SCOUT_TIMEOUT_SECS,
+                )
+                if terrain_brief:
+                    signals += "\n\n" + terrain_brief
+            except Exception as _terrain_e:
+                logger.debug(f"PLS terrain scout skipped: {_terrain_e}")
+        if PLS_BRANCH_PROPOSALS_ENABLED:
+            try:
+                branch_proposals = await asyncio.wait_for(
+                    build_pls_branch_proposals(limit=6),
+                    timeout=PLS_BRANCH_PROPOSALS_TIMEOUT_SECS,
+                )
+                if branch_proposals:
+                    signals += "\n\n" + branch_proposals
+            except Exception as _branch_e:
+                logger.debug(f"PLS branch proposals skipped: {_branch_e}")
+        if PLS_BRANCH_PROPOSAL_STAGING_ENABLED:
+            try:
+                staging_summary = await asyncio.wait_for(
+                    stage_pls_branch_proposals(parent_trace_id=_session_id, parent_round_seq=round_num, limit=6),
+                    timeout=PLS_BRANCH_PROPOSAL_STAGING_TIMEOUT_SECS,
+                )
+                if staging_summary:
+                    signals += "\n\n" + staging_summary
+            except Exception as _stage_e:
+                logger.debug(f"PLS branch proposal staging skipped: {_stage_e}")
         # Inject apply-failure feedback from previous round into signals
         if _pending_apply_feedback:
-            _aw = "\n\n[⚠️ 上一轮自进化apply被拒(沙箱测试失败)] " + _pending_apply_feedback[:200] + ""
+            _aw = "\n\n[⚠️ 上一轮自进化apply被拒(source=self_evolution_apply_result, state_scope=rolling_apply_history)] " + _pending_apply_feedback[:200] + ""
             signals += _aw
             _pending_apply_feedback = None
 
@@ -2941,12 +3382,15 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                     break
                 _consecutive_no_outcome += 1
             if _consecutive_no_outcome >= 3:
-                signals += f"\n\n[行为观测] 连续{_consecutive_no_outcome}轮沙箱无代码变化 (outcome_detected=False)"
+                signals += f"\n\n[行为观测 source=sandbox_diff_snapshot semantic_progress=unknown] 连续{_consecutive_no_outcome}轮未观察到 sandbox tracked diff 变化 (outcome_detected=False)"
 
+        _template_saturation_focus = topic_tracker.get_saturation_focus()
         _struct = [topic_tracker.format_for_prompt(), action_history.format_for_prompt()]
         _struct_text = "\n\n".join(p for p in _struct if p)
         if _struct_text:
             signals = signals + "\n\n" + _struct_text
+        if _template_saturation_focus:
+            signals = signals + "\n\n[结构控制 override]\n" + _template_saturation_focus
 
         # ── 任务选择：螺旋拓荒模式 vs 经典 planner 模式 ──
         _current_pioneer_file = None
@@ -3148,31 +3592,82 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 # Fallback 没有完整 round_log 语境：dry streak 长时只要求收束当前线索，
                 # 不直接跳到无关主题，避免与 PLS 的连续记忆推进相冲突。
                 if consecutive_dry >= 4:  # PLS: 3→4，与 carry_warnings 阈值对齐
-                    round_focus = "当前线索已连续多轮无持久产出：判断是否缺少证据；若已说清，转向相邻问题继续探索"
+                    round_focus = "当前线索已连续多轮未观察到 sandbox tracked diff 变化(source=sandbox_diff_snapshot, semantic_progress=unknown)：先收束它对 Genesis/Yogg 概念面的贡献；若已说清，切换到新的 why / what / how / boundary / failure / practice 缺口。代码、Doctor 和运行观察只作为最小实践证据，不要沿实现细节继续补洞"
+            if _template_saturation_focus:
+                round_focus = _template_saturation_focus
+
+            # 动态编译与渲染 ChapterState (视网膜背景层，不决策，不污染)
+            _chapter_state_text = ""
+            try:
+                _chapter_recent = round_log[-6:] if round_log else []
+                _chapter_outcomes = sum(1 for r in _chapter_recent if r.get("outcome_detected"))
+                _chapter_kb_changes = sum(1 for r in _chapter_recent if r.get("kb_changed"))
+                _chapter_evidence = []
+                if _chapter_outcomes > 0:
+                    _chapter_evidence.append(f"Recent window has {_chapter_outcomes} rounds with sandbox tracked diff changes (durable evidence).")
+                if _chapter_kb_changes > 0:
+                    _chapter_evidence.append(f"Recent window has {_chapter_kb_changes} rounds that updated NodeVault with points/lines (crystallized evidence).")
+                if not _chapter_evidence:
+                    _chapter_evidence.append("No durable sandbox diffs or new database points observed in the recent window (low evidence density).")
+                _chapter_exhausted = topic_tracker.get_exhausted_topics() if topic_tracker else []
+                _chapter_saturation = topic_tracker._current_template_saturation() if topic_tracker else None
+                _chapter_deprecated = [f"Topic '{topic[:60]}...' is exhausted (MAX_ROUNDS_PER_TOPIC reached)." for topic in _chapter_exhausted]
+                if _chapter_saturation:
+                    _chapter_deprecated.append(f"Template '{_chapter_saturation['label']}' is saturated ({_chapter_saturation['count']}/{_chapter_saturation['window']} rounds).")
+                _chapter_stale_actions = [f"Continue analyzing or re-verifying '{topic[:50]}...'." for topic in _chapter_exhausted]
+                if _chapter_saturation:
+                    _chapter_stale_actions.append(f"Re-applying or explaining via template '{_chapter_saturation['label']}'.")
+                if not _chapter_stale_actions:
+                    _chapter_stale_actions.append("None. Continue organic concept exploration.")
+                _chapter_state_text = build_chapter_state_packet(
+                    diagnostics_summary=PipelineDiagnostics.summary(),
+                    canon=[
+                        "PLS is a local personal concept-world/current chapter-state layer for discontinuous LLM runs.",
+                        "PLS is closest to AI contextualizes AI: context selection, concept activation, memory routing, information identity management, prompt visibility control, and evidence-state rendering.",
+                        "Genesis is local continuity for a person's conceptual world; each run is a new chapter derived from terrain state.",
+                    ],
+                    evidence=_chapter_evidence,
+                    deprecated_directions=_chapter_deprecated,
+                    boundaries=[
+                        "Do not treat read-only file reading, directory listing, or database SELECTs as physical progress.",
+                        "Do not write synonymous points/lessons to bypass TopicTracker template-saturation controls.",
+                        "Do not execute direct file modifications to genesis/ source files; all writes must enter Doctor sandbox (doctor.sh exec).",
+                    ],
+                    stale_actions=_chapter_stale_actions,
+                    active_question=round_focus,
+                    progress_class=progress_class,
+                )
+            except Exception:
+                pass
 
             if round_num == 1:
-                prompt = AUTO_PROMPT_FIRST.format(directive=round_focus, signals=signals)
+                prompt = AUTO_PROMPT_FIRST.format(
+                    directive=round_focus,
+                    signals=signals,
+                    chapter_state=_chapter_state_text
+                )
             else:
                 history_entries = []
                 for e in round_log[-5:]:
-                    residue = e.get("attention_residue") or _extract_attention_residue(
-                        e.get("response_full") or e.get("response_preview") or "",
-                        e.get("events") or [],
-                    )
+                    confirmed = _summarize_confirmed_pls_results(e.get("events") or [], e.get("kb_delta") or {}, limit=4)
+                    if not confirmed:
+                        confirmed = "落库: 无确认PLS结果"
                     residue_text = ""
-                    if residue:
-                        residue_kind = "断在" if e.get("status") in ("timeout", "interrupted", "exception") else "停在"
-                        residue_text = f"；{residue_kind}：「{residue}」"
+                    if e.get("status") in ("timeout", "interrupted", "exception"):
+                        residue = e.get("attention_residue") or _extract_attention_residue("", e.get("events") or [])
+                        if residue:
+                            residue_text = f"；断在：「{residue}」"
                     history_entries.append(
-                        f"R{e['round']}: {e.get('activity_summary') or e['kb_delta_summary']} | {e.get('frontier_preview') or e['response_preview']}{residue_text}"
+                        f"R{e['round']}: {e.get('activity_summary') or e['kb_delta_summary']} | {confirmed}{residue_text}"
                     )
-                history = "[已完成的行动]\n" + "\n".join(history_entries) + "\n不要重复以上内容。" if history_entries else ""
+                history = "[已完成的行动]\n" + "\n".join(history_entries) + "\n以上只列已落库或工具确认的行动；文本自述的概念简称不是可直接连线的node_id。" if history_entries else ""
                 frontier = last_frontier if last_frontier and last_frontier.strip() != "(无输出)" else "(上轮无可复用前沿；先从当前记忆中选择相邻问题)"
                 knowledge_state_text = _format_knowledge_state(last_knowledge_state)
                 prompt = AUTO_PROMPT_CONTINUE.format(
                     directive=round_focus,
                     knowledge_state=knowledge_state_text, frontier_state=frontier,
                     history=history, signals=signals,
+                    chapter_state=_chapter_state_text,
                 )
 
             _append_md(f"\n---\n## 第 {round_num} 轮\n\n### 信号\n```\n{signals}\n```\n\n### Prompt\n```\n{prompt[:2000]}\n```\n\n")
@@ -3452,9 +3947,8 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 )
                 consecutive_error = 0
                 last_good_knowledge_state = knowledge_state.copy()
-                # 首轮成功完成后清除自进化重启标记（证明 apply 的新代码能正常工作）
-                if round_num == 1 and SELF_EVOLUTION_ENABLED:
-                    SelfEvolution.clear_restart_marker()
+                # 自进化重启标记由 check_and_rollback_if_needed() 管理 canary 生命周期，
+                # 不在首轮手动清除——金丝雀观察需要跨重启持久化。
             knowledge_state_text = _format_knowledge_state(knowledge_state)
             last_knowledge_state = knowledge_state
             attention_residue = "" if round_is_error else _extract_attention_residue(response, round_events)
@@ -3642,10 +4136,20 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 "next_checks": ["总结当前线索还剩什么未证实", "选择一个相邻问题继续推进"],
             }
             await channel.send(f"🔀 {_topic_result['message']}")
+        elif _topic_result["action"] == "close_template":
+            last_knowledge_state = {
+                "issue": "上一解释模板已同构饱和，下一轮必须切换到非同构问题",
+                "verified_facts": [],
+                "failed_attempts": [_topic_result["message"]],
+                "next_checks": [
+                    "不要继续把新对象归入同一解释模板",
+                    "优先找反例、边界条件、修复路径、或与 Genesis 自身治理无关的低饱和邻域",
+                ],
+            }
+            await channel.send(f"🔀 {_topic_result['message']}")
         elif _topic_result["action"] == "suggest_switch" and isinstance(last_knowledge_state, dict):
             _fa = last_knowledge_state.get("failed_attempts") or []
-            _fa.insert(0, _topic_result["message"])
-            last_knowledge_state["failed_attempts"] = _fa[:5]
+            last_knowledge_state["failed_attempts"] = _dedupe_compact_items([_topic_result["message"], *_fa])
 
         # ── 熔断：连续错误 ──
         if consecutive_error >= 5:
@@ -3693,7 +4197,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
         if self_evolution and consecutive_error == 0:
             try:
                 logger.debug(f"auto R{round_num} self_evolution.check_round start")
-                _se_result = await self_evolution.check_round(round_num, channel)
+                _se_result = await self_evolution.check_round(round_num, channel, agent)
                 logger.debug(f"auto R{round_num} self_evolution.check_round done")
                 if _se_result and _se_result.get("apply_attempted") and not _se_result.get("apply_succeeded"):
                     _apply_feedback = _se_result.get("apply_reason", "unknown")
