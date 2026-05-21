@@ -6,11 +6,13 @@ Knowledge Query Layer — 只读查询，为 G/Lens prompt 生成认知数据。
 """
 
 import json
+import os
 import re
 from collections import defaultdict
 from typing import List, Dict, Any
 import sqlite3
 import logging
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,8 @@ class KnowledgeQuery:
 
     # 噪声标签：系统自动打的来源标记，不代表主题
     _NOISE_TAGS = frozenset({"auto_managed", "tool", "skill", "scavenger", "meta_redesign_derivation"})
+    _HEARTBEAT_STALE_AFTER_SECONDS = 3900
+    _TYPE_SIGNAL_NOTE = "type=工具塑形schema字段，非语义角色/验证状态"
 
     def __init__(self, conn: sqlite3.Connection):
         self._conn = conn
@@ -43,7 +47,7 @@ class KnowledgeQuery:
     def get_digest(self, top_k: int = 4) -> str:
         """精简认知目录：类别计数 + 入线数拓扑 + 知识缺口"""
         type_rows = self._conn.execute(
-            "SELECT type, COUNT(*) AS cnt FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%' AND ablation_active = 0 GROUP BY type ORDER BY cnt DESC"
+            "SELECT type, COUNT(*) AS cnt FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%' AND ablation_active = 0 AND COALESCE(is_virtual, 0) = 0 GROUP BY type ORDER BY cnt DESC"
         ).fetchall()
         type_counts = {r['type']: r['cnt'] for r in type_rows}
         total = sum(type_counts.values())
@@ -53,21 +57,25 @@ class KnowledgeQuery:
             """SELECT rl.basis_point_id, COUNT(*) as incoming, kn.type, kn.title
                FROM reasoning_lines rl
                JOIN knowledge_nodes kn ON rl.basis_point_id = kn.node_id
-               WHERE kn.node_id NOT LIKE 'MEM_CONV%' AND kn.ablation_active = 0
+               WHERE kn.node_id NOT LIKE 'MEM_CONV%'
+                 AND kn.ablation_active = 0
+                 AND COALESCE(kn.is_virtual, 0) = 0
+                 AND COALESCE(rl.same_round, 0) = 0
                GROUP BY rl.basis_point_id
                ORDER BY incoming DESC
                LIMIT ?""",
             (top_k,)
         ).fetchall()
 
-        # 前沿节点：最近创建、入线数=0（尚未被验证的新知识）
+        # 前沿节点：最近创建、尚未被后续作为 basis 引用（非验证状态）
         frontier_rows = self._conn.execute(
             """SELECT kn.node_id, kn.type, kn.title, kn.created_at
                FROM knowledge_nodes kn
                WHERE kn.node_id NOT LIKE 'MEM_CONV%'
                  AND kn.ablation_active = 0
+                 AND COALESCE(kn.is_virtual, 0) = 0
                  AND kn.type IN ('LESSON', 'CONTEXT', 'DISCOVERY')
-                 AND kn.node_id NOT IN (SELECT basis_point_id FROM reasoning_lines)
+                 AND kn.node_id NOT IN (SELECT basis_point_id FROM reasoning_lines WHERE COALESCE(same_round, 0) = 0)
                  AND kn.node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS')
                ORDER BY kn.created_at DESC
                LIMIT ?""",
@@ -78,13 +86,13 @@ class KnowledgeQuery:
         void_rows = self.get_recent_voids(limit=3)
 
         cats = " | ".join(f"{t}:{c}" for t, c in type_counts.items() if c > 0)
-        lines = [f"[认知目录] {total}节点 | {cats}"]
+        lines = [f"[认知目录] {total}节点 | {cats}", self._TYPE_SIGNAL_NOTE]
         if top_incoming:
-            lines.append("基础（高入线数，已被反复验证）:")
+            lines.append("基础候选（被频繁作为 basis 引用，非验证证明）:")
             for r in top_incoming:
-                lines.append(f"- [{r['basis_point_id']}] <{r['type']}> {r['title']} (入线:{r['incoming']})")
+                lines.append(f"- [{r['basis_point_id']}] <{r['type']}> {r['title']}")
         if frontier_rows:
-            lines.append("探索（入线=0，尚未被验证的前沿）:")
+            lines.append("前沿候选（尚未被后续作为 basis 引用，非验证状态）:")
             for r in frontier_rows:
                 lines.append(f"- [{r['node_id']}] <{r['type']}> {r['title']}")
         if void_rows:
@@ -102,7 +110,9 @@ class KnowledgeQuery:
         """
         rows = self._conn.execute(
             """SELECT type, title, tags FROM knowledge_nodes
-               WHERE node_id NOT LIKE 'MEM_CONV%' AND ablation_active = 0
+               WHERE node_id NOT LIKE 'MEM_CONV%'
+                 AND ablation_active = 0
+                 AND COALESCE(is_virtual, 0) = 0
                ORDER BY type, usage_count DESC"""
         ).fetchall()
         if not rows:
@@ -212,42 +222,51 @@ class KnowledgeQuery:
 
             lines.append("")
 
-        # 基础（高入线数，已被反复验证）——含被矛盾标记的节点
+        # 基础候选（高入线数引用代理，非验证证明）——含被 CONTRADICTS 标记的节点
         top_incoming = self._conn.execute(
             """SELECT rl.basis_point_id, COUNT(*) as incoming, kn.type, kn.title,
-                      CASE WHEN ne.source_id IS NOT NULL THEN 1 ELSE 0 END as has_contradiction
+                      CASE WHEN ne.target_id IS NOT NULL THEN 1 ELSE 0 END as has_contradiction
                FROM reasoning_lines rl
                JOIN knowledge_nodes kn ON rl.basis_point_id = kn.node_id
-               LEFT JOIN node_edges ne ON kn.node_id = ne.target_id AND ne.relation = 'CONTRADICTS'
+               LEFT JOIN (
+                   SELECT DISTINCT target_id FROM node_edges WHERE relation = 'CONTRADICTS'
+               ) ne ON kn.node_id = ne.target_id
                WHERE kn.node_id NOT LIKE 'MEM_CONV%'
+                 AND kn.ablation_active = 0
+                 AND COALESCE(kn.is_virtual, 0) = 0
+                 AND COALESCE(rl.same_round, 0) = 0
                GROUP BY rl.basis_point_id
                ORDER BY incoming DESC
                LIMIT 4"""
         ).fetchall()
         if top_incoming:
-            lines.append("基础:")
+            lines.append("基础候选（频繁被引用，非验证证明）:")
             for r in top_incoming:
                 # PLS: 用矛盾边标记而非 usage 胜率
-                contradiction_marker = " ⚔️矛盾" if r['has_contradiction'] else ""
+                contradiction_marker = " CONTRADICTS标记" if r['has_contradiction'] else ""
                 lines.append(f"  {r['basis_point_id']} <{r['type']}> {r['title']}{contradiction_marker}")
             lines.append("")
 
-        # 探索（入线=0，尚未被验证的前沿）
+        # 前沿候选（尚未被后续作为 basis 引用，非验证状态）
         frontier_rows = self._conn.execute(
             """SELECT kn.node_id, kn.type, kn.title,
-                      CASE WHEN ne.source_id IS NOT NULL THEN 1 ELSE 0 END as has_contradiction
+                      CASE WHEN ne.target_id IS NOT NULL THEN 1 ELSE 0 END as has_contradiction
                FROM knowledge_nodes kn
-               LEFT JOIN node_edges ne ON kn.node_id = ne.target_id AND ne.relation = 'CONTRADICTS'
+               LEFT JOIN (
+                   SELECT DISTINCT target_id FROM node_edges WHERE relation = 'CONTRADICTS'
+               ) ne ON kn.node_id = ne.target_id
                WHERE kn.node_id NOT LIKE 'MEM_CONV%'
+                 AND kn.ablation_active = 0
+                 AND COALESCE(kn.is_virtual, 0) = 0
                  AND kn.type IN ('LESSON', 'CONTEXT', 'DISCOVERY')
-                 AND kn.node_id NOT IN (SELECT basis_point_id FROM reasoning_lines)
+                 AND kn.node_id NOT IN (SELECT basis_point_id FROM reasoning_lines WHERE COALESCE(same_round, 0) = 0)
                ORDER BY kn.created_at DESC
                LIMIT 4"""
         ).fetchall()
         if frontier_rows:
-            lines.append("探索（入线=0，前沿）:")
+            lines.append("前沿候选（尚未被后续作为 basis 引用，非验证状态）:")
             for r in frontier_rows:
-                contradiction_marker = " ⚔️矛盾" if r['has_contradiction'] else ""
+                contradiction_marker = " CONTRADICTS标记" if r['has_contradiction'] else ""
                 lines.append(f"  {r['node_id']} <{r['type']}> {r['title']}{contradiction_marker}")
             lines.append("")
 
@@ -283,17 +302,17 @@ class KnowledgeQuery:
         return "\n".join(lines)
 
     def generate_l1_digest(self, max_nodes: int = 20) -> str:
-        """L1 压缩知识摘要（PLS 版）：用入线数（拓扑价值）选出节点。
+        """L1 压缩知识摘要（PLS 版）：用引用拓扑代理选出节点。
 
         替代 generate_map 注入 GP prompt。目标 ~500-800 tokens。
         设计：
-          - 按入线数降序排（拓扑价值 = 被多少新点基于它产生）
+          - 内部按入线数降序排，但不向 GP 暴露具体数字
           - 按 type 分组，每组最多 6 个，每个节点一行
-          - 附带 VOID 计数 + 最近 DISCOVERY
+          - 附带 VOID 是否存在 + 最近 DISCOVERY
         """
         # 分层采样：每种类型取最近 30 条，避免单一类型垄断候选池
         type_names = self._conn.execute(
-            "SELECT DISTINCT type FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%' AND ablation_active = 0"
+            "SELECT DISTINCT type FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%' AND ablation_active = 0 AND COALESCE(is_virtual, 0) = 0"
         ).fetchall()
         all_candidates = []
         for tr in type_names:
@@ -301,11 +320,15 @@ class KnowledgeQuery:
             type_rows = self._conn.execute(
                 """SELECT kn.node_id, kn.type, kn.title, kn.tags,
                           kn.updated_at, kn.last_verified_at, kn.trust_tier,
-                          kn.usage_success_count, kn.usage_fail_count, kn.usage_count,
-                          CASE WHEN ne.source_id IS NOT NULL THEN 1 ELSE 0 END as has_contradiction
+                          CASE WHEN ne.target_id IS NOT NULL THEN 1 ELSE 0 END as has_contradiction
                    FROM knowledge_nodes kn
-                   LEFT JOIN node_edges ne ON kn.node_id = ne.target_id AND ne.relation = 'CONTRADICTS'
-                   WHERE kn.node_id NOT LIKE 'MEM_CONV%' AND kn.ablation_active = 0 AND kn.type = ?
+                   LEFT JOIN (
+                       SELECT DISTINCT target_id FROM node_edges WHERE relation = 'CONTRADICTS'
+                   ) ne ON kn.node_id = ne.target_id
+                   WHERE kn.node_id NOT LIKE 'MEM_CONV%'
+                     AND kn.ablation_active = 0
+                     AND COALESCE(kn.is_virtual, 0) = 0
+                     AND kn.type = ?
                    ORDER BY kn.updated_at DESC
                    LIMIT 30""", (t,)
             ).fetchall()
@@ -314,11 +337,13 @@ class KnowledgeQuery:
         if not all_candidates:
             return "[L1] 知识库为空"
 
-        # PLS: 批量获取入线数，按拓扑价值排序
+        # PLS: 批量获取入线数，内部按引用代理排序；输出不暴露具体数字
         all_ids = [dict(r)['node_id'] for r in all_candidates]
         incoming_counts = self._conn.execute(
             """SELECT basis_point_id, COUNT(*) as incoming FROM reasoning_lines
-               WHERE basis_point_id IN ({}) GROUP BY basis_point_id""".format(
+               WHERE basis_point_id IN ({})
+                 AND COALESCE(same_round, 0) = 0
+               GROUP BY basis_point_id""".format(
                    ','.join('?' * len(all_ids))
                ), all_ids
         ).fetchall()
@@ -341,20 +366,15 @@ class KnowledgeQuery:
             quota = 1 + int(remaining * len(items) / max(total_candidates, 1))
             by_type[t] = items[:quota]
 
-        # 统计
-        type_rows = self._conn.execute(
-            "SELECT type, COUNT(*) AS cnt FROM knowledge_nodes WHERE node_id NOT LIKE 'MEM_CONV%' AND ablation_active = 0 GROUP BY type"
-        ).fetchall()
-        total = sum(r['cnt'] for r in type_rows)
-        void_count = 0
+        has_void = False
         try:
-            vr = self._conn.execute("SELECT COUNT(*) as cnt FROM void_tasks WHERE status = 'open'").fetchone()
-            void_count = vr['cnt'] if vr else 0
+            vr = self._conn.execute("SELECT 1 FROM void_tasks WHERE status = 'open' LIMIT 1").fetchone()
+            has_void = bool(vr)
         except Exception:
             pass
 
-        selected_count = sum(len(v) for v in by_type.values())
-        lines = [f"[L1 Knowledge · {total} nodes · {void_count} VOID · top {selected_count} by freshness]"]
+        void_label = "VOID队列存在" if has_void else "VOID队列未观察到开放项"
+        lines = [f"[L1 Knowledge · proxy-safe summary · {void_label} · sampled by reference topology]", self._TYPE_SIGNAL_NOTE]
 
         type_order = ["LESSON", "CONTEXT", "DISCOVERY", "ASSET", "PATTERN", "EPISODE", "ENTITY", "EVENT", "ACTION", "TOOL"]
         seen_types = set()
@@ -366,26 +386,57 @@ class KnowledgeQuery:
             if t not in seen_types:
                 self._render_l1_group(lines, t, by_type[t])
 
-        lines.append("→ search_knowledge_nodes(keywords=[...]) 深入搜索")
+        lines.append("→ search_knowledge_nodes(keywords=[...]) 深入搜索；基础候选=引用代理，非验证证明")
         return "\n".join(lines)
 
     @staticmethod
     def _render_l1_group(lines: list, ntype: str, nodes: list, max_per_group: int = 6):
         """渲染 L1 单个类型分组（紧凑格式，PLS 版）"""
         shown = nodes[:max_per_group]
-        lines.append(f"{ntype} ({len(nodes)}):")
+        lines.append(f"{ntype}:")
         for d in shown:
-            # PLS: 拓扑角色 + 矛盾标记，不用 usage 胜率
+            # PLS: 拓扑角色 + CONTRADICTS 标记，不用 usage 胜率或具体入线数字
             inc = d.get('incoming', 0)
-            role = "基础" if inc >= 2 else "探索"
-            contradiction_marker = " ⚔️" if d.get('has_contradiction') else ""
+            role = "基础候选" if inc >= 2 else "前沿候选"
+            contradiction_marker = " CONTRADICTS标记" if d.get('has_contradiction') else ""
             record = f"  {d['node_id']} {d['title'][:40]} ({role}{contradiction_marker})"
             lines.append(record)
         remaining = len(nodes) - len(shown)
         if remaining > 0:
-            lines.append(f"  ... +{remaining}")
+            lines.append("  ... 还有未展开候选")
 
     # ─── 记忆与对话 ───
+
+    @staticmethod
+    def _compact_memory_line(text: str, limit: int = 360) -> str:
+        compact = " ".join(str(text or "").split())
+        if len(compact) <= limit:
+            return compact
+        return compact[: limit - 3].rstrip() + "..."
+
+    @classmethod
+    def _compact_memory_user_part(cls, content: str) -> str:
+        if str(content or "").lstrip().startswith("AutoSession:"):
+            auto_part = content.split("AutoSession:", 1)[1].split("\nGenesis:", 1)[0].strip()
+            return cls._compact_memory_line(auto_part, 320)
+        if "用户:" not in content:
+            return ""
+        user_part = content.split("用户:", 1)[1].split("\nGenesis:", 1)[0].strip()
+        if user_part.lstrip().startswith("[auto_session]"):
+            return cls._compact_memory_line(user_part, 320)
+        if "[GENESIS_USER_REQUEST_START]" in user_part:
+            actual = user_part.split("[GENESIS_USER_REQUEST_START]", 1)[1]
+            directive = ""
+            if "## 用户方向" in actual:
+                directive = actual.split("## 用户方向", 1)[1]
+                for stop in ("\n\n", "\n上一轮工作记忆", "\n上一轮探索前沿", "\n当前信号", "\n当前系统信号"):
+                    idx = directive.find(stop)
+                    if idx >= 0:
+                        directive = directive[:idx]
+                        break
+            auto_summary = "[auto_session]\nsource: auto_mode_injection\ndirective: " + cls._compact_memory_line(directive or actual, 260)
+            return cls._compact_memory_line(auto_summary, 320)
+        return cls._compact_memory_line(user_part, 260)
 
     def get_recent_memory(self, limit: int = 5) -> str:
         """拉取最近 N 条对话记忆 — G 的短期记忆，不压缩"""
@@ -400,7 +451,11 @@ class KnowledgeQuery:
             return ""
         lines = []
         for r in reversed(rows):  # 按时间正序
-            lines.append(r['full_content'])
+            content = r['full_content']
+            user_summary = self._compact_memory_user_part(content)
+            response_summary = self._extract_conversation_topic(content, max_chars=360)
+            summary_parts = [part for part in (user_summary, response_summary) if part]
+            lines.append("\n  ".join(summary_parts) if summary_parts else self._compact_memory_line(content, 420))
             lines.append("---")
         return "\n".join(lines)
 
@@ -524,12 +579,82 @@ class KnowledgeQuery:
 
     # ─── 心跳 / 守护进程状态 ───
 
+    @staticmethod
+    def _parse_heartbeat_timestamp(value):
+        if not value:
+            return None
+        if isinstance(value, datetime):
+            return value
+        text = str(value).strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                return datetime.strptime(text[:19], fmt)
+            except ValueError:
+                continue
+        return None
+
+    @staticmethod
+    def _pid_is_alive(pid) -> bool:
+        try:
+            pid_int = int(pid)
+        except (TypeError, ValueError):
+            return False
+        if pid_int <= 0:
+            return False
+        try:
+            os.kill(pid_int, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            pass
+        except OSError:
+            return False
+        # PID 复用防护：验证 /proc/<pid>/cmdline 包含 genesis 相关进程标记
+        try:
+            with open(f"/proc/{pid_int}/cmdline", "rb") as f:
+                cmdline = f.read()
+            # 检查是否包含 genesis 或 python 相关标记
+            cmdline_str = cmdline.decode("utf-8", errors="replace").lower()
+            if any(marker in cmdline_str for marker in ("genesis", "python", "yogg")):
+                return True
+            return False
+        except (FileNotFoundError, PermissionError, OSError):
+            return False
+
     def get_heartbeats(self) -> List[Dict[str, Any]]:
-        """读取所有进程心跳状态"""
+        """读取所有进程心跳状态，含 PID 复用防护。
+        
+        状态分类:
+        - running: 心跳新鲜 + PID 存活且进程身份匹配
+        - stale: 心跳过期但 PID 仍存活（进程可能卡死）
+        - dead: PID 不存在或进程身份不匹配（已崩溃/已重启）
+        - unknown: 无心跳记录或无 PID
+        """
         rows = self._conn.execute(
             "SELECT process_name, status, last_heartbeat, last_summary, pid FROM process_heartbeat ORDER BY last_heartbeat DESC"
         ).fetchall()
-        return [dict(r) for r in rows]
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        result = []
+        for r in rows:
+            beat = dict(r)
+            heartbeat_at = self._parse_heartbeat_timestamp(beat.get("last_heartbeat"))
+            age_seconds = int(max(0, (now - heartbeat_at).total_seconds())) if heartbeat_at else None
+            heartbeat_stale = age_seconds is None or age_seconds > self._HEARTBEAT_STALE_AFTER_SECONDS
+            pid_alive = self._pid_is_alive(beat.get("pid"))
+            # 三级状态分类（替代二元 stale_snapshot）
+            if not pid_alive:
+                effective_status = "dead"
+            elif heartbeat_stale:
+                effective_status = "stale"
+            else:
+                effective_status = "running"
+            beat["heartbeat_age_seconds"] = age_seconds
+            beat["heartbeat_stale"] = heartbeat_stale
+            beat["pid_alive"] = pid_alive
+            beat["effective_status"] = effective_status
+            beat["state_signal_kind"] = "heartbeat_snapshot"
+            result.append(beat)
+        return result
 
     def get_daemon_status_summary(self) -> str:
         """给 G 的守护进程状态摘要"""
@@ -540,8 +665,10 @@ class KnowledgeQuery:
         for b in beats:
             ts = b.get("last_heartbeat", "?")
             name = b.get("process_name", "?")
-            status = b.get("status", "?")
+            status = b.get("effective_status") or b.get("status", "?")
             summary = b.get("last_summary", "")
             summary_preview = summary[:80] if summary else ""
-            lines.append(f"- {name}: {status} (last: {ts}) {summary_preview}")
+            age = b.get("heartbeat_age_seconds")
+            age_text = f" age={age}s" if age is not None else ""
+            lines.append(f"- {name}: {status}{age_text} (last: {ts}) {summary_preview}")
         return "\n".join(lines)

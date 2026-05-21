@@ -28,6 +28,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from genesis.core.base import MessageRole
+from genesis.v4.diagnostics import PipelineDiagnostics
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,16 @@ class CPhaseMixin:
             return "FULL"
         return "LIGHT"
 
+    def _eligible_arena_nodes(self, active_nodes):
+        roles = getattr(self, "execution_active_node_roles", {}) or {}
+        if not roles:
+            return list(active_nodes or [])
+        eligible_roles = {"search_suggested", "opened", "basis_used"}
+        return [
+            nid for nid in list(active_nodes or [])
+            if roles.get(nid, set()) & eligible_roles
+        ]
+
     @staticmethod
     def _classify_tool_result(tool_name: str, result: str) -> bool:
         """从工具返回值提取客观成功/失败信号（环境信号，非 LLM 自报）。
@@ -134,17 +145,18 @@ class CPhaseMixin:
         # 信号来源：Op 工具调用的客观结果（exit code / Error 前缀），非 Op 自报 STATUS
         # 阈值：>= 0.7 = 成功, <= 0.3 = 失败, 中间 / 无信号 = 中性（只记 usage_count）
         unique_active_nodes = list(dict.fromkeys(self.execution_active_nodes))
+        arena_nodes = self._eligible_arena_nodes(unique_active_nodes)
         env_ratio = self._compute_env_success()
-        if unique_active_nodes:
-            self.vault.increment_usage(unique_active_nodes)
+        if arena_nodes:
+            self.vault.increment_usage(arena_nodes)
             if env_ratio is not None and env_ratio >= 0.7:
-                self.vault.record_usage_outcome(unique_active_nodes, success=True)
-                logger.info(f"Knowledge Arena: +boost for {len(unique_active_nodes)} nodes (env_ratio={env_ratio:.2f}, tools={len(self._op_tool_outcomes)})")
+                self.vault.record_usage_outcome(arena_nodes, success=True)
+                logger.info(f"Knowledge Arena: +boost for {len(arena_nodes)} nodes (env_ratio={env_ratio:.2f}, tools={len(self._op_tool_outcomes)})")
             elif env_ratio is not None and env_ratio <= 0.3:
-                self.vault.record_usage_outcome(unique_active_nodes, success=False)
-                logger.info(f"Knowledge Arena: -decay for {len(unique_active_nodes)} nodes (env_ratio={env_ratio:.2f}, tools={len(self._op_tool_outcomes)})")
+                self.vault.record_usage_outcome(arena_nodes, success=False)
+                logger.info(f"Knowledge Arena: -decay for {len(arena_nodes)} nodes (env_ratio={env_ratio:.2f}, tools={len(self._op_tool_outcomes)})")
             else:
-                logger.info(f"Knowledge Arena: NEUTRAL for {len(unique_active_nodes)} nodes (env_ratio={env_ratio}, tools={len(self._op_tool_outcomes)})")
+                logger.info(f"Knowledge Arena: NEUTRAL for {len(arena_nodes)} nodes (env_ratio={env_ratio}, tools={len(self._op_tool_outcomes)})")
 
         # ── Persona 在线学习（同样使用环境信号）────────────────────────
         if self.blackboard and self.blackboard.entries:
@@ -209,7 +221,7 @@ class CPhaseMixin:
         # 评估已修剪的节点（ablation_active=3 且已观察≥5分钟）
         try:
             # 复用 ablation_baselines 表，查 ablation_active=3 的节点
-            observing_pruned = self.vault.get_ablation_observing_nodes(min_duration_seconds=300)
+            observing_pruned = self.vault.get_ablation_observing_nodes(min_duration_seconds=300, ablation_states=[3])
             # 从 observing 中筛选 ablation_active=3 的
             for nid, title, baseline in observing_pruned[:5]:
                 node_row = self.vault._conn.execute(
@@ -255,6 +267,24 @@ class CPhaseMixin:
 
         c_tokens_total = 0  # Gardener tokens 异步计入
         self.c_messages = []
+
+        # ── 诊断信号: C-Phase 零产出检测 ──
+        # 确定性组件全部静默 + 非 SKIP → 知识沉淀可能静默失效
+        had_arena = bool(arena_nodes)
+        had_trace = bool(trace_pipeline_result and trace_pipeline_result.get("entity_count", 0) > 0)
+        had_ablation = bool(ablation_candidates)
+        had_pruning = bool(pruning_candidates)
+        c_phase_silent = (
+            mode != "SKIP"
+            and not had_arena
+            and not had_trace
+            and not had_ablation
+            and not had_pruning
+        )
+        PipelineDiagnostics.c_phase_zero_output.record(c_phase_silent)
+        if c_phase_silent:
+            logger.info(f"C-Phase zero output: arena={had_arena} trace={had_trace} ablation={had_ablation} pruning={had_pruning}")
+
         logger.info(f"C-Process deterministic parts finished (Arena + Trace + Ablation). Gardener running in background.")
         await self._safe_callback(step_callback, "c_phase_done", {
             "mode": mode, "c_tokens": c_tokens_total,
@@ -552,13 +582,17 @@ class CPhaseMixin:
                         relation=relation,
                         weight=args.get("weight", 1.0),
                     )
-                    edges_added.append({
-                        "source_id": source_id,
-                        "target_id": target_id,
-                        "relation": relation,
-                        "result": str(result)[:100],
-                    })
-                    logger.info(f"C-Gardener: {source_id} --[{relation}]--> {target_id}")
+                    result_text = str(result)
+                    if result_text.startswith("✅"):
+                        edges_added.append({
+                            "source_id": source_id,
+                            "target_id": target_id,
+                            "relation": relation,
+                            "result": result_text[:100],
+                        })
+                        logger.info(f"C-Gardener: {source_id} --[{relation}]--> {target_id}")
+                    else:
+                        logger.info(f"C-Gardener refused: {source_id} --[{relation}]--> {target_id}: {result_text[:120]}")
                 except Exception as e:
                     logger.warning(f"Reflection edge creation failed: {e}")
 

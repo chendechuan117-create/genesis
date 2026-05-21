@@ -11,7 +11,7 @@ import os
 import sys
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, str(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))))
 
@@ -76,21 +76,72 @@ class BackgroundDaemon:
             except Exception as e:
                 logger.error(f"Node cleanup 异常: {e}", exc_info=True)
 
-        # Evidence Assessor 批量触发（每 GC 轮次同步运行）
+            # 心跳活墓园清理：删除已死亡且超过 24h 的旧心跳
+            try:
+                cutoff = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=24)).isoformat()
+                hb_deleted = self.vault.cleanup_stale_heartbeats(cutoff)
+                if hb_deleted:
+                    logger.info(f"Heartbeat cleanup: 清理了 {hb_deleted} 个过期心跳")
+            except Exception as e:
+                logger.error(f"Heartbeat cleanup 异常: {e}", exc_info=True)
+
+        # ── Trace Pipeline 三阶段（每 GC 轮次同步运行）──
+        # Phase 1: 实体提取（增量，轻量）
+        # Phase 2: 关系重建 + 社区检测（全量，较重）
+        # Phase 3: Evidence Assessment（被动评估已有节点一致性）
         evidence_stats = {}
         if self.cycle_count % GC_EVERY_N_CYCLES == 0:
             try:
                 from genesis.v4.trace_pipeline.runner import process_pending_traces
-                batch_result = process_pending_traces(limit=200, rebuild_relationships=False)
+                batch_result = process_pending_traces(limit=200, rebuild_relationships=True)
+                processed = batch_result.get("processed", 0)
+                skipped = batch_result.get("skipped", 0)
+                total_entities = batch_result.get("total_entities", 0)
+                rel_stats = batch_result.get("relationship_stats", {})
+                community_stats = batch_result.get("community_stats", {})
                 evidence_stats = batch_result.get("evidence_assessment", {})
+
+                # 三阶段可见性日志
+                phase1_info = f"entities={total_entities} new_canonical={batch_result.get('new_canonical', 0)}"
+                phase2_info = f"co_occurs={rel_stats.get('co_occurrence', 0)} diagnosed_by={rel_stats.get('error_patterns', 0)} communities={community_stats.get('valid', 0)}/{community_stats.get('total', 0)}"
                 reinforced = len(evidence_stats.get("reinforced", []))
                 weakened = len(evidence_stats.get("weakened", []))
-                if reinforced or weakened:
-                    logger.info(f"Evidence Assessor: reinforced={reinforced} weakened={weakened}")
-            except Exception as e:
-                logger.error(f"Evidence Assessor 异常: {e}", exc_info=True)
+                phase3_info = f"reinforced={reinforced} weakened={weakened}"
 
-        logger.info(f"Cycle #{self.cycle_count} 完成 | 签名修复:{sig_fixed} GC:{gc_count} 硬删:{hard_del} 证据评估:{evidence_stats.get('reinforced', [])[:1]}")
+                logger.info(f"Trace Pipeline: processed={processed} skipped={skipped}")
+                logger.info(f"  Phase1 [extract]: {phase1_info}")
+                logger.info(f"  Phase2 [rebuild]: {phase2_info}")
+                logger.info(f"  Phase3 [evidence]: {phase3_info}")
+            except Exception as e:
+                logger.error(f"Trace Pipeline 异常: {e}", exc_info=True)
+
+        # ── 干跑审计报告（每 GC 轮次，只读不修改）──
+        if self.cycle_count % GC_EVERY_N_CYCLES == 0:
+            try:
+                void_report = self.vault.void_maintenance_report(stale_days=14)
+                if void_report["stale_count"] or void_report["duplicate_count"]:
+                    logger.info(
+                        f"VOID audit: stale={void_report['stale_count']} "
+                        f"duplicate={void_report['duplicate_count']} "
+                        f"resolvable={void_report['resolvable_count']}"
+                    )
+            except Exception as e:
+                logger.error(f"VOID audit 异常: {e}", exc_info=True)
+
+            try:
+                topo_report = self.vault.topology_audit_report()
+                if topo_report["orphan_count"] or topo_report["zero_incoming_count"] or topo_report["virtual_nodes"]["total"] or topo_report["contradicts_edges"]["total"]:
+                    logger.info(
+                        f"Topology audit: orphan_edges={topo_report['orphan_count']} "
+                        f"zero_incoming={topo_report['zero_incoming_count']} "
+                        f"virtual={topo_report['virtual_nodes']['total']} "
+                        f"contradicts={topo_report['contradicts_edges']['total']} "
+                        f"schema_issues={topo_report['schema_issue_count']}"
+                    )
+            except Exception as e:
+                logger.error(f"Topology audit 异常: {e}", exc_info=True)
+
+        logger.info(f"Cycle #{self.cycle_count} 完成 | 签名修复:{sig_fixed} GC:{gc_count} 硬删:{hard_del}")
         self.vault.heartbeat("daemon", "idle",
                               f"sig:{sig_fixed} gc:{gc_count} hdel:{hard_del}")
 

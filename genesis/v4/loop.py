@@ -12,6 +12,8 @@ import logging
 import traceback
 import hashlib
 import inspect
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 
 from genesis.core.base import Message, MessageRole, LLMProvider, PerformanceMetrics, ToolCall
@@ -48,7 +50,7 @@ def _env_int(name: str, default: int, minimum: int = 0) -> int:
 GP_BLOCKED_TOOLS = frozenset([
     "record_context_node", "record_lesson_node", "create_meta_node",
     "delete_node", "create_graph_node", "create_node_edge",
-    "record_tool_node", "record_discovery",
+    "record_tool_node", "record_discovery", "pls_query",
 ])
 
 class V4Loop(LensPhaseMixin, CPhaseMixin):
@@ -62,6 +64,15 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
 
     C_PHASE_MAX_ITER = PIPELINE_CONFIG.c_phase_max_iter
     TOOL_EXEC_TIMEOUT = PIPELINE_CONFIG.tool_exec_timeout
+    CONSUMED_TOOL_RECEIPT_LIMITS = {
+        "search_knowledge_nodes": 5000,
+        "get_knowledge_node_content": 4500,
+        "read_file": 4000,
+        "shell": 3500,
+        "web_search": 2500,
+    }
+    DEFAULT_CONSUMED_TOOL_RECEIPT_LIMIT = 1800
+    PHASE_TRACE_SIGNATURE_BUDGET = 6000
 
     def __init__(
         self,
@@ -88,6 +99,13 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         self.inferred_signature: Dict[str, Any] = {}
         self.blackboard: Optional[Blackboard] = None  # Multi-G 黑板
         self._llm_call_seq = 0
+        self._surface_potential_sample_count = 0
+        self._reported_potential_sample_count = 0
+        self.potential_baseline: Dict[str, int] = {}
+        self.current_state_preview: Dict[str, Any] = {}
+        self._current_state_surfaces: Dict[str, Any] = {}
+        self._knowledge_routing_preview: Dict[str, Any] = {}
+        self._lens_preview: Dict[str, Any] = {}
 
         # 启动时恢复 persona 学习数据（只在首次 V4Loop 实例化时加载一次）
         Blackboard.load_from_db()
@@ -117,14 +135,17 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
             "min_tokens": min(cls._token_history),
         }
 
-    async def run(self, user_input: str, step_callback: Any = None, image_paths: Optional[List[str]] = None, loop_config: Optional[Dict[str, Any]] = None, initial_knowledge_state: Optional[Dict[str, Any]] = None, knowledge_cursor: Optional[Dict[str, Any]] = None) -> Tuple[str, PerformanceMetrics]:
+    async def run(self, user_input: str, step_callback: Any = None, image_paths: Optional[List[str]] = None, loop_config: Optional[Dict[str, Any]] = None, initial_knowledge_state: Optional[Dict[str, Any]] = None, knowledge_cursor: Optional[Dict[str, Any]] = None, session_id: str = None) -> Tuple[str, PerformanceMetrics]:
         """执行主管线 GP -> C (Unified Mode)"""
         self.metrics.start_time = time.time()
         self.user_input = user_input
+        self.session_id = session_id
         self.image_paths = image_paths or []
         self.loop_config = dict(loop_config or {})
         self.g_messages = []
         self.execution_active_nodes: List[str] = []  # Knowledge Arena: 追踪被使用的节点
+        self.execution_active_node_roles: Dict[str, set] = {}
+        self._gp_reached_max_iterations = False
         self._knowledge_cursor_in = knowledge_cursor  # 上轮知识游标
         self._op_tool_outcomes: List[Dict[str, Any]] = []  # 环境信号：工具调用客观结果
         self._signature_drift_events: List[Dict[str, Any]] = []  # 签名偏差检测事件
@@ -135,10 +156,17 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         self.inferred_signature = self.vault.signature.infer(_sig_input)
         self.blackboard = None  # 每次请求重置
         self._llm_call_seq = 0
+        self._surface_potential_sample_count = 0
+        self._reported_potential_sample_count = 0
+        self.potential_baseline = {}
+        self.current_state_preview = {}
+        self._current_state_surfaces = {}
+        self._knowledge_routing_preview = {}
+        self._lens_preview = {}
         self.knowledge_state = self._normalize_knowledge_state(initial_knowledge_state)
         seed_lines = [line.strip() for line in _sig_input.splitlines() if line.strip()]
         if not self.knowledge_state.get("issue") and seed_lines:
-            self.knowledge_state["issue"] = self._truncate_knowledge_state_text(seed_lines[0], 240)
+            self.knowledge_state["issue"] = self._clean_knowledge_state_text(seed_lines[0])
 
         # === Multi-G 透镜预激活 ===
         disable_multi_g = self.loop_config.get("disable_multi_g")
@@ -146,20 +174,67 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
             disable_multi_g = _env_bool("GENESIS_DISABLE_MULTI_G", False)
         if disable_multi_g:
             reason = "runtime_disabled" if "disable_multi_g" in self.loop_config else "env_disabled"
+            self._lens_preview = {"status": "skipped", "reason": reason}
             await self._safe_callback(step_callback, "lens_skipped", {"phase": "LENS_PHASE", "reason": reason})
         elif self._should_activate_multi_g(user_input):
             try:
                 self.blackboard = await self._run_lens_phase(user_input, step_callback)
+                self._lens_preview = {
+                    "status": "active",
+                    "entries": self.blackboard.entry_count,
+                    "voids": len(self.blackboard.search_voids),
+                }
                 logger.info(f"Multi-G lens phase completed: {self.blackboard.entry_count} entries, {len(self.blackboard.search_voids)} voids")
             except Exception as e:
                 logger.error(f"Multi-G lens phase failed (falling back to single-G): {e}", exc_info=True)
                 self.blackboard = None
+                self._lens_preview = {"status": "failed", "reason": str(e)[:160]}
         else:
+            self._lens_preview = {"status": "skipped", "reason": "gate_closed"}
             await self._safe_callback(step_callback, "lens_skipped", {"phase": "LENS_PHASE", "reason": "gate_closed"})
 
         # === Tracing ===
         self.tracer = Tracer.get_instance()
         self.trace_id = self.tracer.start_trace(user_input)
+
+        # === V6 Signature Shadow Prediction (Silent Shadow Mode) ===
+        try:
+            from genesis.v6.signature_shadow import SignatureShadowPredictor, append_jsonl, DEFAULT_LOG_PATH
+            
+            def _run_shadow_prediction(text: str, trace_id: str, db_path: Path):
+                try:
+                    predictor = SignatureShadowPredictor(
+                        fields=["error_kind", "framework", "task_kind", "runtime", "target_kind"],
+                        min_label_count=3,
+                        max_tokens=160,
+                        alpha=1.0
+                    )
+                    predictor.fit(db_path)
+                    result = predictor.predict(text, top_k=3)
+                    record = {
+                        "mode": "shadow_only",
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "trace_id": trace_id,
+                        "user_input_preview": text[:300],
+                        "nodevault_db": str(db_path),
+                        **result,
+                    }
+                    append_jsonl(DEFAULT_LOG_PATH, record)
+                    logger.info(f"V6 Shadow Prediction logged for trace_id={trace_id}")
+                except Exception as shadow_err:
+                    logger.warning(f"V6 Shadow Prediction internal error: {shadow_err}")
+
+            asyncio.create_task(
+                asyncio.to_thread(
+                    _run_shadow_prediction,
+                    user_input,
+                    self.trace_id,
+                    self.vault.db_path
+                )
+            )
+        except Exception as shadow_outer_err:
+            logger.warning(f"V6 Shadow Prediction failed to schedule: {shadow_outer_err}")
+
         self._phase_count = 0
         self._llm_call_count = 0
         self._tool_call_count = 0
@@ -259,6 +334,8 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                 "cache_hit_rate": round(self.metrics.prompt_cache_hit_tokens / self.metrics.input_tokens, 3),
             }
         diagnostics_summary = PipelineDiagnostics.summary()
+        potential_sample_count = self.vault.count_potential_samples(self.trace_id) if hasattr(self.vault, "count_potential_samples") else self._surface_potential_sample_count
+        current_state_preview = self.get_current_state_preview()
         self.vault.heartbeat("main_loop", "idle",
             f"done GP={self.metrics.g_tokens}t cache={cache_stats['cache_hit_rate']*100:.1f}%" if cache_stats else f"done GP={self.metrics.g_tokens}t",
             extra={
@@ -269,6 +346,11 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                 "kb_entropy": kb_entropy,
                 "cache_stats": cache_stats,
                 "diagnostics": diagnostics_summary,
+                "potential_samples": {
+                    "trace_count": potential_sample_count,
+                    "routing_count": self._surface_potential_sample_count,
+                },
+                "current_state_preview": current_state_preview,
             }
         )
         if diagnostics_summary["firing_count"] > 0:
@@ -323,24 +405,153 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
             "gp": _ser(self.g_messages, "GP"),
             "c": _ser(self.c_messages, "C"),
             "c_phase_mode": getattr(self, "_last_c_phase_mode", None),
-            "inferred_signature": self.inferred_signature,
+            "inferred_signature": self._compact_signature_for_trace(self.inferred_signature),
             "knowledge_state": self.get_knowledge_state(),
+            "current_state_preview": self.get_current_state_preview(),
         }
 
     def get_knowledge_state(self) -> Dict[str, Any]:
         return self._normalize_knowledge_state(getattr(self, "knowledge_state", {}))
 
-    @staticmethod
-    def _truncate_knowledge_state_text(text: Any, limit: int = 220) -> str:
-        compact = " ".join(str(text or "").split())
+    def get_current_state_preview(self) -> Dict[str, Any]:
+        active_ids = list(dict.fromkeys(getattr(self, "execution_active_nodes", []) or []))[:12]
+        roles_by_node = getattr(self, "execution_active_node_roles", {}) or {}
+        titles = {}
+        if active_ids:
+            try:
+                titles = self.vault.batch_get_titles(active_ids) if hasattr(self.vault, "batch_get_titles") else {}
+            except Exception:
+                titles = {}
+        active_nodes = []
+        for node_id in active_ids:
+            active_nodes.append({
+                "node_id": node_id,
+                "title": titles.get(node_id, ""),
+                "roles": sorted(str(role) for role in roles_by_node.get(node_id, set())),
+            })
+        outcomes = getattr(self, "_op_tool_outcomes", []) or []
+        tool_outcome_summary = {
+            "total": len(outcomes),
+            "success": sum(1 for item in outcomes if item.get("success") is True),
+            "failed": sum(1 for item in outcomes if item.get("success") is False),
+            "neutral": sum(1 for item in outcomes if item.get("success") is None),
+        }
+        issue = self._trim_context_text((self.get_knowledge_state() or {}).get("issue", ""), 240)
+        signature = self._compact_signature_for_trace(getattr(self, "inferred_signature", {}))
+        prompt_surfaces = dict(getattr(self, "_current_state_surfaces", {}) or {})
+        routing_state = dict(getattr(self, "_knowledge_routing_preview", {}) or {})
+        execution_state = {
+            "active_nodes": active_nodes,
+            "tool_outcomes": tool_outcome_summary,
+        }
+        preview = {
+            "schema": "genesis.current_state_preview.v1",
+            "time_slices": {
+                "input_state": {
+                    "issue": issue,
+                    "signature": signature,
+                    "prompt_surfaces": prompt_surfaces,
+                },
+                "routing_state": routing_state,
+                "execution_state": execution_state,
+                "post_round_state_ref": {
+                    "available_in_auto_report": "knowledge_state",
+                    "phase": "after_round",
+                },
+            },
+            "issue": issue,
+            "signature": signature,
+            "prompt_surfaces": prompt_surfaces,
+            "lens": dict(getattr(self, "_lens_preview", {}) or {}),
+            "routing": routing_state,
+            "active_nodes": active_nodes,
+            "tool_outcomes": tool_outcome_summary,
+        }
+        self.current_state_preview = preview
+        return preview
+
+    def _trim_context_text(self, text: Any, limit: int) -> str:
+        compact = str(text or "")
         if len(compact) <= limit:
             return compact
-        return compact[: limit - 3].rstrip() + "..."
+        head_len = max(0, int(limit * 0.65))
+        tail_len = max(0, limit - head_len - 90)
+        omitted = len(compact) - head_len - tail_len
+        tail = compact[-tail_len:].lstrip() if tail_len else ""
+        suffix = f"\n\n...[已省略 {omitted} 字符，完整结果已记录在 trace/report]..."
+        return compact[:head_len].rstrip() + (suffix + "\n\n" + tail if tail else suffix)
+
+    def _summarize_consumed_tool_result(self, tool_name: str, result: str) -> str:
+        text = str(result or "")
+        limit = self.CONSUMED_TOOL_RECEIPT_LIMITS.get(tool_name, self.DEFAULT_CONSUMED_TOOL_RECEIPT_LIMIT)
+        summary = self._trim_context_text(text, limit)
+        priority_lines = []
+        if tool_name == "search_knowledge_nodes":
+            for line in text.splitlines():
+                stripped = line.strip()
+                if "[建议挂载]" in stripped or stripped.startswith("[PLS") or stripped.startswith("POINT ["):
+                    if stripped not in priority_lines:
+                        priority_lines.append(stripped[:500])
+                if len(priority_lines) >= 8:
+                    break
+        if priority_lines:
+            prefix = "\n".join(priority_lines)
+            if prefix not in summary:
+                summary = prefix + "\n\n" + summary
+        if summary != text:
+            return f"[已消费工具结果收据：{tool_name}]\n{summary}"
+        return summary
+
+    def _messages_for_provider(self) -> List[Dict[str, Any]]:
+        last_assistant_idx = -1
+        for idx, msg in enumerate(self.g_messages):
+            if msg.role == MessageRole.ASSISTANT:
+                last_assistant_idx = idx
+        out = []
+        for idx, msg in enumerate(self.g_messages):
+            if msg.role == MessageRole.TOOL and idx < last_assistant_idx:
+                out.append(Message(
+                    role=MessageRole.TOOL,
+                    content=self._summarize_consumed_tool_result(msg.name or "tool", msg.content or ""),
+                    tool_call_id=msg.tool_call_id,
+                    name=msg.name,
+                ).to_dict())
+            else:
+                out.append(msg.to_dict())
+        return out
+
+    def _compact_signature_for_trace(self, signature: Any) -> Dict[str, Any]:
+        try:
+            normalized = self.vault.signature.normalize(signature)
+        except Exception:
+            normalized = signature if isinstance(signature, dict) else {}
+        compact: Dict[str, Any] = {}
+        for key in sorted((normalized or {}).keys()):
+            value = normalized.get(key)
+            if not value:
+                continue
+            if key == "evidence_refs":
+                continue
+            if isinstance(value, list):
+                item = [self._trim_context_text(str(v), 120) for v in value[:3] if v]
+            else:
+                item = self._trim_context_text(str(value), 120)
+            candidate = dict(compact)
+            candidate[key] = item
+            if len(json.dumps(candidate, ensure_ascii=False, default=str)) > self.PHASE_TRACE_SIGNATURE_BUDGET:
+                compact["_truncated"] = True
+                break
+            compact[key] = item
+        return compact
+
+    @staticmethod
+    def _clean_knowledge_state_text(text: Any) -> str:
+        return " ".join(str(text or "").split())
 
     def _normalize_knowledge_state(self, knowledge_state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         raw = knowledge_state if isinstance(knowledge_state, dict) else {}
         normalized = KnowledgeState(
-            issue=self._truncate_knowledge_state_text(raw.get("issue", ""), 240),
+            issue=self._clean_knowledge_state_text(raw.get("issue", "")),
             verified_facts=[],
             failed_attempts=[],
             next_checks=[],
@@ -351,12 +562,10 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                 values = [values]
             cleaned_values = []
             for value in values:
-                cleaned = self._truncate_knowledge_state_text(value, 220)
+                cleaned = self._clean_knowledge_state_text(value)
                 if not cleaned or cleaned.upper() == "NONE" or cleaned in cleaned_values:
                     continue
                 cleaned_values.append(cleaned)
-                if len(cleaned_values) >= 5:
-                    break
             normalized[key] = cleaned_values
         return normalized
 
@@ -380,12 +589,27 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         gp_tools = self._get_gp_tools()
         gp_tool_names = [t.name for t in gp_tools]
 
+        recent_memory = self.vault.get_recent_memory()
+        inferred_signature_text = self.vault.signature.render(self.inferred_signature)
+        daemon_status = self.vault.get_daemon_status_summary()
+        knowledge_state_text = self.factory.render_knowledge_state(self.knowledge_state)
+        knowledge_map = self.vault.generate_l1_digest()
+        self._current_state_surfaces = {
+            "recent_memory": "present" if recent_memory else "absent",
+            "inferred_signature": "present" if inferred_signature_text else "absent",
+            "daemon_status": "present" if daemon_status else "absent",
+            "knowledge_state": "present" if knowledge_state_text else "absent",
+            "knowledge_map": "present" if knowledge_map else "absent",
+            "trace_experience": "present" if trace_exp else "absent",
+            "gp_tool_count": len(gp_tool_names),
+        }
+
         gp_prompt = self.factory.build_gp_prompt(
-            recent_memory=self.vault.get_recent_memory(),
-            inferred_signature=self.vault.signature.render(self.inferred_signature),
-            daemon_status=self.vault.get_daemon_status_summary(),
-            knowledge_state=self.factory.render_knowledge_state(self.knowledge_state),
-            knowledge_map=self.vault.generate_l1_digest(),
+            recent_memory=recent_memory,
+            inferred_signature=inferred_signature_text,
+            daemon_status=daemon_status,
+            knowledge_state=knowledge_state_text,
+            knowledge_map=knowledge_map,
             trace_experience=trace_exp,
             gp_tool_names=gp_tool_names,
         )
@@ -454,6 +678,13 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                 role=MessageRole.SYSTEM,
                 content=routing_text,
             ))
+            if self._surface_potential_sample_count:
+                await self._safe_callback(step_callback, "surface_potential_samples", {
+                    "phase": "GP_PHASE",
+                    "source": "knowledge_routing",
+                    "count": self._surface_potential_sample_count,
+                })
+                self._reported_potential_sample_count = self._surface_potential_sample_count
 
         schema = [t.to_schema() for t in gp_tools]
 
@@ -481,7 +712,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
 
             self._llm_call_count += 1
             jailbreak = {"role": "system", "content": "[Reminder] 你有知识库和执行工具。能动手就动手，能查就查，别空谈。"}
-            messages_to_send = [m.to_dict() for m in self.g_messages] + [jailbreak]
+            messages_to_send = self._messages_for_provider() + [jailbreak]
             llm_call_started = time.time()
             llm_call_id = await self._emit_llm_call_start(step_callback, "GP_PHASE", i, stream=True)
             try:
@@ -558,7 +789,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                     t0 = time.time()
                     try:
                         tool_args = dict(tc.arguments or {})
-                        if tc.name in {"record_lesson_node", "record_point", "record_line"}:
+                        if tc.name in {"record_lesson_node", "record_point", "record_line", "search_knowledge_nodes"}:
                             tool = self.tools.get(tc.name)
                             try:
                                 params = inspect.signature(getattr(tool, "execute")).parameters if tool else {}
@@ -569,6 +800,8 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                                 tool_args.setdefault("_trace_id", self.trace_id)
                             if accepts_kwargs or "_round_seq" in params:
                                 tool_args.setdefault("_round_seq", i)
+                        if tc.name == "search_knowledge_nodes" and hasattr(self.vault, "count_potential_samples"):
+                            self.potential_baseline[tc.id] = self.vault.count_potential_samples(self.trace_id)
                         res = await asyncio.wait_for(
                             self.tools.execute(tc.name, tool_args),
                             timeout=self.TOOL_EXEC_TIMEOUT
@@ -625,6 +858,17 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                         })
                         # 签名学习
                         self._merge_signature_from_texts(res_text[:500])
+                        if tc.name == "search_knowledge_nodes" and hasattr(self.vault, "count_potential_samples"):
+                            current_potential_count = self.vault.count_potential_samples(self.trace_id)
+                            baseline_count = self.potential_baseline.get(tc.id, 0) or 0
+                            new_potential_count = max(0, current_potential_count - baseline_count)
+                            if new_potential_count:
+                                await self._safe_callback(step_callback, "surface_potential_samples", {
+                                    "phase": "GP_PHASE",
+                                    "source": "search_knowledge_nodes",
+                                    "count": new_potential_count,
+                                    "iteration": i,
+                                })
 
                     await self._safe_callback(step_callback, "tool_result", {
                         "phase": "GP_PHASE",
@@ -634,12 +878,20 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                         "iteration": i,
                         "duration_ms": round(duration_ms, 1),
                     })
+                    is_success = self._classify_tool_result(tc.name, res_text)
                     self.tracer.log_tool_call(
                         self.trace_id, parent=self._g_span, phase="GP",
                         tool_name=tc.name, tool_args=tc.arguments,
-                        tool_result=res_text, duration_ms=duration_ms
+                        tool_result=res_text, duration_ms=duration_ms,
+                        error=None if is_success else res_text[:200]
                     )
                     self.metrics.tools_used.append(tc.name)
+                    if tc.name == "search_knowledge_nodes":
+                        self._track_active_nodes_from_search(res_text)
+                    elif tc.name == "get_knowledge_node_content":
+                        node_id = str((tc.arguments or {}).get("node_id") or "").strip()
+                        if node_id:
+                            self._mark_active_nodes([node_id], "tool_opened")
                     self.g_messages.append(Message(role=MessageRole.TOOL, content=res_text, tool_call_id=tc.id, name=tc.name))
 
                 continue
@@ -664,6 +916,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                 continue
 
         logger.warning(f"GP reached max iterations ({gp_max_iterations}) without finalizing.")
+        self._gp_reached_max_iterations = True
         self.tracer.end_span(self._g_span, status="timeout")
         for msg in reversed(self.g_messages):
             if msg.role == MessageRole.ASSISTANT and msg.content and msg.content.strip():
@@ -737,6 +990,15 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
             logger.info(f"GP tools: unblocked {unblock & GP_BLOCKED_TOOLS} via loop_config")
         return gp_tools
 
+    def _mark_active_nodes(self, node_ids: List[str], role: str):
+        for nid in node_ids or []:
+            node_id = str(nid or "").strip()
+            if not node_id or node_id.startswith("MEM_CONV"):
+                continue
+            if node_id not in self.execution_active_nodes:
+                self.execution_active_nodes.append(node_id)
+            self.execution_active_node_roles.setdefault(node_id, set()).add(role)
+
     def _track_active_nodes_from_search(self, search_result: str):
         """从搜索结果中提取建议挂载的节点 ID 并追踪"""
         match = re.search(r"\[建议挂载\]\s*(.+)", search_result)
@@ -745,9 +1007,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
             if node_line == "无强推荐":
                 return
             node_ids = [nid.strip() for nid in node_line.split(",") if nid.strip()]
-            for nid in node_ids:
-                if nid and not nid.startswith("MEM_CONV") and nid not in self.execution_active_nodes:
-                    self.execution_active_nodes.append(nid)
+            self._mark_active_nodes(node_ids, "tool_suggested")
 
 
     def _apply_knowledge_routing(self) -> Optional[str]:
@@ -766,6 +1026,11 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
 
         cursor = self._knowledge_cursor_in
         use_cursor = False
+        self._knowledge_routing_preview = {
+            "strategy": "none",
+            "injected": False,
+            "cursor_available": bool(cursor and cursor.get("active_node_ids")),
+        }
 
         if cursor and cursor.get("active_node_ids"):
             # 话题漂移检测
@@ -777,61 +1042,147 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
             else:
                 overlap = 0.0
             use_cursor = overlap >= 0.3
+            self._knowledge_routing_preview.update({
+                "cursor_overlap": round(overlap, 3),
+                "used_cursor": use_cursor,
+                "cursor_active_count": len(cursor.get("active_node_ids") or []),
+                "cursor_keyword_count": len(cursor_keywords),
+            })
             logger.info(f"Knowledge routing: cursor overlap={overlap:.2f}, use_cursor={use_cursor}")
 
         if use_cursor:
+            self._knowledge_routing_preview["strategy"] = "cursor"
             return self._route_from_cursor(cursor)
         else:
+            self._knowledge_routing_preview["strategy"] = "vector"
             return self._route_from_vector_search(_sig_input)
 
     def _route_from_cursor(self, cursor: Dict[str, Any]) -> Optional[str]:
         """确定性路由：沿游标节点 + 1-hop 邻居预加载"""
         node_ids = cursor["active_node_ids"][:8]
         routed_ids, surface_roles, surface_result = self._expand_route_surface(node_ids, context_budget=24)
-        return self._render_preloaded_nodes(
+        if not routed_ids:
+            self._knowledge_routing_preview.update({"injected": False, "reason": "empty_cursor_surface"})
+            return None
+        self._knowledge_routing_preview.update({
+            "injected": True,
+            "seed_count": len(node_ids),
+            "routed_count": len(routed_ids),
+            "surface": self._summarize_surface_result(surface_result),
+        })
+        rendered = self._render_preloaded_nodes(
             routed_ids, header="[知识游标] 上轮活跃节点组装的当轮面（连续任务，沿边导航）：",
             surface_roles=surface_roles,
             surface_result=surface_result,
         )
+        if rendered:
+            self._mark_active_nodes([nid for nid in node_ids if nid in routed_ids], "routing_seed")
+        return rendered
 
     def _route_from_vector_search(self, query_text: str) -> Optional[str]:
         """向量搜索路由：基于用户输入自动检索最相关的节点 + graph walk"""
         if not self.vault.vector_engine.is_ready:
             logger.debug("Knowledge routing: vector engine not ready, skip")
+            self._knowledge_routing_preview.update({"injected": False, "reason": "vector_engine_not_ready"})
             return None
 
         # 向量粗排
         results = self.vault.vector_engine.search(query_text, top_k=10, threshold=0.45)
         if not results:
             logger.info("Knowledge routing: vector search returned 0 hits")
+            self._knowledge_routing_preview.update({"injected": False, "reason": "vector_no_hits", "vector_hits": 0})
             return None
 
         node_ids = [r[0] for r in results]
         scores = {r[0]: r[1] for r in results}
+        self._knowledge_routing_preview.update({"vector_hits": len(node_ids)})
         logger.info(f"Knowledge routing: vector search hit {len(node_ids)} nodes, top={scores.get(node_ids[0], 0):.3f}")
         routed_ids, surface_roles, surface_result = self._expand_route_surface(node_ids, context_budget=24)
-        return self._render_preloaded_nodes(
-            routed_ids, header=f"[知识预加载] 向量检索命中 {len(node_ids)} 节点并组装当轮面（无需为形式手动搜索）：",
+        if not routed_ids:
+            self._knowledge_routing_preview.update({"injected": False, "reason": "empty_vector_surface"})
+            return None
+        self._knowledge_routing_preview.update({
+            "injected": True,
+            "seed_count": len(node_ids),
+            "routed_count": len(routed_ids),
+            "surface": self._summarize_surface_result(surface_result),
+        })
+        rendered = self._render_preloaded_nodes(
+            routed_ids, header="[知识预加载] 向量检索已命中相关节点并组装当轮面（无需为形式手动搜索）：",
             similarity_scores=scores,
             surface_roles=surface_roles,
             surface_result=surface_result,
         )
+        if rendered:
+            self._mark_active_nodes([nid for nid in node_ids if nid in routed_ids], "routing_seed")
+        return rendered
 
     def _expand_route_surface(self, seed_ids: List[str], context_budget: int = 24) -> Tuple[List[str], Dict[str, str], Dict[str, Any]]:
         try:
             from genesis.v4.surface import SurfaceExpander
-            surface_result = SurfaceExpander(self.vault).expand_surface(seed_ids, context_budget=context_budget)
+            excluded_ids = self.vault.get_excluded_ids(seed_ids) if hasattr(self.vault, "get_excluded_ids") else set()
+            visible_seed_ids = [nid for nid in seed_ids if nid not in excluded_ids]
+            if not visible_seed_ids:
+                return [], {}, {}
+            surface_result = SurfaceExpander(self.vault).expand_surface(visible_seed_ids, context_budget=context_budget)
+            self._record_surface_potential_samples(surface_result, source="knowledge_routing")
             surface_nodes = surface_result.get("surface_nodes", []) if surface_result else []
             if not surface_nodes:
-                return seed_ids, {}, {}
+                return visible_seed_ids, {}, {}
             surface_ids = [nid for nid, _ in surface_nodes]
-            routed_ids = list(dict.fromkeys(seed_ids + surface_ids))
+            routed_ids = list(dict.fromkeys(visible_seed_ids + surface_ids))
             surface_roles = {nid: role for nid, role in surface_nodes}
-            logger.info(f"Knowledge routing: SurfaceExpander assembled {len(routed_ids)} nodes from {len(seed_ids)} seeds")
+            logger.info(f"Knowledge routing: SurfaceExpander assembled {len(routed_ids)} nodes from {len(visible_seed_ids)} visible seeds")
             return routed_ids, surface_roles, surface_result
         except Exception as e:
             logger.debug(f"Knowledge routing surface expansion skipped: {e}")
-            return seed_ids, {}, {}
+            try:
+                excluded_ids = self.vault.get_excluded_ids(seed_ids) if hasattr(self.vault, "get_excluded_ids") else set()
+                return [nid for nid in seed_ids if nid not in excluded_ids], {}, {}
+            except Exception:
+                return [], {}, {}
+
+    def _summarize_surface_result(self, surface_result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not surface_result:
+            return {}
+        role_counts: Dict[str, int] = {}
+        for _, role in surface_result.get("surface_nodes", []) or []:
+            role_counts[str(role)] = role_counts.get(str(role), 0) + 1
+        return {
+            "fill": surface_result.get("fill_count", 0),
+            "push": surface_result.get("push_count", 0),
+            "co_presence": surface_result.get("co_presence_count", 0),
+            "roles": role_counts,
+            "potential_samples": len(surface_result.get("potential_samples", []) or []),
+            "virtual_saturation": len(surface_result.get("virtual_saturation", []) or []),
+        }
+
+    def _active_role_for_surface_role(self, role: Any) -> Optional[str]:
+        role_text = str(role or "").strip()
+        if role_text == "基础":
+            return "surface_basis"
+        if role_text == "探索":
+            return "surface_frontier"
+        if role_text == "游离":
+            return "surface_co_presence"
+        return None
+
+    def _record_surface_potential_samples(self, surface_result: Optional[Dict[str, Any]], source: str = "surface") -> int:
+        try:
+            samples = (surface_result or {}).get("potential_samples", [])
+            if not samples or not hasattr(self.vault, "record_potential_samples"):
+                return 0
+            count = self.vault.record_potential_samples(
+                samples,
+                trace_id=getattr(self, "trace_id", None),
+                round_seq=None,
+                source=source,
+            )
+            self._surface_potential_sample_count += count
+            return count
+        except Exception as e:
+            logger.debug(f"record surface potential samples skipped: {e}")
+            return 0
 
     def _render_preloaded_nodes(self, node_ids: List[str], header: str,
                                  similarity_scores: Optional[Dict[str, float]] = None,
@@ -896,15 +1247,28 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
             return None
 
         for nid in loaded_ids:
-            if nid not in self.execution_active_nodes:
-                self.execution_active_nodes.append(nid)
+            active_role = self._active_role_for_surface_role((surface_roles or {}).get(nid))
+            if active_role:
+                self._mark_active_nodes([nid], active_role)
         if surface_result:
             fill_count = surface_result.get("fill_count", 0)
             push_count = surface_result.get("push_count", 0)
             co_presence_count = surface_result.get("co_presence_count", 0)
-            lines.append(f"\n[面状态] 已经完成填充→推进→共场组装：基础节点 {fill_count} 个，探索节点 {push_count} 个，游离点 {co_presence_count} 个。")
+            state_parts = []
+            if fill_count:
+                state_parts.append("有基础候选")
+            if push_count:
+                state_parts.append("有探索前沿")
+            if co_presence_count:
+                state_parts.append("存在共场游离点")
+            lines.append(f"\n[面状态] 已经完成填充→推进→共场组装：{' | '.join(state_parts) if state_parts else '未形成稳定面'}。")
             if co_presence_count:
                 lines.append("[共场] 游离点只是受控走神材料，用于触发“或许？”，不是必须处理的任务。")
+            potential_samples = surface_result.get("potential_samples", [])
+            if potential_samples:
+                lines.append("[势] 以下只是当轮“或许？”样本，不是事实或任务：")
+                for sample in potential_samples[:3]:
+                    lines.append(f"  - {sample.get('title', '未命名势')}：{sample.get('detail', '')}")
             for area_hint, _ in surface_result.get("virtual_saturation", [])[:3]:
                 lines.append(f"[饱和] {area_hint}：该区域路径重叠频繁，优先转向不饱和邻域。")
         lines.append(f"\n如需深入某个节点，用 get_knowledge_node_content 读取完整内容。")
@@ -913,6 +1277,8 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
 
     def export_knowledge_cursor(self) -> Dict[str, Any]:
         """导出当前知识游标供下一轮使用"""
+        if getattr(self, "_gp_reached_max_iterations", False):
+            return {"active_node_ids": [], "search_keywords": [], "timestamp": time.time(), "cursor_suppressed": True}
         # 从搜索结果和工具调用中收集搜索关键词
         search_keywords = set()
         # 从用户输入中提取关键词
@@ -922,8 +1288,13 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         for token in re.findall(r'[\w\u4e00-\u9fff]{2,}', _sig_input):
             search_keywords.add(token.lower())
 
+        allowed_roles = {"tool_suggested", "tool_opened", "search_suggested", "opened", "basis_used"}
+        eligible_ids = [
+            nid for nid in self.execution_active_nodes
+            if self.execution_active_node_roles.get(nid, set()) & allowed_roles
+        ]
         return {
-            "active_node_ids": list(self.execution_active_nodes)[:12],
+            "active_node_ids": list(dict.fromkeys(eligible_ids))[:12],
             "search_keywords": list(search_keywords)[:20],
             "timestamp": time.time(),
         }

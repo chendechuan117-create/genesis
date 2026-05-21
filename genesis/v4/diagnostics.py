@@ -178,6 +178,13 @@ class PipelineDiagnostics:
         cooldown_secs=60.0,
     )
 
+    empty_evidence_validated = DiagnosticSignal(
+        name="empty_evidence_validated",
+        window_size=10,
+        threshold=0.3,
+        description="节点声称 validated 但无硬证据支撑，证据质量可能系统性退化",
+    )
+
     @classmethod
     def all_signals(cls) -> List[DiagnosticSignal]:
         return [
@@ -186,6 +193,7 @@ class PipelineDiagnostics:
             cls.op_timeout,
             cls.token_efficiency_degradation,
             cls.provider_consecutive_failure,
+            cls.empty_evidence_validated,
         ]
 
     @classmethod

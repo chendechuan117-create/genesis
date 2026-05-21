@@ -76,7 +76,7 @@ def test_pipeline_diagnostics_summary():
     summary = PipelineDiagnostics.summary()
     assert "firing_count" in summary
     assert "total_signals" in summary
-    assert summary["total_signals"] == 5
+    assert summary["total_signals"] == 6
     assert "signals" in summary
     assert "c_phase_zero_output" in summary["signals"]
     assert "search_zero_hit" in summary["signals"]
@@ -85,10 +85,10 @@ def test_pipeline_diagnostics_summary():
 
 def test_pipeline_diagnostics_all_signals():
     signals = PipelineDiagnostics.all_signals()
-    assert len(signals) == 5
+    assert len(signals) == 6
     names = {s.name for s in signals}
     expected = {"c_phase_zero_output", "search_zero_hit", "op_timeout",
-                "token_efficiency_degradation", "provider_consecutive_failure"}
+                "token_efficiency_degradation", "provider_consecutive_failure", "empty_evidence_validated"}
     assert names == expected, f"Missing signals: {expected - names}"
 
 

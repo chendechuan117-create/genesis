@@ -15,6 +15,7 @@ from typing import Dict, Any, List
 from genesis.v4.manager import METADATA_SIGNATURE_FIELDS
 from genesis.v4.knowledge_query import normalize_node_dict
 from genesis.v4.surface import BASIS_INCOMING_FLOOR, BASIS_INCOMING_PERCENTILE
+from genesis.v4.diagnostics import PipelineDiagnostics
 from genesis.tools._base import BaseNodeTool
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,12 @@ logger = logging.getLogger(__name__)
 
 class SearchKnowledgeNodesTool(BaseNodeTool):
     """节点管理工具：全局搜索。前后台均有权限使用。"""
+
+    _EXACT_NODE_ID_RE = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b")
+
+    @property
+    def cost_estimate(self) -> str:
+        return "cheap"
 
     # ── 搜索命中率仪表盘（进程级统计） ──
     _search_total: int = 0
@@ -68,6 +75,82 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
             self.vault.add_void_task(void_id=void_id, query=query_text, source=source)
         except Exception as e:
             logger.debug(f"search void recording failed: {e}")
+
+    @classmethod
+    def _extract_exact_node_ids(cls, keywords) -> List[str]:
+        if not keywords:
+            return []
+        items = keywords if isinstance(keywords, (list, tuple)) else [keywords]
+        exact_ids = []
+        seen = set()
+        for item in items:
+            for match in cls._EXACT_NODE_ID_RE.findall(str(item or "")):
+                if match not in seen:
+                    seen.add(match)
+                    exact_ids.append(match)
+        return exact_ids
+
+    def _render_exact_id_visibility_notice(self, conn, node_ids: List[str], ntype: str = "ALL", returned_node_ids=None) -> str:
+        exact_ids = list(dict.fromkeys(nid for nid in (node_ids or []) if nid))
+        if not exact_ids:
+            return ""
+        returned_node_ids = set(returned_node_ids or [])
+        placeholders = ",".join("?" * len(exact_ids))
+        rows = conn.execute(
+            f"""SELECT kn.node_id, kn.type, kn.title,
+                      COALESCE(kn.is_virtual, 0) AS is_virtual,
+                      COALESCE(kn.ablation_active, 0) AS ablation_active,
+                      CASE WHEN EXISTS (
+                          SELECT 1 FROM node_edges ne
+                          WHERE ne.target_id = kn.node_id AND ne.relation = 'CONTRADICTS'
+                      ) THEN 1 ELSE 0 END AS contradicted
+               FROM knowledge_nodes kn
+               WHERE kn.node_id IN ({placeholders})""",
+            tuple(exact_ids),
+        ).fetchall()
+        if not rows:
+            return ""
+        row_by_id = {row["node_id"]: row for row in rows}
+        lines = ["⚠️ [节点存在但未作为活跃知识返回] 查询的 node_id 已存在，因此不记录为知识空洞："]
+        requested_type = (ntype or "ALL").upper()
+        for node_id in exact_ids:
+            row = row_by_id.get(node_id)
+            if not row:
+                continue
+            reasons = []
+            if node_id.startswith("MEM_CONV"):
+                reasons.append("conversation-memory filtered")
+            if requested_type != "ALL" and (row["type"] or "").upper() != requested_type:
+                reasons.append(f"type={row['type']} not requested {requested_type}")
+            if int(row["is_virtual"] or 0):
+                reasons.append("virtual-node filtered")
+            if int(row["ablation_active"] or 0):
+                reasons.append(f"ablation_active={row['ablation_active']}")
+            if int(row["contradicted"] or 0):
+                reasons.append("CONTRADICTS-filtered")
+            if node_id in returned_node_ids and not reasons:
+                continue
+            reason_text = ", ".join(reasons) if reasons else "filtered by current visibility policy"
+            lines.append(f"- {node_id} <{row['type']}> {row['title']} — {reason_text}")
+        if len(lines) == 1:
+            return ""
+        lines.append("这不是知识缺口；不要为这些 node_id 重建重复节点。需要内容时请用 get_knowledge_node_content 或放宽可见性/类型条件。")
+        return "\n".join(lines)
+
+    def _record_potential_samples(self, surface_result: Dict[str, Any], trace_id: str = None, round_seq: int = None) -> int:
+        try:
+            samples = (surface_result or {}).get("potential_samples", [])
+            if not samples or not hasattr(self.vault, "record_potential_samples"):
+                return 0
+            return self.vault.record_potential_samples(
+                samples,
+                trace_id=trace_id,
+                round_seq=round_seq,
+                source="search_knowledge_nodes",
+            )
+        except Exception as e:
+            logger.debug(f"search potential sample recording failed: {e}")
+            return 0
 
     @classmethod
     def get_fusion_scores(cls, node_ids: list = None) -> Dict[str, float]:
@@ -139,6 +222,8 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
             return "support"
         if invalidation_reason == "audit_outdated":
             return "conditional"
+        if self._is_reflection_meta_asset_candidate(node):
+            return "conditional"
         knowledge_state = reliability.get("knowledge_state")
         if knowledge_state == "unverified":
             return "conditional"  # PLS: 未验证≠无价值，入线数可能>0
@@ -162,6 +247,8 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
             return "经审计判定已过时，默认不直接挂载；仅在兼容旧方案时参考"
         if invalidation_reason == "manual_outdated":
             return "已被手动标记为过时，默认不挂载，仅在复盘时参考"
+        if self._is_reflection_meta_asset_candidate(node):
+            return "reflection_meta候选资产，仅证明曾被登记/叙述，未证明产物成立"
         knowledge_state = reliability.get("knowledge_state")
         if knowledge_state == "historical":
             return "历史知识，仅在复盘或延续旧轨迹时再挂载"
@@ -187,12 +274,37 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
         }
         return labels.get(bucket or "", "背景")
 
+    def _is_reflection_meta_asset_candidate(self, node: Dict[str, Any]) -> bool:
+        ntype = (node.get("ntype") or node.get("type") or "").upper()
+        if ntype != "ASSET":
+            return False
+        source = str(node.get("content_source") or node.get("source") or "").strip().lower()
+        if source != "reflection_meta":
+            return False
+        reliability = node.get("reliability") or {}
+        validation_status = str(reliability.get("validation_status") or "").strip().lower()
+        last_verified_at = str(reliability.get("last_verified_at") or node.get("last_verified_at") or "").strip()
+        trust_tier = str(reliability.get("trust_tier") or node.get("trust_tier") or "").strip().upper()
+        return trust_tier == "REFLECTION" and validation_status != "validated" and not last_verified_at
+
     def _bucket_summary(self, rows: List[Dict[str, Any]], limit: int = 4) -> str:
         parts = []
         for row in rows[:limit]:
             reason = row.get("active_reason") or self._active_reason(row)
             parts.append(f"{row['node_id']}({reason})")
         return " | ".join(parts)
+
+    @staticmethod
+    def _usage_signal_label(node: Dict[str, Any]) -> str:
+        positive = node.get('usage_success_count', 0) or 0
+        negative = node.get('usage_fail_count', 0) or 0
+        if positive and negative:
+            return "Arena反馈混合"
+        if positive:
+            return "Arena正反馈"
+        if negative:
+            return "Arena负反馈"
+        return ""
 
     def _topo_value(self, node: Dict[str, Any]) -> float:
         """PLS 拓扑价值：入线数归一化。被更多新点基于它产生的点价值更高。
@@ -326,7 +438,7 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
     def is_concurrency_safe(self, arguments: Dict[str, Any]) -> bool:
         return True  # 只读搜索，可并行
 
-    async def execute(self, keywords: List[str] = None, ntype: str = "ALL", signature: Dict[str, Any] = None, conversation_context: str = None) -> str:
+    async def execute(self, keywords: List[str] = None, ntype: str = "ALL", signature: Dict[str, Any] = None, conversation_context: str = None, _trace_id: str = None, _round_seq: int = None) -> str:
         try:
             normalized_signature = self.vault.signature.normalize(signature)
             # Query Expansion: 用对话上下文扩展搜索关键词
@@ -346,20 +458,23 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 query_str = " ".join(expanded_keywords)
                 results = self.vault.vector_engine.search(query_str, top_k=15, threshold=0.55)
                 semantic_ids = [r[0] for r in results]
+            exact_node_ids = self._extract_exact_node_ids(keywords)
 
             conn = self.vault._conn
             with conn:
-                query = ("SELECT node_id, type, title, tags, prerequisites, resolves, metadata_signature, "
-                         "usage_count, usage_success_count, usage_fail_count, last_verified_at, "
-                         "verification_source, updated_at, trust_tier, is_virtual, ablation_active FROM knowledge_nodes "
-                         "WHERE node_id NOT LIKE 'MEM_CONV%'"
-                         " AND COALESCE(is_virtual, 0) = 0"
-                         " AND COALESCE(ablation_active, 0) = 0"
-                         " AND node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS')")
+                query = ("SELECT kn.node_id, kn.type, kn.title, kn.tags, kn.prerequisites, kn.resolves, kn.metadata_signature, "
+                         "kn.usage_count, kn.usage_success_count, kn.usage_fail_count, kn.last_verified_at, "
+                         "kn.verification_source, kn.updated_at, kn.trust_tier, kn.is_virtual, kn.ablation_active, "
+                         "nc.source AS content_source FROM knowledge_nodes kn "
+                         "LEFT JOIN node_contents nc ON kn.node_id = nc.node_id "
+                         "WHERE kn.node_id NOT LIKE 'MEM_CONV%'"
+                         " AND COALESCE(kn.is_virtual, 0) = 0"
+                         " AND COALESCE(kn.ablation_active, 0) = 0"
+                         " AND kn.node_id NOT IN (SELECT target_id FROM node_edges WHERE relation = 'CONTRADICTS')")
                 params = []
 
                 if ntype != "ALL":
-                    query += " AND type = ?"
+                    query += " AND kn.type = ?"
                     params.append(ntype)
 
                 if keywords or semantic_ids:
@@ -384,7 +499,7 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                                 unique_tokens.append(t)
                         keyword_conditions = []
                         for token in unique_tokens:
-                            keyword_conditions.append("(title LIKE ? OR tags LIKE ? OR node_id LIKE ? OR resolves LIKE ?)")
+                            keyword_conditions.append("(kn.title LIKE ? OR kn.tags LIKE ? OR kn.node_id LIKE ? OR kn.resolves LIKE ?)")
                             kw_like = f"%{token}%"
                             params.extend([kw_like, kw_like, kw_like, kw_like])
                         if keyword_conditions:
@@ -393,18 +508,27 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     # 降维式的语义向量匹配 (Vector Similarity)
                     if semantic_ids:
                         placeholders = ','.join('?' * len(semantic_ids))
-                        conditions.append(f"node_id IN ({placeholders})")
+                        conditions.append(f"kn.node_id IN ({placeholders})")
                         params.extend(semantic_ids)
 
                     if conditions:
                         query += " AND (" + " OR ".join(conditions) + ")"
 
-                query += " ORDER BY updated_at DESC LIMIT ?"
+                query += " ORDER BY kn.updated_at DESC LIMIT ?"
                 params.append(40 if normalized_signature else 15)
                 rows = conn.execute(query, tuple(params)).fetchall()
 
                 if not rows:
                     self._record_search_stats(hit=False)
+                    exact_notice = self._render_exact_id_visibility_notice(conn, exact_node_ids, ntype)
+                    if exact_notice:
+                        return exact_notice
+                    PipelineDiagnostics.search_zero_hit.record(True)
+                    # 零命中诊断日志：记录搜索上下文以便排查召回问题
+                    logger.info(
+                        f"Search zero-hit: keywords={keywords} ntype={ntype} "
+                        f"semantic_ids={len(semantic_ids)} signature={bool(normalized_signature)}"
+                    )
                     # 记录搜索空洞 → VOID 任务队列（引导未来探索方向）
                     self._record_search_void(keywords, ntype)
                     return f"⚠️ [未命中] 未找到与 {keywords} 相关的 {ntype} 节点（字面+语义均无匹配）。当前处于未知区域，请基于通用能力处理。"
@@ -423,6 +547,10 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 row_dicts = [r for r in row_dicts if not r.get('ablation_active')]
                 if not row_dicts:
                     self._record_search_stats(hit=False)
+                    exact_notice = self._render_exact_id_visibility_notice(conn, exact_node_ids, ntype)
+                    if exact_notice:
+                        return exact_notice
+                    PipelineDiagnostics.search_zero_hit.record(True)
                     return f"⚠️ [未命中] 未找到与 {keywords} 相关的有效 {ntype} 节点（所有候选已衰减淘汰）。当前处于未知区域，请基于通用能力处理。"
 
                 # Reranker 精排：用 Cross-Encoder 按相关度重新排序
@@ -430,6 +558,7 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     row_dicts = [r for r in row_dicts if self._signature_gate(self.vault.signature.parse(r.get('metadata_signature')), normalized_signature)]
                     if not row_dicts:
                         self._record_search_stats(hit=False)
+                        PipelineDiagnostics.search_zero_hit.record(True)
                         sig_text = self.vault.signature.render(normalized_signature)
                         return f"⚠️ [签名过滤后未命中] 未找到同时满足关键词 {keywords} 与签名 {sig_text} 的 {ntype} 节点。建议放宽部分硬环境约束后重试。"
                 row_dicts = self.vault.vector_engine.rerank(query_str, row_dicts)
@@ -584,9 +713,20 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
 
                 # === 知识邻域视图（连根拔起） ===
                 total_neighbors = sum(len(v) for v in graph_related_ids.values())
-                lines = [f"🔍 [知识邻域] 查询: {keywords} | 命中 {len(row_dicts)} 节点，关联 {total_neighbors} 邻居"]
+                lines = [f"🔍 [知识邻域] 查询: {keywords} | 已组装相关知识邻域"]
+                lines.append("type=工具塑形schema字段，非语义角色/验证状态")
                 if normalized_signature:
                     lines.append(f"签名: {self.vault.signature.render(normalized_signature)}")
+                returned_node_ids = {r["node_id"] for r in row_dicts}
+                exact_notice = self._render_exact_id_visibility_notice(
+                    conn,
+                    exact_node_ids,
+                    ntype,
+                    returned_node_ids=returned_node_ids,
+                )
+                exact_id_resolved = bool(exact_notice) or bool(set(exact_node_ids) & returned_node_ids)
+                if exact_notice:
+                    lines.append(exact_notice)
                 lines.append("")
 
                 # 直接命中节点 + 维度信息 + 内联边（连根拔起视图）
@@ -611,14 +751,9 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                         meta.append("基础")
                     else:
                         meta.append("探索")
-                    wins = r.get('usage_success_count', 0) or 0
-                    losses = r.get('usage_fail_count', 0) or 0
-                    if wins and losses:
-                        meta.append("有实战记录")
-                    elif wins:
-                        meta.append("有成功记录")
-                    elif losses:
-                        meta.append("有失败记录")
+                    usage_label = self._usage_signal_label(r)
+                    if usage_label:
+                        meta.append(usage_label)
                     reliability = r.get('reliability') or {}
                     if reliability.get('epoch_stale'):
                         meta.append("旧快照")
@@ -664,6 +799,11 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     invalidation_reason = reliability.get('invalidation_reason') or ""
                     if invalidation_reason:
                         detail_parts.append(f"invalid:{invalidation_reason}")
+                    evidence_artifact_types = reliability.get('evidence_artifact_types') or []
+                    if evidence_artifact_types:
+                        artifact_label = ",".join(str(t) for t in evidence_artifact_types[:3])
+                        detail_parts.append(f"evidence:artifact_type_only={artifact_label}")
+                        detail_parts.append(f"source_identity:{reliability.get('source_identity_status') or 'absent'}")
                     if r.get('resolves'):
                         detail_parts.append(f"resolves:{r['resolves'][:80]}")
                     if detail_parts:
@@ -739,7 +879,7 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     lines.extend(void_hints)
 
                 # ── 低密度 → VOID 记录（知识缺口，引导未来探索） ──
-                if should_record_void:
+                if should_record_void and not exact_id_resolved:
                     self._record_search_void(keywords, ntype,
                                              extra=f"topo_density={total_nodes},basis={basis_count},edges={cone_edge_count}")
 
@@ -749,6 +889,7 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     expander = SurfaceExpander(self.vault)
                     seed_ids = [r['node_id'] for r in row_dicts]
                     surface_result = expander.expand_surface(seed_ids, context_budget=80)
+                    self._record_potential_samples(surface_result, trace_id=_trace_id, round_seq=_round_seq)
                     surface_text = expander.render_surface(surface_result)
                     if surface_text:
                         lines.append("")
@@ -759,6 +900,7 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 # ── 搜索仪表盘统计 ──
                 top_scores = [r.get('fusion_score', 0.0) for r in row_dicts[:5]]
                 self._record_search_stats(hit=True, top_fusion_scores=top_scores)
+                PipelineDiagnostics.search_zero_hit.record(False)
 
                 return "\n".join(lines)
         except Exception as e:
