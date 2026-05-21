@@ -119,6 +119,11 @@ class Tool(ABC):
         """工具参数 Schema (OpenAI Function Calling 格式)"""
         pass
     
+    @property
+    def cost_estimate(self) -> str:
+        """工具成本估算: cheap | moderate | expensive。子类覆写。"""
+        return "moderate"
+    
     @abstractmethod
     async def execute(self, **kwargs) -> str:
         """执行工具"""
@@ -149,7 +154,7 @@ class Tool(ABC):
             "type": "function",
             "function": {
                 "name": self.name,
-                "description": self.description,
+                "description": f"{self.description} [cost:{self.cost_estimate}]",
                 "parameters": params
             }
         }

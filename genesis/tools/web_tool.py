@@ -20,6 +20,10 @@ SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://127.0.0.1:8080")
 class WebSearchTool(Tool):
     """Web 搜索工具（SearXNG + Tavily 双引擎）"""
     
+    @property
+    def cost_estimate(self) -> str:
+        return "expensive"
+    
     def is_concurrency_safe(self, arguments: Dict[str, Any]) -> bool:
         return True  # 只读搜索，可并行
     

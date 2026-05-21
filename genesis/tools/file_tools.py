@@ -27,6 +27,10 @@ def _format_file_success(action_title: str, path: Path, size: int, encoding: str
 class ReadFileTool(Tool):
     """读取文件工具"""
     
+    @property
+    def cost_estimate(self) -> str:
+        return "cheap"
+    
     def is_concurrency_safe(self, arguments: Dict[str, Any]) -> bool:
         return True  # 只读，可并行
 
@@ -237,6 +241,10 @@ class WriteFileTool(Tool):
     """写入文件工具"""
     
     @property
+    def cost_estimate(self) -> str:
+        return "moderate"
+    
+    @property
     def name(self) -> str:
         return "write_file"
     
@@ -410,6 +418,10 @@ class GrepFilesTool(Tool):
     """跨文件文本搜索工具"""
 
     @property
+    def cost_estimate(self) -> str:
+        return "cheap"
+
+    @property
     def name(self) -> str:
         return "grep_files"
 
@@ -554,6 +566,10 @@ class GrepFilesTool(Tool):
 
 class ListDirectoryTool(Tool):
     """列出目录工具"""
+    
+    @property
+    def cost_estimate(self) -> str:
+        return "cheap"
     
     def is_concurrency_safe(self, arguments: Dict[str, Any]) -> bool:
         return True  # 只读，可并行

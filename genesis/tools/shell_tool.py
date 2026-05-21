@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 class ShellTool(Tool):
     """Shell 命令执行工具 (支持沙箱)"""
     
+    @property
+    def cost_estimate(self) -> str:
+        return "moderate"
+    
     def __init__(
         self, 
         timeout: int = 600, 
