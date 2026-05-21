@@ -95,3 +95,14 @@ def test_mcp_tools_call_uses_same_registry_gate_after_adapter_patch(monkeypatch)
     assert sent[1][1]["content"][0]["text"] == "OK:hi"
     assert "isError" not in sent[1][1]
     assert tool.calls == [{"message": "hi"}]
+
+
+def test_registry_ignores_schema_extra_arguments():
+    reg = ToolRegistry()
+    tool = EchoProbeTool()
+    reg.register(tool)
+
+    result = run(reg.execute("echo_probe", {"message": "hi", "description": "extra"}))
+
+    assert result == "OK:hi"
+    assert tool.calls == [{"message": "hi"}]
