@@ -1,5 +1,6 @@
 """
-Genesis V4 - 提示词工厂 (Prompt Factory)
+Genesis V4 - 提示词工厂
+class GPPromptFactory:
 
 从 manager.py 中提取的 FactoryManager / NodeManagementTools / Persona 常量。
 FactoryManager 负责组装 G/Op/C/Lens 各阶段的系统提示词。
@@ -130,6 +131,18 @@ class FactoryManager:
         issue = " ".join(str(knowledge_state.get("issue") or "").split())
         if issue:
             lines.append(f"issue: {issue}")
+        labels = {
+            "verified_facts": "observations(source=rolling_state_proxy, non_verification)",
+            "failed_attempts": "avoid_repeating(source=rolling_state_proxy)",
+            "next_checks": "next_checks(source=rolling_state_proxy)",
+        }
+        replacements = {
+            "已确认:": "候选观察(source=rolling_state_proxy):",
+            "已确认事实": "已写入观察",
+            "已知事实": "已写入节点",
+            "有活动但无持久产出": "有工具/回复活动但未观察到 sandbox tracked diff 变化(source=sandbox_diff_snapshot, semantic_progress=unknown)",
+            "无持久产出": "未观察到 sandbox tracked diff 变化(source=sandbox_diff_snapshot, semantic_progress=unknown)",
+        }
         for key in ["verified_facts", "failed_attempts", "next_checks"]:
             values = knowledge_state.get(key) or []
             if isinstance(values, str):
@@ -137,11 +150,13 @@ class FactoryManager:
             normalized = []
             for value in values:
                 cleaned = " ".join(str(value or "").split())
+                for old, new in replacements.items():
+                    cleaned = cleaned.replace(old, new)
                 if not cleaned or cleaned.upper() == "NONE" or cleaned in normalized:
                     continue
                 normalized.append(cleaned)
             if normalized:
-                lines.append(f"{key}:")
+                lines.append(f"{labels.get(key, key)}:")
                 lines.extend([f"- {value}" for value in normalized])
         return "\n".join(lines)
 
@@ -171,7 +186,7 @@ class FactoryManager:
         map_block = ""
         if knowledge_map:
             map_block = f"""[L1 Knowledge — 声明式知识摘要]
-按当前任务相关性排序的知识节点。优先看基础节点，再沿推理线推进到探索节点。
+按当前任务相关性排序的知识节点。优先看基础候选，再沿推理线推进到探索候选；基础候选表示被频繁引用，不等于已验证。
 需要详情用 search_knowledge_nodes(keywords=[...]) 或 get_knowledge_node_content(node_id=...)。
 {knowledge_map}
 """
@@ -201,7 +216,7 @@ class FactoryManager:
         knowledge_state_block = ""
         if knowledge_state:
             knowledge_state_block = f"""[当前工作记忆]
-以下是当前轮次沉淀出的最小工作记忆。只有 verified_facts 可以直接当作已证实事实；failed_attempts 表示应避免原样重复；next_checks 是优先检查项：
+以下是当前轮次沉淀出的最小工作记忆。observations 是滚动状态代理信号，不是验证证明；avoid_repeating 表示应避免原样重复；next_checks 是优先检查项：
 {knowledge_state}
 """
 
@@ -240,18 +255,18 @@ class FactoryManager:
 2. [知识路径] 过程里是否自然产生了值得保存的新理解
 
 记忆标签指导你的行动：
-- **基础节点**（已被反复验证）→ 直接作为推理基础使用
-- **探索节点**（新近产生）→ 需要验证后再依赖
+- **基础候选**（被频繁引用）→ 可优先参考，但不是验证证明
+- **探索候选**（新近产生）→ 需要证据支撑后再依赖
 - **知识空洞** → 优先调查
 
 不要把记忆当成外部报告反复质疑；像人使用经验一样先用它。只有当代码证据、执行结果或新观察与记忆冲突时，才停下来核对。记录知识不是做笔记：只有形成了以后还会用到的新理解时才写点；写点时用线说明它来自哪些已有经验。
 
-{map_block}
-{experience_block}
 {signature_block}
-{memory_block}
-{knowledge_state_block}
+{experience_block}
+{map_block}
 {daemon_block}
+{knowledge_state_block}
+{memory_block}
 """
 
     def build_lens_prompt(self, persona: str, user_question: str, shared_knowledge: str = "", g_interpretation: str = "", blackboard_state: str = "", knowledge_digest: str = "", inferred_signature: str = "", conversation_digest: str = "") -> str:
@@ -341,12 +356,66 @@ class NodeManagementTools:
             vault = NodeVault()
         self.vault = vault
 
+    @staticmethod
+    def _compact_auto_memory_text(text: str, limit: int) -> str:
+        compact = "\n".join(line.strip() for line in str(text or "").splitlines() if line.strip())
+        if len(compact) <= limit:
+            return compact
+        return compact[: limit - 3].rstrip() + "..."
+
+    @staticmethod
+    def _extract_auto_section(text: str, header: str) -> str:
+        if header not in text:
+            return ""
+        rest = text.split(header, 1)[1]
+        stops = ["\n## ", "\n上一轮工作记忆", "\n上一轮探索前沿", "\n当前信号", "\n当前系统信号", "\n## 沙箱规则"]
+        end = len(rest)
+        for stop in stops:
+            idx = rest.find(stop)
+            if idx >= 0:
+                end = min(end, idx)
+        return " ".join(rest[:end].split())
+
+    def _sanitize_memory_user_msg(self, user_msg: str) -> str:
+        text = str(user_msg or "")
+        if "[GENESIS_USER_REQUEST_START]" not in text:
+            return text
+        actual = text.split("[GENESIS_USER_REQUEST_START]", 1)[1].strip()
+        directive = self._extract_auto_section(actual, "## 用户方向")
+        if not directive:
+            for line in actual.splitlines():
+                stripped = line.strip()
+                if stripped and not stripped.startswith(("#", "-", "当前信号", "当前系统信号")):
+                    directive = stripped
+                    break
+        issue = ""
+        for line in actual.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("- issue:") or stripped.startswith("issue:"):
+                issue = stripped.lstrip("- ").strip()
+                break
+        parts = ["[auto_session]", "source: auto_mode_injection"]
+        if directive:
+            parts.append("directive: " + self._compact_auto_memory_text(directive, 420))
+        if issue:
+            parts.append("prior_issue: " + self._compact_auto_memory_text(issue, 420))
+        return "\n".join(parts) if len(parts) > 2 else "[auto_session]\nsource: auto_mode_injection\ndirective: " + self._compact_auto_memory_text(actual, 700)
+
+    @staticmethod
+    def _is_auto_session_memory(user_payload: str) -> bool:
+        return str(user_payload or "").lstrip().startswith("[auto_session]")
+
     def store_conversation(self, user_msg: str, agent_response: str):
         """记录 G 的短期记忆（纯时间序列，给 G 起步上下文用的）"""
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         node_id = f"MEM_CONV_{ts}"
-        title = user_msg[:40].replace("\n", " ").strip()
-        memory_content = f"用户: {user_msg}\nGenesis: {agent_response}"
+        user_payload = self._sanitize_memory_user_msg(user_msg)
+        response_payload = str(agent_response or "")
+        title = user_payload[:40].replace("\n", " ").strip()
+        if self._is_auto_session_memory(user_payload):
+            memory_content = f"AutoSession:\n{user_payload}\nGenesis: {response_payload}"
+        else:
+            memory_content = f"用户: {user_payload}\nGenesis: {response_payload}"
 
         self.vault.create_node(
             node_id=node_id,

@@ -214,9 +214,9 @@ class TraceQueryTool(Tool):
                 if lessons:
                     lines.append("\n── 相关声明式知识（NodeVault） ──")
                     for l in lessons:
-                        win = l["usage_success_count"] or 0
-                        fail = l["usage_fail_count"] or 0
-                        record = f"  win={win}/{win+fail} | {l['title'][:60]}"
+                        positive = l["usage_success_count"] or 0
+                        negative = l["usage_fail_count"] or 0
+                        record = f"  Arena反馈 +{positive}/-{negative} | {l['title'][:60]}"
                         lines.append(record)
                     lines.append("  → 用 get_knowledge_node_content 查看详情")
         except Exception:

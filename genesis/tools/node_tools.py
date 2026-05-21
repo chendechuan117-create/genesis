@@ -9,6 +9,36 @@ from genesis.tools._base import BaseNodeTool, TRUST_SCHEMA_PROPERTIES  # noqa: F
 logger = logging.getLogger(__name__)
 
 
+def _format_endpoint_visibility_rejection(vault: NodeVault, endpoints: List[tuple[str, str]]) -> str:
+    clean_ids = list(dict.fromkeys(nid for _, nid in endpoints if nid))
+    if not clean_ids:
+        return ""
+    try:
+        placeholders = ",".join("?" * len(clean_ids))
+        rows = vault._conn.execute(
+            f"SELECT node_id, COALESCE(ablation_active, 0) ablation_active, COALESCE(is_virtual, 0) is_virtual FROM knowledge_nodes WHERE node_id IN ({placeholders})",
+            clean_ids,
+        ).fetchall()
+    except Exception:
+        return ""
+    status = {row["node_id"]: row for row in rows}
+    blocked = []
+    for role, nid in endpoints:
+        if not nid:
+            continue
+        row = status.get(nid)
+        if row is None:
+            blocked.append(f"{role}_missing")
+            continue
+        ablation_active = int(row["ablation_active"] or 0)
+        is_virtual = int(row["is_virtual"] or 0)
+        if ablation_active > 0:
+            blocked.append(f"{role}_hidden(ablation_active={ablation_active})")
+        if is_virtual:
+            blocked.append(f"{role}_virtual(is_virtual={is_virtual})")
+    return "；".join(blocked)
+
+
 
 class RecordContextNodeTool(BaseNodeTool):
     """节点管理工具：记录环境与状态变量节点。专属后台 C 进程权限。"""
@@ -34,7 +64,7 @@ class RecordContextNodeTool(BaseNodeTool):
             "required": ["node_id", "title", "state_description"]
         }
 
-    async def execute(self, node_id: str, title: str, state_description: str, metadata_signature: Dict[str, Any] = None, last_verified_at: str = None, verification_source: str = None, _trace_id: str = None, _round_seq: int = None) -> str:
+    async def execute(self, node_id: str, title: str, state_description: str, metadata_signature: Dict[str, Any] = None, evidence_refs: List[Dict[str, Any]] = None, last_verified_at: str = None, verification_source: str = None, _trace_id: str = None, _round_seq: int = None) -> str:
         try:
             existed = node_id in self.vault.get_node_briefs([node_id])
             self.vault.create_node(
@@ -46,6 +76,7 @@ class RecordContextNodeTool(BaseNodeTool):
                 full_content=state_description,
                 source="reflection",
                 metadata_signature=metadata_signature,
+                evidence_refs=evidence_refs,
                 last_verified_at=last_verified_at,
                 verification_source=verification_source,
                 trust_tier="REFLECTION"
@@ -69,7 +100,7 @@ class RecordPointTool(BaseNodeTool):
 
     @property
     def description(self) -> str:
-        return "记录一个轻量知识点。发现新洞察时先写点，再用 record_line 连接它基于哪些已有点。"
+        return "记录一个已形成可复用理解的轻量知识点，默认 CONTEXT；只有经过验证的强结晶经验才显式写 LESSON。写点后用 record_line 连接它基于哪些已有点。"
 
     @property
     def parameters(self) -> Dict[str, Any]:
@@ -79,7 +110,7 @@ class RecordPointTool(BaseNodeTool):
                 "title": {"type": "string", "description": "可选一句话标题；不填时从 content 自动生成"},
                 "content": {"type": "string", "description": "知识点内容，写清楚发现、约束或经验"},
                 "node_id": {"type": "string", "description": "可选节点ID；不填时自动生成 P_ 前缀ID"},
-                "point_type": {"type": "string", "enum": ["LESSON", "CONTEXT"], "description": "点类型，默认 LESSON"},
+                "point_type": {"type": "string", "enum": ["LESSON", "CONTEXT"], "description": "点类型，默认 CONTEXT；LESSON 仅用于可复用强结晶"},
                 "tags": {"type": "string", "description": "逗号分隔标签，默认 auto_managed"},
                 "resolves": {"type": "string", "description": "这个点主要解释/解决的问题或现象"},
                 **TRUST_SCHEMA_PROPERTIES
@@ -87,7 +118,7 @@ class RecordPointTool(BaseNodeTool):
             "required": ["content"]
         }
 
-    async def execute(self, title: str = "", content: str = "", node_id: str = "", point_type: str = "LESSON", tags: str = "auto_managed", resolves: str = "", metadata_signature: Dict[str, Any] = None, last_verified_at: str = None, verification_source: str = None, _trace_id: str = None, _round_seq: int = None) -> str:
+    async def execute(self, title: str = "", content: str = "", node_id: str = "", point_type: str = "CONTEXT", tags: str = "auto_managed", resolves: str = "", metadata_signature: Dict[str, Any] = None, evidence_refs: List[Dict[str, Any]] = None, last_verified_at: str = None, verification_source: str = None, _trace_id: str = None, _round_seq: int = None) -> str:
         try:
             title = (title or "").strip()
             content = (content or "").strip()
@@ -98,7 +129,7 @@ class RecordPointTool(BaseNodeTool):
                 title = first_line[:57].rstrip() + "..." if len(first_line) > 60 else first_line
             if not title or not content:
                 return "Error: title 和 content 不能为空。"
-            resolved_type = (point_type or "LESSON").strip().upper()
+            resolved_type = (point_type or "CONTEXT").strip().upper()
             if resolved_type not in {"LESSON", "CONTEXT"}:
                 return "Error: point_type 必须是 LESSON 或 CONTEXT。"
             resolved_id = (node_id or "").strip()
@@ -115,6 +146,7 @@ class RecordPointTool(BaseNodeTool):
                 source="gp_point",
                 resolves=resolves or None,
                 metadata_signature=metadata_signature,
+                evidence_refs=evidence_refs,
                 last_verified_at=last_verified_at,
                 verification_source=verification_source,
                 trust_tier="REFLECTION",
@@ -152,6 +184,43 @@ class RecordLineTool(BaseNodeTool):
             "required": ["new_point_id", "basis_point_id", "reasoning"]
         }
 
+    def _resolve_missing_node_id(self, nid: str) -> tuple[str | None, str]:
+        prefix_rows = []
+        try:
+            prefix_rows = self.vault._conn.execute(
+                "SELECT node_id, title FROM knowledge_nodes WHERE node_id LIKE ? ORDER BY updated_at DESC LIMIT 5",
+                (f"{nid}_%",)
+            ).fetchall()
+        except Exception:
+            prefix_rows = []
+        if len(prefix_rows) == 1:
+            resolved_id = prefix_rows[0]['node_id']
+            resolved_title = str(prefix_rows[0]['title'] or "")
+            logger.info(f"record_line: node_id前缀解析 {nid} → {resolved_id} (title='{resolved_title[:40]}')")
+            return resolved_id, ""
+        if len(prefix_rows) > 1:
+            candidates = [f"{row['node_id']}:{str(row['title'] or '')[:30]}" for row in prefix_rows[:5]]
+            return None, f"{nid} 匹配多个真实节点，请改用完整ID: {candidates}"
+        if re.fullmatch(r"P_R\d+[A-Z]?", nid):
+            return None, f"{nid} 像是未落库的概念简称，不是可连线的真实node_id；请先用record_point返回的ID，或用search_knowledge_nodes找到canonical ID"
+        hint = re.sub(r'^(P_|LESSON_|CONTEXT_|ASSET_|EPISODE_|DISC_|ACTION_|EVENT_|TOOL_)', '', nid)
+        hint = re.sub(r'_?\d{8}$', '', hint)
+        hint = hint.strip('_')
+        if hint and len(hint) >= 4:
+            try:
+                rows = self.vault._conn.execute(
+                    "SELECT node_id, title FROM knowledge_nodes WHERE title LIKE ? ORDER BY updated_at DESC LIMIT 3",
+                    (f"%{hint}%",)
+                ).fetchall()
+                if rows:
+                    resolved_id = rows[0]['node_id']
+                    resolved_title = str(rows[0]['title'] or "")
+                    logger.info(f"record_line: 模糊解析 {nid} → {resolved_id} (title='{resolved_title[:40]}')")
+                    return resolved_id, ""
+            except Exception:
+                pass
+        return None, ""
+
     async def execute(self, new_point_id: str, basis_point_id: str, reasoning: str, _trace_id: str = None, _round_seq: int = None) -> str:
         try:
             new_point_id = (new_point_id or "").strip()
@@ -167,23 +236,13 @@ class RecordLineTool(BaseNodeTool):
                 # LLM 经常编造 node_id（如 P_VERIFY_DISC_14E85206_ENTRYPOINT_LINK_20260427），
                 # 实际 ID 是 md5 生成的（如 P_94777BDE08）。尝试按 title 子串模糊匹配。
                 resolved = {}
+                resolution_hints = []
                 for nid in missing:
-                    # 从 ID 中提取语义关键词（去掉 P_/LESSON_/CONTEXT_ 等前缀和日期后缀）
-                    hint = re.sub(r'^(P_|LESSON_|CONTEXT_|ASSET_|EPISODE_|DISC_|ACTION_|EVENT_|TOOL_)', '', nid)
-                    hint = re.sub(r'_?\d{8}$', '', hint)  # 去掉日期后缀
-                    hint = hint.strip('_')
-                    if hint and len(hint) >= 4:
-                        # 在数据库中按 title LIKE 搜索
-                        try:
-                            rows = self.vault._conn.execute(
-                                "SELECT node_id, title FROM knowledge_nodes WHERE title LIKE ? ORDER BY updated_at DESC LIMIT 3",
-                                (f"%{hint}%",)
-                            ).fetchall()
-                            if rows:
-                                resolved[nid] = rows[0]['node_id']
-                                logger.info(f"record_line: 模糊解析 {nid} → {rows[0]['node_id']} (title='{rows[0]['title'][:40]}')")
-                        except Exception:
-                            pass
+                    resolved_id, resolution_hint = self._resolve_missing_node_id(nid)
+                    if resolved_id:
+                        resolved[nid] = resolved_id
+                    elif resolution_hint:
+                        resolution_hints.append(resolution_hint)
                 # 替换解析成功的 ID
                 if resolved.get(new_point_id):
                     new_point_id = resolved[new_point_id]
@@ -193,7 +252,11 @@ class RecordLineTool(BaseNodeTool):
                 briefs = self.vault.get_node_briefs([new_point_id, basis_point_id])
                 still_missing = [nid for nid in [new_point_id, basis_point_id] if nid not in briefs]
                 if still_missing:
-                    return f"Error: 节点不存在，无法连线: {still_missing}。提示：请先调用 record_point 创建节点，然后用返回的 ID 连线。"
+                    hint_text = f" 解析提示：{'；'.join(resolution_hints)}。" if resolution_hints else ""
+                    return f"Error: 节点不存在，无法连线: {still_missing}。{hint_text}提示：请先调用 record_point 创建节点，然后用返回的 ID 连线。"
+            blocked_reason = _format_endpoint_visibility_rejection(self.vault, [("new", new_point_id), ("basis", basis_point_id)])
+            if blocked_reason:
+                return f"Error: 推理线写入被拒绝: {new_point_id} --[based_on]--> {basis_point_id}。原因: {blocked_reason}。这些端点当前不可连线；请改用 active 且非 virtual 的节点。"
             if basis_point_id in self.vault.get_reasoning_basis_ids(new_point_id):
                 return f"ℹ️ LINE 已存在: {new_point_id} --[based_on]--> {basis_point_id}"
             try:
@@ -202,7 +265,7 @@ class RecordLineTool(BaseNodeTool):
                 current_round_seq = None
             same_round_ids = self.vault.get_same_round_ids([basis_point_id], trace_id=_trace_id, round_seq=current_round_seq)
             same_round = 1 if basis_point_id in same_round_ids else 0
-            self.vault.create_reasoning_line(
+            created = self.vault.create_reasoning_line(
                 new_point_id,
                 basis_point_id,
                 reasoning=reasoning,
@@ -211,6 +274,10 @@ class RecordLineTool(BaseNodeTool):
                 trace_id=_trace_id,
                 round_seq=current_round_seq,
             )
+            if not created:
+                blocked_reason = _format_endpoint_visibility_rejection(self.vault, [("new", new_point_id), ("basis", basis_point_id)])
+                detail = f"原因: {blocked_reason}。" if blocked_reason else "请确认两个节点都存在、不是自引用，且端点 active/非 virtual。"
+                return f"Error: 推理线写入被拒绝: {new_point_id} --[based_on]--> {basis_point_id}。{detail}"
             marker = "同轮" if same_round else "异轮"
 
             # ── 碰撞检测（写后去重）：收集该新点的完整 basis 集合，检查重叠 ──
@@ -218,7 +285,7 @@ class RecordLineTool(BaseNodeTool):
             # record_line 是两步流程（record_point + record_line），碰撞在连线时才能判断
             collision_hint = ""
             try:
-                full_basis = list(self.vault.get_reasoning_basis_ids(new_point_id))
+                full_basis = list(self.vault.get_reasoning_basis_ids(new_point_id, include_same_round=False))
                 if len(full_basis) >= 2:
                     collision_candidates = self.vault.find_collision_candidates(full_basis, min_overlap=2, exclude_ids=[new_point_id])
                     if collision_candidates:
@@ -291,7 +358,7 @@ class RecordLessonNodeTool(BaseNodeTool):
             "required": ["node_id", "title", "trigger_verb", "trigger_noun", "trigger_context", "action_steps", "because_reason", "resolves", "reasoning_basis"]
         }
 
-    async def execute(self, node_id: str, title: str, trigger_verb: str, trigger_noun: str, trigger_context: str, action_steps: List[str], because_reason: str, prerequisites: List[str] = None, resolves: str = None, contradicts: str = None, reasoning_basis: List[Dict[str, str]] = None, metadata_signature: Dict[str, Any] = None, last_verified_at: str = None, verification_source: str = None, _trace_id: str = None, _round_seq: int = None) -> str:
+    async def execute(self, node_id: str, title: str, trigger_verb: str, trigger_noun: str, trigger_context: str, action_steps: List[str], because_reason: str, prerequisites: List[str] = None, resolves: str = None, contradicts: str = None, reasoning_basis: List[Dict[str, str]] = None, metadata_signature: Dict[str, Any] = None, evidence_refs: List[Dict[str, Any]] = None, last_verified_at: str = None, verification_source: str = None, _trace_id: str = None, _round_seq: int = None) -> str:
         # ── validateInput: reasoning_basis 必填校验 ──
         if not reasoning_basis:
             return "Error: reasoning_basis 不能为空。记录 LESSON 必须声明基于哪些已有节点产生此经验，且每条线的reasoning必须针对该basis节点回答不同的因果角度。请先搜索知识库，找到相关节点后填写 reasoning_basis。没有线的创新 = 无法判断价值 = 无法去重 = 噪音。"
@@ -314,6 +381,18 @@ class RecordLessonNodeTool(BaseNodeTool):
                 basis_entries.append({"id": bid, "reasoning": br})
         valid_basis = [e["id"] for e in basis_entries]
         valid_basis_set = set(valid_basis)
+        if not valid_basis:
+            return "Error: reasoning_basis 清洗后没有可用节点。不能创建没有有效推理线的 LESSON。"
+        basis_briefs = self.vault.get_node_briefs(valid_basis)
+        missing_basis = [bid for bid in valid_basis if bid not in basis_briefs]
+        if missing_basis:
+            return f"Error: reasoning_basis 包含不存在节点，拒绝写入 LESSON: {missing_basis}。请先用 search_knowledge_nodes 找到 canonical ID，或先 record_point 创建 basis。"
+        contradict_target = (contradicts or "").strip()
+        if contradict_target:
+            if contradict_target == node_id:
+                return f"Error: CONTRADICTS 不能指向自身: {node_id}。"
+            if contradict_target not in self.vault.get_node_briefs([contradict_target]):
+                return f"Error: CONTRADICTS 目标节点不存在，拒绝写入 LESSON: {contradict_target}。"
         try:
             current_round_seq = int(_round_seq) if _round_seq is not None else None
         except (TypeError, ValueError):
@@ -405,6 +484,7 @@ class RecordLessonNodeTool(BaseNodeTool):
                 prerequisites=prereq_str,
                 resolves=resolves,
                 metadata_signature=metadata_signature,
+                evidence_refs=evidence_refs,
                 last_verified_at=last_verified_at,
                 verification_source=verification_source,
                 trust_tier="REFLECTION"
@@ -435,20 +515,23 @@ class RecordLessonNodeTool(BaseNodeTool):
 
             # CONTRADICTS 边：标记旧节点已被新知识反驳
             contradicts_msg = ""
-            if contradicts:
-                target_id = contradicts.strip()
-                self.vault.add_edge(node_id, target_id, "CONTRADICTS", weight=1.0)
-                contradicts_msg = f" ⚠️ 已标记 [{target_id}] 为被反驳，该节点将不再出现在搜索结果中。"
-                logger.info(f"CONTRADICTS: [{node_id}] --[CONTRADICTS]--> [{target_id}]")
+            if contradict_target:
+                if self.vault.add_edge(node_id, contradict_target, "CONTRADICTS", weight=1.0):
+                    contradicts_msg = f" ⚠️ 已标记 [{contradict_target}] 为被反驳，该节点将不再出现在搜索结果中。"
+                    logger.info(f"CONTRADICTS: [{node_id}] --[CONTRADICTS]--> [{contradict_target}]")
 
             # ── 推理线（点线面架构）：新点连线到 basis 节点，每条线用独立的因果推理 ──
             line_msg = ""
             if basis_entries:
+                failed_lines = []
                 for entry in basis_entries:
                     bid = entry["id"]
                     line_reasoning = entry["reasoning"]
                     sr = 1 if bid in same_round_ids else 0
-                    self.vault.create_reasoning_line(node_id, bid, reasoning=line_reasoning, source="GP", same_round=sr, trace_id=_trace_id, round_seq=current_round_seq)
+                    if not self.vault.create_reasoning_line(node_id, bid, reasoning=line_reasoning, source="GP", same_round=sr, trace_id=_trace_id, round_seq=current_round_seq):
+                        failed_lines.append(bid)
+                if failed_lines:
+                    return f"Error: LESSON 节点已写入但以下推理线被拒绝: {failed_lines}。请检查节点 ID 和自引用。"
                 line_msg = f" 🔗 {len(basis_entries)}条推理线→{valid_basis}"
 
             if dedup_action == "relate" and merged_node_id:
@@ -500,7 +583,7 @@ class CreateMetaNodeTool(BaseNodeTool):
             "required": ["node_id", "ntype", "title", "content"]
         }
 
-    async def execute(self, node_id: str, ntype: str, title: str, content: str, tags: str = "", resolves: str = "", metadata_signature: Dict[str, Any] = None, last_verified_at: str = None, verification_source: str = None) -> str:
+    async def execute(self, node_id: str, ntype: str, title: str, content: str, tags: str = "", resolves: str = "", metadata_signature: Dict[str, Any] = None, evidence_refs: List[Dict[str, Any]] = None, last_verified_at: str = None, verification_source: str = None) -> str:
         try:
             self.vault.create_node(
                 node_id=node_id,
@@ -512,6 +595,7 @@ class CreateMetaNodeTool(BaseNodeTool):
                 source="reflection_meta",
                 resolves=resolves or None,
                 metadata_signature=metadata_signature,
+                evidence_refs=evidence_refs,
                 last_verified_at=last_verified_at,
                 verification_source=verification_source,
                 trust_tier="REFLECTION"
@@ -581,7 +665,7 @@ class CreateGraphNodeTool(BaseNodeTool):
             "required": ["node_id", "ntype", "title", "content"]
         }
 
-    async def execute(self, node_id: str, ntype: str, title: str, content: str, tags: str = "", metadata_signature: Dict[str, Any] = None, last_verified_at: str = None, verification_source: str = None) -> str:
+    async def execute(self, node_id: str, ntype: str, title: str, content: str, tags: str = "", metadata_signature: Dict[str, Any] = None, evidence_refs: List[Dict[str, Any]] = None, last_verified_at: str = None, verification_source: str = None) -> str:
         try:
             self.vault.create_node(
                 node_id=node_id,
@@ -592,6 +676,7 @@ class CreateGraphNodeTool(BaseNodeTool):
                 full_content=content,
                 source="reflection_graph",
                 metadata_signature=metadata_signature,
+                evidence_refs=evidence_refs,
                 last_verified_at=last_verified_at,
                 verification_source=verification_source,
                 trust_tier="REFLECTION"
@@ -632,7 +717,11 @@ class CreateNodeEdgeTool(BaseNodeTool):
 
     async def execute(self, source_id: str, target_id: str, relation: str, weight: float = 1.0) -> str:
         try:
-            self.vault.add_edge(source_id, target_id, relation, weight)
+            created = self.vault.add_edge(source_id, target_id, relation, weight)
+            if not created:
+                blocked_reason = _format_endpoint_visibility_rejection(self.vault, [("source", source_id), ("target", target_id)])
+                detail = blocked_reason or "端点缺失、自引用、隐藏或虚拟"
+                return f"Error: 边建立被拒绝: {source_id} --[{relation}]--> {target_id}。原因: {detail}。"
             return f"✅ 边建立: {source_id} --[{relation}]--> {target_id}"
         except Exception as e:
             logger.error(f"Edge creation failed: {e}")
@@ -663,7 +752,7 @@ class RecordToolNodeTool(BaseNodeTool):
             "required": ["node_id", "tool_name", "title", "source_code"]
         }
 
-    async def execute(self, node_id: str, tool_name: str, title: str, source_code: str, tags: str = "tool,python,skill", metadata_signature: Dict[str, Any] = None, last_verified_at: str = None, verification_source: str = None) -> str:
+    async def execute(self, node_id: str, tool_name: str, title: str, source_code: str, tags: str = "tool,python,skill", metadata_signature: Dict[str, Any] = None, evidence_refs: List[Dict[str, Any]] = None, last_verified_at: str = None, verification_source: str = None) -> str:
         try:
             # 验证源码是否包含 Tool 类
             if "class" not in source_code or "Tool" not in source_code:
@@ -679,6 +768,7 @@ class RecordToolNodeTool(BaseNodeTool):
                 full_content=source_code,
                 source="skill_creation",
                 metadata_signature=metadata_signature,
+                evidence_refs=evidence_refs,
                 last_verified_at=last_verified_at,
                 verification_source=verification_source,
                 trust_tier="REFLECTION"

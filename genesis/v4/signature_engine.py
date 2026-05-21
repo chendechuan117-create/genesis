@@ -6,6 +6,7 @@ NodeVault 通过组合模式委托签名操作到此引擎。
 """
 
 import json
+import ast
 import functools
 import logging
 from datetime import datetime, timedelta
@@ -39,6 +40,13 @@ class SignatureEngine:
 
     _DIM_FRESHNESS_DAYS = PIPELINE_CONFIG.dim_freshness_days
     _LEARNED_MARKER_MAX_PER_KEY = PIPELINE_CONFIG.learned_marker_max_per_key
+    _ENVIRONMENT_SCOPE_FIELDS = {
+        "environment_scope",
+        "applies_to_environment_scope",
+        "observed_environment_scope",
+    }
+    _MAX_VALUES_PER_FIELD = 3
+    _MAX_VALUE_CHARS = 120
 
     def __init__(self, conn, vault=None):
         self._conn = conn
@@ -81,7 +89,7 @@ class SignatureEngine:
             except Exception:
                 pass
             for key, value in sig.items():
-                if key in _CORE_FIELDS_SET or key in _DIM_OPERATIONAL_BLACKLIST:
+                if key in _CORE_FIELDS_SET or key in _DIM_OPERATIONAL_BLACKLIST or key in _PROTECTED_METADATA_FIELDS:
                     continue
                 if key not in dim_freq:
                     dim_freq[key] = {}
@@ -144,7 +152,7 @@ class SignatureEngine:
             return False
         if len(key) > 30 or not _re.fullmatch(r'[a-z][a-z0-9_]*', key):
             return False
-        if key in _CORE_FIELDS_SET or key in _DIM_OPERATIONAL_BLACKLIST:
+        if key in _CORE_FIELDS_SET or key in _DIM_OPERATIONAL_BLACKLIST or key in _PROTECTED_METADATA_FIELDS:
             return False
         existing = self._learned_markers.get(key, set())
         if val in existing:
@@ -180,26 +188,77 @@ class SignatureEngine:
         except Exception:
             return {}
 
-        _MAX_VALUES_PER_FIELD = 3
         normalized: Dict[str, Any] = {}
         for key, value in signature.items():
             if not value:
                 continue
-            if isinstance(value, list):
-                sorted_vals = sorted(set(str(v).strip() for v in value if v))[:_MAX_VALUES_PER_FIELD]
-                if sorted_vals:
-                    normalized[key] = sorted_vals if len(sorted_vals) > 1 else sorted_vals[0]
-            elif isinstance(value, str):
-                item_str = value.strip()
-                if "," in item_str:
-                    sorted_vals = sorted(set(p.strip() for p in item_str.split(",") if p.strip()))[:_MAX_VALUES_PER_FIELD]
-                    if sorted_vals:
-                        normalized[key] = sorted_vals if len(sorted_vals) > 1 else sorted_vals[0]
+            if key == "evidence_refs" and isinstance(value, list):
+                refs = []
+                for raw_ref in value[:10]:
+                    if not isinstance(raw_ref, dict):
+                        continue
+                    ref = {}
+                    for ref_key, limit in (("type", 80), ("ref", 300), ("excerpt", 500), ("observed_at", 80)):
+                        ref_value = str(raw_ref.get(ref_key) or "").strip()
+                        if ref_value:
+                            ref[ref_key] = ref_value[:limit]
+                    if ref.get("type") and (ref.get("ref") or ref.get("excerpt")):
+                        refs.append(ref)
+                if refs:
+                    normalized[key] = refs
+                continue
+            values = self._signature_scalar_values(key, value)
+            if values:
+                if key in self._ENVIRONMENT_SCOPE_FIELDS:
+                    normalized[key] = values[0]
                 else:
-                    normalized[key] = item_str
+                    normalized[key] = values if len(values) > 1 else values[0]
             else:
-                normalized[key] = value
+                if not isinstance(value, (list, tuple, set, str, dict)):
+                    normalized[key] = value
         return normalized
+
+    def _signature_scalar_values(self, key: str, value: Any) -> List[str]:
+        items: List[str] = []
+
+        def collect(raw: Any):
+            if raw is None:
+                return
+            if isinstance(raw, (list, tuple, set)):
+                for nested in raw:
+                    collect(nested)
+                return
+            text = str(raw).strip()
+            if not text:
+                return
+            parsed = None
+            if len(text) >= 2 and text[0] in "[(" and text[-1] in "])":
+                try:
+                    parsed = json.loads(text)
+                except Exception:
+                    try:
+                        parsed = ast.literal_eval(text)
+                    except Exception:
+                        parsed = None
+                if isinstance(parsed, (list, tuple, set)):
+                    collect(parsed)
+                    return
+            if key not in self._ENVIRONMENT_SCOPE_FIELDS and "," in text:
+                for part in text.split(","):
+                    collect(part)
+                return
+            if key in self._ENVIRONMENT_SCOPE_FIELDS and ("[" in text or "]" in text or "(" in text or ")" in text):
+                return
+            text = " ".join(text.split())
+            if len(text) > self._MAX_VALUE_CHARS:
+                text = text[: self._MAX_VALUE_CHARS].rstrip()
+            if text and text not in items:
+                items.append(text)
+
+        collect(value)
+        if key in self._ENVIRONMENT_SCOPE_FIELDS:
+            return items[: self._MAX_VALUES_PER_FIELD]
+        return sorted(items)[: self._MAX_VALUES_PER_FIELD]
 
     def normalize(self, signature: Any) -> Dict[str, Any]:
         """标准化签名（外部接口名为 normalize，NodeVault 门面映射到 normalize_metadata_signature）"""
@@ -242,6 +301,7 @@ class SignatureEngine:
         if not normalized:
             return ""
         display_signature = dict(normalized)
+        display_signature.pop("evidence_refs", None)
         display_signature.pop(METADATA_SCHEMA_VERSION_FIELD, None)
         if display_signature.get("applies_to_environment_scope") == display_signature.get("environment_scope"):
             display_signature.pop("applies_to_environment_scope", None)
@@ -291,7 +351,7 @@ class SignatureEngine:
                 if existing_values:
                     sorted_vals = sorted(set(str(v) for v in existing_values))
                     merged[key] = sorted_vals if len(sorted_vals) > 1 else sorted_vals[0]
-        return merged
+        return self.normalize(merged)
 
     # ── 字段解析辅助 ──────────────────────────────────
 

@@ -89,6 +89,8 @@ _PROTECTED_METADATA_FIELDS = frozenset({
     "observed_environment_scope", "observed_environment_epoch",
     "applies_to_environment_scope", "applies_to_environment_epoch",
     "invalidation_reason",
+    "evidence_refs", "evidence_ref_count", "evidence_ref_types",
+    "validation_gate",
     METADATA_SCHEMA_VERSION_FIELD,
 })
 _ENVIRONMENT_SCOPE_ALIASES = {
