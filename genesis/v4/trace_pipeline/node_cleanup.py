@@ -98,6 +98,7 @@ def cleanup(dry_run: bool = True, db_path: Optional[Path] = None) -> Dict[str, A
 
     deleted_ids = [r["node_id"] for r in to_delete]
 
+    hard_deleted = 0
     if not dry_run and deleted_ids:
         placeholders = ','.join('?' * len(deleted_ids))
         db.execute(f"DELETE FROM node_contents WHERE node_id IN ({placeholders})", deleted_ids)
@@ -105,13 +106,15 @@ def cleanup(dry_run: bool = True, db_path: Optional[Path] = None) -> Dict[str, A
                    deleted_ids + deleted_ids)
         db.execute(f"DELETE FROM knowledge_nodes WHERE node_id IN ({placeholders})", deleted_ids)
         db.commit()
+        hard_deleted = len(deleted_ids)
         logger.info(f"Hard deleted {len(deleted_ids)} unused nodes (age > {_DELETE_AGE_DAYS}d)")
 
     db.close()
 
     return {
         "dry_run": dry_run,
-        "hard_deleted": len(deleted_ids),
+        "would_delete": len(deleted_ids),
+        "hard_deleted": hard_deleted,
         "deleted_samples": [{"id": r["node_id"], "type": r["type"], "title": r["title"][:60]} for r in to_delete[:5]],
     }
 

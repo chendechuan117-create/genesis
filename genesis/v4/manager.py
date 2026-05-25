@@ -2885,7 +2885,7 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             logger.error(f"Failed to delete node {node_id}: {e}")
             return False
 
-    def purge_forgotten_knowledge(self, days_threshold: int = 7) -> int:
+    def purge_forgotten_knowledge(self, days_threshold: int = 7, dry_run: bool = False) -> int:
         """
         垃圾回收 (GC)：
         清理未使用过且超过 `days_threshold` 天的节点（排除 HUMAN tier）。
@@ -2901,6 +2901,11 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
         rows = self._conn.execute(query).fetchall()
 
         deleted_count = 0
+        if dry_run:
+            if rows:
+                logger.info(f"NodeVault GC dry-run: {len(rows)} forgotten/unused low-confidence nodes.")
+            return len(rows)
+
         for r in rows:
             node_id = r['node_id']
             if self.delete_node(node_id):

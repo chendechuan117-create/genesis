@@ -62,7 +62,7 @@ def assess_evidence() -> Dict[str, Any]:
         if not lessons:
             store.close()
             vault_conn.close()
-            return {"reinforced": [], "weakened": [], "neutral_count": 0}
+            return {"reinforced": [], "weakened": [], "neutral_count": 0, "write_mode": "dry_run"}
 
         # 2. 获取最近的 ERROR 实体（含时间信息）
         now = time.time()
@@ -107,15 +107,12 @@ def assess_evidence() -> Dict[str, Any]:
             verdict = _assess_match(matched_errors, recent_cutoff)
 
             if verdict == "reinforce" and len(reinforced) < _MAX_ADJUSTMENTS:
-                # 证据支持：节点声称解决的错误最近未出现 → 记录为 usage success
-                vault_conn.execute(
-                    "UPDATE knowledge_nodes SET usage_success_count = usage_success_count + 1, updated_at = CURRENT_TIMESTAMP WHERE node_id = ?",
-                    (node_id,)
-                )
                 reinforced.append({
                     "node_id": node_id,
                     "title": lesson["title"][:50],
                     "reason": "resolved_error_not_seen_recently",
+                    "applied": False,
+                    "source": "passive_evidence",
                 })
 
             elif verdict == "weaken" and len(weakened) < _MAX_ADJUSTMENTS:
@@ -125,15 +122,12 @@ def assess_evidence() -> Dict[str, Any]:
                 if wins >= 5 and wins / max(wins + fails, 1) >= 0.8:
                     neutral_count += 1
                     continue
-                # 证据矛盾：节点声称解决的错误仍频繁出现 → 记录为 usage fail
-                vault_conn.execute(
-                    "UPDATE knowledge_nodes SET usage_fail_count = usage_fail_count + 1, updated_at = CURRENT_TIMESTAMP WHERE node_id = ?",
-                    (node_id,)
-                )
                 weakened.append({
                     "node_id": node_id,
                     "title": lesson["title"][:50],
                     "reason": "resolved_error_still_frequent",
+                    "applied": False,
+                    "source": "passive_evidence",
                 })
             else:
                 neutral_count += 1
@@ -150,6 +144,7 @@ def assess_evidence() -> Dict[str, Any]:
             "reinforced": reinforced,
             "weakened": weakened,
             "neutral_count": neutral_count,
+            "write_mode": "dry_run",
         }
 
     except Exception as e:
