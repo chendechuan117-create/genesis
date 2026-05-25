@@ -97,6 +97,32 @@ def _check_verification_specificity(action_text: str) -> float:
     return SPECIFICITY_BONUS_LOW
 
 
+def _reference_diversity_profile(entries: List["BoardEntry"], global_node_refs) -> Dict[str, Any]:
+    evidence_entries = [
+        entry for entry in entries
+        if isinstance(entry, EvidenceEntry) and entry.evidence_node_ids
+    ]
+    total_refs = sum(global_node_refs.values())
+    unique_nodes = len(global_node_refs)
+    personas = {
+        entry.persona for entry in evidence_entries
+        if entry.persona
+    }
+    multi_persona = len(personas) >= 2
+    single_shared_anchor = unique_nodes == 1 and total_refs >= 3 and multi_persona
+    sparse_independent_evidence = len(evidence_entries) >= 3 and unique_nodes <= 1 and not single_shared_anchor
+    convergence = 1.0 - unique_nodes / total_refs if total_refs > 0 else 0.0
+    return {
+        "total_refs": total_refs,
+        "unique_nodes": unique_nodes,
+        "evidence_entries": len(evidence_entries),
+        "personas": len(personas),
+        "convergence": convergence,
+        "single_shared_anchor": single_shared_anchor,
+        "sparse_independent_evidence": sparse_independent_evidence,
+    }
+
+
 class Blackboard:
     """
     Multi-G 共享黑板
@@ -411,17 +437,27 @@ class Blackboard:
         # ── 人格多样性重排：确保不同认知视角进入 top-K ──
         scored = self._diversity_rerank(scored)
         
-        # ── 收敛度感知：检测知识库多样性不足 ──
-        total_refs = sum(global_node_refs.values())
-        unique_nodes = len(global_node_refs)
-        if total_refs > 0:
-            convergence = 1.0 - unique_nodes / total_refs
-            if convergence > CONVERGENCE_VOID_THRESHOLD and len(self.entries) >= 3:
-                logger.info(f"Blackboard: high convergence={convergence:.2f} → soft void")
+        # ── 收敛度感知：区分共享锚点与独立证据不足 ──
+        diversity = _reference_diversity_profile(self.entries, global_node_refs)
+        total_refs = diversity["total_refs"]
+        unique_nodes = diversity["unique_nodes"]
+        convergence = diversity["convergence"]
+        if total_refs > 0 and len(self.entries) >= 3:
+            if diversity["sparse_independent_evidence"] or (
+                convergence > CONVERGENCE_VOID_THRESHOLD and not diversity["single_shared_anchor"]
+            ):
+                logger.info(f"Blackboard: independent evidence sparse convergence={convergence:.2f} → soft void")
                 self._search_voids.append({
                     "persona": "_blackboard",
                     "query": f"知识库多样性不足(convergence={convergence:.2f}, {unique_nodes}独立/{total_refs}总引用)",
                     "source": "convergence_detection"
+                })
+            elif diversity["single_shared_anchor"]:
+                logger.info(f"Blackboard: shared anchor convergence={convergence:.2f} → no diversity void")
+                self._search_voids.append({
+                    "persona": "_blackboard",
+                    "query": f"多透镜共享同一基础锚点(convergence={convergence:.2f}, {unique_nodes}独立/{total_refs}总引用)",
+                    "source": "shared_anchor_detection"
                 })
         
         if scored:
