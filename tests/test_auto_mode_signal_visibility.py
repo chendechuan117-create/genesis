@@ -73,6 +73,38 @@ def test_auto_knowledge_state_is_not_destructively_trimmed(monkeypatch):
     assert len(state["next_checks"]) == 9
 
 
+def test_round_topology_classifies_anchored_then_wandering(monkeypatch):
+    discord_stub = types.ModuleType("discord")
+    discord_stub.TextChannel = object
+    sys.modules.setdefault("discord", discord_stub)
+
+    from genesis.auto_mode import _build_round_topology
+
+    events = [
+        {"t": 1.0, "type": "llm_call_start", "phase": "GP_PHASE"},
+        {"t": 2.0, "type": "tool_result", "name": "record_point", "result_preview": "✅ POINT [P_A] created", "iteration": 0},
+        {"t": 3.0, "type": "tool_result", "name": "record_line", "result_preview": "✅ LINE: P_A --[RELATED_TO]--> P_BASE", "iteration": 0},
+        {"t": 4.0, "type": "tool_result", "name": "search_knowledge_nodes", "result_preview": "found", "iteration": 1},
+        {"t": 5.0, "type": "llm_call_start", "phase": "GP_PHASE"},
+        {"t": 6.0, "type": "tool_result", "name": "record_point", "result_preview": "✅ POINT [P_B] created", "iteration": 2},
+        {"t": 7.0, "type": "llm_call_end", "phase": "GP_PHASE", "data": {"tool_call_count": 1, "content_chars": 10}},
+    ]
+    topology = _build_round_topology(events, duration_s=8.0)
+
+    assert topology["schema"] == "genesis.round_topology.v1"
+    assert topology["classification"] == "anchored_then_wandering"
+    assert topology["anchor_timing"] == "early_anchor"
+    assert topology["post_anchor_shape"] == "compact"
+    assert topology["points_created"] == 2
+    assert topology["lines_successful"] == 1
+    assert topology["knowledge_searches"] == 1
+    assert topology["gp_llm_calls"] == 2
+    assert topology["first_anchor_point_id"] == "P_A"
+    assert topology["first_anchor_basis_id"] == "P_BASE"
+    assert topology["new_points_after_anchor"] == 1
+    assert topology["last_gp_tool_call_count"] == 1
+
+
 def test_frontier_carry_warnings_expose_signal_provenance(monkeypatch):
     discord_stub = types.ModuleType("discord")
     discord_stub.TextChannel = object

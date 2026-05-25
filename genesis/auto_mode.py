@@ -917,6 +917,137 @@ def _build_pls_telemetry(round_events: list, kb_delta: dict | None = None) -> di
     return telemetry
 
 
+def _build_round_topology(round_events: list, duration_s: float | None = None) -> dict:
+    def _num(value, default=0.0):
+        try:
+            return float(value)
+        except Exception:
+            return default
+
+    def _phase(event):
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        return event.get("phase") or data.get("phase")
+
+    def _ids(event, result):
+        args = event.get("args") if isinstance(event.get("args"), dict) else {}
+        point_id = args.get("node_id") or args.get("point_id")
+        new_point_id = args.get("new_point_id")
+        basis_point_id = args.get("basis_point_id")
+        if not point_id:
+            match = re.search(r"POINT\s+\[([^\]]+)\]", result)
+            point_id = match.group(1) if match else None
+        if not new_point_id:
+            match = re.search(r":\s*([^\s]+)\s*--\[", result)
+            new_point_id = match.group(1) if match else None
+        if not basis_point_id:
+            match = re.search(r"--\[[^\]]+\]-->\s*([^\s]+)", result)
+            basis_point_id = match.group(1) if match else None
+        return str(point_id) if point_id else None, str(new_point_id) if new_point_id else None, str(basis_point_id) if basis_point_id else None
+
+    topology = {
+        "schema": "genesis.round_topology.v1", "classification": "no_successful_point",
+        "anchor_timing": "no_anchor", "post_anchor_shape": "no_anchor", "anchored": False,
+        "points_created": 0, "lines_successful": 0, "anchored_points": 0, "knowledge_searches": 0,
+        "tool_results": 0, "gp_llm_calls": 0, "observed_duration_s": 0.0,
+        "first_point_id": None, "first_point_t": None, "first_point_iteration": None,
+        "first_anchor_point_id": None, "first_anchor_basis_id": None, "first_anchor_t": None, "first_anchor_iteration": None,
+        "late_secs_after_anchor": None, "gp_llm_after_anchor": 0, "tools_after_anchor": 0,
+        "search_after_anchor": 0, "new_points_after_anchor": 0, "lines_after_anchor": 0,
+        "lines_to_anchor_point_after_anchor": 0, "last_gp_tool_call_count": None,
+        "last_gp_content_chars": None, "timeout_risk_shape": False,
+    }
+    points, lines, tool_indices, search_indices, gp_start_indices = [], [], [], [], []
+    max_t = 0.0
+
+    for idx, event in enumerate(round_events or []):
+        if not isinstance(event, dict):
+            continue
+        event_t = _num(event.get("t"), 0.0)
+        max_t = max(max_t, event_t)
+        event_type, name = event.get("type"), str(event.get("name") or "").strip()
+        if event_type == "llm_call_start" and _phase(event) == "GP_PHASE":
+            gp_start_indices.append(idx)
+        elif event_type == "llm_call_end" and _phase(event) == "GP_PHASE":
+            data = event.get("data") if isinstance(event.get("data"), dict) else {}
+            topology["last_gp_tool_call_count"] = data.get("tool_call_count")
+            topology["last_gp_content_chars"] = data.get("content_chars")
+        if event_type not in ("tool_result", "search_result"):
+            continue
+        result = str(event.get("result_preview") or event.get("content") or "")
+        if event_type == "tool_result":
+            tool_indices.append(idx)
+        if name == "search_knowledge_nodes":
+            search_indices.append(idx)
+        if name == "record_point" and (result.startswith("✅ POINT") or result.startswith("♻️ POINT")):
+            point_id, _new_id, _basis_id = _ids(event, result)
+            points.append({"idx": idx, "id": point_id, "t": event_t, "iteration": event.get("iteration")})
+        elif name == "record_line" and (result.startswith("✅ LINE") or result.startswith("ℹ️ LINE")):
+            _point_id, new_point_id, basis_point_id = _ids(event, result)
+            lines.append({"idx": idx, "new_point_id": new_point_id, "basis_point_id": basis_point_id, "t": event_t, "iteration": event.get("iteration")})
+
+    topology["points_created"] = len(points)
+    topology["lines_successful"] = len(lines)
+    topology["tool_results"] = len(tool_indices)
+    topology["knowledge_searches"] = len(search_indices)
+    topology["gp_llm_calls"] = len(gp_start_indices)
+    topology["observed_duration_s"] = round(_num(duration_s, 0.0) or max_t, 2)
+    if points:
+        topology["first_point_id"] = points[0]["id"]
+        topology["first_point_t"] = points[0]["t"]
+        topology["first_point_iteration"] = points[0]["iteration"]
+
+    first_anchor = None
+    anchored_ids = set()
+    for point in points:
+        if not point.get("id"):
+            continue
+        point_lines = [line for line in lines if line.get("new_point_id") == point["id"] and line["idx"] > point["idx"]]
+        if point_lines:
+            anchored_ids.add(point["id"])
+            first_anchor = first_anchor or (point, point_lines[0])
+    topology["anchored_points"] = len(anchored_ids)
+
+    if not first_anchor:
+        if points:
+            topology["classification"] = "point_without_successful_line"
+        return topology
+
+    anchor_point, anchor_line = first_anchor
+    anchor_idx = anchor_line["idx"]
+    anchor_t = _num(anchor_line["t"], 0.0)
+    topology.update({
+        "classification": "anchored_compact", "anchored": True,
+        "anchor_timing": "early_anchor" if anchor_t < 120 else "mid_anchor" if anchor_t < 400 else "late_anchor",
+        "first_anchor_point_id": anchor_point["id"], "first_anchor_basis_id": anchor_line.get("basis_point_id"),
+        "first_anchor_t": anchor_line["t"], "first_anchor_iteration": anchor_line.get("iteration"),
+        "late_secs_after_anchor": round(max(0.0, topology["observed_duration_s"] - anchor_line["t"]), 2),
+        "gp_llm_after_anchor": sum(1 for idx in gp_start_indices if idx > anchor_idx),
+        "tools_after_anchor": sum(1 for idx in tool_indices if idx > anchor_idx),
+        "search_after_anchor": sum(1 for idx in search_indices if idx > anchor_idx),
+        "new_points_after_anchor": sum(1 for point in points if point["idx"] > anchor_idx),
+        "lines_after_anchor": sum(1 for line in lines if line["idx"] > anchor_idx),
+        "lines_to_anchor_point_after_anchor": sum(1 for line in lines if line["new_point_id"] == anchor_point["id"] and line["idx"] > anchor_idx),
+    })
+    topology["timeout_risk_shape"] = topology["gp_llm_after_anchor"] >= 20 and topology["new_points_after_anchor"] >= 2
+    if topology["timeout_risk_shape"]:
+        topology["post_anchor_shape"] = "timeout_risk"
+    elif topology["new_points_after_anchor"] >= 2:
+        topology["post_anchor_shape"] = "point_cascade"
+    elif topology["search_after_anchor"] >= 2 and topology["new_points_after_anchor"] > 0:
+        topology["post_anchor_shape"] = "search_expansion"
+    elif topology["new_points_after_anchor"] == 1 and topology["search_after_anchor"] == 0 and topology["gp_llm_after_anchor"] <= 10 and topology["tools_after_anchor"] <= 15:
+        topology["post_anchor_shape"] = "bounded_verification"
+    elif topology["tools_after_anchor"] > 8 or topology["gp_llm_after_anchor"] > 6:
+        topology["post_anchor_shape"] = "extended_same_point"
+    else:
+        topology["post_anchor_shape"] = "compact"
+    if topology["new_points_after_anchor"] > 0:
+        topology["classification"] = "anchored_then_wandering"
+    elif topology["tools_after_anchor"] > 8 or topology["gp_llm_after_anchor"] > 6:
+        topology["classification"] = "anchored_extended_same_point"
+    return topology
+
+
 def _format_pls_telemetry(telemetry: dict | None) -> str:
     t = telemetry or {}
     cheap = t.get('tool_cost_cheap', 0)
@@ -3752,8 +3883,21 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                                 "stream": data.get("stream"), "duration_ms": data.get("duration_ms"),
                                 "finish_reason": data.get("finish_reason"), "tool_call_count": data.get("tool_call_count"),
                                 "content_chars": data.get("content_chars"), "reasoning_chars": data.get("reasoning_chars"),
-                                "total_tokens": data.get("total_tokens"), "error": data.get("error"),
+                                "input_tokens": data.get("input_tokens"), "output_tokens": data.get("output_tokens"),
+                                "total_tokens": data.get("total_tokens"), "cache_hit_tokens": data.get("cache_hit_tokens"),
+                                "cache_hit_rate": data.get("cache_hit_rate"), "cache_bucket": data.get("cache_bucket"),
+                                "error": data.get("error"),
                             }
+                            if evt.event_type == "llm_call_end":
+                                bucket = data.get("cache_bucket") or "unknown"
+                                cache_stats = round_record.setdefault("llm_cache_stats", {})
+                                stat = cache_stats.setdefault(bucket, {"calls": 0, "input_tokens": 0, "cache_hit_tokens": 0})
+                                input_tokens = int(data.get("input_tokens") or 0)
+                                cache_hit_tokens = int(data.get("cache_hit_tokens") or 0)
+                                stat["calls"] += 1
+                                stat["input_tokens"] += input_tokens
+                                stat["cache_hit_tokens"] += cache_hit_tokens
+                                stat["cache_hit_rate"] = round(stat["cache_hit_tokens"] / stat["input_tokens"], 3) if stat["input_tokens"] else None
                         else:
                             entry["data"] = {"raw": str(data)[:200]}
                         if evt.event_type == "llm_call_start":
@@ -3791,14 +3935,20 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             "c_phase_summary": None,
             "knowledge_search_count": 0,
             "pls_telemetry": _build_pls_telemetry(round_events),
+            "round_topology": _build_round_topology(round_events),
             "attention_residue": "",
             "exception": None,
         }
         round_log.append(round_record)
+        round_topology_event_count = -1
 
         def _flush_round_record():
+            nonlocal round_topology_event_count
             round_record["updated_at"] = _time_module.strftime("%Y-%m-%d %H:%M:%S", _time_module.localtime())
             round_record["event_count"] = len(round_events)
+            if round_record.get("status") != "running" or len(round_events) == 0 or len(round_events) - round_topology_event_count >= 20:
+                round_record["round_topology"] = _build_round_topology(round_events, round_record.get("duration_s"))
+                round_topology_event_count = len(round_events)
             _write_round_json(round_record)
 
         def _observe_round_state():
