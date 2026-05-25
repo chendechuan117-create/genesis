@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 PROVIDER_KEY_MAP = {
     "xcode": "xcode_api_key",
     "xcode_backup": "xcode_api_key",
+    "aliyun": "aliyun_api_key",
     "newshrimp": "newshrimp_api_key",
     "newshrimp_openai": "newshrimp_api_key",
     "newshrimp_backup": "newshrimp_api_key",
@@ -41,12 +42,20 @@ class ProviderRouter(LLMProvider):
     """
     
     # 回退探活：failover 后每隔此秒数尝试恢复首选 provider
-    RECOVERY_COOLDOWN_SECS = 60
+    RECOVERY_COOLDOWN_SECS = int(os.getenv("GENESIS_PROVIDER_RECOVERY_COOLDOWN_SECS", "60"))
     # 每小时刷新 provider 连接，防止长连接腐化
     REFRESH_INTERVAL_SECS = 3600
 
     def __init__(self, config: Any, api_key: str = None, base_url: str = None, model: str = None):
         self.config = config
+        self.recovery_cooldown_secs = int(
+            getattr(config, "genesis_provider_recovery_cooldown_secs", None)
+            or os.getenv("GENESIS_PROVIDER_RECOVERY_COOLDOWN_SECS", str(self.RECOVERY_COOLDOWN_SECS))
+        )
+        self.newshrimp_retry_cooldown_secs = int(
+            getattr(config, "genesis_newshrimp_retry_cooldown_secs", None)
+            or os.getenv("GENESIS_NEWSHRIMP_RETRY_COOLDOWN_SECS", "18000")
+        )
         self.providers: Dict[str, Any] = {}
         self.active_provider_name = 'xcode'
         self._preferred_provider_name: Optional[str] = None  # 首选 provider
@@ -91,12 +100,15 @@ class ProviderRouter(LLMProvider):
             'newshrimp_3_openai', 'newshrimp_2_openai', 'newshrimp_openai',
             'newshrimp_3_backup_openai', 'newshrimp_2_backup_openai', 'newshrimp_backup_openai'
         ]
-        prefer_newshrimp_openai = os.getenv("GENESIS_NEWSHRIMP_OPENAI_FIRST", "").lower() in ("1", "true", "yes", "on")
+        prefer_newshrimp_openai = (
+            getattr(self.config, "genesis_newshrimp_openai_first", None)
+            or os.getenv("GENESIS_NEWSHRIMP_OPENAI_FIRST", "")
+        ).lower() in ("1", "true", "yes", "on")
         fallback_order = (
             newshrimp_openai_order + newshrimp_order
             if prefer_newshrimp_openai else
             newshrimp_order + newshrimp_openai_order
-        ) + ['xcode', 'xcode_backup', 'deepseek']
+        ) + ['aliyun', 'xcode', 'xcode_backup', 'deepseek']
         requires_anthropic_messages = any(
             name in self.providers
             and 'deepseek-v4-pro' in ((getattr(self.providers[name], 'default_model', '') or '').lower())
@@ -117,7 +129,8 @@ class ProviderRouter(LLMProvider):
         # Quota dead — hard limit, must wait until reset
         for pat in ("daily_limit_exceeded", "usage_limit_exceeded", "insufficient_quota",
                      "billing_hard_limit", "monthly_limit", "account_on_hold",
-                     "plan_limit_reached"):
+                     "plan_limit_reached", "insufficient_user_quota", "用户额度不足",
+                     "额度不足"):
             if pat in err_lower:
                 return ("quota_dead", 3600, "💰")  # until UTC midnight ~1h max
         # Rate limited — cooldown escalates with fail_count (handled in _mark_provider_unhealthy)
@@ -128,7 +141,7 @@ class ProviderRouter(LLMProvider):
                 return ("rate_limited", 60, "⏳")
         # Network dead — SSL, connection refused, Cloudflare 524/5xx
         for pat in ("ssl", "connection error", "network error", "connecterror",
-                     "524", "502", "503", "504", "timeoutexception"):
+                     "524", "502", "503", "504", "timeoutexception", "timeout"):
             if pat in err_lower:
                 return ("network_dead", 300, "🔌")
         # Default: transient, short cooldown
@@ -154,12 +167,19 @@ class ProviderRouter(LLMProvider):
         # newshrimp 450次/300分钟限 → 30s 太短(又撞429) → 需要更长冷却
         if state == "rate_limited" and fail_count > 1:
             cooldown = min(cooldown * (2 ** (fail_count - 1)), 300)  # 60→120→240→300s cap
+        if name.startswith("newshrimp"):
+            cooldown = max(cooldown, self.newshrimp_retry_cooldown_secs)
         self._provider_health[name] = {
             "state": state,
             "until": time.time() + cooldown,
             "fail_count": fail_count,
         }
         logger.info(f"{emoji} Provider {name} marked {state} for {cooldown}s (fail #{fail_count})")
+
+    def _mark_newshrimp_pool_unhealthy(self, err_str: str):
+        for pname in self.failover_order:
+            if pname.startswith("newshrimp") and pname in self.providers and self._is_provider_healthy(pname):
+                self._mark_provider_unhealthy(pname, err_str)
 
     def _switch_provider(self, target: str):
         """Switch active provider"""
@@ -204,29 +224,32 @@ class ProviderRouter(LLMProvider):
         # 但不探活已知 quota_dead 的 provider
         if (
             self._preferred_provider_name
-            and self.active_provider_name != self._preferred_provider_name
-            and self._preferred_provider_name in self.providers
-            and (time.time() - self._last_recovery_attempt) > self.RECOVERY_COOLDOWN_SECS
-            and self._is_provider_healthy(self._preferred_provider_name)
+            and not self.active_provider_name.startswith("newshrimp")
+            and (time.time() - self._last_recovery_attempt) > self.recovery_cooldown_secs
         ):
-            self._last_recovery_attempt = time.time()
-            try:
-                probe_provider = self.providers[self._preferred_provider_name]
-                # 探活：轻量 chat completion (max_tokens=1)
-                # 不用 GET /models — models 可能被 CDN 缓存，而 inference 后端实际挂了
-                _probe_msgs = [{"role": "user", "content": "ping"}]
-                _probe_kwargs = {k: v for k, v in kwargs.items() if k not in ("tools", "stream", "stream_callback")}
-                _probe_kwargs["max_tokens"] = 1
-                await probe_provider.chat(messages=_probe_msgs, **_probe_kwargs)
-                # 探活成功，恢复首选（不返回 probe 结果，继续走正常路径用真实消息）
-                self._switch_provider(self._preferred_provider_name)
-                self._failover_time = 0
-                # 清除健康记录
-                self._provider_health.pop(self._preferred_provider_name, None)
-                logger.info(f"✅ Provider recovered: back to {self._preferred_provider_name}")
-            except Exception as probe_e:
-                self._mark_provider_unhealthy(self._preferred_provider_name, str(probe_e))
-                logger.debug(f"Recovery probe to {self._preferred_provider_name} failed: {probe_e}")
+            recovery_candidates = [
+                name for name in self.failover_order
+                if name.startswith("newshrimp") and name in self.providers and self._is_provider_healthy(name)
+            ]
+            if recovery_candidates:
+                self._last_recovery_attempt = time.time()
+                for candidate in recovery_candidates:
+                    try:
+                        probe_provider = self.providers[candidate]
+                        # 探活：轻量 chat completion (max_tokens=1)
+                        # 不用 GET /models — models 可能被 CDN 缓存，而 inference 后端实际挂了
+                        _probe_msgs = [{"role": "user", "content": "ping"}]
+                        _probe_kwargs = {k: v for k, v in kwargs.items() if k not in ("tools", "stream", "stream_callback")}
+                        _probe_kwargs["max_tokens"] = 1
+                        await probe_provider.chat(messages=_probe_msgs, **_probe_kwargs)
+                        self._switch_provider(candidate)
+                        self._failover_time = 0
+                        self._provider_health.pop(candidate, None)
+                        logger.info(f"✅ Provider recovered: back to {candidate}")
+                        break
+                    except Exception as probe_e:
+                        self._mark_provider_unhealthy(candidate, str(probe_e))
+                        logger.debug(f"Recovery probe to {candidate} failed: {probe_e}")
 
         # 如果当前 active provider 不健康，立即切换到下一个健康的
         if not self._is_provider_healthy(self.active_provider_name):
@@ -270,9 +293,9 @@ class ProviderRouter(LLMProvider):
             # 成功后清除健康记录
             self._provider_health.pop(self.active_provider_name, None)
             return result
-        except WallClockTimeoutError:
-            raise  # 总超时不是 provider 故障，直接上抛，不触发 failover
         except Exception as e:
+            if isinstance(e, WallClockTimeoutError) and not self.active_provider_name.startswith("newshrimp"):
+                raise
             err_str = str(e)
             logger.error(f"Provider {self.active_provider_name} Failed: {e}")
             
@@ -282,6 +305,8 @@ class ProviderRouter(LLMProvider):
             
             # 标记当前 provider 不健康
             self._mark_provider_unhealthy(self.active_provider_name, err_str)
+            if isinstance(e, WallClockTimeoutError) and self.active_provider_name.startswith("newshrimp"):
+                self._mark_newshrimp_pool_unhealthy(err_str)
             self._failover_time = time.time()
             
             # Dynamic Failover (仅对 5xx / 网络 / 超时等服务端故障)
@@ -321,6 +346,8 @@ class ProviderRouter(LLMProvider):
                     except Exception as e2:
                         logger.error(f"Backup Provider {next_provider_name} also failed: {e2}")
                         self._mark_provider_unhealthy(next_provider_name, str(e2))
+                        if isinstance(e2, WallClockTimeoutError) and next_provider_name.startswith("newshrimp"):
+                            self._mark_newshrimp_pool_unhealthy(str(e2))
                         continue # Try next
             
             dur = (time.time() - t0) * 1000

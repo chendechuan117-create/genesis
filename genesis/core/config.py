@@ -26,6 +26,12 @@ class GlobalConfig:
     xcode_backup_ssl_verify: bool = True
     xcode_model: str = "gpt-5.4"
     deepseek_api_key: Optional[str] = None
+    aliyun_api_key: Optional[str] = None
+    aliyun_base_url: Optional[str] = None
+    aliyun_model: str = "deepseek-v4-flash"
+    genesis_newshrimp_openai_first: Optional[str] = None
+    genesis_newshrimp_retry_cooldown_secs: Optional[str] = None
+    genesis_provider_recovery_cooldown_secs: Optional[str] = None
     
     # NewShrimp (K2.6)
     newshrimp_api_key: Optional[str] = None
@@ -155,6 +161,12 @@ class ConfigManager:
         "AIXJ_BACKUP_BASE_URL": "xcode_backup_base_url",
         "AIXJ_MODEL": "xcode_model",
         "DEEPSEEK_API_KEY": "deepseek_api_key",
+        "ALIYUN_API_KEY": "aliyun_api_key",
+        "ALIYUN_BASE_URL": "aliyun_base_url",
+        "ALIYUN_MODEL": "aliyun_model",
+        "GENESIS_NEWSHRIMP_OPENAI_FIRST": "genesis_newshrimp_openai_first",
+        "GENESIS_NEWSHRIMP_RETRY_COOLDOWN_SECS": "genesis_newshrimp_retry_cooldown_secs",
+        "GENESIS_PROVIDER_RECOVERY_COOLDOWN_SECS": "genesis_provider_recovery_cooldown_secs",
         "NEWSHRIMP_API_KEY": "newshrimp_api_key",
         "NEWSHRIMP_BASE_URL": "newshrimp_base_url",
         "NEWSHRIMP_BACKUP_BASE_URL": "newshrimp_backup_base_url",

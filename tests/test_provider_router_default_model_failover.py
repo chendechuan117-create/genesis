@@ -1,3 +1,4 @@
+import asyncio
 import importlib
 import sys
 import types
@@ -139,10 +140,11 @@ def _build_router_with_registry(monkeypatch, router_module, builders, config=Non
     monkeypatch.setattr(router_module.provider_registry, 'get_builder', lambda name: builders[name])
 
     cfg = config or SimpleNamespace(
-        aixj_api_key='aixj-key',
-        aixj_api_keys=[],
-        codex_api_key='codex-key',
-        gemini_api_key='gemini-key',
+        xcode_api_key='xcode-key',
+        aliyun_api_key=None,
+        newshrimp_api_key=None,
+        newshrimp_2_api_key=None,
+        newshrimp_3_api_key=None,
         deepseek_api_key=None,
         openai_api_key=None,
         openrouter_api_key=None,
@@ -158,106 +160,105 @@ def _build_router_with_registry(monkeypatch, router_module, builders, config=Non
 
 
 def test_provider_router_init_prefers_available_provider_and_exposes_its_default_model(monkeypatch, router_module):
-    aixj = DummyProvider('aixj', 'gpt-4.1', [ok_response('ok')])
-    codex = DummyProvider('codex', 'gpt-4.1-mini', [ok_response('codex-ok')])
+    xcode = DummyProvider('xcode', 'gpt-4.1', [ok_response('ok')])
+    xcode_backup = DummyProvider('xcode_backup', 'gpt-4.1-mini', [ok_response('backup-ok')])
 
     router = _build_router_with_registry(
         monkeypatch,
         router_module,
         {
-            'aixj': lambda config: aixj,
-            'codex': lambda config: codex,
+            'xcode': lambda config: xcode,
+            'xcode_backup': lambda config: xcode_backup,
         },
     )
 
-    assert router.active_provider_name == 'aixj'
-    assert router.get_active_provider() is aixj
+    assert router.active_provider_name == 'xcode'
+    assert router.get_active_provider() is xcode
     assert router.get_default_model() == 'gpt-4.1'
     assert router.get_default_model() != 'gpt-5.4'
 
 
-@pytest.mark.asyncio
-async def test_provider_router_failover_switches_active_provider_and_default_model(monkeypatch, router_module):
-    aixj = DummyProvider(
-        'aixj',
+def test_provider_router_failover_switches_active_provider_and_default_model(monkeypatch, router_module):
+    xcode = DummyProvider(
+        'xcode',
         'gpt-4.1',
         [ProviderError(503, 'Service temporarily unavailable', error_type='http_error')],
     )
-    codex = DummyProvider('codex', 'gpt-4.1-mini', [ok_response('ok-from-codex')])
+    xcode_backup = DummyProvider('xcode_backup', 'gpt-4.1-mini', [ok_response('ok-from-backup')])
 
     router = _build_router_with_registry(
         monkeypatch,
         router_module,
         {
-            'aixj': lambda config: aixj,
-            'codex': lambda config: codex,
+            'xcode': lambda config: xcode,
+            'xcode_backup': lambda config: xcode_backup,
         },
     )
 
-    result = await router.chat(messages=[{'role': 'user', 'content': 'ping'}])
+    result = asyncio.run(router.chat(messages=[{'role': 'user', 'content': 'ping'}]))
 
-    assert result.content == 'ok-from-codex'
-    assert aixj.calls == 1
-    assert codex.calls == 1
-    assert router.active_provider_name == 'codex'
-    assert router.get_active_provider() is codex
+    assert result.content == 'ok-from-backup'
+    assert xcode.calls == 1
+    assert xcode_backup.calls == 1
+    assert router.active_provider_name == 'xcode_backup'
+    assert router.get_active_provider() is xcode_backup
     assert router.get_default_model() == 'gpt-4.1-mini'
     assert router.get_default_model() != 'gpt-5.4'
 
 
 
 
-def test_aixj_responses_is_registered_but_not_in_failover_order(monkeypatch, router_module):
-    aixj = DummyProvider('aixj', 'gpt-4.1', [ok_response('aixj-ok')])
-    codex = DummyProvider('codex', 'gpt-4.1-mini', [ok_response('codex-ok')])
-    gemini = DummyProvider('gemini', 'gemini-2.5-flash', [ok_response('gemini-ok')])
-
-    aixj_responses_builder = router_module.provider_registry.get_builder('aixj_responses')
+def test_xcode_responses_is_registered_but_not_in_failover_order(monkeypatch, router_module):
+    xcode = DummyProvider('xcode', 'gpt-4.1', [ok_response('xcode-ok')])
+    xcode_backup = DummyProvider('xcode_backup', 'gpt-4.1-mini', [ok_response('backup-ok')])
+    xcode_responses = DummyProvider('xcode_responses', 'gpt-4.1', [ok_response('responses-ok')])
 
     router = _build_router_with_registry(
         monkeypatch,
         router_module,
         {
-            'aixj': lambda config: aixj,
-            'aixj_responses': lambda config: aixj_responses_builder(config),
-            'codex': lambda config: codex,
-            'gemini': lambda config: gemini,
+            'xcode': lambda config: xcode,
+            'xcode_responses': lambda config: xcode_responses,
+            'xcode_backup': lambda config: xcode_backup,
         },
     )
 
-    assert 'aixj_responses' in router.providers
-    assert router.providers['aixj_responses'].provider_name == 'aixj_responses'
-    assert 'aixj_responses' not in router.failover_order
-    assert router.failover_order == ['aixj', 'codex', 'gemini']
+    assert 'xcode_responses' in router.providers
+    assert router.providers['xcode_responses'].name == 'xcode_responses'
+    assert 'xcode_responses' not in router.failover_order
+    assert router.failover_order == ['xcode', 'xcode_backup']
 
 
-@pytest.mark.asyncio
-async def test_provider_router_recovery_probe_restores_preferred_provider_default_model(monkeypatch, router_module):
-
-
-@pytest.mark.asyncio
-async def test_provider_router_recovery_probe_restores_preferred_provider_default_model(monkeypatch, router_module):
-    aixj = DummyProvider('aixj', 'gpt-4.1', [ok_response('probe-ok'), ok_response('real-ok')])
-    codex = DummyProvider('codex', 'gpt-4.1-mini', [ok_response('codex-ok')])
+def test_provider_router_recovery_probe_restores_preferred_provider_default_model(monkeypatch, router_module):
+    newshrimp = DummyProvider('newshrimp', 'kimi-k2.6', [ok_response('probe-ok'), ok_response('real-ok')])
+    xcode = DummyProvider('xcode', 'gpt-4.1', [ok_response('xcode-ok')])
 
     router = _build_router_with_registry(
         monkeypatch,
         router_module,
         {
-            'aixj': lambda config: aixj,
-            'codex': lambda config: codex,
+            'newshrimp': lambda config: newshrimp,
+            'xcode': lambda config: xcode,
         },
+        config=SimpleNamespace(
+            xcode_api_key='xcode-key',
+            newshrimp_api_key='newshrimp-key',
+            newshrimp_2_api_key=None,
+            newshrimp_3_api_key=None,
+            aliyun_api_key=None,
+            deepseek_api_key=None,
+        ),
     )
-    router._switch_provider('codex')
+    router._switch_provider('xcode')
     router._last_recovery_attempt = 0
     router._last_refresh_time = 10**12
 
     monkeypatch.setattr(router_module.time, 'time', lambda: 10**9)
 
-    result = await router.chat(messages=[{'role': 'user', 'content': 'real-request'}])
+    result = asyncio.run(router.chat(messages=[{'role': 'user', 'content': 'real-request'}]))
 
     assert result.content == 'real-ok'
-    assert aixj.calls == 2
-    assert codex.calls == 0
-    assert router.active_provider_name == 'aixj'
-    assert router.get_default_model() == 'gpt-4.1'
+    assert newshrimp.calls == 2
+    assert xcode.calls == 0
+    assert router.active_provider_name == 'newshrimp'
+    assert router.get_default_model() == 'kimi-k2.6'

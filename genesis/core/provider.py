@@ -255,6 +255,8 @@ class NativeHTTPProvider(BaseLLMProvider):
         stop_seqs = self.stop_sequences if "stop" not in kwargs else kwargs["stop"]
         if self.provider_name == 'groq' and len(stop_seqs) > 4:
             stop_seqs = stop_seqs[:4]
+        if self.provider_name.startswith('newshrimp') and self.provider_name.endswith('_openai') and len(stop_seqs) > 3:
+            stop_seqs = stop_seqs[:3]
             
         request_params = {
             "model": model,
@@ -263,6 +265,7 @@ class NativeHTTPProvider(BaseLLMProvider):
         }
         if stream:
             request_params["stream"] = True
+            request_params.setdefault("stream_options", {"include_usage": True})
         
         if "stop" not in request_params and stop_seqs:
              request_params["stop"] = stop_seqs
@@ -497,8 +500,25 @@ class NativeHTTPProvider(BaseLLMProvider):
             input_tokens=usage.get('prompt_tokens', 0),
             output_tokens=usage.get('completion_tokens', 0),
             total_tokens=usage.get('total_tokens', 0),
-            prompt_cache_hit_tokens=usage.get('prompt_cache_hit_tokens', 0)
+            prompt_cache_hit_tokens=self._extract_cache_hit_tokens(usage)
         )
+
+    @staticmethod
+    def _extract_cache_hit_tokens(usage: Dict[str, Any]) -> int:
+        if not usage:
+            return 0
+        value = usage.get('prompt_cache_hit_tokens')
+        if isinstance(value, int):
+            return value
+        details = usage.get('prompt_tokens_details')
+        if isinstance(details, dict):
+            cached = details.get('cached_tokens')
+            if isinstance(cached, int):
+                return cached
+        value = usage.get('cache_read_input_tokens')
+        if isinstance(value, int):
+            return value
+        return 0
 
     @staticmethod
     def _try_split_concat_tool_call(raw_name: str, raw_args: str, base_idx: int) -> Optional[List[ToolCall]]:
@@ -659,6 +679,10 @@ class NativeHTTPProvider(BaseLLMProvider):
                             
                         try:
                             chunk = json.loads(chunk_str)
+                            if 'usage' in chunk and chunk['usage']:
+                                output_tokens = chunk['usage'].get('completion_tokens', 0)
+                                input_tokens = chunk['usage'].get('prompt_tokens', 0)
+                                prompt_cache_hit_tokens = self._extract_cache_hit_tokens(chunk['usage'])
                             choices = chunk.get('choices')
                             if not choices: continue
                             
@@ -697,7 +721,7 @@ class NativeHTTPProvider(BaseLLMProvider):
                                         named = [k for k in tool_call_chunks if tool_call_chunks[k]["name"]]
                                         if named:
                                             merge_idx = max(named)
-                                            if 'function' in tc and 'arguments' in tc['function']:
+                                            if 'function' in tc and isinstance(tc['function'].get('arguments'), str):
                                                 tool_call_chunks[merge_idx]["args"] += tc['function']['arguments']
                                             continue
                                     
@@ -705,13 +729,13 @@ class NativeHTTPProvider(BaseLLMProvider):
                                         tool_call_chunks[idx] = {"id": "", "name": "", "args": ""}
                                     if has_id: tool_call_chunks[idx]["id"] = tc['id']
                                     if 'function' in tc:
-                                        if 'name' in tc['function']: tool_call_chunks[idx]["name"] += tc['function']['name']
-                                        if 'arguments' in tc['function']: tool_call_chunks[idx]["args"] += tc['function']['arguments']
+                                        if isinstance(tc['function'].get('name'), str): tool_call_chunks[idx]["name"] += tc['function']['name']
+                                        if isinstance(tc['function'].get('arguments'), str): tool_call_chunks[idx]["args"] += tc['function']['arguments']
                             
                             if 'usage' in chunk and chunk['usage']:
                                 output_tokens = chunk['usage'].get('completion_tokens', 0)
                                 input_tokens = chunk['usage'].get('prompt_tokens', 0)
-                                prompt_cache_hit_tokens = chunk['usage'].get('prompt_cache_hit_tokens', 0)
+                                prompt_cache_hit_tokens = self._extract_cache_hit_tokens(chunk['usage'])
 
                         except json.JSONDecodeError:
                             continue

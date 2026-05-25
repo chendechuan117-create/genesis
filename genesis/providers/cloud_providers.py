@@ -49,6 +49,21 @@ def _build_deepseek(config) -> NativeHTTPProvider:
     )
 
 
+def _build_aliyun(config) -> NativeHTTPProvider:
+    api_key = getattr(config, 'aliyun_api_key', None)
+    if not api_key: return None
+    base_url = getattr(config, 'aliyun_base_url', None) or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    default_model = getattr(config, 'aliyun_model', None) or "deepseek-v4-flash"
+    return NativeHTTPProvider(
+        api_key=api_key,
+        base_url=base_url,
+        default_model=default_model,
+        connect_timeout=8,
+        read_timeout=60,
+        provider_name="aliyun"
+    )
+
+
 def _build_xcode_responses(config) -> AIXJResponsesProvider:
     api_key = getattr(config, 'xcode_api_key', None)
     if not api_key: return None
@@ -261,6 +276,7 @@ def _build_newshrimp_3_backup_openai(config) -> NativeHTTPProvider:
 provider_registry.register("xcode", _build_xcode)
 provider_registry.register("xcode_backup", _build_xcode_backup)
 provider_registry.register("deepseek", _build_deepseek)
+provider_registry.register("aliyun", _build_aliyun)
 provider_registry.register("xcode_responses", _build_xcode_responses)
 provider_registry.register("newshrimp", _build_newshrimp)
 provider_registry.register("newshrimp_openai", _build_newshrimp_openai)

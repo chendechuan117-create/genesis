@@ -1,6 +1,7 @@
 import importlib
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 
@@ -48,29 +49,28 @@ def _load_cloud_providers_module():
     _stub_httpx()
     _stub_aixj_responses_provider()
 
-    if 'genesis.providers' not in sys.modules:
-        pkg = types.ModuleType('genesis.providers')
-        pkg.__path__ = ['/workspace/genesis/providers']
-        sys.modules['genesis.providers'] = pkg
-
     sys.modules.pop('genesis.providers.cloud_providers', None)
+    pkg = types.ModuleType('genesis.providers')
+    pkg.__path__ = [str(Path(__file__).resolve().parents[1] / 'genesis' / 'providers')]
+    sys.modules['genesis.providers'] = pkg
     return importlib.import_module('genesis.providers.cloud_providers')
 
 
-def test_aixj_and_codex_default_models_do_not_regress_to_gpt_5_4():
+def test_cloud_provider_default_models_match_current_policy():
     cloud_providers = _load_cloud_providers_module()
     config = SimpleNamespace(
-        aixj_api_key='aixj-key',
-        aixj_api_keys=[],
-        codex_api_key='codex-key',
+        xcode_api_key='xcode-key',
+        xcode_backup_base_url='https://backup.example/v1',
+        aliyun_api_key='aliyun-key',
     )
 
-    aixj = cloud_providers._build_aixj(config)
-    codex = cloud_providers._build_codex(config)
+    xcode = cloud_providers._build_xcode(config)
+    xcode_backup = cloud_providers._build_xcode_backup(config)
+    aliyun = cloud_providers._build_aliyun(config)
 
-    assert aixj is not None
-    assert codex is not None
-    assert aixj.get_default_model() == 'gpt-4.1'
-    assert codex.get_default_model() == 'gpt-4.1'
-    assert aixj.get_default_model() != 'gpt-5.4'
-    assert codex.get_default_model() != 'gpt-5.4'
+    assert xcode is not None
+    assert xcode_backup is not None
+    assert aliyun is not None
+    assert xcode.get_default_model() == 'gpt-5.4'
+    assert xcode_backup.get_default_model() == 'gpt-5.4'
+    assert aliyun.get_default_model() == 'deepseek-v4-flash'
