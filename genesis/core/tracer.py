@@ -280,7 +280,7 @@ class Tracer:
         now = time.time()
         name = f"llm:{model}" if model else "llm_call"
         meta = {"has_tool_calls": has_tool_calls}
-        if cache_hit_tokens:
+        if cache_hit_tokens is not None:
             meta["cache_hit_tokens"] = cache_hit_tokens
         try:
             self._conn.execute(
@@ -293,7 +293,7 @@ class Tracer:
                 (span_id, trace_id, parent, name, phase,
                  now - (duration_ms / 1000), now, duration_ms,
                  model, input_tokens, output_tokens, total_tokens,
-                 cache_hit_tokens or None,
+                 cache_hit_tokens,
                  json.dumps(meta, ensure_ascii=False),
                  "error" if error else "completed", error or None)
             )

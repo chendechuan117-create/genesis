@@ -186,6 +186,7 @@ class CPhaseMixin:
 
         # ── 真理区分消融触发（确定性，零 LLM）──────────────────────
         # 检查是否有节点满足消融条件（入线数≥5），自动标记为消融观察
+        ablation_candidates = []
         try:
             ablation_candidates = self.vault.check_ablation_candidates(min_incoming=5)
             if ablation_candidates:
@@ -209,6 +210,7 @@ class CPhaseMixin:
         # 比消融更激进：故意移除高惯性节点，诱导新解释涌现
         # 消融 = 验证必要性（缺了它行不行？）→ 不行就恢复
         # 修剪 = 诱导涌现（故意拿走，逼系统找新路）→ 等新东西长出来
+        pruning_candidates = []
         try:
             pruning_candidates = self.vault.check_proactive_pruning_candidates(min_incoming=8, min_neighbor_density=5)
             if pruning_candidates:

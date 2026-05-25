@@ -106,6 +106,8 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         self._current_state_surfaces: Dict[str, Any] = {}
         self._knowledge_routing_preview: Dict[str, Any] = {}
         self._lens_preview: Dict[str, Any] = {}
+        self._cache_phase_stats: Dict[str, Dict[str, Any]] = {}
+        self._cache_bucket_stats: Dict[str, Dict[str, Any]] = {}
 
         # 启动时恢复 persona 学习数据（只在首次 V4Loop 实例化时加载一次）
         Blackboard.load_from_db()
@@ -158,6 +160,8 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         self._llm_call_seq = 0
         self._surface_potential_sample_count = 0
         self._reported_potential_sample_count = 0
+        self._cache_phase_stats = {}
+        self._cache_bucket_stats = {}
         self.potential_baseline = {}
         self.current_state_preview = {}
         self._current_state_surfaces = {}
@@ -332,6 +336,8 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                 "input_tokens": self.metrics.input_tokens,
                 "cache_hit_tokens": self.metrics.prompt_cache_hit_tokens,
                 "cache_hit_rate": round(self.metrics.prompt_cache_hit_tokens / self.metrics.input_tokens, 3),
+                "by_phase": self._summarize_cache_stats(self._cache_phase_stats),
+                "by_bucket": self._summarize_cache_stats(self._cache_bucket_stats),
             }
         diagnostics_summary = PipelineDiagnostics.summary()
         potential_sample_count = self.vault.count_potential_samples(self.trace_id) if hasattr(self.vault, "count_potential_samples") else self._surface_potential_sample_count
@@ -686,7 +692,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                 })
                 self._reported_potential_sample_count = self._surface_potential_sample_count
 
-        schema = [t.to_schema() for t in gp_tools]
+        schema = [t.to_schema() for t in sorted(gp_tools, key=lambda t: t.name)]
 
         _consecutive_errors = 0
         _MAX_CONSECUTIVE_ERRORS = 3
@@ -740,7 +746,7 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
                 ))
                 continue
 
-            self._update_metrics(response)
+            self._update_metrics(response, phase="GP")
 
             self.g_messages.append(Message(
                 role=MessageRole.ASSISTANT,
@@ -1320,14 +1326,52 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         except Exception as e:
             logger.error(f"Failed to save memory: {e}")
 
+    @staticmethod
+    def _record_cache_stat(stats: Dict[str, Dict[str, Any]], key: str, response: Any):
+        input_tokens = int(getattr(response, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(response, "output_tokens", 0) or 0)
+        cache_hit_tokens = int(getattr(response, "prompt_cache_hit_tokens", 0) or 0)
+        stat = stats.setdefault(key, {
+            "calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_hit_tokens": 0,
+            "zero_hit_calls": 0,
+            "missing_usage_calls": 0,
+        })
+        stat["calls"] += 1
+        stat["input_tokens"] += input_tokens
+        stat["output_tokens"] += output_tokens
+        stat["cache_hit_tokens"] += cache_hit_tokens
+        if input_tokens <= 0:
+            stat["missing_usage_calls"] += 1
+        elif cache_hit_tokens == 0:
+            stat["zero_hit_calls"] += 1
+
+    @staticmethod
+    def _summarize_cache_stats(stats: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        summarized = {}
+        for key, stat in sorted(stats.items()):
+            item = dict(stat)
+            input_tokens = item.get("input_tokens", 0) or 0
+            item["cache_hit_rate"] = round((item.get("cache_hit_tokens", 0) or 0) / input_tokens, 3) if input_tokens else None
+            summarized[key] = item
+        return summarized
+
     def _update_metrics(self, response: Any, phase: str = "G"):
+        phase_key = str(phase or "unknown").lower()
+        bucket_key = phase_key
+        if phase_key == "gp":
+            bucket_key = "gp_first" if self._cache_phase_stats.get("gp", {}).get("calls", 0) == 0 else "gp_warm"
+        self._record_cache_stat(self._cache_phase_stats, phase_key, response)
+        self._record_cache_stat(self._cache_bucket_stats, bucket_key, response)
         tokens = response.input_tokens + response.output_tokens
         self.metrics.input_tokens += response.input_tokens
         self.metrics.output_tokens += response.output_tokens
         self.metrics.total_tokens += response.total_tokens
         self.metrics.prompt_cache_hit_tokens += getattr(response, 'prompt_cache_hit_tokens', 0)
         self.metrics.iterations += 1
-        if phase == "G":
+        if phase in ("G", "GP", "LENS"):
             self.metrics.g_tokens += tokens
         elif phase == "Op":
             self.metrics.op_tokens += tokens
@@ -1381,14 +1425,26 @@ class V4Loop(LensPhaseMixin, CPhaseMixin):
         if label:
             payload["label"] = label
         if response is not None:
+            input_tokens = int(getattr(response, "input_tokens", 0) or 0)
+            cache_hit_tokens = int(getattr(response, "prompt_cache_hit_tokens", 0) or 0)
+            cache_bucket = str(phase or "").lower()
+            if phase == "GP_PHASE":
+                cache_bucket = "gp_first" if iteration == 0 else "gp_warm"
+            elif phase == "LENS_PHASE":
+                cache_bucket = "lens"
+            elif phase == "C_PHASE":
+                cache_bucket = "c"
             payload.update({
                 "finish_reason": getattr(response, "finish_reason", None),
                 "tool_call_count": len(getattr(response, "tool_calls", []) or []),
                 "content_chars": len(getattr(response, "content", "") or ""),
                 "reasoning_chars": len(getattr(response, "reasoning_content", "") or ""),
-                "input_tokens": getattr(response, "input_tokens", 0),
+                "input_tokens": input_tokens,
                 "output_tokens": getattr(response, "output_tokens", 0),
                 "total_tokens": getattr(response, "total_tokens", 0),
+                "cache_hit_tokens": cache_hit_tokens,
+                "cache_hit_rate": round(cache_hit_tokens / input_tokens, 3) if input_tokens else None,
+                "cache_bucket": cache_bucket,
             })
         if error is not None:
             payload["error"] = str(error)[:300]
