@@ -63,16 +63,18 @@ class BackgroundDaemon:
         hard_del = 0
         if self.cycle_count % GC_EVERY_N_CYCLES == 0:
             try:
-                gc_count = self.vault.purge_forgotten_knowledge(days_threshold=7)
-                logger.info(f"GC 清理了 {gc_count} 个废弃节点")
+                gc_count = self.vault.purge_forgotten_knowledge(days_threshold=7, dry_run=True)
+                if gc_count:
+                    logger.info(f"GC dry-run: {gc_count} 个废弃节点候选")
             except Exception as e:
                 logger.error(f"GC 异常: {e}", exc_info=True)
             # 节点清理：未使用+超龄节点硬删
             try:
-                cleanup_result = node_cleanup(dry_run=False)
+                cleanup_result = node_cleanup(dry_run=True)
                 hard_del = cleanup_result.get("hard_deleted", 0)
-                if hard_del:
-                    logger.info(f"Node cleanup: 硬删 {hard_del}")
+                would_delete = cleanup_result.get("would_delete", hard_del)
+                if would_delete:
+                    logger.info(f"Node cleanup dry-run: {would_delete} 个硬删候选")
             except Exception as e:
                 logger.error(f"Node cleanup 异常: {e}", exc_info=True)
 
@@ -99,7 +101,7 @@ class BackgroundDaemon:
                 total_entities = batch_result.get("total_entities", 0)
                 rel_stats = batch_result.get("relationship_stats", {})
                 community_stats = batch_result.get("community_stats", {})
-                evidence_stats = batch_result.get("evidence_assessment", {})
+                evidence_stats = batch_result.get("evidence_stats") or batch_result.get("evidence_assessment", {})
 
                 # 三阶段可见性日志
                 phase1_info = f"entities={total_entities} new_canonical={batch_result.get('new_canonical', 0)}"
@@ -141,9 +143,9 @@ class BackgroundDaemon:
             except Exception as e:
                 logger.error(f"Topology audit 异常: {e}", exc_info=True)
 
-        logger.info(f"Cycle #{self.cycle_count} 完成 | 签名修复:{sig_fixed} GC:{gc_count} 硬删:{hard_del}")
+        logger.info(f"Cycle #{self.cycle_count} 完成 | 签名修复:{sig_fixed} GC候选:{gc_count} 硬删:{hard_del}")
         self.vault.heartbeat("daemon", "idle",
-                              f"sig:{sig_fixed} gc:{gc_count} hdel:{hard_del}")
+                              f"sig:{sig_fixed} gc_candidates:{gc_count} hdel:{hard_del}")
 
 
 # ════════════════════════════════════════════

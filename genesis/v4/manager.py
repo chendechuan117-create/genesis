@@ -1054,6 +1054,277 @@ class NodeVault(EnvironmentEpochMixin, ArenaConfidenceMixin):
             "schema_issue_count": len(schema_issues),
         }
 
+    def contradiction_audit_report(self, stale_days: int = 30, limit: int = 20) -> Dict[str, Any]:
+        stale_days = max(1, int(stale_days or 30))
+        limit = max(1, int(limit or 20))
+        stale_window = f"-{stale_days} days"
+
+        total = self._conn.execute(
+            "SELECT COUNT(*) FROM node_edges WHERE relation = 'CONTRADICTS'"
+        ).fetchone()[0]
+        recent = self._conn.execute(
+            "SELECT COUNT(*) FROM node_edges WHERE relation = 'CONTRADICTS' "
+            "AND created_at > datetime('now', ?)",
+            (stale_window,),
+        ).fetchone()[0]
+        stale = self._conn.execute(
+            "SELECT COUNT(*) FROM node_edges WHERE relation = 'CONTRADICTS' "
+            "AND (created_at IS NULL OR created_at < datetime('now', ?))",
+            (stale_window,),
+        ).fetchone()[0]
+        orphan = self._conn.execute(
+            "SELECT COUNT(*) FROM node_edges ne "
+            "LEFT JOIN knowledge_nodes s ON ne.source_id = s.node_id "
+            "LEFT JOIN knowledge_nodes t ON ne.target_id = t.node_id "
+            "WHERE ne.relation = 'CONTRADICTS' "
+            "AND (s.node_id IS NULL OR t.node_id IS NULL)"
+        ).fetchone()[0]
+        both_active = self._conn.execute(
+            "SELECT COUNT(*) FROM node_edges ne "
+            "JOIN knowledge_nodes s ON ne.source_id = s.node_id "
+            "JOIN knowledge_nodes t ON ne.target_id = t.node_id "
+            "WHERE ne.relation = 'CONTRADICTS' "
+            "AND COALESCE(s.ablation_active, 0) = 0 "
+            "AND COALESCE(t.ablation_active, 0) = 0 "
+            "AND COALESCE(s.is_virtual, 0) = 0 "
+            "AND COALESCE(t.is_virtual, 0) = 0"
+        ).fetchone()[0]
+        unresolved_active = self._conn.execute(
+            "SELECT COUNT(*) FROM node_edges ne "
+            "JOIN knowledge_nodes s ON ne.source_id = s.node_id "
+            "JOIN knowledge_nodes t ON ne.target_id = t.node_id "
+            "WHERE ne.relation = 'CONTRADICTS' "
+            "AND (ne.created_at IS NULL OR ne.created_at < datetime('now', ?)) "
+            "AND COALESCE(s.ablation_active, 0) = 0 "
+            "AND COALESCE(t.ablation_active, 0) = 0 "
+            "AND COALESCE(s.is_virtual, 0) = 0 "
+            "AND COALESCE(t.is_virtual, 0) = 0",
+            (stale_window,),
+        ).fetchone()[0]
+
+        sample_rows = self._conn.execute(
+            "SELECT ne.source_id, ne.target_id, ne.weight, ne.created_at, "
+            "s.type AS source_type, s.title AS source_title, s.usage_count AS source_usage, "
+            "s.usage_success_count AS source_success, s.usage_fail_count AS source_fail, "
+            "s.last_verified_at AS source_last_verified_at, "
+            "t.type AS target_type, t.title AS target_title, t.usage_count AS target_usage, "
+            "t.usage_success_count AS target_success, t.usage_fail_count AS target_fail, "
+            "t.last_verified_at AS target_last_verified_at "
+            "FROM node_edges ne "
+            "JOIN knowledge_nodes s ON ne.source_id = s.node_id "
+            "JOIN knowledge_nodes t ON ne.target_id = t.node_id "
+            "WHERE ne.relation = 'CONTRADICTS' "
+            "AND (ne.created_at IS NULL OR ne.created_at < datetime('now', ?)) "
+            "AND COALESCE(s.ablation_active, 0) = 0 "
+            "AND COALESCE(t.ablation_active, 0) = 0 "
+            "AND COALESCE(s.is_virtual, 0) = 0 "
+            "AND COALESCE(t.is_virtual, 0) = 0 "
+            "ORDER BY COALESCE(ne.created_at, '1970-01-01') ASC LIMIT ?",
+            (stale_window, limit),
+        ).fetchall()
+        unresolved_active_samples = []
+        for r in sample_rows:
+            unresolved_active_samples.append({
+                "source_id": r["source_id"],
+                "source_type": r["source_type"],
+                "source_title": (r["source_title"] or "")[:80],
+                "source_usage": r["source_usage"],
+                "source_success": r["source_success"],
+                "source_fail": r["source_fail"],
+                "source_last_verified_at": r["source_last_verified_at"],
+                "target_id": r["target_id"],
+                "target_type": r["target_type"],
+                "target_title": (r["target_title"] or "")[:80],
+                "target_usage": r["target_usage"],
+                "target_success": r["target_success"],
+                "target_fail": r["target_fail"],
+                "target_last_verified_at": r["target_last_verified_at"],
+                "weight": r["weight"],
+                "created_at": r["created_at"],
+            })
+
+        orphan_rows = self._conn.execute(
+            "SELECT ne.source_id, ne.target_id, ne.weight, ne.created_at, "
+            "CASE WHEN s.node_id IS NULL THEN 0 ELSE 1 END AS source_exists, "
+            "CASE WHEN t.node_id IS NULL THEN 0 ELSE 1 END AS target_exists "
+            "FROM node_edges ne "
+            "LEFT JOIN knowledge_nodes s ON ne.source_id = s.node_id "
+            "LEFT JOIN knowledge_nodes t ON ne.target_id = t.node_id "
+            "WHERE ne.relation = 'CONTRADICTS' "
+            "AND (s.node_id IS NULL OR t.node_id IS NULL) "
+            "ORDER BY COALESCE(ne.created_at, '1970-01-01') ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        orphan_samples = []
+        for r in orphan_rows:
+            orphan_samples.append({
+                "source_id": r["source_id"],
+                "target_id": r["target_id"],
+                "source_exists": bool(r["source_exists"]),
+                "target_exists": bool(r["target_exists"]),
+                "weight": r["weight"],
+                "created_at": r["created_at"],
+            })
+
+        return {
+            "dry_run": True,
+            "signal_kind": "contradiction_edge_marker_not_resolution",
+            "stale_days": stale_days,
+            "total": total,
+            "recent_count": recent,
+            "stale_count": stale,
+            "orphan_count": orphan,
+            "both_active_count": both_active,
+            "unresolved_active_count": unresolved_active,
+            "unresolved_active_samples": unresolved_active_samples,
+            "orphan_samples": orphan_samples,
+        }
+
+    def env_fact_freshness_report(self, stale_days: int = 7, limit: int = 20, current_runtime: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        import getpass
+        import re
+        import socket
+
+        stale_days = max(1, int(stale_days or 7))
+        limit = max(1, int(limit or 20))
+        current_runtime = dict(current_runtime or {})
+        runtime = {
+            "cwd": str(current_runtime.get("cwd") or Path.cwd()),
+            "home": str(current_runtime.get("home") or Path.home()),
+            "user": str(current_runtime.get("user") or getpass.getuser()),
+            "host": str(current_runtime.get("host") or socket.gethostname()),
+        }
+        cutoff = datetime.utcnow() - timedelta(days=stale_days)
+
+        def parse_dt(value: Any) -> Optional[datetime]:
+            if not value:
+                return None
+            text = str(value).strip().replace("Z", "+00:00")
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+                try:
+                    return datetime.strptime(text[:len(fmt)], fmt)
+                except ValueError:
+                    pass
+            try:
+                parsed = datetime.fromisoformat(text)
+                if parsed.tzinfo is not None:
+                    parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+                return parsed
+            except ValueError:
+                return None
+
+        def abs_paths(text: str) -> List[str]:
+            return [p.rstrip(".,;:)]}") for p in re.findall(r"/(?:[A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+", text or "")]
+
+        def mismatch_signals(subject: str, text: str) -> List[Dict[str, str]]:
+            haystack = f"{subject}\n{text}"
+            lowered = haystack.lower()
+            paths = abs_paths(haystack)
+            mismatches = []
+            if ("cwd" in lowered or "working_dir" in lowered or "working directory" in lowered) and runtime["cwd"] not in haystack:
+                observed = next((p for p in paths if p != runtime["cwd"]), "")
+                if observed:
+                    mismatches.append({"field": "cwd", "observed": observed, "expected": runtime["cwd"]})
+            if "home" in lowered and runtime["home"] not in haystack:
+                observed = next((p for p in paths if p != runtime["home"]), "")
+                if observed:
+                    mismatches.append({"field": "home", "observed": observed, "expected": runtime["home"]})
+            user_match = re.search(r"(?:user|username)\s*[:=]\s*([A-Za-z0-9_.-]+)", haystack, re.IGNORECASE)
+            if not user_match:
+                user_match = re.search(r"运行用户为\s*([A-Za-z0-9_.-]+)", haystack)
+            if user_match:
+                observed = user_match.group(1)
+                if observed != runtime["user"]:
+                    mismatches.append({"field": "user", "observed": observed, "expected": runtime["user"]})
+            host_match = re.search(r"(?:host|hostname)\s*[:=]\s*([A-Za-z0-9_.-]+)", haystack, re.IGNORECASE)
+            if host_match:
+                observed = host_match.group(1)
+                if observed != runtime["host"]:
+                    mismatches.append({"field": "host", "observed": observed, "expected": runtime["host"]})
+            return mismatches
+
+        rows = self._conn.execute(
+            "SELECT k.node_id, k.title, k.tags, k.resolves, k.metadata_signature, "
+            "k.created_at, k.updated_at, k.last_verified_at, k.verification_source, c.full_content "
+            "FROM knowledge_nodes k "
+            "LEFT JOIN node_contents c ON k.node_id = c.node_id "
+            "WHERE k.node_id NOT LIKE 'MEM_CONV%' "
+            "AND k.type = 'DISCOVERY' "
+            "AND (k.title LIKE '[ENV_FACT]%' "
+            "  OR LOWER(COALESCE(k.tags, '')) LIKE '%env_fact%' "
+            "  OR k.metadata_signature LIKE '%ENV_FACT%' "
+            "  OR COALESCE(c.full_content, '') LIKE '%ENV_FACT%') "
+            "ORDER BY COALESCE(k.last_verified_at, k.created_at, '1970-01-01') ASC"
+        ).fetchall()
+
+        unverified_count = 0
+        stale_verified_count = 0
+        current_anchor_count = 0
+        stale_or_unverified_samples = []
+        mismatch_candidates = []
+
+        for row in rows:
+            signature = self.signature.parse(row["metadata_signature"])
+            content = {}
+            try:
+                content = json.loads(row["full_content"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                content = {}
+            subject = str(signature.get("subject") or content.get("subject") or row["resolves"] or "").strip()
+            description = str(content.get("description") or row["title"] or "").strip()
+            evidence_tool = str(signature.get("evidence_tool") or content.get("evidence_tool") or "").strip()
+            observed_at = str(signature.get("observed_at") or content.get("observed_at") or "").strip()
+            combined_text = f"{row['title'] or ''}\n{row['tags'] or ''}\n{row['resolves'] or ''}\n{row['full_content'] or ''}\n{json.dumps(signature, ensure_ascii=False)}"
+            lowered = f"{subject}\n{description}\n{combined_text}".lower()
+            current_anchor = any(token in lowered for token in ("cwd", "working_dir", "working directory", "workspace", "home", "user", "username", "host", "hostname", "service", "pid", "venv", "python"))
+            if current_anchor:
+                current_anchor_count += 1
+
+            last_verified = parse_dt(row["last_verified_at"])
+            unverified = last_verified is None
+            stale_verified = bool(last_verified and last_verified < cutoff)
+            if unverified:
+                unverified_count += 1
+            if stale_verified:
+                stale_verified_count += 1
+
+            sample = {
+                "node_id": row["node_id"],
+                "title": (row["title"] or "")[:100],
+                "subject": subject,
+                "description": description[:160],
+                "evidence_tool": evidence_tool,
+                "observed_at": observed_at,
+                "created_at": row["created_at"],
+                "last_verified_at": row["last_verified_at"],
+                "verification_source": row["verification_source"],
+                "current_state_sensitive": current_anchor,
+                "freshness_state": "unverified" if unverified else ("stale" if stale_verified else "current"),
+            }
+            if (unverified or stale_verified) and len(stale_or_unverified_samples) < limit:
+                stale_or_unverified_samples.append(sample)
+
+            mismatches = mismatch_signals(subject, combined_text)
+            if mismatches and len(mismatch_candidates) < limit:
+                mismatch_sample = dict(sample)
+                mismatch_sample["mismatches"] = mismatches
+                mismatch_candidates.append(mismatch_sample)
+
+        return {
+            "dry_run": True,
+            "signal_kind": "env_fact_freshness_not_revalidation",
+            "stale_days": stale_days,
+            "current_runtime": runtime,
+            "total": len(rows),
+            "unverified_count": unverified_count,
+            "stale_verified_count": stale_verified_count,
+            "stale_or_unverified_count": unverified_count + stale_verified_count,
+            "current_anchor_count": current_anchor_count,
+            "mismatch_candidate_count": len(mismatch_candidates),
+            "stale_or_unverified_samples": stale_or_unverified_samples,
+            "mismatch_candidates": mismatch_candidates,
+        }
+
     def heartbeat(self, process_name: str, status: str = "running", summary: str = "", extra: Dict[str, Any] = None):
         """写入当前进程心跳"""
         import os
