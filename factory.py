@@ -4,6 +4,7 @@ Genesis V4 — 极简工厂
 """
 
 import logging
+import re
 from typing import Optional
 
 from genesis.core.provider import NativeHTTPProvider
@@ -76,8 +77,9 @@ def create_agent(
         logger.error(f"V4 tool group [web_tools] failed: {e}")
 
     try:
-        from genesis.tools.skill_creator_tool import SkillCreatorTool
+        from genesis.tools.skill_creator_tool import SkillCreatorTool, SkillInventoryTool
         tools.register(SkillCreatorTool(tools))
+        tools.register(SkillInventoryTool(tools))
     except Exception as e:
         logger.error(f"V4 tool group [skill_creator] failed: {e}")
 
@@ -191,6 +193,9 @@ def autoload_physical_skills(registry: ToolRegistry) -> int:
                 continue
             try:
                 source_code = py_file.read_text(encoding="utf-8")
+                if not re.search(r'class\s+\w+\s*\(\s*Tool\s*\)', source_code):
+                    logger.debug(f"autoload_physical_skills: skip '{tool_name}' (no Tool subclass)")
+                    continue
                 ok = registry.register_from_source(
                     name=tool_name,
                     source_code=source_code,
