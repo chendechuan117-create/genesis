@@ -384,6 +384,8 @@ class ShellTool(Tool):
     async def _execute_sync(self, command: str, cwd: str = None, is_daemon: bool = False) -> str:
         """执行命令。长命令自动 spawn+poll，短命令同步等待。"""
         try:
+            cwd_fallback_note = None
+            cwd_resolved = None
             # 安全检查
             dangerous_patterns = ['rm -rf /', 'dd if=', 'mkfs', ':(){:|:&};:']
             if any(pattern in command for pattern in dangerous_patterns):
@@ -393,13 +395,14 @@ class ShellTool(Tool):
             if self.use_sandbox and self.sandbox:
                 cmd_to_run = f"cd {cwd} && {command}" if cwd else command
                 code, stdout, stderr = self.sandbox.exec_command(cmd_to_run, timeout=self.timeout)
-                return self._format_result(command, cwd, code, stdout, stderr, cwd_fallback_note=cwd_fallback_note)
+                cwd_resolved = cwd
+                return self._format_result(command, cwd, code, stdout, stderr, cwd_fallback_note=cwd_fallback_note, cwd_resolved=cwd_resolved, executor="sandbox")
 
             # 设置工作目录
             work_dir = None
-            cwd_fallback_note = None
             if cwd:
                 work_dir, cwd_fallback_note = self._resolve_work_dir(cwd)
+                cwd_resolved = str(work_dir)
 
             # 常驻服务检测
             known_daemons = ('scrcpy', 'server', 'daemon', 'npm start', 'python -m http.server')
@@ -447,14 +450,14 @@ class ShellTool(Tool):
 
             stdout_text = stdout.decode('utf-8', errors='replace')
             stderr_text = stderr.decode('utf-8', errors='replace')
-            return self._format_result(command, cwd, process.returncode, stdout_text, stderr_text, cwd_fallback_note=cwd_fallback_note)
+            return self._format_result(command, cwd, process.returncode, stdout_text, stderr_text, cwd_fallback_note=cwd_fallback_note, cwd_resolved=cwd_resolved, executor="host")
 
         except Exception as e:
             logger.error(f"执行命令失败: {command}, error: {e}")
             return f"Error: 执行命令失败 - {str(e)}"
 
     @staticmethod
-    def _format_result(command: str, cwd, code: int, stdout: str, stderr: str, cwd_fallback_note: str = None) -> str:
+    def _format_result(command: str, cwd, code: int, stdout: str, stderr: str, cwd_fallback_note: str = None, cwd_resolved: str = None, executor: str = None) -> str:
         """统一格式化命令执行结果"""
         
         # 安全网：限制输出总长度，防止单次工具输出撑爆上下文
@@ -466,6 +469,8 @@ class ShellTool(Tool):
         result.append(f"命令: {command}")
         if cwd:
             result.append(f"目录: {cwd}")
+        if cwd_resolved or executor:
+            result.append(f"[cwd-meta] requested={cwd or ''} resolved={cwd_resolved or ''} executor={executor or ''}")
         if cwd_fallback_note:
             result.append(cwd_fallback_note)
         result.append(f"退出码: {code}")

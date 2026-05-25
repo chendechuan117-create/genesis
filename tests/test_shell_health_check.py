@@ -1,5 +1,6 @@
 import subprocess
 import time
+import asyncio
 
 import pytest
 
@@ -138,6 +139,23 @@ def test_shell_health_check_surfaces_top_level_aggregate_fields(monkeypatch):
     assert "Summary: network probe degraded but jobs healthy" in output
     assert "Warnings: probe timeout; disk nearing threshold" in output
     assert "Issues: network reachability degraded" in output
+
+
+def test_shell_tool_sandbox_execute_surfaces_cwd_meta_without_name_error():
+    from genesis.tools.shell_tool import ShellTool
+
+    class DummySandbox:
+        def exec_command(self, command, timeout):
+            return 0, "ok", ""
+
+    tool = ShellTool(timeout=1, use_sandbox=False, job_manager=object())
+    tool.use_sandbox = True
+    tool.sandbox = DummySandbox()
+
+    output = asyncio.run(tool._execute_sync("pwd", "/workspace"))
+
+    assert "[cwd-meta] requested=/workspace resolved=/workspace executor=sandbox" in output
+    assert "NameError" not in output
 
 
 def test_shell_health_check_network_probe_summary_without_error_is_stable(monkeypatch):
