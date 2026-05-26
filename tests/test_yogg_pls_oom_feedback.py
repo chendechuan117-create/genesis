@@ -5,6 +5,7 @@ from genesis.v4.c_phase import CPhaseMixin
 from genesis.v4.loop import V4Loop
 from genesis.v4.prompt_factory import FactoryManager, NodeManagementTools
 from genesis.v4.signature_engine import SignatureEngine
+from genesis.tools.search_tool import SearchKnowledgeNodesTool
 
 
 class DummyVault:
@@ -229,3 +230,69 @@ def test_arena_ignores_preloaded_only_nodes():
 
     loop = ArenaLoop()
     assert loop._eligible_arena_nodes(["P_PRE", "P_SEARCH"]) == ["P_SEARCH"]
+
+
+def test_arena_accepts_current_tool_active_roles_only():
+    class ArenaLoop(CPhaseMixin):
+        def __init__(self):
+            self.execution_active_node_roles = {
+                "P_SUGGESTED": {"tool_suggested"},
+                "P_OPENED": {"tool_opened"},
+                "P_ROUTED": {"routing_seed"},
+                "P_SURFACE": {"surface_basis"},
+                "P_PRE": {"preloaded"},
+            }
+
+    loop = ArenaLoop()
+    assert loop._eligible_arena_nodes([
+        "P_SUGGESTED",
+        "P_OPENED",
+        "P_ROUTED",
+        "P_SURFACE",
+        "P_PRE",
+    ]) == ["P_SUGGESTED", "P_OPENED"]
+
+
+def test_type_rank_shadow_delta_detects_reordered_suggestions():
+    tool = SearchKnowledgeNodesTool()
+    rows = [
+        {"node_id": "P_ASSET", "ntype": "ASSET", "fusion_score": 0.10},
+        {"node_id": "P_UNKNOWN", "ntype": "PROPOSAL", "fusion_score": 0.95},
+        {"node_id": "P_LESSON", "ntype": "LESSON", "fusion_score": 0.80},
+    ]
+    current_rows = sorted(rows, key=lambda r: (tool._type_rank(r), -(r.get("fusion_score", 0.0))))
+    current_ids = [r["node_id"] for r in current_rows]
+    report = tool._build_type_rank_shadow_report(current_rows, current_ids, limit=3)
+
+    assert report["current_top"] == ["P_ASSET", "P_LESSON", "P_UNKNOWN"]
+    assert report["shadow_top"] == ["P_UNKNOWN", "P_LESSON", "P_ASSET"]
+    assert report["first_divergence"] == 0
+    assert report["overlap"] == ["P_ASSET", "P_LESSON", "P_UNKNOWN"]
+
+
+def test_type_rank_shadow_counts_unknown_type_suppression():
+    tool = SearchKnowledgeNodesTool()
+    rows = [
+        {"node_id": "P_ASSET_1", "ntype": "ASSET", "fusion_score": 0.10},
+        {"node_id": "P_LESSON_1", "ntype": "LESSON", "fusion_score": 0.20},
+        {"node_id": "P_ASSET_2", "ntype": "ASSET", "fusion_score": 0.30},
+        {"node_id": "P_UNKNOWN", "ntype": "PROPOSAL", "fusion_score": 0.99},
+    ]
+    current_rows = sorted(rows, key=lambda r: (tool._type_rank(r), -(r.get("fusion_score", 0.0))))
+    current_ids = [r["node_id"] for r in current_rows[:3]]
+    report = tool._build_type_rank_shadow_report(current_rows, current_ids, limit=3)
+
+    assert report["current_top"] == ["P_ASSET_2", "P_ASSET_1", "P_LESSON_1"]
+    assert report["shadow_top"] == ["P_UNKNOWN", "P_ASSET_2", "P_LESSON_1"]
+    assert report["unknown_type_suppression"] == 1
+    assert report["unknown_type_suppressed_ids"] == ["P_UNKNOWN"]
+    assert report["arena_attribution_delta"] == ["P_UNKNOWN"]
+
+
+def test_type_rank_shadow_report_getter_returns_copy():
+    SearchKnowledgeNodesTool.reset_type_rank_shadow_report()
+    SearchKnowledgeNodesTool._last_type_rank_shadow_report = {"current_top": ["P_A"]}
+    report = SearchKnowledgeNodesTool.get_type_rank_shadow_report()
+    report["current_top"].append("P_MUTATED")
+
+    assert SearchKnowledgeNodesTool.get_type_rank_shadow_report()["current_top"] == ["P_A"]

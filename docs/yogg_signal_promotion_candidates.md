@@ -18,6 +18,13 @@ First manual consumption review:
 docs/yogg_signal_promotion_review.md
 ```
 
+Reasoning proof review:
+
+```text
+docs/yogg_reasoning_proof_review.md
+docs/yogg_reasoning_proof_review_cases.md
+```
+
 The purpose is to identify which Yogg-produced `P_*` signals can be promoted from `ACTIVITY` into one of the following reviewable artifacts:
 
 ```text
@@ -73,6 +80,14 @@ The candidate list should be treated as a promotion queue, not as accepted truth
 ## 2. Promotion criteria
 
 A Yogg signal is promotion-worthy only if it has at least one stable path into review or action.
+
+Before applying the promotion criteria, review the signal's reasoning chain:
+
+```text
+claim → definitions → evidence bindings → inference steps → falsifiers → scope boundary → artifact class
+```
+
+A rhetorically strong conclusion should not be promoted unless its proof chain survives this review.
 
 | Criterion | Question |
 |---|---|

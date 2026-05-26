@@ -134,3 +134,69 @@ def test_legacy_round_reports_missing_domain_fields(tmp_path):
     assert domains["line_consumption_evidence"]["mappable"] is False
     assert "record_line_success" in domains["line_consumption_evidence"]["missing_requirements"]
     assert "phase_trace.current_state_preview.active_nodes" in domains["line_consumption_evidence"]["missing_requirements"]
+
+
+def test_line_consumption_not_observed_when_point_not_in_active_nodes():
+    """line created but point ID not in active_nodes → consumption NOT observed"""
+    record = {
+        "session_id": "s1",
+        "round": 1,
+        "status": "completed",
+        "progress_class": "strong",
+        "outcome_detected": False,
+        "kb_changed": True,
+        "kb_delta": {"new_nodes": [{"node_id": "P_NEW"}], "updated_nodes": []},
+        "events": [
+            {"type": "tool_result", "name": "record_line", "result_preview": "✅ LINE [异轮]: P_NEW --[based_on]--> P_OLD"},
+        ],
+        "phase_trace": {"current_state_preview": {"active_nodes": [{"node_id": "P_OTHER"}]}},
+        "pls_telemetry": {"points_created": 1, "lines_created": 1, "cross_round_lines": 1, "line_errors": 0},
+    }
+    domains = classify_record_domains(record)
+    assert domains["line_activity_evidence"]["observed"] is True
+    assert domains["line_consumption_evidence"]["mappable"] is True
+    assert domains["line_consumption_evidence"]["observed"] is False
+
+
+def test_line_consumption_observed_when_point_in_active_nodes():
+    """line created AND point ID in active_nodes → consumption observed (weak)"""
+    record = {
+        "session_id": "s1",
+        "round": 1,
+        "status": "completed",
+        "progress_class": "strong",
+        "outcome_detected": False,
+        "kb_changed": True,
+        "kb_delta": {"new_nodes": [{"node_id": "P_NEW"}], "updated_nodes": []},
+        "events": [
+            {"type": "tool_result", "name": "record_line", "result_preview": "✅ LINE [异轮]: P_NEW --[based_on]--> P_OLD"},
+        ],
+        "phase_trace": {"current_state_preview": {"active_nodes": [{"node_id": "P_NEW"}]}},
+        "pls_telemetry": {"points_created": 1, "lines_created": 1, "cross_round_lines": 1, "line_errors": 0},
+    }
+    domains = classify_record_domains(record)
+    assert domains["line_activity_evidence"]["observed"] is True
+    assert domains["line_consumption_evidence"]["observed"] is True
+    assert domains["line_consumption_evidence"]["consumption_tier"] == "weak_active_context"
+
+
+def test_line_consumption_requires_both_line_success_and_active_nodes():
+    """Without active_nodes field, consumption is not mappable even with line success"""
+    record = {
+        "session_id": "s1",
+        "round": 1,
+        "status": "completed",
+        "progress_class": "strong",
+        "outcome_detected": False,
+        "kb_changed": True,
+        "kb_delta": {"new_nodes": [{"node_id": "P_NEW"}], "updated_nodes": []},
+        "events": [
+            {"type": "tool_result", "name": "record_line", "result_preview": "✅ LINE [异轮]: P_NEW --[based_on]--> P_OLD"},
+        ],
+        "phase_trace": {},
+        "pls_telemetry": {"points_created": 1, "lines_created": 1, "cross_round_lines": 1, "line_errors": 0},
+    }
+    domains = classify_record_domains(record)
+    assert domains["line_activity_evidence"]["observed"] is True
+    assert domains["line_consumption_evidence"]["mappable"] is False
+    assert "phase_trace.current_state_preview.active_nodes" in domains["line_consumption_evidence"]["missing_requirements"]

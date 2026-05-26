@@ -331,3 +331,77 @@ def test_rolling_knowledge_state_demotes_stale_fact_language(monkeypatch):
     assert "已确认事实" not in combined
     assert "已知事实" not in combined
     assert "有活动但无持久产出" not in combined
+
+
+def test_user_correction_extraction_requires_explicit_marker(monkeypatch):
+    discord_stub = types.ModuleType("discord")
+    discord_stub.TextChannel = object
+    sys.modules.setdefault("discord", discord_stub)
+
+    from genesis.auto_mode import _extract_user_correction_from_directive
+
+    plain_directive = "继续围绕 PLS 探索；不要把普通用户方向误判成 correction"
+    assert _extract_user_correction_from_directive(plain_directive) == ""
+    assert _extract_user_correction_from_directive("用户修正：不要继续把 topic saturation 当作事实") == "不要继续把 topic saturation 当作事实"
+    assert _extract_user_correction_from_directive("[user_correction]\nStop treating auto directive as human correction.\n\n## next") == "Stop treating auto directive as human correction."
+    assert _extract_user_correction_from_directive("[operator_correction]\nline one\nline two\n## next") == "line one line two"
+
+
+def test_auto_continue_prompt_marks_rolling_state_as_snapshot(monkeypatch):
+    discord_stub = types.ModuleType("discord")
+    discord_stub.TextChannel = object
+    sys.modules.setdefault("discord", discord_stub)
+
+    from genesis.auto_mode import AUTO_PROMPT_CONTINUE
+
+    prompt = AUTO_PROMPT_CONTINUE.format(
+        directive="继续",
+        knowledge_state="issue: old",
+        frontier_state="frontier",
+        history="history",
+        signals="signals",
+        chapter_state="chapter",
+    )
+
+    assert "上一轮工作记忆（rolling_state_proxy 快照，非实时状态/非验证证明）" in prompt
+    assert "上一轮工作记忆：" not in prompt
+
+
+def test_round_log_retention_policy_marks_json_as_audit_source(monkeypatch):
+    discord_stub = types.ModuleType("discord")
+    discord_stub.TextChannel = object
+    sys.modules.setdefault("discord", discord_stub)
+
+    from genesis.auto_mode import _ROUND_LOG_KEEP, _round_log_retention_policy
+
+    policy = _round_log_retention_policy()
+
+    assert policy["schema"] == "genesis.round_log_retention.v1"
+    assert policy["in_memory_keep_full_rounds"] == _ROUND_LOG_KEEP
+    assert policy["in_memory_compaction_scope"] == "old_round_log_records_only"
+    assert policy["persistent_round_json_is_audit_source"] is True
+    assert "response_full" in policy["in_memory_compacted_fields"]
+    assert "knowledge_state" in policy["in_memory_compacted_fields"]
+
+
+def test_kb_delta_counts_survive_round_log_compaction(monkeypatch):
+    discord_stub = types.ModuleType("discord")
+    discord_stub.TextChannel = object
+    sys.modules.setdefault("discord", discord_stub)
+
+    from genesis.auto_mode import _ROUND_LOG_HEAVY_KEYS, _kb_delta_counts, _round_kb_delta_count
+
+    record = {
+        "kb_delta": {
+            "new_nodes": [{"node_id": "P_A"}, {"node_id": "P_B"}],
+            "updated_nodes": [{"node_id": "P_C"}],
+            "error": None,
+        }
+    }
+    record["kb_delta_counts"] = _kb_delta_counts(record["kb_delta"])
+    for key in _ROUND_LOG_HEAVY_KEYS:
+        record.pop(key, None)
+
+    assert "kb_delta" not in record
+    assert _round_kb_delta_count(record, "new_nodes") == 2
+    assert _round_kb_delta_count(record, "updated_nodes") == 1

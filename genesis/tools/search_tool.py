@@ -38,6 +38,7 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
     _fusion_score_count: int = 0
     # ── 节点级信用归因缓存：最近一次搜索的 {node_id: fusion_score} ──
     _last_fusion_scores: Dict[str, float] = {}
+    _last_type_rank_shadow_report: Dict[str, Any] = {}
 
     @classmethod
     def _record_search_stats(cls, hit: bool, top_fusion_scores: list = None):
@@ -163,6 +164,17 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
     def reset_fusion_cache(cls):
         """每次请求开始时重置，防止上一次请求的分数污染当前归因"""
         cls._last_fusion_scores = {}
+
+    @classmethod
+    def get_type_rank_shadow_report(cls) -> Dict[str, Any]:
+        return {
+            key: list(value) if isinstance(value, list) else value
+            for key, value in cls._last_type_rank_shadow_report.items()
+        }
+
+    @classmethod
+    def reset_type_rank_shadow_report(cls):
+        cls._last_type_rank_shadow_report = {}
 
     @classmethod
     def get_search_stats(cls) -> dict:
@@ -331,6 +343,38 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
             "TOOL": 7,
         }
         return ranks.get(ntype, 99)
+
+    def _build_type_rank_shadow_report(self, recommended_rows: List[Dict[str, Any]], current_ids: List[str], limit: int = 6) -> Dict[str, Any]:
+        rows = list(recommended_rows or [])
+        current_top = [str(nid) for nid in list(current_ids or [])[:limit] if nid]
+        shadow_rows = sorted(
+            rows,
+            key=lambda r: (-(r.get('fusion_score', 0.0) or 0.0), str(r.get('node_id') or "")),
+        )
+        shadow_top = [str(r.get('node_id')) for r in shadow_rows[:limit] if r.get('node_id')]
+        shadow_set = set(shadow_top)
+        current_set = set(current_top)
+        first_divergence = None
+        for idx in range(max(len(current_top), len(shadow_top))):
+            current_id = current_top[idx] if idx < len(current_top) else None
+            shadow_id = shadow_top[idx] if idx < len(shadow_top) else None
+            if current_id != shadow_id:
+                first_divergence = idx
+                break
+        unknown_type_suppressed_ids = [
+            str(r.get('node_id'))
+            for r in shadow_rows[:limit]
+            if r.get('node_id') and str(r.get('node_id')) not in current_set and self._type_rank(r) == 99
+        ]
+        return {
+            "current_top": current_top,
+            "shadow_top": shadow_top,
+            "overlap": [nid for nid in current_top if nid in shadow_set],
+            "first_divergence": first_divergence,
+            "unknown_type_suppression": len(unknown_type_suppressed_ids),
+            "unknown_type_suppressed_ids": unknown_type_suppressed_ids,
+            "arena_attribution_delta": [nid for nid in shadow_top if nid not in current_set],
+        }
 
     def _signature_values(self, signature: Dict[str, Any], key: str) -> List[str]:
         signature = signature or {}
@@ -818,6 +862,11 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                 # 建议挂载（紧凑列表）
                 lines.append("")
                 suggested_ids = [r['node_id'] for r in recommended_rows[:6]]
+                self.__class__._last_type_rank_shadow_report = self._build_type_rank_shadow_report(
+                    recommended_rows,
+                    suggested_ids,
+                    limit=6,
+                )
                 # 补充：被多个命中节点引用的邻居也值得挂载
                 neighbor_freq = {}
                 for nid, neighbors in graph_related_ids.items():

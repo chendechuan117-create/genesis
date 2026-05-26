@@ -113,6 +113,8 @@ Documents:
 ```text
 docs/yogg_signal_promotion_candidates.md
 docs/yogg_signal_promotion_review.md
+docs/yogg_reasoning_proof_review.md
+docs/yogg_reasoning_proof_review_cases.md
 docs/v6_outcome_domain_contract.md
 docs/yogg_governance_review_outcome_draft.md
 docs/yogg_value_audit_summary.md
@@ -158,7 +160,7 @@ python -m py_compile genesis/v6/aggregate_outcome_governance.py genesis/v6/consu
 Whitespace check:
 
 ```bash
-git diff --check -- docs/yogg_value_audit_handoff.md docs/yogg_value_audit_summary.md docs/v6_outcome_domains_runtime_proposal.md docs/v6_outcome_domain_contract.md docs/yogg_governance_review_outcome_draft.md genesis/v6/aggregate_outcome_governance.py genesis/v6/consume_outcome_domain_rows.py genesis/v6/canonicalize_outcome_domains.py genesis/v6/audit_outcome_domain_compatibility.py genesis/v6/audit_yogg_signal_promotion.py tests/test_v6_outcome_governance_aggregator.py tests/test_v6_outcome_domain_row_consumer.py tests/test_v6_outcome_domain_canonicalizer.py tests/test_v6_outcome_domain_compatibility.py tests/test_v6_yogg_signal_promotion.py
+git diff --check -- docs/yogg_reasoning_proof_review.md docs/yogg_reasoning_proof_review_cases.md docs/yogg_value_audit_handoff.md docs/yogg_value_audit_summary.md docs/v6_outcome_domains_runtime_proposal.md docs/v6_outcome_domain_contract.md docs/yogg_governance_review_outcome_draft.md genesis/v6/aggregate_outcome_governance.py genesis/v6/consume_outcome_domain_rows.py genesis/v6/canonicalize_outcome_domains.py genesis/v6/audit_outcome_domain_compatibility.py genesis/v6/audit_yogg_signal_promotion.py tests/test_v6_outcome_governance_aggregator.py tests/test_v6_outcome_domain_row_consumer.py tests/test_v6_outcome_domain_canonicalizer.py tests/test_v6_outcome_domain_compatibility.py tests/test_v6_yogg_signal_promotion.py
 ```
 
 ## 6. What not to do from this chain
@@ -180,6 +182,20 @@ promote/canary anything from this audit
 ## 7. Next phase options
 
 Only these next phases are justified.
+
+## 7.0 Reasoning proof review
+
+Meaning:
+
+```text
+Review whether a Yogg claim has a traceable proof chain before promoting it as signal, governance outcome, runtime proposal, or training candidate.
+```
+
+Boundary:
+
+```text
+Do not treat proof review as a new automatic audit layer or runtime authorization.
+```
 
 ## 7.1 Phase B report-only runtime emission proposal review
 

@@ -27,6 +27,18 @@ logger = logging.getLogger("DiscordBot.Auto")
 
 # ─── Memory Management ────────────────────────────────────────────
 _ROUND_LOG_KEEP = 2  # keep last N rounds full; older rounds compacted (heavy fields dropped)
+_ROUND_LOG_HEAVY_KEYS = (
+    "events",
+    "response_full",
+    "signals",
+    "prompt_preview",
+    "frontier_text",
+    "knowledge_state_text",
+    "phase_trace",
+    "kb_delta",
+    "knowledge_state",
+    "frontier_state",
+)
 
 # Synchronous RSS check — fires at round boundaries BEFORE async code runs,
 # so it works even when cgroup memory.high would freeze the event loop.
@@ -80,6 +92,16 @@ def _env_bool(name: str, default: bool) -> bool:
         return False
     logger.warning(f"Invalid {name}={raw!r}; fallback to {default}")
     return default
+
+
+def _round_log_retention_policy() -> dict:
+    return {
+        "schema": "genesis.round_log_retention.v1",
+        "in_memory_keep_full_rounds": _ROUND_LOG_KEEP,
+        "in_memory_compacted_fields": list(_ROUND_LOG_HEAVY_KEYS),
+        "in_memory_compaction_scope": "old_round_log_records_only",
+        "persistent_round_json_is_audit_source": True,
+    }
 
 
 # ─── Constants ───────────────────────────────────────────────────
@@ -150,7 +172,7 @@ AUTO_PROMPT_CONTINUE = """继续自主概念探索。上一轮留下的是痕迹
 ## 用户方向
 {directive}
 
-上一轮工作记忆：
+上一轮工作记忆（rolling_state_proxy 快照，非实时状态/非验证证明）：
 {knowledge_state}
 
 上一轮探索前沿：
@@ -597,6 +619,23 @@ def _format_node_telemetry(before: dict, after: dict) -> str:
     return "节点计数观测: 无法判断"
 
 
+def _kb_delta_counts(kb_delta: dict) -> dict:
+    kb_delta = kb_delta if isinstance(kb_delta, dict) else {}
+    return {
+        "new_nodes": len(kb_delta.get("new_nodes") or []),
+        "updated_nodes": len(kb_delta.get("updated_nodes") or []),
+        "error": bool(kb_delta.get("error")),
+    }
+
+
+def _round_kb_delta_count(record: dict, key: str) -> int:
+    record = record if isinstance(record, dict) else {}
+    counts = record.get("kb_delta_counts")
+    if isinstance(counts, dict) and key in counts:
+        return int(counts.get(key) or 0)
+    return int(_kb_delta_counts(record.get("kb_delta") or {}).get(key) or 0)
+
+
 def _compact_whitespace(text: str) -> str:
     return " ".join(str(text or "").split())
 
@@ -606,6 +645,47 @@ def _trim_frontier_item(text: str, limit: int = 220) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3].rstrip() + "..."
+
+
+_USER_CORRECTION_MARKERS = (
+    "user_correction",
+    "operator_correction",
+    "human_correction",
+    "用户修正",
+    "用户纠正",
+    "人工修正",
+    "人为修正",
+)
+
+
+def _extract_user_correction_from_directive(directive: str) -> str:
+    lines = str(directive or "").splitlines()
+    collecting = False
+    collected = []
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            if collecting:
+                break
+            continue
+        for marker in _USER_CORRECTION_MARKERS:
+            marker_re = re.escape(marker)
+            bracket_match = re.match(rf"^\[{marker_re}\]\s*(.*)$", line, flags=re.IGNORECASE)
+            colon_match = re.match(rf"^{marker_re}\s*[:：]\s*(.*)$", line, flags=re.IGNORECASE)
+            match = bracket_match or colon_match
+            if not match:
+                continue
+            rest = match.group(1).strip()
+            if rest:
+                return _trim_frontier_item(rest, 500)
+            collecting = True
+            break
+        else:
+            if collecting:
+                if line.startswith("#"):
+                    break
+                collected.append(line)
+    return _trim_frontier_item(" ".join(collected), 500) if collected else ""
 
 
 def _format_kb_node_ref(node: dict, title_limit: int = 60) -> str:
@@ -3276,6 +3356,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
     """自主探索模式：用户指令驱动 → 工具探索 → 知识沉淀 → 报告"""
     if not directive:
         directive = AUTO_DEFAULT_DIRECTIVE
+    explicit_user_correction = _extract_user_correction_from_directive(directive)
     state = auto_state.get(channel.id)
     if not state:
         logger.warning(f"/auto runner exited before start | channel={channel.id} state=missing")
@@ -3767,6 +3848,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                     ],
                     stale_actions=_chapter_stale_actions,
                     active_question=round_focus,
+                    user_correction=explicit_user_correction,
                     progress_class=progress_class,
                 )
             except Exception:
@@ -3922,6 +4004,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             "events": round_events, "event_count": 0,
             "response_full": "", "response_preview": "",
             "kb_delta": {"new_nodes": [], "updated_nodes": [], "error": "pending"},
+            "kb_delta_counts": {"new_nodes": 0, "updated_nodes": 0, "error": True},
             "kb_delta_summary": "pending", "kb_changed": False,
             "activity_detected": False, "activity_summary": "pending", "progress_class": "pending",
             "outcome_detected": False,
@@ -3937,6 +4020,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             "knowledge_search_count": 0,
             "pls_telemetry": _build_pls_telemetry(round_events),
             "round_topology": _build_round_topology(round_events),
+            "round_log_retention": _round_log_retention_policy(),
             "attention_residue": "",
             "exception": None,
         }
@@ -3966,7 +4050,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
                 f"+{len(kb_delta['new_nodes'])}新/{len(kb_delta['updated_nodes'])}更新"
                 if not kb_delta["error"] else "KB-delta-error"
             )
-            return kb_delta, kb_changed, kb_delta_summary, node_telemetry
+            return kb_delta, _kb_delta_counts(kb_delta), kb_changed, kb_delta_summary, node_telemetry
 
         _flush_round_record()
 
@@ -3975,7 +4059,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             nonlocal consecutive_dry, final_node_telemetry, last_frontier, last_knowledge_state, last_reanchor_streak
             if round_record.get("status") != "running":
                 return
-            kb_delta, kb_changed, kb_delta_summary, node_telemetry = _observe_round_state()
+            kb_delta, kb_delta_counts, kb_changed, kb_delta_summary, node_telemetry = _observe_round_state()
             final_node_telemetry = node_telemetry
             # Classify first (interrupted = no outcome)
             progress_profile = _classify_auto_round_progress(
@@ -4013,7 +4097,8 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             pls_telemetry = _build_pls_telemetry(round_events, kb_delta)
             round_record.update({
                 "status": "interrupted", "duration_s": round(_time_module.time() - t0, 1),
-                "kb_delta": kb_delta, "kb_delta_summary": kb_delta_summary, "kb_changed": kb_changed,
+                "kb_delta": kb_delta, "kb_delta_counts": kb_delta_counts,
+                "kb_delta_summary": kb_delta_summary, "kb_changed": kb_changed,
                 "activity_detected": progress_profile["activity_detected"],
                 "activity_summary": progress_profile["activity_summary"],
                 "progress_class": progress_profile["progress_class"],
@@ -4049,7 +4134,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             response = result.response if hasattr(result, 'response') else result.get("response", "") if isinstance(result, dict) else ""
             total_tokens = result.total_tokens if hasattr(result, 'total_tokens') else 0
             round_is_error = _is_error_response(response, total_tokens)
-            kb_delta, kb_changed, kb_delta_summary, node_telemetry = _observe_round_state()
+            kb_delta, kb_delta_counts, kb_changed, kb_delta_summary, node_telemetry = _observe_round_state()
             final_node_telemetry = node_telemetry
 
             # Ground truth: did sandbox diff change since round start?
@@ -4115,7 +4200,8 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             round_record.update({
                 "status": "completed", "duration_s": round(duration, 1), "tokens": total_tokens,
                 "response_full": response or "", "response_preview": (response or "")[:300].replace("\n", " "),
-                "kb_delta": kb_delta, "kb_delta_summary": kb_delta_summary, "kb_changed": kb_changed,
+                "kb_delta": kb_delta, "kb_delta_counts": kb_delta_counts,
+                "kb_delta_summary": kb_delta_summary, "kb_changed": kb_changed,
                 "activity_detected": progress_profile["activity_detected"],
                 "activity_summary": progress_profile["activity_summary"],
                 "progress_class": progress_profile["progress_class"],
@@ -4163,7 +4249,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             logger.error(f"Auto round {round_num} timeout: {err_str}", exc_info=True)
             await channel.send(f"⚠️ 第{round_num}轮超时: {err_str}")
             _append_md(f"### Response (timeout)\n\n{err_str}\n\n")
-            kb_delta, kb_changed, kb_delta_summary, node_telemetry = _observe_round_state()
+            kb_delta, kb_delta_counts, kb_changed, kb_delta_summary, node_telemetry = _observe_round_state()
             final_node_telemetry = node_telemetry
             # Classify first (timeout = no outcome)
             progress_profile = _classify_auto_round_progress(
@@ -4192,7 +4278,8 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             pls_telemetry = _build_pls_telemetry(round_events, kb_delta)
             round_record.update({
                 "status": "timeout", "duration_s": round(duration, 1),
-                "kb_delta": kb_delta, "kb_delta_summary": kb_delta_summary, "kb_changed": kb_changed,
+                "kb_delta": kb_delta, "kb_delta_counts": kb_delta_counts,
+                "kb_delta_summary": kb_delta_summary, "kb_changed": kb_changed,
                 "activity_detected": progress_profile["activity_detected"],
                 "activity_summary": progress_profile["activity_summary"],
                 "progress_class": progress_profile["progress_class"],
@@ -4222,7 +4309,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             err_str = str(e)[:300]
             await channel.send(f"⚠️ 第{round_num}轮异常: {err_str}")
             _append_md(f"### Response (exception)\n\n{err_str}\n\n")
-            kb_delta, kb_changed, kb_delta_summary, node_telemetry = _observe_round_state()
+            kb_delta, kb_delta_counts, kb_changed, kb_delta_summary, node_telemetry = _observe_round_state()
             final_node_telemetry = node_telemetry
             # Classify first (exception = no outcome)
             progress_profile = _classify_auto_round_progress(
@@ -4251,7 +4338,8 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
             pls_telemetry = _build_pls_telemetry(round_events, kb_delta)
             round_record.update({
                 "status": "exception", "duration_s": round(duration, 1),
-                "kb_delta": kb_delta, "kb_delta_summary": kb_delta_summary, "kb_changed": kb_changed,
+                "kb_delta": kb_delta, "kb_delta_counts": kb_delta_counts,
+                "kb_delta_summary": kb_delta_summary, "kb_changed": kb_changed,
                 "activity_detected": progress_profile["activity_detected"],
                 "activity_summary": progress_profile["activity_summary"],
                 "progress_class": progress_profile["progress_class"],
@@ -4327,9 +4415,7 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
         # (activity_summary, kb_delta_summary, frontier_preview, response_preview)
         # and cross-round observations (outcome_detected, kb_changed, c_phase_summary).
         for _old_rec in round_log[:-_ROUND_LOG_KEEP] if len(round_log) > _ROUND_LOG_KEEP else []:
-            for _heavy_key in ("events", "response_full", "signals", "prompt_preview",
-                               "frontier_text", "knowledge_state_text", "phase_trace",
-                               "kb_delta", "knowledge_state", "frontier_state"):
+            for _heavy_key in _ROUND_LOG_HEAVY_KEYS:
                 _old_rec.pop(_heavy_key, None)
         _save_session_memory()
         _release_memory()
@@ -4403,9 +4489,10 @@ async def run_auto(channel: discord.TextChannel, agent, auto_state: dict, direct
         "dry_rounds": total_rounds - progress_rounds,
         "stop_reason": stop_reason,
         "total_tokens": sum(r.get("tokens", 0) for r in round_log),
-        "total_new_nodes": sum(len(r.get("kb_delta", {}).get("new_nodes", [])) for r in round_log),
-        "total_updated_nodes": sum(len(r.get("kb_delta", {}).get("updated_nodes", [])) for r in round_log),
+        "total_new_nodes": sum(_round_kb_delta_count(r, "new_nodes") for r in round_log),
+        "total_updated_nodes": sum(_round_kb_delta_count(r, "updated_nodes") for r in round_log),
         "doctor_sync_summary": doctor_sync_summary,
+        "round_log_retention": _round_log_retention_policy(),
         "rounds_dir": str(_rounds_dir),
     }
     try:

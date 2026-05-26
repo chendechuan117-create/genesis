@@ -93,7 +93,7 @@ class CPhaseMixin:
         roles = getattr(self, "execution_active_node_roles", {}) or {}
         if not roles:
             return list(active_nodes or [])
-        eligible_roles = {"search_suggested", "opened", "basis_used"}
+        eligible_roles = {"search_suggested", "opened", "basis_used", "tool_suggested", "tool_opened"}
         return [
             nid for nid in list(active_nodes or [])
             if roles.get(nid, set()) & eligible_roles
