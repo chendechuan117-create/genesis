@@ -1,6 +1,6 @@
 from pathlib import Path
 
-AUTO_MODE_PATH = Path('/workspace/genesis/auto_mode.py')
+AUTO_MODE_PATH = Path(__file__).resolve().parents[1] / 'genesis' / 'auto_mode.py'
 NO_MATCHING = '🧪 No test files found for diff changes — passing by default'
 COLLECTION_SKIPPED = '⚠️ Smoke test: pytest collection failed for discovered tests\n🧪 Skipping broken test files — passing by default'
 
@@ -8,7 +8,7 @@ COLLECTION_SKIPPED = '⚠️ Smoke test: pytest collection failed for discovered
 def _extract_check_round_window() -> str:
     text = AUTO_MODE_PATH.read_text(encoding='utf-8')
     start = text.index('        # 1. Run diff-scoped tests in sandbox (only test files related to current changes)')
-    end = text.index('        # 4. Write restart marker + record history + clear cooling state')
+    end = text.index('        # 5. Write restart marker + record history + clear cooling state')
     return text[start:end]
 
 
@@ -29,12 +29,15 @@ def success_message_for(output: str) -> str:
     return '🧬 ✅ 测试通过'
 
 
-def test_message_contract_patch_does_not_require_new_apply_history_statuses():
+def test_message_contract_patch_keeps_success_out_of_failure_apply_window():
     window = _extract_check_round_window()
     assert 'self.apply_history.append({' in window
-    assert window.count('self.apply_history.append({') == 2
+    assert '"status": "test_unverified"' in window
+    assert '"status": "test_collection_failed"' in window
     assert '"status": "test_failed"' in window
-    assert '"status": "apply_failed"' in window
+    assert '"status": "review_blocked"' in window
+    assert '"status": status' in window
+    assert 'status = "apply_failed"' in window
     assert '"status": "success"' not in window
 
 

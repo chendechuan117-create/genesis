@@ -1,6 +1,6 @@
 from pathlib import Path
 
-AUTO_MODE = Path('/workspace/genesis/auto_mode.py')
+AUTO_MODE = Path(__file__).resolve().parents[1] / 'genesis' / 'auto_mode.py'
 
 
 def _read() -> str:
