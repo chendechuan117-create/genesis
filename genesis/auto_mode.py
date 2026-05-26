@@ -2845,6 +2845,64 @@ class SelfEvolution:
             logger.warning(f"SelfEvolution file-status check failed: {e}")
             return {}
 
+    @staticmethod
+    def _build_privileged_promotion_review(
+        rollback_commit: str,
+        applied_commit: str,
+        review_decision: str,
+        review_comment: str,
+        review_timestamp: str,
+    ) -> dict:
+        decision = str(review_decision or "SKIPPED").strip() or "SKIPPED"
+        comment_preview = str(review_comment or "")[:800]
+        return {
+            "action": "self_evolution_restart",
+            "command": "sudo systemctl restart yogg-auto.service",
+            "service_target": "yogg-auto.service",
+            "runner_user": "yoga",
+            "sudo_scope": "/usr/bin/systemctl restart yogg-auto.service",
+            "rollback_mechanism": f"git reset --hard {rollback_commit}" if rollback_commit else "git reset --hard <rollback_commit>",
+            "canary_rounds": SELF_EVOLUTION_CANARY_ROUNDS,
+            "crash_guard_threshold": 3,
+            "manual_override_path": "human operator disables or stops yogg-auto.service with password-gated sudo",
+            "audit_record_path": str(SelfEvolution._RESTART_MARKER),
+            "reviewer_decision": decision,
+            "reviewer_identity": "twin_review_llm",
+            "review_timestamp": review_timestamp,
+            "review_mode": SELF_EVOLUTION_REVIEW_MODE,
+            "review_decision": decision,
+            "review_comment_preview": comment_preview,
+        }
+
+    @staticmethod
+    def _build_restart_marker(
+        rollback_commit: str,
+        applied_commit: str,
+        review_decision: str,
+        review_comment: str,
+    ) -> dict:
+        timestamp = _time_module.strftime("%Y-%m-%d %H:%M:%S")
+        review = SelfEvolution._build_privileged_promotion_review(
+            rollback_commit=rollback_commit,
+            applied_commit=applied_commit,
+            review_decision=review_decision,
+            review_comment=review_comment,
+            review_timestamp=timestamp,
+        )
+        marker = {
+            "rollback_commit": rollback_commit,
+            "applied_commit": applied_commit,
+            "timestamp": timestamp,
+            "canary_rounds": SELF_EVOLUTION_CANARY_ROUNDS,
+            "review_mode": review["review_mode"],
+            "review_decision": review["review_decision"],
+            "review_warning": "",
+            "privileged_promotion_review": review,
+        }
+        if review["review_decision"] == "REJECT" and review["review_mode"] == "shadow":
+            marker["review_warning"] = "Twin-Review returned REJECT in shadow mode before privileged restart"
+        return marker
+
     async def _try_apply(self, round_num: int, channel, agent=None) -> dict:
         """Test → apply → write restart marker.
 
@@ -3249,6 +3307,8 @@ NEEDS_CHANGES: <建议> — 如果变更方向对但还需继续打磨
             "timestamp": _time_module.strftime("%Y-%m-%d %H:%M:%S"),
             "rollback_commit": rollback_commit,
             "applied_commit": applied_commit,
+            "review_mode": SELF_EVOLUTION_REVIEW_MODE,
+            "review_decision": review_decision,
         })
         self.file_cooldowns.clear()  # 沙箱已 reset，diff 应为空
         self._save()
@@ -3256,19 +3316,23 @@ NEEDS_CHANGES: <建议> — 如果变更方向对但还需继续打磨
         # Write restart marker for yogg_auto.py crash-loop detection + canary observation
         try:
             self._RESTART_MARKER.parent.mkdir(parents=True, exist_ok=True)
-            self._RESTART_MARKER.write_text(json.dumps({
-                "rollback_commit": rollback_commit,
-                "applied_commit": applied_commit,
-                "timestamp": _time_module.strftime("%Y-%m-%d %H:%M:%S"),
-                "canary_rounds": SELF_EVOLUTION_CANARY_ROUNDS,
-            }), encoding="utf-8")
+            self._RESTART_MARKER.write_text(json.dumps(
+                self._build_restart_marker(
+                    rollback_commit=rollback_commit,
+                    applied_commit=applied_commit,
+                    review_decision=review_decision,
+                    review_comment=review_comment,
+                ),
+                ensure_ascii=False,
+            ), encoding="utf-8")
         except Exception as e:
             logger.error(f"SelfEvolution: restart marker write failed: {e}")
 
         await channel.send(
             f"🧬 [5/5] 自进化完成 | rollback={rollback_commit[:8]} → applied={applied_commit[:8]}\n"
             f"🔄 正在重启服务以加载新代码...\n"
-            f"[canary] 金丝雀观察: 重启后观察 {SELF_EVOLUTION_CANARY_ROUNDS} 轮，无崩溃则标记成功"
+            f"[canary] 金丝雀观察: 重启后观察 {SELF_EVOLUTION_CANARY_ROUNDS} 轮，无崩溃则标记成功\n"
+            f"[review] Twin-Review={review_decision} mode={SELF_EVOLUTION_REVIEW_MODE}"
         )
 
         # 5. Restart — this kills the current process, systemd restarts it
@@ -3297,6 +3361,12 @@ NEEDS_CHANGES: <建议> — 如果变更方向对但还需继续打磨
             applied_commit = data.get("applied_commit", "")
             ts = data.get("timestamp", "?")
             canary = data.get("canary_rounds", 0)
+            review = data.get("privileged_promotion_review") if isinstance(data.get("privileged_promotion_review"), dict) else {}
+            review_decision = data.get("review_decision") or review.get("review_decision") or "?"
+            review_mode = data.get("review_mode") or review.get("review_mode") or "?"
+            review_warning = data.get("review_warning") or ""
+            if review_warning:
+                logger.warning(f"SelfEvolution: privileged review warning | {review_warning}")
             if canary > 0:
                 canary -= 1
                 data["canary_rounds"] = canary
@@ -3304,18 +3374,18 @@ NEEDS_CHANGES: <建议> — 如果变更方向对但还需继续打磨
                     marker.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
                     logger.info(
                         f"SelfEvolution: canary observing round {SELF_EVOLUTION_CANARY_ROUNDS - canary}/{SELF_EVOLUTION_CANARY_ROUNDS} | "
-                        f"applied={applied_commit[:8]} rollback={rollback_commit[:8]}"
+                        f"applied={applied_commit[:8]} rollback={rollback_commit[:8]} review={review_decision}/{review_mode}"
                     )
                 else:
                     marker.unlink(missing_ok=True)
                     logger.info(
                         f"SelfEvolution: canary PASSED after {SELF_EVOLUTION_CANARY_ROUNDS} rounds | "
-                        f"applied={applied_commit[:8]} → production"
+                        f"applied={applied_commit[:8]} → production review={review_decision}/{review_mode}"
                     )
             else:
                 logger.info(
                     f"SelfEvolution: post-apply startup (no canary) | "
-                    f"applied={applied_commit[:8]} rollback={rollback_commit[:8]} ts={ts}"
+                    f"applied={applied_commit[:8]} rollback={rollback_commit[:8]} ts={ts} review={review_decision}/{review_mode}"
                 )
             return False
         except Exception as e:

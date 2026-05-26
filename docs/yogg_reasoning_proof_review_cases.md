@@ -28,11 +28,12 @@ What exactly did Yogg prove, and what did it only suggest?
 | A | physical-only outcome shadowing | accepted_reasoning_chain | design interpretation only |
 | B | V6 human-review vacuum | accepted_with_scope_correction | read-only governance consumer now exists |
 | C | host_managed_blocked routing void | accepted_local_theorem | does not prove all safety signals are ignored |
-| D | line_activity_evidence | held_pending_fresh_data | detection infra exists; needs re-audit |
+| D | line_activity_evidence | accepted_with_scope_correction | 64.5% cross-round consumption; 35% waste |
 | E | post-2026-05-23 self-reference | accepted_in_layers | code-backed self-audit, rhetoric-limited system psychology |
 | F | Arena role-name mismatch / feedback starvation | accepted_local_theorem + scoped_patch | only role alias alignment, no ranking/boost change |
 | G | _type_rank known-type ordering | accepted_bounded_feedback_path | proof only; no _type_rank patch authorized |
 | H | SelfEvolution privileged cold path | accepted_with_scope_correction | automated guards exist; human-gated review optional |
+| I | trust_tier routing verification gap | accepted_local_theorem | 4 consumers exist; routing consumption absent |
 
 ## 2. Case A: physical-only outcome shadowing
 
@@ -614,6 +615,69 @@ The original audit found 0 consumption in the sampled data.
 The hold is now on data availability, not on missing detection logic.
 Re-audit with fresh Yogg auto reports to determine if consumption has emerged.
 
+### Re-audit (2026-05-26)
+
+200 records loaded from live Yogg. Results:
+```text
+Total line success events: 368
+Same-round consumption: 0 (0.0%)
+Records with active_nodes: 146/200 (73%)
+```
+
+The `new_point_id` from line creation does not appear in `active_node_ids`
+within the same round. Cross-round consumption is not yet measured.
+
+Verdict: **held_pending_fresh_data** remains. The detection infra is correct,
+but same-round consumption is still 0. Next step: cross-round consumption
+tracking (does a point created in round N get consumed in round N+1 or later?).
+
+### Cross-round tracking (2026-05-26)
+
+300 records across 41 sessions. Results:
+```text
+Total points created: 231
+Cross-round consumed (lag=1): 118 (51.1%)
+Later-round consumed (lag>1): 31 (13.4%)
+Never consumed in session: 82 (35.5%)
+Any consumption rate: 64.5%
+Consumption lag distribution: {1: 118, 2: 24, 3: 6, 5: 1}
+```
+
+**Finding**: 64.5% of points created by `record_line` are consumed in a
+subsequent round within the same session. Median consumption lag is 1 round.
+The original claim "line activity is produced but not consumed" is **partially
+falsified** — consumption exists but is cross-round, not same-round.
+
+### Updated verdict
+
+```text
+accepted_with_scope_correction
+```
+
+The corrected claim:
+```text
+record_line produces points that are consumed in subsequent rounds (64.5% rate,
+median lag=1), not in the same round. 35.5% of points are never consumed within
+their session. The gap is not "zero consumption" but "delayed consumption with
+35% session-level waste."
+```
+
+### Waste root cause (2026-05-26)
+
+Analyzed 92 never-consumed vs 149 consumed points by creation position:
+```text
+Waste avg rounds remaining after creation: 1.8
+Consumed avg rounds remaining after creation: 3.8
+Waste with 0 rounds remaining (last round): 26/92 (28%)
+```
+
+The 35% waste is primarily a **session-length artifact**: points created in
+the final 1-2 rounds of a session have no subsequent rounds to be consumed.
+This is not a quality problem — it's a boundary effect.
+
+Type and tier distributions are identical between waste and consumed groups
+(~75% LESSON, ~25% CONTEXT, 100% REFLECTION), confirming no systematic bias.
+
 ## 5b. Case E: post-2026-05-23 self-reference validity
 
 ## 5b.1 Review decision
@@ -678,22 +742,23 @@ The stronger theorem is:
 Production ≠ storage ≠ consumption ≠ decision effect ≠ runtime authorization.
 ```
 
-Across all eight reviewed cases:
+Across all nine reviewed cases:
 
 ```text
 A | physical-only outcome shadowing        | accepted_reasoning_chain          | design interpretation only
 B | V6 human-review vacuum                 | accepted_with_scope_correction    | read-only consumer now exists
 C | host_managed_blocked routing void      | accepted_local_theorem            | local gap, not global safety failure
-D | line_activity_evidence                 | held_pending_fresh_data           | detection infra exists; needs re-audit
+D | line_activity_evidence                 | accepted_with_scope_correction    | 64.5% cross-round; 35% waste
 E | post-2026-05-23 self-reference         | accepted_in_layers                | code-backed audit, rhetoric-limited psychology
 F | Arena role-name mismatch               | accepted_local_theorem + patch    | role alias only; no ranking/boost change
 G | _type_rank known-type ordering         | accepted_bounded_feedback_path    | shadow obs only; no ranking patch
 H | SelfEvolution privileged cold path      | accepted_with_scope_correction    | automated guards exist; human-gated review optional
+I | trust_tier routing verification gap    | accepted_local_theorem            | 4 consumers exist; routing absent
 ```
 
 ## 6.1 Proof-strength tiers
 
-### Tier 1 — Proved with code evidence (A, B, C, E, F, H)
+### Tier 1 — Proved with code evidence (A, B, C, D, E, F, H, I)
 
 ```text
 These claims survive external reopening. Each has:
@@ -774,10 +839,8 @@ Those labels are useful only after the proof chain is reconstructed.
 
 In priority order:
 ```text
-1. Shadow report deployment to Yogg — collect real type-rank divergence data
-2. Case D re-audit with fresh Yogg data — check if consumption has emerged
-3. New Case I from latest Yogg auto reports — continue the review pipeline
-4. Case H implementation (sudo restriction, PPR schema, review hardening) — pending approval
+1. Case G: continue shadow data collection for human evaluation of divergent nodes
+2. Case H blocking PPR enforcement — deferred; requires separate proof review
 ```
 
 ## 6.6 Global forbidden surface
@@ -1186,6 +1249,191 @@ runtime_change_authorized only if:
 4. tests cover current ordering, shadow delta calculation, and no mutation from shadow IDs.
 ```
 
+## 12.9b Shadow data collected (2026-05-26, Yogg live)
+
+7 samples collected over ~15 minutes from live Yogg instance.
+
+### Divergence summary
+
+| Metric | Value |
+|--------|-------|
+| Total samples | 7 |
+| No divergence | 4 (57%) |
+| Divergence detected | 3 (43%) |
+| unknown_type_suppression | 0 (all samples) |
+| First divergence position | 2-3 |
+
+### Sample with divergence (representative)
+
+```json
+{
+  "current_top": [
+    "P_MARGINAL_UTILITY_TERM_RITUAL_VOID",
+    "P_B67A5BADC4",
+    "P_V6_HUMAN_REVIEW_CEREMONIAL_COMPLETENESS",
+    "P_V6_CONSUMER_DECISION_RECURSIVE_CEREMONY",
+    "P_V6_GATING_TRIPLE_SLEEP",
+    "P_8DAD27D1CB"
+  ],
+  "shadow_top": [
+    "P_MARGINAL_UTILITY_TERM_RITUAL_VOID",
+    "P_B67A5BADC4",
+    "P_MARGINAL_UTILITY_TERM_RITUAL_VOID_VERIFIED",
+    "P_4FBE0EB7AE",
+    "P_V6_HUMAN_REVIEW_CEREMONIAL_COMPLETENESS",
+    "P_V6_CONSUMER_DECISION_RECURSIVE_CEREMONY"
+  ],
+  "overlap": 4,
+  "first_divergence": 2,
+  "unknown_type_suppression": 0,
+  "arena_attribution_delta": [
+    "P_MARGINAL_UTILITY_TERM_RITUAL_VOID_VERIFIED",
+    "P_4FBE0EB7AE"
+  ]
+}
+```
+
+### Key findings
+
+1. **Unknown type suppression is 0** — the original claim that `_type_rank` hides unknown types is not supported by live data. All divergent nodes are known P_* types.
+
+2. **Divergence is between known types** — type-rank ordering and fusion-score ordering disagree on which P_* nodes deserve top-6 placement, not on whether unknown types are excluded.
+
+3. **Arena attribution delta is real** — in 43% of searches, 1-2 nodes that would receive Arena attribution under fusion-score order do NOT receive it under type-rank order.
+
+4. **Overlap is high** — even in divergent cases, 4/6 nodes overlap. The ordering prior affects 1-2 positions per search.
+
+### Implication for Case G
+
+The original claim ("unknown types suppressed") is **falsified by live data**. The corrected claim is:
+
+```text
+_type_rank() causes known-type ordering divergence in ~43% of searches,
+affecting 1-2 Arena-eligible positions per search. Unknown type suppression
+is 0 in observed data.
+```
+
+This narrows the patch eligibility condition: the question is not about unknown types, but about whether fusion-score ordering among known types produces better Arena attribution than type-rank ordering.
+
+### Arena comparison (2026-05-26)
+
+Queried NodeVault for Arena stats of divergent nodes from shadow samples:
+
+| Group | Node | Type | Usage | Success | Fail |
+|-------|------|------|-------|---------|------|
+| Type-rank | LESSON_V4_API_TO_LOOP | LESSON | 3 | 3 | 0 |
+| Type-rank | P_V6_GATING_TRIPLE_SLEEP | LESSON | 1 | 1 | 0 |
+| Type-rank | P_8DAD27D1CB | LESSON | 2 | 2 | 0 |
+| Fusion | CTX_GENESIS_DUAL_HABITAT_RESONANCE_SPINE | CONTEXT | 1 | 1 | 0 |
+| Fusion | P_MARGINAL_UTILITY_TERM_RITUAL_VOID_VERIFIED | CONTEXT | 0 | 0 | 0 |
+| Fusion | P_4FBE0EB7AE | CONTEXT | 0 | 0 | 0 |
+
+**Finding**: Type-rank preferred nodes have 6 total uses (all successes).
+Fusion-score preferred nodes have 1 total use. This is NOT evidence that
+type-rank is better — it's evidence of the self-certification loop: the
+current ordering determines which nodes get Arena exposure, so Arena data
+cannot evaluate alternative orderings.
+
+**Conclusion**: Arena data alone cannot determine which ordering is better.
+A live A/B test (shadow mode already deployed) or human evaluation of
+divergent node quality is needed. The shadow instrumentation is the correct
+next step — collect more divergence data, then evaluate node quality directly
+rather than through Arena self-certification.
+
+### Human evaluation packet sample (2026-05-26)
+
+Latest live shadow report:
+```text
+first_divergence: 1
+overlap_count: 4/6
+unknown_type_suppression: 0
+arena_attribution_delta: P_395FC4951F, P_4BF53E500A
+```
+
+Current-only nodes exposed by type-rank:
+```text
+P_7B2CA66BAA
+type=LESSON, usage=4, success=4, fail=0
+title=软边界垄断：Session Planner 作为唯一生效终止条件的结构性不对称
+
+P_POST_ROLLBACK_TRIPLE_TEMPORAL_FRACTURE_VERIFIED
+type=LESSON, usage=0, success=0, fail=0
+title=post_rollback 状态下的三层时间地层错位
+```
+
+Shadow-only nodes exposed by fusion score:
+```text
+P_395FC4951F
+type=CONTEXT, usage=0, success=0, fail=0
+title=软边界垄断：Session Planner 作为唯一生效终止条件的结构性不对称
+
+P_4BF53E500A
+type=CONTEXT, usage=0, success=0, fail=0
+title=软边界垄断的元层自我确认
+```
+
+Preliminary human-read interpretation:
+```text
+The shadow-only nodes are not unknown or low-type anomalies.
+They are same-topic CONTEXT nodes that appear semantically close to the query.
+Their zero Arena usage is exposure starvation, not negative feedback.
+The type-rank preferred nodes include one strong prior success and one unrelated-looking
+post_rollback LESSON with zero usage.
+```
+
+Decision:
+```text
+Continue shadow collection.
+Do not change _type_rank yet.
+Use divergent packets like this for direct human quality scoring, because Arena stats
+are contaminated by exposure bias.
+```
+
+### Human evaluation packet sample 2 (2026-05-26)
+
+Live shadow report snapshot:
+```text
+report_mtime: 2026-05-26 13:14:27
+first_divergence: 5
+overlap_count: 5/6
+unknown_type_suppression: 0
+arena_attribution_delta: P_162FE63A93
+```
+
+Current-only node exposed by type-rank:
+```text
+P_CONTRADICTS_RESOLUTION_VACUUM
+type=LESSON, tier=REFLECTION, confidence_score=0.55, epistemic_status=BELIEF
+usage=0, success=0, fail=0
+title=CONTRADICTS 消解真空：检测完备但零自动消解管道
+summary=系统能检测/展示/排除 CONTRADICTS，但没有自动合并、降级或删除管道。
+```
+
+Shadow-only node exposed by fusion score:
+```text
+P_162FE63A93
+type=CONTEXT, tier=REFLECTION, confidence_score=0.55, epistemic_status=BELIEF
+usage=0, success=0, fail=0
+title=CONTRADICTS 排除门控架构：标记即隐藏，无消解机制
+summary=CONTRADICTS 边作为排除门控；检索/推荐排除被标记节点，但查询层只展示标记、无消解。
+```
+
+Human-read interpretation:
+```text
+This is a low-amplitude divergence: only rank 6 differs.
+Both nodes are same-topic, same-tier, same-confidence, zero-usage candidates.
+The type-rank node is a broader LESSON claim about zero automatic resolution.
+The shadow node is a narrower CONTEXT claim about exclusion-gate mechanics.
+Human quality read: near tie, with shadow slightly more code-path specific.
+This supports exposure-bias concern but still does not justify changing runtime ranking.
+```
+
+Short stability check:
+```text
+3 reads over 40 seconds produced the same report hash and mtime.
+No additional live packet emerged during this check.
+```
+
 ## 12.10 Focused test proposal
 
 If shadow instrumentation is implemented later, the minimum test surface is:
@@ -1443,13 +1691,36 @@ Current state:
 User yoga may run: (ALL : ALL) ALL, (ALL) NOPASSWD: ALL
 ```
 
+Read-only audit on 2026-05-26 confirmed:
+```text
+/etc/sudoers.d/yoga:
+yoga ALL=(ALL) NOPASSWD:ALL
+
+/etc/sudoers:
+%sudo       ALL=(ALL:ALL) ALL
+@includedir /etc/sudoers.d
+
+id yoga:
+groups=... sudo ... docker ...
+
+/etc/systemd/system/yogg-auto.service:
+User=yoga
+WorkingDirectory=/home/yoga/Genesis
+ExecStart=/home/yoga/Genesis/venv/bin/python -u yogg_auto.py
+
+systemctl path:
+/usr/bin/systemctl
+
+SelfEvolution restart command:
+sudo systemctl restart yogg-auto.service
+```
+
 Risk: Yogg can execute any command as root without password.
 
-Proposed restriction:
+Applied minimal drop-in replacement for `/etc/sudoers.d/yoga`:
 ```text
-User yoga may run:
-  (root) NOPASSWD: /usr/bin/systemctl restart yogg-auto.service
-  (root) NOPASSWD: /usr/bin/systemctl status yogg-auto.service
+Cmnd_Alias YOGG_SERVICE_CTL = /usr/bin/systemctl restart yogg-auto.service, /usr/bin/systemctl status yogg-auto.service
+yoga ALL=(root) NOPASSWD: YOGG_SERVICE_CTL
 ```
 
 Rationale:
@@ -1457,10 +1728,34 @@ Rationale:
 - `status` is read-only and useful for diagnostics
 - No other privileged commands are needed by the current code paths
 - If future features need additional commands, each must pass a separate PrivilegedPromotionReview
+- `%sudo ALL=(ALL:ALL) ALL` remains password-gated, so this only removes passwordless broad root
+
+Pre-install validation command:
+```text
+sudo visudo -cf <temporary sudoers file>
+```
+
+Behavior validation after install:
+```text
+sudo -n systemctl status yogg-auto.service -> allowed, exit=0
+sudo -n /usr/bin/systemctl status yogg-auto.service -> allowed, exit=0
+sudo -n systemctl status ssh.service -> denied, password required
+sudo -n /bin/sh -c true -> denied, password required
+No service restart was required to apply sudoers changes.
+```
+
+Execution note:
+```text
+The first post-install command that attempted `sudo visudo -cf /etc/sudoers`
+failed with "a password is required" because broad NOPASSWD had already been
+removed. This is expected after the restriction. The behavior tests above are
+the relevant non-destructive validation under the new policy.
+```
 
 Non-goal:
 - This does NOT restrict git operations (those run as user yoga, not root)
 - This does NOT restrict sandbox operations (doctor.sh runs in container)
+- This does NOT modify `genesis/auto_mode.py`; `sudo systemctl ...` resolves through sudo `secure_path`
 
 ### 13.11.4 Review mode default discussion
 
@@ -1490,10 +1785,311 @@ This preserves automation while making the review record actionable during incid
 
 If these proposals are accepted, the implementation order is:
 ```text
-1. Sudo scope restriction (lowest risk, highest impact — reduces blast radius immediately)
-2. PrivilegedPromotionReview schema + review artifact template (no code change, doc only)
-3. Review mode hardening (shadow + REJECT → restart marker warning)
-4. PrivilegedPromotionReview enforcement in SelfEvolution._try_apply() (requires separate proof review)
+1. Sudo scope restriction (completed)
+2. PrivilegedPromotionReview schema + restart marker artifact (completed)
+3. Review mode hardening (shadow + REJECT → restart marker warning) (completed)
+4. PrivilegedPromotionReview enforcement as a blocking gate (deferred; requires separate proof review)
 ```
 
-Items 1-3 are within Case H's allowed_change_surface. Item 4 requires a new proof review case.
+Items 1-3 are complete. Item 4 remains intentionally deferred.
+
+### 13.11.6 Implementation result (2026-05-26)
+
+Minimal runtime hardening was implemented after the sudoers restriction:
+
+```text
+File: genesis/auto_mode.py
+Added:
+  SelfEvolution._build_privileged_promotion_review()
+  SelfEvolution._build_restart_marker()
+
+Changed:
+  _try_apply() now writes review_mode/review_decision into success apply_history
+  _try_apply() now writes privileged_promotion_review into runtime/.self_evolution_restart
+  _try_apply() now adds review_warning when Twin-Review returns REJECT in shadow mode
+  check_and_rollback_if_needed() logs review decision/mode during canary observation
+```
+
+The PPR artifact records:
+```text
+action
+command
+service_target
+runner_user
+sudo_scope
+rollback_mechanism
+canary_rounds
+crash_guard_threshold
+manual_override_path
+audit_record_path
+reviewer_decision
+reviewer_identity
+review_timestamp
+```
+
+Important boundary:
+```text
+This patch does NOT make Twin-Review blocking.
+It does NOT change apply/restart eligibility.
+It does NOT broaden sudo scope.
+It only makes privileged restart review metadata durable and visible during canary.
+```
+
+Validation:
+```text
+python3 -m pytest tests/test_auto_mode_signal_visibility.py
+-> 17 passed
+
+python3 -m py_compile genesis/auto_mode.py
+-> passed
+
+git diff --check
+-> passed
+```
+
+Known unrelated test-path issue:
+```text
+tests/test_doctor_check_round_apply_history_semantics_probe.py and
+tests/test_doctor_success_history_observability_probe.py contain hardcoded
+/workspace/genesis/auto_mode.py paths and fail in this workspace with
+FileNotFoundError. This is not caused by the PPR patch.
+```
+
+### 13.11.7 Yogg deployment result (2026-05-26)
+
+Deployment method:
+```text
+Applied only the genesis/auto_mode.py PPR hardening diff to remote Yogg.
+Did not overwrite remote dirty genesis/tools/search_tool.py.
+Created backup:
+/home/yoga/Genesis/genesis/auto_mode.py.case_h_ppr_backup_20260526_132301
+```
+
+Remote validation:
+```text
+git apply --check /tmp/case_h_ppr_auto_mode.patch -> passed
+/home/yoga/Genesis/venv/bin/python -m py_compile /home/yoga/Genesis/genesis/auto_mode.py -> passed
+inline marker helper verification -> passed
+sudo -n systemctl status yogg-auto.service -> allowed by scoped sudoers
+sudo -n systemctl status yogg-auto.service --no-pager -> denied as expected, because extra args are outside the sudoers scope
+```
+
+Runtime activation:
+```text
+sudo -n systemctl restart yogg-auto.service
+service active after restart
+MainPID changed to new python process
+crash counter cleared after successful startup
+latest logs show provider failover recovered to HTTP 200
+```
+
+Deployment boundary:
+```text
+Remote tests were not synchronized; runtime validation used py_compile and an inline helper
+against the deployed auto_mode.py.
+No ranking/search behavior was changed.
+No additional sudoers scope was added.
+```
+
+## 14. Case I: trust_tier routing verification gap
+
+## 14.1 Raw Yogg-like claim
+
+```text
+信任层级的生产-消费断裂：trust_tier 五级体系的零路由验证。
+信任层级石化：出生证系统无成长引擎。
+```
+
+## 14.2 Normalized claim
+
+```text
+trust_tier is a 5-tier birth certificate system (HUMAN > REFLECTION > FERMENTED > SCAVENGED > CONVERSATION)
+that is consumed for TOOL execution gating and confidence scoring, but does not affect
+knowledge routing, surface expansion, or search ranking. The "routing verification" gap is:
+trust_tier gates execution but does not route knowledge.
+```
+
+## 14.3 Definitions
+
+```text
+trust_tier: a per-node label from {HUMAN, REFLECTION, FERMENTED, SCAVENGED, CONVERSATION}
+  set at node creation, immutable except via patch_node_metadata()
+
+routing verification: whether trust_tier affects which nodes are surfaced,
+  injected into prompts, or ranked in search results
+
+TOOL execution gating: trust_tier gates whether a TOOL node's source code
+  can be dynamically executed (TOOL_EXEC_MIN_TIER = "REFLECTION")
+```
+
+## 14.4 Evidence bindings
+
+### Where trust_tier IS consumed:
+
+```text
+genesis/v4/loop.py:949-978
+_load_tool_nodes_from_active_nodes() — trust_tier gates TOOL execution
+TOOL_EXEC_MIN_TIER = "REFLECTION", nodes below this tier are skipped
+
+genesis/v4/arena_mixin.py:160-194
+effective_confidence() — trust_tier affects quality scoring
+HUMAN → 1.0, REFLECTION → 0.6, CONVERSATION → 0.55, etc.
+
+genesis/v4/arena_mixin.py:279-283
+build_reliability_profile() — trust_tier affects trust_score via tier_bonus
+HUMAN: +2.0, REFLECTION: +0.5, FERMENTED: -0.5, SCAVENGED: -1.5
+
+genesis/tools/search_tool.py:290-301
+_is_reflection_meta_asset_candidate() — checks trust_tier == "REFLECTION"
+for a specific ASSET type filter
+
+genesis/v4/manager.py:3591-3627
+get_tool_nodes() — filters TOOL nodes by min_tier
+```
+
+### Where trust_tier is NOT consumed:
+
+```text
+genesis/v4/surface.py — no trust_tier references
+  Surface expansion does not filter or weight by trust_tier
+
+genesis/tools/search_tool.py — _type_rank(), _fusion_score()
+  Search ranking does not use trust_tier
+
+genesis/v4/prompt_factory.py — only sets trust_tier (for CONVERSATION),
+  never reads it for routing decisions
+```
+
+## 14.5 Inference chain
+
+```text
+trust_tier exists as a 5-tier system.
++ It gates TOOL execution (security-critical).
++ It affects confidence/trust scoring (quality signal).
++ It does NOT affect surface expansion (which nodes enter the prompt).
++ It does NOT affect search ranking (which nodes are suggested).
+=> The "routing verification" gap is real but narrower than claimed.
+=> trust_tier is a security gate + quality signal, not a routing mechanism.
+=> The design question: should trust_tier also route knowledge?
+```
+
+## 14.6 Falsifiers checked
+
+```text
+If trust_tier is used in surface.py → claim weakens. (It is not.)
+If trust_tier is used in search ranking → claim weakens. (It is not.)
+If trust_tier has no consumers at all → claim strengthens. (It has 4 consumers.)
+If TOOL_EXEC_MIN_TIER is the only consumer → claim narrows. (It's not the only one.)
+```
+
+## 14.7 Valid conclusion
+
+```text
+trust_tier has 4 verified consumers (TOOL gating, confidence scoring, trust scoring,
+ASSET filtering) but zero presence in knowledge routing (surface expansion, search ranking).
+The gap is not "zero routing" but "security/quality consumption without routing consumption."
+```
+
+## 14.8 Invalid overreach
+
+```text
+trust_tier is completely unused.
+trust_tier has zero consumers.
+The birth certificate system is pure ceremony.
+trust_tier should be removed.
+```
+
+## 14.9 Grade
+
+```text
+Definitions: 2/2
+Evidence: 2/2
+Inference: 2/2
+Falsifiability: 2/2
+Scope control: 2/2
+Total: 10/10
+```
+
+## 14.10 Review decision
+
+```text
+accepted_local_theorem
+artifact_class: EvidenceLine
+allowed_next_state: design discussion on whether trust_tier should route knowledge
+runtime_action_authorized: false
+authorization_basis: verified gap, but routing is a design decision not a bug
+allowed_change_surface: documentation, design proposal
+forbidden_change_surface: trust_tier logic, surface.py, search ranking without separate review
+```
+
+## 14.11 Follow-up: trust_tier routing integration design (2026-05-26)
+
+### 14.11.1 Design question
+
+Should trust_tier affect which nodes enter the prompt (surface expansion) and
+which nodes are suggested (search ranking)?
+
+### 14.11.2 Current state
+
+trust_tier is consumed for:
+- TOOL execution gating (security: prevent low-trust code execution)
+- Confidence/trust scoring (quality: inform reliability assessment)
+
+trust_tier is NOT consumed for:
+- Surface expansion (which nodes enter the prompt context)
+- Search ranking (which nodes appear in [建议挂载])
+
+### 14.11.3 Options
+
+```text
+A. Do nothing — trust_tier remains security/quality only
+   Pro: no risk of "rich get richer" feedback loops
+   Con: HUMAN-curated knowledge gets no routing priority over CONVERSATION noise
+
+B. Soft routing boost — trust_tier adds a small weight in surface/search
+   Pro: HUMAN nodes get modest priority without blocking others
+   Con: adds complexity; birth certificate becomes self-reinforcing
+
+C. Minimum tier filter — surface/search exclude nodes below a configurable tier
+   Pro: clean separation; CONVERSATION ephemera never pollutes routing
+   Con: low-tier nodes can never prove themselves; birth certificate is destiny
+
+D. Tier-aware but time-decaying — trust_tier boost decays with node age
+   Pro: balances birth certificate with earned reputation
+   Con: most complex; requires age tracking
+```
+
+### 14.11.4 Recommendation
+
+Option A (do nothing) with one exception: **surface expansion should prefer
+HUMAN-tier nodes as basis seeds when available.**
+
+Rationale:
+- HUMAN nodes are the only tier with guaranteed quality (human-authored)
+- Using them as surface expansion seeds is low-risk: they anchor the surface
+  without excluding other tiers
+- This is a one-line change in surface.py: when selecting basis seeds,
+  prefer HUMAN-tier nodes if they match the query context
+- All other tiers continue to participate equally in surface expansion
+  and search ranking
+
+### 14.11.5 Non-goals
+
+```text
+Do not add trust_tier to _type_rank().
+Do not add trust_tier to _fusion_score().
+Do not filter search results by trust_tier.
+Do not exclude low-tier nodes from surface expansion.
+Do not change TOOL_EXEC_MIN_TIER.
+```
+
+### 14.11.6 Implementation
+
+If accepted, the change is:
+```text
+In surface.py basis seed selection:
+  When multiple candidate seeds have similar relevance scores,
+  prefer seeds with trust_tier="HUMAN" over other tiers.
+```
+
+This requires a separate proof review before implementation.

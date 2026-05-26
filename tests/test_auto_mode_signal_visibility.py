@@ -405,3 +405,72 @@ def test_kb_delta_counts_survive_round_log_compaction(monkeypatch):
     assert "kb_delta" not in record
     assert _round_kb_delta_count(record, "new_nodes") == 2
     assert _round_kb_delta_count(record, "updated_nodes") == 1
+
+
+def test_self_evolution_restart_marker_records_privileged_review(monkeypatch):
+    discord_stub = types.ModuleType("discord")
+    discord_stub.TextChannel = object
+    sys.modules.setdefault("discord", discord_stub)
+
+    from genesis import auto_mode
+
+    monkeypatch.setattr(auto_mode, "SELF_EVOLUTION_REVIEW_MODE", "shadow")
+    monkeypatch.setattr(auto_mode, "SELF_EVOLUTION_CANARY_ROUNDS", 3)
+
+    marker = auto_mode.SelfEvolution._build_restart_marker(
+        rollback_commit="abc123",
+        applied_commit="def456",
+        review_decision="REJECT",
+        review_comment="unsafe change",
+    )
+
+    review = marker["privileged_promotion_review"]
+    assert marker["rollback_commit"] == "abc123"
+    assert marker["applied_commit"] == "def456"
+    assert marker["canary_rounds"] == 3
+    assert marker["review_mode"] == "shadow"
+    assert marker["review_decision"] == "REJECT"
+    assert marker["review_warning"] == "Twin-Review returned REJECT in shadow mode before privileged restart"
+    assert review["action"] == "self_evolution_restart"
+    assert review["command"] == "sudo systemctl restart yogg-auto.service"
+    assert review["service_target"] == "yogg-auto.service"
+    assert review["runner_user"] == "yoga"
+    assert review["sudo_scope"] == "/usr/bin/systemctl restart yogg-auto.service"
+    assert review["rollback_mechanism"] == "git reset --hard abc123"
+    assert review["canary_rounds"] == 3
+    assert review["crash_guard_threshold"] == 3
+    assert review["manual_override_path"] == "human operator disables or stops yogg-auto.service with password-gated sudo"
+    assert review["audit_record_path"]
+    assert review["reviewer_decision"] == "REJECT"
+    assert review["reviewer_identity"] == "twin_review_llm"
+    assert review["review_timestamp"] == marker["timestamp"]
+    assert review["review_mode"] == "shadow"
+    assert review["review_comment_preview"] == "unsafe change"
+
+
+def test_self_evolution_canary_preserves_review_metadata(tmp_path, monkeypatch):
+    discord_stub = types.ModuleType("discord")
+    discord_stub.TextChannel = object
+    sys.modules.setdefault("discord", discord_stub)
+
+    from genesis import auto_mode
+
+    monkeypatch.setattr(auto_mode, "SELF_EVOLUTION_REVIEW_MODE", "shadow")
+    monkeypatch.setattr(auto_mode, "SELF_EVOLUTION_CANARY_ROUNDS", 3)
+    marker_path = tmp_path / ".self_evolution_restart"
+    monkeypatch.setattr(auto_mode.SelfEvolution, "_RESTART_MARKER", marker_path)
+
+    marker = auto_mode.SelfEvolution._build_restart_marker(
+        rollback_commit="abc123",
+        applied_commit="def456",
+        review_decision="REJECT",
+        review_comment="unsafe change",
+    )
+    marker_path.write_text(auto_mode.json.dumps(marker, ensure_ascii=False), encoding="utf-8")
+
+    assert auto_mode.SelfEvolution.check_and_rollback_if_needed() is False
+    persisted = auto_mode.json.loads(marker_path.read_text(encoding="utf-8"))
+    assert persisted["canary_rounds"] == 2
+    assert persisted["review_decision"] == "REJECT"
+    assert persisted["review_mode"] == "shadow"
+    assert persisted["privileged_promotion_review"]["review_decision"] == "REJECT"
