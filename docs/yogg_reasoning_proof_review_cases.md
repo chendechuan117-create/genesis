@@ -1434,6 +1434,31 @@ Short stability check:
 No additional live packet emerged during this check.
 ```
 
+### Shadow report no-delta sample (2026-05-26)
+
+Latest live report after PPR deployment:
+```text
+report_mtime: 2026-05-26 13:31:03
+first_divergence: 3
+overlap_count: 6/6
+unknown_type_suppression: 0
+arena_attribution_delta: []
+```
+
+Interpretation:
+```text
+The current and shadow rankings differed in order but not in top-6 membership.
+This is not a human quality packet because there are no current-only or shadow-only nodes.
+It matters for rank-position analysis, but it does not affect Arena attribution membership.
+```
+
+Implication:
+```text
+Future Case G accounting should separate:
+1. order-only divergence (same top-k set, no Arena attribution delta)
+2. membership divergence (different top-k set, requires human packet scoring)
+```
+
 ## 12.10 Focused test proposal
 
 If shadow instrumentation is implemented later, the minimum test surface is:
