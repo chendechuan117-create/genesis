@@ -10,6 +10,7 @@ import json
 import hashlib
 import math
 import re
+from pathlib import Path
 from typing import Dict, Any, List
 
 from genesis.v4.manager import METADATA_SIGNATURE_FIELDS
@@ -867,6 +868,17 @@ class SearchKnowledgeNodesTool(BaseNodeTool):
                     suggested_ids,
                     limit=6,
                 )
+                # 持久化到文件，供外部只读检索
+                try:
+                    import json as _json
+                    _path = Path("runtime/type_rank_shadow_report.json")
+                    _path.parent.mkdir(parents=True, exist_ok=True)
+                    _path.write_text(_json.dumps(
+                        self.__class__._last_type_rank_shadow_report,
+                        ensure_ascii=False, indent=2, default=str,
+                    ), encoding="utf-8")
+                except Exception:
+                    pass
                 # 补充：被多个命中节点引用的邻居也值得挂载
                 neighbor_freq = {}
                 for nid, neighbors in graph_related_ids.items():
