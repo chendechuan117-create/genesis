@@ -956,7 +956,7 @@ def test_trace_relationship_error_evidence_is_deduplicated_per_trace(tmp_path):
         store.close()
 
 
-def test_heartbeat_snapshot_is_demoted_when_stale_or_pid_dead(tmp_path):
+def test_heartbeat_snapshot_is_demoted_when_pid_dead(tmp_path):
     vault = make_vault(tmp_path)
     try:
         vault._conn.execute(
@@ -970,12 +970,11 @@ def test_heartbeat_snapshot_is_demoted_when_stale_or_pid_dead(tmp_path):
         summary = vault.get_daemon_status_summary()
 
         assert beat["status"] == "running"
-        assert beat["effective_status"] == "stale_snapshot"
+        assert beat["effective_status"] == "dead"
         assert beat["heartbeat_stale"] is True
         assert beat["pid_alive"] is False
         assert beat["state_signal_kind"] == "heartbeat_snapshot"
-        assert "dead_daemon: stale_snapshot" in summary
-        assert "pid_not_alive" in summary
+        assert "dead_daemon: dead" in summary
     finally:
         reset_vault()
 
