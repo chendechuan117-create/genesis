@@ -2830,16 +2830,21 @@ class SelfEvolution:
         try:
             _, output = await _run_doctor_sync_command("file-status", timeout_secs=30)
             result = {}
+            unparsed_lines = []
             for line in output.strip().split("\n"):
                 line = line.strip()
                 if not line:
+                    continue
+                if line.startswith("$ ./scripts/doctor.sh file-status") or line == "(exit=0)":
                     continue
                 # Format: T:path:hash or U:path:hash or H:path:host-managed
                 parts = line.split(":", 2)
                 if len(parts) == 3 and parts[0] in ("T", "U", "H"):
                     result[parts[1]] = {"hash": parts[2], "type": parts[0]}
-            if not result and output.strip():
-                logger.warning(f"SelfEvolution file-status: got output but no valid T:/U: lines parsed: {output[:200]}")
+                else:
+                    unparsed_lines.append(line)
+            if not result and unparsed_lines:
+                logger.warning(f"SelfEvolution file-status: got output but no valid T:/U:/H: lines parsed: {' '.join(unparsed_lines)[:200]}")
             return result
         except Exception as e:
             logger.warning(f"SelfEvolution file-status check failed: {e}")

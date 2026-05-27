@@ -63,6 +63,7 @@ CREATE INDEX IF NOT EXISTS idx_er_source ON entity_relationships(source_entity_i
 CREATE INDEX IF NOT EXISTS idx_er_target ON entity_relationships(target_entity_id);
 CREATE INDEX IF NOT EXISTS idx_er_type ON entity_relationships(rel_type);
 CREATE INDEX IF NOT EXISTS idx_re_trace ON relationship_evidence(trace_id);
+CREATE INDEX IF NOT EXISTS idx_re_rel_trace ON relationship_evidence(rel_id, trace_id);
 """
 
 # 只为高信号实体类型建立关系（COMMAND 太多太杂，过滤掉）
@@ -206,12 +207,19 @@ class TraceRelationshipBuilder:
                 ).fetchone()
 
                 if existing:
+                    rel_id = existing["rel_id"]
+                    evidence_exists = conn.execute(
+                        "SELECT 1 FROM relationship_evidence "
+                        "WHERE rel_id = ? AND trace_id = ? LIMIT 1",
+                        (rel_id, err["trace_id"])
+                    ).fetchone()
+                    if evidence_exists:
+                        continue
                     conn.execute(
                         "UPDATE entity_relationships SET evidence_count = evidence_count + 1, "
                         "last_seen_at = ? WHERE rel_id = ?",
-                        (now, existing["rel_id"])
+                        (now, rel_id)
                     )
-                    rel_id = existing["rel_id"]
                 else:
                     cursor = conn.execute(
                         "INSERT INTO entity_relationships "

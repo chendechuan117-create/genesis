@@ -875,6 +875,87 @@ def test_trace_query_cross_reference_uses_arena_feedback_wording(tmp_path, monke
         reset_vault()
 
 
+def test_trace_relationship_error_evidence_is_deduplicated_per_trace(tmp_path):
+    from genesis.v4.trace_pipeline.entity_extractor import TraceEntity
+    from genesis.v4.trace_pipeline.entity_store import TraceEntityStore
+    from genesis.v4.trace_pipeline.relationship_builder import TraceRelationshipBuilder
+
+    db_path = tmp_path / "trace.sqlite"
+    store = TraceEntityStore(db_path=db_path)
+    rb = TraceRelationshipBuilder(db_path=db_path)
+    try:
+        store.store_entities([
+            TraceEntity(
+                entity_type="ERROR",
+                value="Traceback",
+                confidence=1.0,
+                source_span_id="span-error",
+                source_trace_id="tr-one",
+                source_tool="test",
+                extraction_rule="test",
+                raw_fragment="Traceback",
+            ),
+            TraceEntity(
+                entity_type="FILE",
+                value="scripts/doctor.sh",
+                confidence=1.0,
+                source_span_id="span-file",
+                source_trace_id="tr-one",
+                source_tool="test",
+                extraction_rule="test",
+                raw_fragment="scripts/doctor.sh",
+            ),
+            TraceEntity(
+                entity_type="FILE",
+                value="scripts/doctor.sh",
+                confidence=1.0,
+                source_span_id="span-file-duplicate",
+                source_trace_id="tr-one",
+                source_tool="test",
+                extraction_rule="test",
+                raw_fragment="scripts/doctor.sh",
+            ),
+        ], trace_id="tr-one")
+
+        rb.build_error_patterns()
+        rb.build_error_patterns()
+
+        conn = rb._get_conn()
+        assert conn.execute("SELECT COUNT(*) FROM relationship_evidence").fetchone()[0] == 1
+        assert conn.execute("SELECT evidence_count FROM entity_relationships").fetchone()[0] == 1
+
+        store.store_entities([
+            TraceEntity(
+                entity_type="ERROR",
+                value="Traceback",
+                confidence=1.0,
+                source_span_id="span-error-two",
+                source_trace_id="tr-two",
+                source_tool="test",
+                extraction_rule="test",
+                raw_fragment="Traceback",
+            ),
+            TraceEntity(
+                entity_type="FILE",
+                value="scripts/doctor.sh",
+                confidence=1.0,
+                source_span_id="span-file-two",
+                source_trace_id="tr-two",
+                source_tool="test",
+                extraction_rule="test",
+                raw_fragment="scripts/doctor.sh",
+            ),
+        ], trace_id="tr-two")
+
+        rb.build_error_patterns()
+
+        assert conn.execute("SELECT COUNT(*) FROM relationship_evidence").fetchone()[0] == 2
+        assert conn.execute("SELECT evidence_count FROM entity_relationships").fetchone()[0] == 2
+    finally:
+        rb.close()
+        store.close()
+
+
 def test_heartbeat_snapshot_is_demoted_when_stale_or_pid_dead(tmp_path):
     vault = make_vault(tmp_path)
     try:

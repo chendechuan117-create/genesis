@@ -80,3 +80,13 @@ def test_self_evolution_blocks_host_managed_file_status_before_apply_flow():
     assert '"status": "host_managed_blocked"' in apply_window
     assert "需要人工审查" in apply_window
     assert apply_window.index("if h_files:") < apply_window.index("开始自进化应用流程")
+
+
+def test_self_evolution_file_status_ignores_clean_doctor_wrapper_output():
+    text = _read(AUTO_MODE)
+    file_status_window = _slice_between(text, "async def _get_file_status", "async def _try_apply")
+
+    assert 'line.startswith("$ ./scripts/doctor.sh file-status")' in file_status_window
+    assert 'line == "(exit=0)"' in file_status_window
+    assert "unparsed_lines" in file_status_window
+    assert "if not result and unparsed_lines:" in file_status_window

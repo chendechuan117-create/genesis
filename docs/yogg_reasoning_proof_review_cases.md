@@ -1459,6 +1459,42 @@ Future Case G accounting should separate:
 2. membership divergence (different top-k set, requires human packet scoring)
 ```
 
+### Shadow report membership-divergence sample (2026-05-27)
+
+Latest live report from Yogg:
+```text
+report_mtime: 2026-05-27 05:33:17
+first_divergence: 4
+overlap_count: 5/6
+unknown_type_suppression: 0
+arena_attribution_delta: CTX_LLM_METADATA_TOKEN_FORM
+```
+
+Current-only node exposed by type-rank:
+```text
+P_LLM_PHYSICS_LAW6_C_GARDENER_VERIFIED
+type=LESSON, tier=REFLECTION, confidence_score=0.55
+usage=13, success=13, fail=0
+title=LLM物理学定律6（观测优于反思）的代码具身化验证：C-Gardener的"反思"(_run_reflection...
+```
+
+Shadow-only node exposed by fusion score:
+```text
+CTX_LLM_METADATA_TOKEN_FORM
+type=CONTEXT, tier=REFLECTION, confidence_score=0.7684
+usage=3, success=3, fail=0
+title=LLM 仅能从自然语言 token 感知元信息
+```
+
+Human-read interpretation:
+```text
+This is a true top-6 membership divergence rather than order-only movement.
+It is not caused by unknown type suppression: both nodes have known types.
+The current type-rank policy prefers an additional LESSON over a higher-confidence CONTEXT.
+The shadow-only CONTEXT is conceptually relevant to the llm_physics packet and may be exposure-starved.
+This strengthens the exposure-bias concern but still only supports shadow observation, not a runtime ranking change.
+```
+
 ## 12.10 Focused test proposal
 
 If shadow instrumentation is implemented later, the minimum test surface is:
